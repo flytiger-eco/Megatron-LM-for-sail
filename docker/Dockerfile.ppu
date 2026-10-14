@@ -1,0 +1,75 @@
+#
+# Megatron-LM-for-SAIL (core_r0.19.0) on PPU
+#
+# Base image: Flytiger PPU PyTorch runtime (SDK 2.2.0 / PyTorch 2.13.0 / CUDA 13.0 / py312).
+# This Dockerfile reproduces the verified flow:
+#   1. fix the build toolchain (setuptools 75.8 needs packaging>=24.2)
+#   2. remove any pre-installed megatron-core
+#   3. clone Megatron-LM-for-sail @ core_r0.19.0 and `pip install --no-build-isolation .`
+#   4. install the unit-test toolchain
+#
+# NOTE on the pip index: the base image's default index is the Flytiger artifactory,
+# which does NOT carry packaging / pytest / click / wrapt. Those are pulled from public
+# PyPI explicitly via --index-url.
+
+ARG BASE_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+FROM ${BASE_IMAGE}
+
+# --- Build/source configuration -------------------------------------------
+ARG MEGATRON_REPO=https://github.com/flytiger-eco/Megatron-LM-for-sail.git
+ARG MEGATRON_BRANCH=core_r0.19.0
+ARG PYPI_INDEX=https://pypi.org/simple
+ARG WORKDIR=/opt/megatron
+
+# PPU SDK / PCCL environment is already provided by the base image:
+#   PPU_SDK=/usr/local/PPU_SDK, PPU_VERSION=2.2.0, CUDA_SDK=/usr/local/PPU_SDK/CUDA_SDK
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    TORCH_CPP_LOG_LEVEL=ERROR
+
+# --- 1. Build toolchain fix -------------------------------------------------
+# The base image ships setuptools 75.8.0 with packaging 21.3. setuptools>=70 calls
+# packaging.utils.canonicalize_version(..., strip_trailing_zero=...), which only
+# exists in packaging>=22 -> "TypeError: canonicalize_version() got an unexpected
+# keyword argument 'strip_trailing_zero'". Upgrade packaging before building.
+RUN pip install --index-url ${PYPI_INDEX} -U "packaging>=24.2"
+
+# --- 2. Remove any pre-installed megatron-core ------------------------------
+RUN pip uninstall -y megatron-core || true
+
+# --- 3. Clone + build Megatron-LM-for-SAIL ----------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone -b ${MEGATRON_BRANCH} ${MEGATRON_REPO} ${WORKDIR}/Megatron-LM-for-sail \
+    || (sleep 5 && rm -rf ${WORKDIR}/Megatron-LM-for-sail \
+        && git clone -b ${MEGATRON_BRANCH} ${MEGATRON_REPO} ${WORKDIR}/Megatron-LM-for-sail)
+WORKDIR ${WORKDIR}/Megatron-LM-for-sail
+RUN pip install --no-build-isolation .
+
+# --- 4. Unit-test toolchain -------------------------------------------------
+# Declared in pyproject.toml [project.optional-dependencies].test plus the runtime
+# imports required by tests/unit_tests/conftest.py (click) and test_imports.py (wrapt).
+RUN pip install --index-url ${PYPI_INDEX} \
+        "pytest==9.1.1" pytest-mock mock pytest-cov pytest-random-order \
+        pytest-asyncio pytest-timeout coverage click wrapt
+
+# Multi-rank fixtures download datasets/tokenizers into /opt/data; concurrent ranks
+# race on the download and stall process-group bootstrap. Pre-create the ready marker.
+RUN mkdir -p /opt/data && touch /opt/data/.ready
+
+# --- Smoke test -------------------------------------------------------------
+# Verifies megatron-core imports and reports version + visible PPU device count.
+RUN python3 -c "import torch, megatron.core as m; \
+print('megatron.core', m.__version__); \
+print('torch', torch.__version__); \
+print('ppu_device_count', torch.cuda.device_count())"
+
+# Default: run a representative, topology-light UT subset.
+# For multi-rank cases launch with device masking, e.g.:
+#   CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m pytest tests/unit_tests/test_utils.py -q
+CMD ["python3", "-m", "pytest", "-q", "--tb=short", "--timeout=300", "-p", "no:cacheprovider", \
+     "tests/unit_tests/test_basic.py", \
+     "tests/unit_tests/test_num_microbatches_calculator.py", \
+     "tests/unit_tests/test_optimizer_param_scheduler.py", \
+     "tests/unit_tests/test_model_parallel_config.py", \
+     "tests/unit_tests/test_num_floating_point_operations.py"]
