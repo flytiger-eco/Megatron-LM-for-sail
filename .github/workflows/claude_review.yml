@@ -1,8 +1,9 @@
 name: Claude Code Review
 
 on:
-  issue_comment:
-    types: [created]
+  # issue_comment:
+  #   types: [created]
+  workflow_dispatch:
 
 jobs:
   # ──────────────────────────────────────────────────────────────────

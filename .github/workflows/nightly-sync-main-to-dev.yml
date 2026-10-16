@@ -16,11 +16,11 @@ name: Nightly Sync Main to Dev
 
 on:
   workflow_dispatch:
-  schedule:
+  # schedule:
     # Twice-weekly cadence: Monday and Thursday at 15:00 UTC.
     # 15:00 UTC = 8 AM PDT (7 AM PST during winter — GitHub Actions cron
     # is UTC-only and does not follow DST). Days-of-week: 1=Mon, 4=Thu.
-    - cron: '0 15 * * 1,4'
+  #   - cron: '0 15 * * 1,4'
 
 concurrency:
   group: nightly-sync-main-to-dev

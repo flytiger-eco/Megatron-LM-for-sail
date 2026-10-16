@@ -2,13 +2,14 @@
 
 name: Auto Swap Labels
 on:
-  pull_request_target:
-    types: [ready_for_review, synchronize]
-    branches:
-      - main
-  workflow_run:
-    workflows: ["Review Trigger"]
-    types: [completed]
+  # pull_request_target:
+  #   types: [ready_for_review, synchronize]
+  #   branches:
+  #     - main
+  # workflow_run:
+  #   workflows: ["Review Trigger"]
+  #   types: [completed]
+  workflow_dispatch:
 
 permissions:
   pull-requests: write
