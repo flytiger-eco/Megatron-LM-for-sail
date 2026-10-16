@@ -1,8 +1,9 @@
 name: Claude Copy PR to Main
 
 on:
-  issue_comment:
-    types: [created]
+  # issue_comment:
+  #   types: [created]
+  workflow_dispatch:
 
 jobs:
   authorize_copy:

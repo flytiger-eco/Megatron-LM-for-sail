@@ -1,11 +1,12 @@
 name: "Codeowners Approval Workflow"
 
 on:
-  push:
-    branches:
-      - "pull-request/[0-9]+"
-  merge_group:
-    types: [checks_requested]
+  # push:
+  #   branches:
+  #     - "pull-request/[0-9]+"
+  # merge_group:
+  #   types: [checks_requested]
+  workflow_dispatch:
 
 jobs:
   pre-flight:

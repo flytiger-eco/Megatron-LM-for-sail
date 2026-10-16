@@ -1,0 +1,131 @@
+name: PPU Build
+on:
+  push:
+    branches: [ci/ppu-validation]
+  pull_request:
+    branches: [ci/ppu-validation]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  # merge_group:
+  #   types: [checks_requested]
+  # schedule:
+  #   - cron: '0 2 * * *'
+  # repository_dispatch:
+  #   types: [ppu-ci]
+  workflow_dispatch:
+    inputs:
+      build:
+        description: 是否构建（关闭则同时跳过 UT）
+        type: boolean
+        default: true
+      unit_test:
+        description: 是否执行 UT
+        type: boolean
+        default: true
+      repeat:
+        description: 每个测试用例重复次数（0 表示跳过 UT）
+        type: number
+        default: 1
+      timeout:
+        description: 每个 bucket 全部重复及两个阶段的总分钟数
+        type: number
+        default: 30
+permissions:
+  contents: read
+concurrency:
+  group: ppu-build-${{ github.event_name == 'schedule' && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+jobs:
+  configure:
+    if: >-
+      vars.PPU_CI_ENABLED == 'true' &&
+      (github.ref == 'refs/heads/ci/ppu-validation' ||
+       (github.event_name == 'pull_request' && github.base_ref == 'ci/ppu-validation')) &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    outputs:
+      config: ${{ steps.config.outputs.config }}
+      build: ${{ steps.config.outputs.build }}
+      unit_test: ${{ steps.config.outputs.unit_test }}
+      unit_matrix: ${{ steps.config.outputs.unit_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: python3 -m pip install click pyyaml
+      - id: config
+        env:
+          PPU_INPUTS: ${{ toJSON(inputs) }}
+          PPU_DEFAULTS: >-
+            {"build":"${{ vars.PPU_BUILD || 'yes' }}","unit_test":"${{ vars.PPU_UNIT_TEST || 'yes' }}",
+            "repeat":"${{ vars.PPU_UNIT_TEST_REPEAT || '1' }}","timeout":"${{ vars.PPU_UNIT_TEST_TIMEOUT || '30' }}"}
+        run: |
+          python3 .github/scripts/ppu_ci.py configure
+          cp .github/scripts/ppu_ci.py .ppu-ci/ppu_ci.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppu-plan
+          path: .ppu-ci/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+  build:
+    needs: configure
+    if: needs.configure.outputs.build == 'true'
+    runs-on: k8s-runner-group-cpu-flytiger
+    environment: ppu-ci
+    timeout-minutes: 180
+    container:
+      image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+      options: --user root
+    env:
+      PPU_IMAGE: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+      PIP_INDEX_URL: ${{ vars.PPU_PIP_INDEX_URL || 'https://pypi.org/simple' }}
+      MAX_JOBS: '16'
+    steps:
+      - name: 准备源码检出工具
+        shell: bash
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+      - name: 检出待测源码
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+      - name: checkout 失败后等待
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 15
+      - name: 重试检出待测源码（最后一次）
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-plan
+          path: .ppu-ci
+      - name: CPU 构建 DEV/LTS 共用的依赖、wheel 和 UT 环境
+        shell: bash
+        run: bash .github/scripts/ppu_ci_build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppu-bundle
+          path: .ppu-ci/
+          include-hidden-files: true
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+  unit-tests:
+    needs: [configure, build]
+    if: needs.configure.outputs.unit_test == 'true'
+    uses: ./.github/workflows/ppu-ut.yml
+    with:
+      matrix: ${{ needs.configure.outputs.unit_matrix }}

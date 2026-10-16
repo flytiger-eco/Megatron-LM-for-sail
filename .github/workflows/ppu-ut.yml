@@ -1,0 +1,90 @@
+name: PPU UT
+on:
+  workflow_call:
+    inputs:
+      matrix:
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  test:
+    name: ${{ matrix.environment }} / ${{ matrix.bucket }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    environment: ppu-ci
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: ${{ matrix.job_minutes }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-bundle
+          path: .ppu-ci
+      - name: 执行 PPU UT bucket
+        id: ppu
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+          nnodes: 0
+          nproc_per_node: ${{ matrix.cards }}
+          namespace: ${{ vars.PPU_NAMESPACE || 'ppu-sched' }}
+          node_selector: "board-type=ZW-M890P"
+          host_volumes: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
+          source_dir: /opt/megatron-lm
+          artifact_paths: .ppu-ci
+          timeout_minutes: ${{ matrix.action_minutes }}
+          cleanup_policy: always
+          dmesg_policy: on_failure
+          container_options: |
+            shm_size: "64Gi"
+          extra_env: PPU_RESULTS_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/unit/${{ matrix.id }}
+          command: |
+            set -euo pipefail
+            cd /opt/megatron-lm
+            tar -xzf .ppu-ci/source.tar.gz
+            bash .github/scripts/ppu_ci_run.sh '${{ matrix.id }}'
+      - name: 上传每个 rank 的真实结果、日志与覆盖率
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-ut-${{ matrix.id }}
+          path: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/unit/${{ matrix.id }}/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+      - name: 检查执行完整性
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        env:
+          PPU_STATUS: ${{ steps.ppu.outputs.job_status }}
+          PPU_OUTCOME: ${{ steps.ppu.outcome }}
+        run: '[[ "$PPU_OUTCOME" == success && "$PPU_STATUS" == succeeded ]]'
+  result:
+    name: UT Pass Rate >= 80%
+    needs: test
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-plan
+          path: .ppu-ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ppu-ut-*
+          path: results
+      - name: 汇总全部用例并应用 80% 通过率门禁
+        env:
+          PPU_MATRIX_RESULT: ${{ needs.test.result }}
+        run: python3 .ppu-ci/ppu_ci.py summarize --results results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ppu-ut-summary
+          path: results/summary.json
+          if-no-files-found: error
+          retention-days: 7
