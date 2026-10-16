@@ -20,9 +20,11 @@ trap prepare_results_for_upload EXIT
 umask 022
 mkdir -p "$PPU_RESULTS_DIR" /opt/data /workspace/data/cache /tmp/checkpoints
 export PPU_REPORT_DIR="$PPU_RESULTS_DIR"
+python3 -m pip uninstall --yes cloud-tpu-client
 tar -xzf .ppu-ci/environment.tar.gz -C /opt
 export PATH="/opt/ppu-ci-venv/bin:$PATH"
 export VIRTUAL_ENV=/opt/ppu-ci-venv UV_PROJECT_ENVIRONMENT=/opt/ppu-ci-venv
+python -m pip check
 export PYTHONPATH="$PWD:$PWD/.github/scripts:${PYTHONPATH:-}"
 export UV_NO_BUILD=1 PIP_ONLY_BINARY=:all: UV_PYTHON_DOWNLOADS=never
 export TORCH_CPP_LOG_LEVEL=ERROR

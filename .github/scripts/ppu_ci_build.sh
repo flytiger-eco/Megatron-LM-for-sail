@@ -6,7 +6,7 @@ export PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL='' PIP_FIND_LINKS=''
 export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 PIP_NO_CACHE_DIR=1
 export DEBIAN_FRONTEND=noninteractive TORCH_CPP_LOG_LEVEL=ERROR
 export MAX_JOBS="${MAX_JOBS:-16}"
-python3 -m pip uninstall --yes megatron-core
+python3 -m pip uninstall --yes megatron-core cloud-tpu-client
 python3 -m venv --system-site-packages /opt/ppu-ci-venv
 export PATH="/opt/ppu-ci-venv/bin:$PATH"
 export VIRTUAL_ENV=/opt/ppu-ci-venv
