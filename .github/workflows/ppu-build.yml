@@ -31,6 +31,11 @@ on:
         default: 30
 permissions:
   contents: read
+env:
+  PIP_INDEX_URL: https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
+  PIP_CONFIG_FILE: /dev/null
+  PIP_EXTRA_INDEX_URL: ''
+  PIP_FIND_LINKS: ''
 concurrency:
   group: ppu-build-${{ github.event_name == 'schedule' && github.run_id || github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'schedule' }}
@@ -51,7 +56,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - run: python3 -m pip install click pyyaml
+      - run: python3 -m pip install --index-url "$PIP_INDEX_URL" click pyyaml
       - id: config
         env:
           PPU_INPUTS: ${{ toJSON(inputs) }}
@@ -78,7 +83,6 @@ jobs:
       image: ghcr.io/actions/actions-runner:latest
     env:
       PPU_IMAGE: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
-      PIP_INDEX_URL: ${{ vars.PPU_PIP_INDEX_URL || 'https://pypi.org/simple' }}
       MAX_JOBS: '16'
     steps:
       - name: 检出待测源码
@@ -128,7 +132,7 @@ jobs:
             cd /opt/megatron-lm
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
-            apt-get install -y --no-install-recommends git ca-certificates
+            apt-get install -y --no-install-recommends git ca-certificates wget
             chown -R "$(id -u):$(id -g)" .
             [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]] || exit 1
             unset WORLD_SIZE RANK LOCAL_RANK
