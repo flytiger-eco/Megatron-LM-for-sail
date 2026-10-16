@@ -73,22 +73,14 @@ jobs:
     if: needs.configure.outputs.build == 'true'
     runs-on: k8s-runner-group-cpu-flytiger
     environment: ppu-ci
-    timeout-minutes: 180
+    timeout-minutes: 210
     container:
-      image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
-      options: --user root
+      image: ghcr.io/actions/actions-runner:latest
     env:
       PPU_IMAGE: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
       PIP_INDEX_URL: ${{ vars.PPU_PIP_INDEX_URL || 'https://pypi.org/simple' }}
       MAX_JOBS: '16'
     steps:
-      - name: 准备源码检出工具
-        shell: bash
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates
       - name: 检出待测源码
         id: checkout
         continue-on-error: true
@@ -112,13 +104,58 @@ jobs:
         with:
           name: ppu-plan
           path: .ppu-ci
-      - name: CPU 构建 DEV/LTS 共用的依赖、wheel 和 UT 环境
+      - name: 在 890P 八卡 Pod 中构建 DEV/LTS 共用产物
+        id: ppu-build
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+          nnodes: 0
+          nproc_per_node: 8
+          namespace: ${{ vars.PPU_NAMESPACE || 'ppu-sched' }}
+          node_selector: "board-type=ZW-M890P"
+          host_volumes: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
+          source_dir: /opt/megatron-lm
+          artifact_paths: .ppu-ci
+          timeout_minutes: 180
+          cleanup_policy: always
+          dmesg_policy: on_failure
+          container_options: |
+            shm_size: "64Gi"
+          extra_env: GITHUB_SHA=${{ github.sha }},PPU_BUNDLE_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build
+          command: |
+            set -euo pipefail
+            umask 022
+            cd /opt/megatron-lm
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends git ca-certificates
+            chown -R "$(id -u):$(id -g)" .
+            [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]] || exit 1
+            unset WORLD_SIZE RANK LOCAL_RANK
+            bash .github/scripts/ppu_ci_build.sh
+            mkdir -p "$PPU_BUNDLE_DIR"
+            cp -R .ppu-ci/. "$PPU_BUNDLE_DIR/"
+            chmod -R a+rX "$PPU_BUNDLE_DIR"
+            printf '%s\n' "$GITHUB_SHA" > "$PPU_BUNDLE_DIR/.complete"
+      - name: 检查 PPU 构建状态与回传产物
+        if: ${{ always() && !cancelled() }}
         shell: bash
-        run: bash .github/scripts/ppu_ci_build.sh
+        env:
+          PPU_STATUS: ${{ steps.ppu-build.outputs.job_status }}
+          PPU_OUTCOME: ${{ steps.ppu-build.outcome }}
+          PPU_BUNDLE_DIR: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build
+        run: |
+          set -euo pipefail
+          [[ "$PPU_OUTCOME" == success && "$PPU_STATUS" == succeeded ]] || exit 1
+          [[ "$(< "$PPU_BUNDLE_DIR/.complete")" == "$GITHUB_SHA" ]] || exit 1
+          [[ "$(< "$PPU_BUNDLE_DIR/commit.txt")" == "$GITHUB_SHA" ]] || exit 1
+          [[ "$(< "$PPU_BUNDLE_DIR/image.txt")" == "$PPU_IMAGE" ]] || exit 1
+          [[ -s "$PPU_BUNDLE_DIR/source.tar.gz" && -s "$PPU_BUNDLE_DIR/environment.tar.gz" ]] || exit 1
+          cmp .ppu-ci/manifest.json "$PPU_BUNDLE_DIR/manifest.json"
       - uses: actions/upload-artifact@v4
         with:
           name: ppu-bundle
-          path: .ppu-ci/
+          path: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build/
           include-hidden-files: true
           compression-level: 0
           if-no-files-found: error
