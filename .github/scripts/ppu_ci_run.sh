@@ -3,6 +3,21 @@ set -euo pipefail
 case_id="${1:?缺少 UT bucket 标识}"
 [[ "$case_id" =~ ^(dev|lts)-[0-9]+$ ]]
 : "${PPU_RESULTS_DIR:?缺少本次作业结果目录}"
+prepare_results_for_upload() {
+    local exit_code=$?
+    trap - EXIT
+    if [[ -d "$PPU_RESULTS_DIR" ]]; then
+        if ! chmod -R -- a+rX "$PPU_RESULTS_DIR"; then
+            printf '::error::无法设置 UT 结果目录的上传读取权限: %s\n' "$PPU_RESULTS_DIR" >&2
+            if ((exit_code == 0)); then
+                exit_code=1
+            fi
+        fi
+    fi
+    exit "$exit_code"
+}
+trap prepare_results_for_upload EXIT
+umask 022
 mkdir -p "$PPU_RESULTS_DIR" /opt/data /workspace/data/cache /tmp/checkpoints
 export PPU_REPORT_DIR="$PPU_RESULTS_DIR"
 tar -xzf .ppu-ci/environment.tar.gz -C /opt
