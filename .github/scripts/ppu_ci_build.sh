@@ -53,7 +53,80 @@ python -m pip install --index-url "$PIP_INDEX_URL" --no-build-isolation \
     'pydantic<2.14' boto3 'multi-storage-client~=0.50' 'einops~=0.8' 'uv==0.13.0' \
     'google-api-python-client>=2'
 python -m pip check
+cat > .ppu-ci/import_diagnostics.py <<'PY'
+import sys
+
+
+def ppu_import_snapshot(label):
+    print('[PPU-IMPORT]', label, flush=True)
+    print('[PPU-IMPORT] interpreter:', sys.executable, sys.prefix, sys.base_prefix, flush=True)
+    print('[PPU-IMPORT] sys.path:', sys.path, flush=True)
+    for name in (
+        'google', 'google.protobuf', 'google.protobuf.runtime_version',
+        'setuptools', 'distutils', 'joblib', 'transformer_engine.pytorch', 'onnx',
+    ):
+        module = sys.modules.get(name)
+        if module is None:
+            continue
+        data = vars(module)
+        path = data.get('__path__')
+        raw_path = vars(path) if hasattr(path, '__dict__') else {}
+        print('[PPU-IMPORT] module:', name, data.get('__file__'), data.get('__version__'),
+              'path:', path if isinstance(path, (list, tuple)) else raw_path.get('_path'),
+              'parent:', raw_path.get('_last_parent_path'), flush=True)
+
+
+def ppu_import_audit(event, args):
+    if event != 'import' or args[0] not in (
+        'google.protobuf', 'google.protobuf.runtime_version', 'setuptools',
+        'distutils', 'joblib', 'transformer_engine.pytorch', 'onnx',
+    ):
+        return
+    ppu_import_snapshot('import ' + args[0])
+    frame = sys._getframe(1)
+    remaining = 24
+    while frame is not None and remaining:
+        if not frame.f_code.co_filename.startswith('<frozen importlib'):
+            print('[PPU-IMPORT] caller:', frame.f_code.co_filename, frame.f_lineno,
+                  frame.f_code.co_name, flush=True)
+            remaining -= 1
+        frame = frame.f_back
+
+
+ppu_original_excepthook = sys.excepthook
+
+
+def ppu_import_excepthook(kind, value, traceback):
+    ppu_import_snapshot('uncaught exception')
+    ppu_original_excepthook(kind, value, traceback)
+
+
+sys.addaudithook(ppu_import_audit)
+sys.excepthook = ppu_import_excepthook
+ppu_import_snapshot('probe startup')
+ppu_os = sys.modules['os']
+for ppu_directory in tuple(sys.path):
+    if not ppu_os.path.isdir(ppu_directory):
+        continue
+    ppu_entries = ppu_os.listdir(ppu_directory)
+    for ppu_name in sorted(ppu_entries):
+        if not (ppu_name.startswith('protobuf') and ppu_name.endswith('.pth')):
+            continue
+        ppu_file = ppu_os.path.join(ppu_directory, ppu_name)
+        with open(ppu_file) as ppu_stream:
+            ppu_content = ppu_stream.read()
+        print('[PPU-IMPORT] protobuf startup file:', ppu_file, repr(ppu_content), flush=True)
+        for ppu_owner in ppu_entries:
+            if not (ppu_owner.startswith('protobuf') and ppu_owner.endswith('.dist-info')):
+                continue
+            ppu_record = ppu_os.path.join(ppu_directory, ppu_owner, 'RECORD')
+            if ppu_os.path.isfile(ppu_record):
+                with open(ppu_record) as ppu_stream:
+                    if any(line.split(',', 1)[0] == ppu_name for line in ppu_stream):
+                        print('[PPU-IMPORT] startup file owner:', ppu_owner, flush=True)
+PY
 python -I - <<'PY'
+exec(compile(open('.ppu-ci/import_diagnostics.py').read(), '.ppu-ci/import_diagnostics.py', 'exec'))
 import importlib
 import importlib.metadata as md
 from pathlib import Path
@@ -70,8 +143,10 @@ for name in (
     'mamba_ssm.ops.triton.layernorm_gated', 'mamba_ssm.ops.triton.ssd_combined',
     'selective_scan_cuda', 'causal_conv1d', 'causal_conv1d_cuda',
 ):
+    ppu_import_snapshot('before ' + name)
     module = importlib.import_module(name)
     print('依赖导入检查通过:', name, module.__file__)
+    ppu_import_snapshot('after ' + name)
 PY
 install -m 0644 .github/scripts/ppu_pytest_policy.py \
     "$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/ppu_pytest_policy.py"
@@ -83,10 +158,13 @@ python -m pip install --no-index --no-deps --ignore-installed dist/*.whl
 python -m pip check
 python -m pip list --format=json > .ppu-ci/installed-packages.json
 python -I - <<'PY'
+exec(compile(open('.ppu-ci/import_diagnostics.py').read(), '.ppu-ci/import_diagnostics.py', 'exec'))
 import sys
 from pathlib import Path
 import torch
+ppu_import_snapshot('before megatron.core')
 import megatron.core
+ppu_import_snapshot('after megatron.core')
 import megatron.training
 from megatron.core.datasets import helpers_cpp
 from megatron.core.extensions import transformer_engine
