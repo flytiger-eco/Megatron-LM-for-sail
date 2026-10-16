@@ -56,7 +56,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - run: python3 -m pip install --index-url "$PIP_INDEX_URL" click pyyaml
+      - name: 准备隔离的配置环境
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ppu-configure-venv"
+          "$RUNNER_TEMP/ppu-configure-venv/bin/python" -m pip install --index-url "$PIP_INDEX_URL" click pyyaml
+          printf '%s\n' "$RUNNER_TEMP/ppu-configure-venv/bin" >> "$GITHUB_PATH"
       - id: config
         env:
           PPU_INPUTS: ${{ toJSON(inputs) }}
