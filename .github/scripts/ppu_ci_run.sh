@@ -20,7 +20,7 @@ trap prepare_results_for_upload EXIT
 umask 022
 mkdir -p "$PPU_RESULTS_DIR" /opt/data /workspace/data/cache /tmp/checkpoints
 export PPU_REPORT_DIR="$PPU_RESULTS_DIR"
-python3 -m pip uninstall --yes cloud-tpu-client
+python3 -m pip uninstall --yes cloud-tpu-client protobuf
 tar -xzf .ppu-ci/environment.tar.gz -C /opt
 export PATH="/opt/ppu-ci-venv/bin:$PATH"
 export VIRTUAL_ENV=/opt/ppu-ci-venv UV_PROJECT_ENVIRONMENT=/opt/ppu-ci-venv
@@ -55,6 +55,12 @@ if count < expected:
     raise RuntimeError(f'可见卡数不足: {count} < {expected}')
 import megatron.core
 from megatron.core.datasets import helpers_cpp
+import google.protobuf
+from importlib.metadata import version
+from pathlib import Path
+assert Path(google.protobuf.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+assert google.protobuf.__version__ == version('protobuf')
+print('protobuf:', google.protobuf.__version__, google.protobuf.__file__)
 print('megatron.core:', megatron.core.__version__, '路径:', megatron.core.__file__)
 print('预编译扩展:', helpers_cpp.__file__)
 PY
