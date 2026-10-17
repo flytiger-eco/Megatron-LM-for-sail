@@ -6,7 +6,7 @@ export PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL='' PIP_FIND_LINKS=''
 export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 PIP_NO_CACHE_DIR=1
 export DEBIAN_FRONTEND=noninteractive TORCH_CPP_LOG_LEVEL=ERROR
 export MAX_JOBS="${MAX_JOBS:-16}"
-python3 -m pip uninstall --yes megatron-core cloud-tpu-client
+python3 -m pip uninstall --yes megatron-core cloud-tpu-client protobuf
 python3 -m venv --system-site-packages /opt/ppu-ci-venv
 export PATH="/opt/ppu-ci-venv/bin:$PATH"
 export VIRTUAL_ENV=/opt/ppu-ci-venv
@@ -169,6 +169,11 @@ import megatron.training
 from megatron.core.datasets import helpers_cpp
 from megatron.core.extensions import transformer_engine
 from megatron.core.ssm import mamba_mixer
+import google.protobuf
+from importlib.metadata import version
+assert Path(google.protobuf.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+assert google.protobuf.__version__ == version('protobuf')
+print('protobuf:', google.protobuf.__version__, google.protobuf.__file__)
 assert transformer_engine.HAVE_TE, 'Megatron 未启用 Transformer Engine'
 assert mamba_mixer.HAVE_MAMBA_SSM, 'Megatron 未启用 Mamba SSM'
 assert mamba_mixer.causal_conv1d_fn is not None, 'Megatron 未启用 causal-conv1d'
