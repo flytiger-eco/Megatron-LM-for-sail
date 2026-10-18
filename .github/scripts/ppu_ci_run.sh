@@ -130,7 +130,8 @@ for ((iteration = 1; iteration <= repeat; iteration++)); do
             python -m torch.distributed.run --standalone --nproc-per-node "$NPROC_PER_NODE" \
             --log-dir "$PPU_RESULTS_DIR/logs/$iteration/$phase" --tee 0:3 --redirects 3 \
             -m coverage run --parallel-mode --source=megatron/core -m pytest \
-            "${args[@]}" -vs --tb=short -m "$selection" "${extra[@]}" || status=$?
+            "${args[@]}" -vs --tb=short -o faulthandler_timeout=300 \
+            -m "$selection" "${extra[@]}" || status=$?
     done
 done
 if python -m coverage combine --keep "$PPU_RESULTS_DIR"; then
