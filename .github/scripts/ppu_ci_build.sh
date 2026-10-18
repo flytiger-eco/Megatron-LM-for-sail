@@ -51,7 +51,7 @@ python -m pip install --index-url "$PIP_INDEX_URL" --no-build-isolation \
     -r .ppu-ci/test-requirements.txt -r .ppu-ci/ppu-requirements.txt \
     pytest-timeout click wrapt requests tensorstore scipy scikit-learn \
     'pydantic<2.14' boto3 'multi-storage-client~=0.50' 'einops~=0.8' 'uv==0.13.0' \
-    'google-api-python-client>=2' pyzmq 'openai[aiohttp]' fastapi uvicorn datasets \
+    'google-api-python-client>=2' pyzmq msgpack 'openai[aiohttp]' fastapi uvicorn datasets \
     'nvidia-modelopt==0.45.0'
 python -m pip check
 cat > .ppu-ci/import_diagnostics.py <<'PY'
@@ -143,7 +143,7 @@ for name in (
     'transformer_engine.pytorch', 'flash_attn.flash_attn_interface', 'flash_attn_2_cuda',
     'mamba_ssm.ops.triton.layernorm_gated', 'mamba_ssm.ops.triton.ssd_combined',
     'selective_scan_cuda', 'causal_conv1d', 'causal_conv1d_cuda',
-    'zmq', 'openai', 'fastapi', 'uvicorn', 'pyarrow', 'pyarrow.parquet', 'datasets', 'modelopt.torch',
+    'zmq', 'msgpack', 'openai', 'fastapi', 'uvicorn', 'pyarrow', 'pyarrow.parquet', 'datasets', 'modelopt.torch',
 ):
     ppu_import_snapshot('before ' + name)
     module = importlib.import_module(name)
@@ -178,6 +178,8 @@ import megatron.training
 from megatron.core.datasets import helpers_cpp
 from megatron.core.extensions import transformer_engine
 from megatron.core.ssm import mamba_mixer
+from megatron.core.inference.engines import dynamic_engine
+import megatron.core.inference.inference_client
 import google.protobuf
 from importlib.metadata import version
 assert Path(google.protobuf.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
@@ -186,6 +188,7 @@ print('protobuf:', google.protobuf.__version__, google.protobuf.__file__)
 assert transformer_engine.HAVE_TE, 'Megatron 未启用 Transformer Engine'
 assert mamba_mixer.HAVE_MAMBA_SSM, 'Megatron 未启用 Mamba SSM'
 assert mamba_mixer.causal_conv1d_fn is not None, 'Megatron 未启用 causal-conv1d'
+assert dynamic_engine.HAVE_ZMQ and dynamic_engine.HAVE_MSGPACK, '推理引擎通信依赖不完整'
 assert Path(megatron.core.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
 assert Path(helpers_cpp.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
 print('megatron.core:', megatron.core.__version__, megatron.core.__file__)

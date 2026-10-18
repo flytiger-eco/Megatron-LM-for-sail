@@ -56,7 +56,7 @@ class MockModel(LanguageModule):
         self.vocab = vocab
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.config = TransformerConfig(
-            num_attention_heads=8, num_layers=8, pipeline_dtype=torch.bfloat16
+            num_attention_heads=8, num_layers=8, hidden_size=128, pipeline_dtype=torch.bfloat16
         )
         self.model_type = ModelType.encoder_or_decoder
 
@@ -64,6 +64,12 @@ class MockModel(LanguageModule):
         del position_ids
         del attention_mask
         batch, seq = x.shape
+        if not is_pp_last_stage(self.pg_collection.pp):
+            return torch.ones(
+                (seq, batch, self.config.hidden_size),
+                dtype=self.config.pipeline_dtype,
+                device=x.device,
+            )
         mock_model_outputs = torch.ones((batch, seq, self.vocab), device=x.device)
         return mock_model_outputs
 
@@ -709,7 +715,8 @@ class TestRLUtils:
             # As we return ones as logits, all logprobs should be the same.
             assert torch.all(logprobs == logprobs[0, 0]).item()
         else:
-            assert logprobs.shape == (BATCH, SEQ, VOCAB)
+            assert logprobs.shape == (SEQ, BATCH, model.config.hidden_size)
+            assert logprobs.dtype == model.config.pipeline_dtype
 
     @pytest.mark.parametrize(
         "ratio, advantage, clamp_eps, kl_beta, entropy_weight, expected",
