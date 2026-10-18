@@ -51,7 +51,8 @@ python -m pip install --index-url "$PIP_INDEX_URL" --no-build-isolation \
     -r .ppu-ci/test-requirements.txt -r .ppu-ci/ppu-requirements.txt \
     pytest-timeout click wrapt requests tensorstore scipy scikit-learn \
     'pydantic<2.14' boto3 'multi-storage-client~=0.50' 'einops~=0.8' 'uv==0.13.0' \
-    'google-api-python-client>=2'
+    'google-api-python-client>=2' pyzmq 'openai[aiohttp]' fastapi uvicorn datasets \
+    'nvidia-modelopt==0.45.0'
 python -m pip check
 cat > .ppu-ci/import_diagnostics.py <<'PY'
 import sys
@@ -142,6 +143,7 @@ for name in (
     'transformer_engine.pytorch', 'flash_attn.flash_attn_interface', 'flash_attn_2_cuda',
     'mamba_ssm.ops.triton.layernorm_gated', 'mamba_ssm.ops.triton.ssd_combined',
     'selective_scan_cuda', 'causal_conv1d', 'causal_conv1d_cuda',
+    'zmq', 'openai', 'fastapi', 'uvicorn', 'datasets', 'modelopt.torch',
 ):
     ppu_import_snapshot('before ' + name)
     module = importlib.import_module(name)
@@ -169,6 +171,8 @@ import megatron.training
 from megatron.core.datasets import helpers_cpp
 from megatron.core.extensions import transformer_engine
 from megatron.core.ssm import mamba_mixer
+import megatron.post_training.model_builder
+import megatron.rl.rl_utils
 import google.protobuf
 from importlib.metadata import version
 assert Path(google.protobuf.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
@@ -186,6 +190,36 @@ PY
 mkdir -p .ppu-ci/data
 if python -c 'import json; raise SystemExit(not json.load(open(".ppu-ci/manifest.json"))["config"]["unit_test"])'; then
     python -m tests.test_utils.python_scripts.download_unit_tests_dataset --assets-dir "$PWD/.ppu-ci/data"
+    export HF_HOME="$PWD/.ppu-ci/data/huggingface-cache"
+    export HF_HUB_CACHE="$HF_HOME/hub" HF_HUB_DISABLE_TELEMETRY=1
+    HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 timeout --signal=TERM --kill-after=30s 900 python - <<'PY'
+import json
+import time
+from pathlib import Path
+from transformers import AutoTokenizer
+from megatron.core.tokenizers.text.libraries.megatron_hf_tokenizer import MEGATRON_CONFIG_MAP
+names = sorted({entry['tokenizer_name'] for entry in MEGATRON_CONFIG_MAP.values()})
+for name in names:
+    for attempt in range(3):
+        try:
+            AutoTokenizer.from_pretrained(name, trust_remote_code=False)
+            print('UT tokenizer 缓存就绪:', name, flush=True)
+            break
+        except (OSError, RuntimeError):
+            if attempt == 2:
+                raise
+            time.sleep(15 * (attempt + 1))
+Path('.ppu-ci/data/hf-tokenizers.json').write_text(json.dumps(names))
+PY
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python - <<'PY'
+import json
+from pathlib import Path
+from transformers import AutoTokenizer
+for name in json.loads(Path('.ppu-ci/data/hf-tokenizers.json').read_text()):
+    tokenizer = AutoTokenizer.from_pretrained(name, local_files_only=True, trust_remote_code=False)
+    assert tokenizer.encode('PPU CI tokenizer cache')
+    print('UT tokenizer 离线检查通过:', name)
+PY
     touch .ppu-ci/data/.ready
 fi
 git ls-files -z > .ppu-ci/source-files.txt
