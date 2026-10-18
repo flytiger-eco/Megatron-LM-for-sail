@@ -2,6 +2,7 @@
 
 import asyncio
 import itertools
+import traceback
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -1635,7 +1636,31 @@ class TestRLUtils:
         # Record runner count before creating graphs
         runners_before = {id(mgr): len(mgr.cudagraph_runners) for mgr in cudagraph_managers}
 
-        create_cudagraphs()
+        if cp > 1:
+            from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
+                AttnFuncWithCPAndKVP2P,
+            )
+
+            original_backward = AttnFuncWithCPAndKVP2P.backward
+
+            def diagnostic_backward(ctx, *args):
+                print(
+                    f"CP 反向捕获: rank={torch.distributed.get_rank()}, "
+                    f"fused_attention={ctx.use_fused_attention}, format={ctx.qkv_format}",
+                    flush=True,
+                )
+                try:
+                    return original_backward(ctx, *args)
+                except Exception:
+                    traceback.print_exc()
+                    raise
+
+            with patch.object(
+                AttnFuncWithCPAndKVP2P, "backward", staticmethod(diagnostic_backward)
+            ):
+                create_cudagraphs()
+        else:
+            create_cudagraphs()
 
         # Verify that each runner has a fwd_graph created
         for mgr in cudagraph_managers:
