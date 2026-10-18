@@ -90,6 +90,21 @@ if [[ ! -f .ppu-ci/data/.ready ]]; then
     exit 1
 fi
 cp -a .ppu-ci/data/. /opt/data/
+export HF_HOME=/opt/data/huggingface-cache HF_HUB_CACHE=/opt/data/huggingface-cache/hub
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1
+python - <<'PY'
+import json
+from pathlib import Path
+from transformers import AutoTokenizer
+for name in json.loads(Path('/opt/data/hf-tokenizers.json').read_text()):
+    tokenizer = AutoTokenizer.from_pretrained(name, local_files_only=True, trust_remote_code=False)
+    assert tokenizer.encode('PPU CI tokenizer cache')
+    print('UT tokenizer 离线检查通过:', name)
+PY
+install -D -m 0644 /opt/data/tokenizers/megatron/gpt2-vocab.json \
+    /home/gitlab-runner/data/gpt3_data/gpt2-vocab.json
+install -D -m 0644 /opt/data/tokenizers/megatron/gpt2-merges.txt \
+    /home/gitlab-runner/data/gpt3_data/gpt2-merges.txt
 export COVERAGE_FILE="$PPU_RESULTS_DIR/.coverage"
 export PYTEST_PLUGINS=ppu_pytest_policy ONE_LOGGER_JOB_CATEGORY=test
 deadline=$((SECONDS + seconds))
