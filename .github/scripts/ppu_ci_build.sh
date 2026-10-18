@@ -178,8 +178,6 @@ import megatron.training
 from megatron.core.datasets import helpers_cpp
 from megatron.core.extensions import transformer_engine
 from megatron.core.ssm import mamba_mixer
-import megatron.post_training.model_builder
-import megatron.rl.rl_utils
 import google.protobuf
 from importlib.metadata import version
 assert Path(google.protobuf.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
@@ -193,6 +191,14 @@ assert Path(helpers_cpp.__file__).resolve().is_relative_to(Path(sys.prefix).reso
 print('megatron.core:', megatron.core.__version__, megatron.core.__file__)
 print('torch:', torch.__version__, '构建 Pod 可见 PPU 卡数:', torch.cuda.device_count())
 print('PPU 构建及导入检查通过:', helpers_cpp.__file__)
+PY
+python - <<'PY'
+from pathlib import Path
+import megatron.post_training.model_builder
+import megatron.rl.rl_utils
+for module in (megatron.post_training.model_builder, megatron.rl.rl_utils):
+    assert Path(module.__file__).resolve().is_relative_to(Path.cwd().resolve())
+    print('UT 源码导入检查通过:', module.__name__, module.__file__)
 PY
 mkdir -p .ppu-ci/data
 if python -c 'import json; raise SystemExit(not json.load(open(".ppu-ci/manifest.json"))["config"]["unit_test"])'; then
