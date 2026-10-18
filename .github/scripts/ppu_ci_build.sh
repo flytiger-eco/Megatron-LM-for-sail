@@ -30,7 +30,7 @@ native_requirements = [
 ]
 Path('.ppu-ci/ppu-requirements.txt').write_text('\n'.join(native_requirements) + '\n')
 Path('.ppu-ci/constraints.txt').write_text(
-    '\n'.join(lines + native_requirements + ['numpy==1.26.4']) + '\n'
+    '\n'.join(lines + native_requirements + ['numpy==1.26.4', 'pyarrow==21.0.0']) + '\n'
 )
 PY
 export PIP_CONSTRAINT="$PWD/.ppu-ci/constraints.txt"
@@ -143,12 +143,19 @@ for name in (
     'transformer_engine.pytorch', 'flash_attn.flash_attn_interface', 'flash_attn_2_cuda',
     'mamba_ssm.ops.triton.layernorm_gated', 'mamba_ssm.ops.triton.ssd_combined',
     'selective_scan_cuda', 'causal_conv1d', 'causal_conv1d_cuda',
-    'zmq', 'openai', 'fastapi', 'uvicorn', 'datasets', 'modelopt.torch',
+    'zmq', 'openai', 'fastapi', 'uvicorn', 'pyarrow', 'pyarrow.parquet', 'datasets', 'modelopt.torch',
 ):
     ppu_import_snapshot('before ' + name)
     module = importlib.import_module(name)
     print('依赖导入检查通过:', name, module.__file__)
     ppu_import_snapshot('after ' + name)
+import numpy as np
+import pyarrow as pa
+from datasets import Dataset
+values = np.arange(4, dtype=np.int64)
+np.testing.assert_array_equal(pa.array(values).to_numpy(), values)
+assert Dataset.from_dict({'value': values}).to_dict() == {'value': values.tolist()}
+print('NumPy、Arrow 和 datasets 数据转换检查通过')
 PY
 install -m 0644 .github/scripts/ppu_pytest_policy.py \
     "$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/ppu_pytest_policy.py"
