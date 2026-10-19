@@ -54,6 +54,37 @@ python -m pip install --index-url "$PIP_INDEX_URL" --no-build-isolation \
     'google-api-python-client>=2' pyzmq msgpack 'openai[aiohttp]' fastapi uvicorn datasets \
     'nvidia-modelopt==0.45.0'
 python -m pip check
+python - <<'PY'
+import hashlib
+import importlib.metadata as md
+import sys
+from pathlib import Path
+distribution = md.distribution('transformer-engine')
+assert distribution.version == '2.16+v0.1.0.ppu2.2.0', distribution.version
+path = Path(distribution.locate_file(
+    'transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py'
+)).resolve()
+assert path.is_relative_to(Path(sys.prefix).resolve()), path
+source = path.read_text()
+original = '''            dq[cu_seqlens_q_padded[-1] :].fill_(0)
+            dk[cu_seqlens_kv_padded[-1] :].fill_(0)
+            dv[cu_seqlens_kv_padded[-1] :].fill_(0)'''
+replacement = '''            _ppu_zero_cp_padding(dq, cu_seqlens_q_padded)
+            _ppu_zero_cp_padding(dk, cu_seqlens_kv_padded)
+            _ppu_zero_cp_padding(dv, cu_seqlens_kv_padded)'''
+assert source.count(original) == 1, 'TE CP 补丁目标不唯一或源码已变化'
+assert '_ppu_zero_cp_padding' not in source, 'TE CP 补丁已经存在'
+patched = source.replace(original, replacement) + '''
+
+def _ppu_zero_cp_padding(gradient, cu_seqlens):
+    indices = torch.arange(gradient.shape[0], device=gradient.device)
+    mask = (indices >= cu_seqlens[-1]).view(-1, *([1] * (gradient.ndim - 1)))
+    gradient.masked_fill_(mask, 0)
+'''
+compile(patched, str(path), 'exec')
+path.write_text(patched)
+print('TE CP 捕获补零修复:', path, 'sha256:', hashlib.sha256(patched.encode()).hexdigest())
+PY
 cat > .ppu-ci/import_diagnostics.py <<'PY'
 import sys
 
@@ -156,6 +187,35 @@ values = np.arange(4, dtype=np.int64)
 np.testing.assert_array_equal(pa.array(values).to_numpy(), values)
 assert Dataset.from_dict({'value': values}).to_dict() == {'value': values.tolist()}
 print('NumPy、Arrow 和 datasets 数据转换检查通过')
+import torch
+from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import _ppu_zero_cp_padding
+for dtype in (torch.float32, torch.bfloat16):
+    for noncontiguous in (False, True):
+        original = torch.arange(54, device='cuda', dtype=torch.float32).reshape(9, 2, 3).to(dtype)
+        original[0, 0, 0] = float('nan')
+        original[1, 0, 0] = float('inf')
+        original[8, 0, 0] = float('nan')
+        if noncontiguous:
+            original = original.transpose(1, 2)
+        gradient = original.clone()
+        cu_seqlens = torch.tensor([0, 5], dtype=torch.int32, device='cuda')
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                _ppu_zero_cp_padding(gradient, cu_seqlens)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            _ppu_zero_cp_padding(gradient, cu_seqlens)
+        for end in (0, 1, 5, 9, 12):
+            gradient.copy_(original)
+            cu_seqlens[-1].fill_(end)
+            graph.replay()
+            expected = original.clone()
+            expected[end:].zero_()
+            torch.testing.assert_close(gradient, expected, rtol=0, atol=0, equal_nan=True)
+        print('TE CP 补零图捕获及动态边界重放检查通过:', dtype, 'noncontiguous=', noncontiguous)
 PY
 install -m 0644 .github/scripts/ppu_pytest_policy.py \
     "$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/ppu_pytest_policy.py"
