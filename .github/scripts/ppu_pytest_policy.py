@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -10,13 +11,28 @@ _tests = {}
 _selected = set()
 _finished = set()
 _collection_errors = []
+_execution_errors = []
+_collected = set()
+_durations = {}
+_started = 0.0
 
 
 def pytest_configure(config):
+    global _started
+    _started = time.monotonic()
+    _collected.clear()
+    _durations.clear()
     _tests.clear()
     _selected.clear()
     _finished.clear()
     _collection_errors.clear()
+    _execution_errors.clear()
+
+
+def pytest_itemcollected(item):
+    if item.nodeid in _collected:
+        _collection_errors.append(f"重复 nodeid: {item.nodeid}")
+    _collected.add(item.nodeid)
 
 
 def pytest_collection_finish(session):
@@ -29,7 +45,10 @@ def pytest_collectreport(report):
 
 
 def pytest_runtest_logreport(report):
+    _durations[report.nodeid] = _durations.get(report.nodeid, 0.0) + report.duration
     if report.failed:
+        if report.when != "call":
+            _execution_errors.append(f"{report.when}: {report.nodeid}")
         _tests[report.nodeid] = "failed"
     elif _tests.get(report.nodeid) != "failed":
         if report.skipped:
@@ -45,6 +64,7 @@ def pytest_sessionfinish(session, exitstatus):
     yield
     complete = (
         not _collection_errors
+        and not _execution_errors
         and exitstatus in (0, 1, 5)
         and _selected == set(_tests)
         and _selected <= _finished
@@ -53,9 +73,19 @@ def pytest_sessionfinish(session, exitstatus):
     rank = int(os.environ.get("RANK", "0"))
     result = {
         "rank": rank,
+        "case_id": os.environ["PPU_CASE_ID"],
+        "phase": os.environ["PPU_TEST_PHASE"],
+        "iteration": int(os.environ["PPU_TEST_ITERATION"]),
+        "target_sha": os.environ.get("PPU_TARGET_SHA", ""),
+        "control_sha": os.environ.get("PPU_CONTROL_SHA", ""),
+        "duration_seconds": time.monotonic() - _started,
+        "durations": _durations,
+        "collected": sorted(_collected),
+        "selected": sorted(_selected),
         "exitstatus": int(exitstatus),
         "complete": complete,
         "collection_errors": _collection_errors,
+        "execution_errors": _execution_errors,
         "tests": _tests,
     }
     directory = Path(os.environ["PPU_REPORT_DIR"])

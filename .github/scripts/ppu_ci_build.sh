@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
+: "${PPU_SOURCE_ROOT:?缺少待测源码目录}"
+: "${PPU_ARTIFACT_DIR:?缺少构建产物目录}"
+: "${PPU_CONTROL_DIR:?缺少可信控制脚本目录}"
+: "${PPU_TARGET_SHA:?缺少待测提交 SHA}"
+: "${PPU_CONTROL_SHA:?缺少可信控制提交 SHA}"
+started_at=$(date +%s)
+cd "$PPU_SOURCE_ROOT"
+[[ "$(git rev-parse HEAD)" == "$PPU_TARGET_SHA" ]]
+[[ ! -e .ppu-ci && ! -L .ppu-ci ]]
+ln -s "$PPU_ARTIFACT_DIR" .ppu-ci
 [[ -f .ppu-ci/manifest.json ]] || exit 1
 export PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
 export PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL='' PIP_FIND_LINKS=''
@@ -217,7 +227,7 @@ for dtype in (torch.float32, torch.bfloat16):
             torch.testing.assert_close(gradient, expected, rtol=0, atol=0, equal_nan=True)
         print('TE CP 补零图捕获及动态边界重放检查通过:', dtype, 'noncontiguous=', noncontiguous)
 PY
-install -m 0644 .github/scripts/ppu_pytest_policy.py \
+install -m 0644 "$PPU_CONTROL_DIR/ppu_pytest_policy.py" \
     "$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/ppu_pytest_policy.py"
 python -m pip wheel --index-url "$PIP_INDEX_URL" --no-build-isolation --no-deps --wheel-dir dist .
 python setup.py build_ext --inplace
@@ -303,4 +313,8 @@ tar -czf .ppu-ci/source.tar.gz --null -T .ppu-ci/source-files.txt megatron/core/
 tar -czf .ppu-ci/environment.tar.gz -C /opt ppu-ci-venv
 cp dist/*.whl .ppu-ci/
 printf '%s\n' "$PPU_IMAGE" > .ppu-ci/image.txt
-printf '%s\n' "$GITHUB_SHA" > .ppu-ci/commit.txt
+printf '%s\n' "$PPU_TARGET_SHA" > .ppu-ci/commit.txt
+printf '%s\n' "$PPU_CONTROL_SHA" > .ppu-ci/control.txt
+ended_at=$(date +%s)
+printf '{"started_at":%s,"completed_at":%s,"elapsed_seconds":%s}\n' \
+    "$started_at" "$ended_at" "$((ended_at - started_at))" > .ppu-ci/build-timing.json

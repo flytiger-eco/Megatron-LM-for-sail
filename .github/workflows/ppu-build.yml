@@ -2,17 +2,25 @@ name: PPU Build
 on:
   push:
     branches: [ci/ppu-validation]
-  pull_request:
+    tags: ['v*']
+  pull_request_target:
     branches: [ci/ppu-validation]
-    types: [opened, synchronize, reopened, labeled, unlabeled]
-  # merge_group:
-  #   types: [checks_requested]
-  # schedule:
-  #   - cron: '0 2 * * *'
-  # repository_dispatch:
-  #   types: [ppu-ci]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
+      scope:
+        description: quick 为 PR 代表性检查，full 为 DEV/LTS 全量
+        type: choice
+        options: [quick, full]
+        default: quick
+      pr_number:
+        description: 维护者授权的 PR 编号（与完整 SHA 同时填写）
+        type: string
+        default: ''
+      pr_sha:
+        description: 已审核的 PR head 完整 40 位 SHA，新提交需重新授权
+        type: string
+        default: ''
       build:
         description: 是否构建（关闭则同时跳过 UT）
         type: boolean
@@ -22,11 +30,11 @@ on:
         type: boolean
         default: true
       repeat:
-        description: 每个测试用例重复次数（0 表示跳过 UT）
+        description: full 重复次数（0 表示跳过 UT；quick 固定 1 次）
         type: number
         default: 1
       timeout:
-        description: 每个 bucket 全部重复及两个阶段的总分钟数
+        description: full 每个 bucket 总分钟数（quick 使用固定分组预算）
         type: number
         default: 30
 permissions:
@@ -37,25 +45,90 @@ env:
   PIP_EXTRA_INDEX_URL: ''
   PIP_FIND_LINKS: ''
 concurrency:
-  group: ppu-build-${{ github.event_name == 'schedule' && github.run_id || github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+  group: ppu-build-${{ startsWith(github.ref, 'refs/tags/v') && format('release-{0}', github.ref) || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full' && inputs.pr_number == '' && format('full-{0}', github.run_id)) || format('quick-{0}', github.event.pull_request.number || inputs.pr_number || github.ref) }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') && !(github.event_name == 'workflow_dispatch' && inputs.scope == 'full' && inputs.pr_number == '') }}
 jobs:
-  configure:
+  authorize:
     if: >-
       vars.PPU_CI_ENABLED == 'true' &&
       (github.ref == 'refs/heads/ci/ppu-validation' ||
-       (github.event_name == 'pull_request' && github.base_ref == 'ci/ppu-validation')) &&
-      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      allowed: ${{ steps.authorize.outputs.allowed }}
+      target_sha: ${{ steps.authorize.outputs.target_sha }}
+      control_sha: ${{ steps.authorize.outputs.control_sha }}
+      pr_number: ${{ steps.authorize.outputs.pr_number }}
+      manual_pr: ${{ steps.authorize.outputs.manual_pr }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
+      - id: authorize
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PPU_INPUTS: ${{ toJSON(inputs) }}
+          PPU_CONTROL_SHA: ${{ github.workflow_sha }}
+          PPU_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          python3 -I control/.github/scripts/ppu_pr_authorize.py authorize
+          mkdir -p .ppu-ci/control
+          cp control/.github/scripts/ppu_pr_authorize.py .ppu-ci/control/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppu-authorization
+          path: .ppu-ci/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+  pr-pending:
+    needs: authorize
+    if: needs.authorize.outputs.pr_number != '0'
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-authorization
+          path: .ppu-ci
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          DESCRIPTION: ${{ needs.authorize.outputs.allowed == 'true' && 'PPU quick 检查进行中' || '等待维护者授权完整 PR SHA' }}
+        run: python3 -I .ppu-ci/control/ppu_pr_authorize.py status --state pending --description "$DESCRIPTION"
+  configure:
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ubuntu-latest
     outputs:
       config: ${{ steps.config.outputs.config }}
       build: ${{ steps.config.outputs.build }}
       unit_test: ${{ steps.config.outputs.unit_test }}
       unit_matrix: ${{ steps.config.outputs.unit_matrix }}
+      scope: ${{ steps.config.outputs.scope }}
+      target_sha: ${{ needs.authorize.outputs.target_sha }}
+      control_sha: ${{ needs.authorize.outputs.control_sha }}
+      manual_pr: ${{ needs.authorize.outputs.manual_pr }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.authorize.outputs.control_sha }}
+          path: control
           persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.target_sha }}
+          path: source
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-authorization
+          path: .ppu-ci
       - name: 准备隔离的配置环境
         run: |
           python3 -m venv "$RUNNER_TEMP/ppu-configure-venv"
@@ -64,12 +137,14 @@ jobs:
       - id: config
         env:
           PPU_INPUTS: ${{ toJSON(inputs) }}
+          PPU_SOURCE_ROOT: ${{ github.workspace }}/source
+          PPU_CONTROL_ROOT: ${{ github.workspace }}/control
           PPU_DEFAULTS: >-
             {"build":"${{ vars.PPU_BUILD || 'yes' }}","unit_test":"${{ vars.PPU_UNIT_TEST || 'yes' }}",
             "repeat":"${{ vars.PPU_UNIT_TEST_REPEAT || '1' }}","timeout":"${{ vars.PPU_UNIT_TEST_TIMEOUT || '30' }}"}
         run: |
-          python3 .github/scripts/ppu_ci.py configure
-          cp .github/scripts/ppu_ci.py .ppu-ci/ppu_ci.py
+          python3 control/.github/scripts/ppu_ci.py configure
+          cp control/.github/scripts/{ppu_ci.py,ppu_ci_build.sh,ppu_ci_run.sh,ppu_pytest_policy.py} .ppu-ci/control/
       - uses: actions/upload-artifact@v4
         with:
           name: ppu-plan
@@ -79,7 +154,7 @@ jobs:
           retention-days: 7
   build:
     needs: configure
-    if: needs.configure.outputs.build == 'true'
+    if: needs.configure.outputs.build == 'true' && (needs.configure.outputs.manual_pr != 'true' || github.run_attempt == 1)
     runs-on: k8s-runner-group-cpu-flytiger
     environment: ppu-ci
     timeout-minutes: 210
@@ -94,6 +169,8 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.configure.outputs.target_sha }}
+          path: source
           fetch-depth: 1
           persist-credentials: false
           submodules: recursive
@@ -105,6 +182,8 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.configure.outputs.target_sha }}
+          path: source
           fetch-depth: 1
           persist-credentials: false
           submodules: recursive
@@ -129,7 +208,7 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: GITHUB_SHA=${{ github.sha }},PPU_BUNDLE_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build
+          extra_env: PPU_TARGET_SHA=${{ needs.configure.outputs.target_sha }},PPU_CONTROL_SHA=${{ needs.configure.outputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_BUNDLE_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build
           command: |
             set -euo pipefail
             umask 022
@@ -138,13 +217,13 @@ jobs:
             apt-get update
             apt-get install -y --no-install-recommends git ca-certificates wget
             chown -R "$(id -u):$(id -g)" .
-            [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]] || exit 1
+            [[ "$(git -C source rev-parse HEAD)" == "$PPU_TARGET_SHA" ]] || exit 1
             unset WORLD_SIZE RANK LOCAL_RANK
-            bash .github/scripts/ppu_ci_build.sh
+            bash "$PPU_CONTROL_DIR/ppu_ci_build.sh"
             mkdir -p "$PPU_BUNDLE_DIR"
             cp -R .ppu-ci/. "$PPU_BUNDLE_DIR/"
             chmod -R a+rX "$PPU_BUNDLE_DIR"
-            printf '%s\n' "$GITHUB_SHA" > "$PPU_BUNDLE_DIR/.complete"
+            printf '%s\n' "$PPU_TARGET_SHA" > "$PPU_BUNDLE_DIR/.complete"
       - name: 检查 PPU 构建状态与回传产物
         if: ${{ always() && !cancelled() }}
         shell: bash
@@ -152,11 +231,15 @@ jobs:
           PPU_STATUS: ${{ steps.ppu-build.outputs.job_status }}
           PPU_OUTCOME: ${{ steps.ppu-build.outcome }}
           PPU_BUNDLE_DIR: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build
+          PPU_TARGET_SHA: ${{ needs.configure.outputs.target_sha }}
+          PPU_CONTROL_SHA: ${{ needs.configure.outputs.control_sha }}
         run: |
           set -euo pipefail
           [[ "$PPU_OUTCOME" == success && "$PPU_STATUS" == succeeded ]] || exit 1
-          [[ "$(< "$PPU_BUNDLE_DIR/.complete")" == "$GITHUB_SHA" ]] || exit 1
-          [[ "$(< "$PPU_BUNDLE_DIR/commit.txt")" == "$GITHUB_SHA" ]] || exit 1
+          [[ "$(< "$PPU_BUNDLE_DIR/.complete")" == "$PPU_TARGET_SHA" ]] || exit 1
+          [[ "$(< "$PPU_BUNDLE_DIR/commit.txt")" == "$PPU_TARGET_SHA" ]] || exit 1
+          [[ "$(< "$PPU_BUNDLE_DIR/control.txt")" == "$PPU_CONTROL_SHA" ]] || exit 1
+          diff -r .ppu-ci/control "$PPU_BUNDLE_DIR/control"
           [[ "$(< "$PPU_BUNDLE_DIR/image.txt")" == "$PPU_IMAGE" ]] || exit 1
           [[ -s "$PPU_BUNDLE_DIR/source.tar.gz" && -s "$PPU_BUNDLE_DIR/environment.tar.gz" ]] || exit 1
           cmp .ppu-ci/manifest.json "$PPU_BUNDLE_DIR/manifest.json"
@@ -170,7 +253,28 @@ jobs:
           retention-days: 7
   unit-tests:
     needs: [configure, build]
-    if: needs.configure.outputs.unit_test == 'true'
+    if: needs.configure.outputs.unit_test == 'true' && (needs.configure.outputs.manual_pr != 'true' || github.run_attempt == 1)
     uses: ./.github/workflows/ppu-ut.yml
     with:
       matrix: ${{ needs.configure.outputs.unit_matrix }}
+      target_sha: ${{ needs.configure.outputs.target_sha }}
+      control_sha: ${{ needs.configure.outputs.control_sha }}
+      manual_pr: ${{ needs.configure.outputs.manual_pr == 'true' }}
+  pr-result:
+    needs: [authorize, pr-pending, configure, build, unit-tests]
+    if: >-
+      always() && needs.authorize.result == 'success' &&
+      needs.authorize.outputs.allowed == 'true' && needs.authorize.outputs.pr_number != '0' &&
+      (needs.authorize.outputs.manual_pr != 'true' || github.run_attempt == 1)
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-authorization
+          path: .ppu-ci
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          STATE: ${{ needs.pr-pending.result == 'success' && needs.configure.result == 'success' && needs.build.result == 'success' && needs.unit-tests.result == 'success' && 'success' || 'failure' }}
+        run: python3 -I .ppu-ci/control/ppu_pr_authorize.py status --state "$STATE" --description 'PPU quick 检查已结束，详见运行报告'
