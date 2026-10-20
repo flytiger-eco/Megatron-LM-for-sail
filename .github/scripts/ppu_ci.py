@@ -152,6 +152,20 @@ def selector_matches(selector: str, nodeid: str) -> bool:
     return nodeid == selector or nodeid.startswith((selector + "::", selector + "["))
 
 
+def validate_selector(selector: str) -> str:
+    if not isinstance(selector, str) or not re.fullmatch(
+        r"tests/unit_tests/[A-Za-z0-9_/]+\.py(?:::[A-Za-z_][A-Za-z0-9_]*)*", selector
+    ):
+        raise ValueError(f"非法 UT selector: {selector}")
+    filename = selector.split("::", 1)[0]
+    path = (ROOT / filename).resolve()
+    if not path.is_relative_to(ROOT / "tests/unit_tests") or not path.is_file():
+        raise ValueError(f"UT 文件不存在或越界: {filename}")
+    if not path.name.startswith("test_"):
+        raise ValueError(f"不是 UT 文件: {filename}")
+    return filename
+
+
 def quick_cases(config: dict) -> dict:
     recipe = json.loads((CONTROL_ROOT / ".github/ppu-pr-tests.json").read_text())
     if recipe.get("schema_version") != 1 or not recipe.get("groups"):
@@ -166,22 +180,26 @@ def quick_cases(config: dict) -> dict:
             raise ValueError(f"quick 分组为空: {case_id}")
         files = set()
         for selector in selectors:
-            if not isinstance(selector, str) or not re.fullmatch(
-                r"tests/unit_tests/[A-Za-z0-9_/]+\.py(?:::[A-Za-z_][A-Za-z0-9_]*)*", selector
-            ):
-                raise ValueError(f"非法 UT selector: {selector}")
-            filename = selector.split("::", 1)[0]
-            path = (ROOT / filename).resolve()
-            if not path.is_relative_to(ROOT / "tests/unit_tests") or not path.is_file():
-                raise ValueError(f"UT 文件不存在或越界: {filename}")
-            if not path.name.startswith("test_"):
-                raise ValueError(f"不是 UT 文件: {filename}")
+            filename = validate_selector(selector)
             if any(
                 selector_matches(old, selector) or selector_matches(selector, old) for old in seen
             ):
                 raise ValueError(f"重复或重叠 selector: {selector}")
             seen.append(selector)
             files.add(filename)
+        excluded = group.get("excluded", {})
+        if not isinstance(excluded, dict):
+            raise ValueError(f"quick 排除清单必须包含 selector 与原因: {case_id}")
+        for selector, reason in excluded.items():
+            validate_selector(selector)
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError(f"排除用例必须说明原因: {selector}")
+            if not any(
+                selector != parent and selector_matches(parent, selector) for parent in selectors
+            ):
+                raise ValueError(f"排除用例必须属于已选 selector 的子集: {selector}")
+            if any(old != selector and selector_matches(old, selector) for old in excluded):
+                raise ValueError(f"排除 selector 重叠: {selector}")
         minutes = positive(group["minutes"], "quick group timeout", 35)
         cases[case_id] = {
             "id": case_id,
@@ -192,6 +210,7 @@ def quick_cases(config: dict) -> dict:
             "minutes": minutes,
             "repeat": 1,
             "args": selectors,
+            "excluded": excluded,
             "files": sorted(files),
             "strict_selection": True,
         }
@@ -283,6 +302,11 @@ def case_results(case: dict, directory: Path, identity: dict | None = None) -> d
                             selector_matches(selector, nodeid) for selector in case["args"]
                         ):
                             raise ValueError(f"执行了清单以外的用例: {nodeid}")
+                        if any(
+                            selector_matches(selector, nodeid)
+                            for selector in case.get("excluded", {})
+                        ):
+                            raise ValueError(f"执行了明确排除的用例: {nodeid}")
                         key = f"{iteration}:{phase}:{nodeid}"
                         if OUTCOME_ORDER[outcome] > OUTCOME_ORDER.get(outcomes.get(key), -1):
                             outcomes[key] = outcome
@@ -290,6 +314,9 @@ def case_results(case: dict, directory: Path, identity: dict | None = None) -> d
                     errors.append(f"{case['id']}/{filename}: {exc}")
             elapsed += phase_seconds
     if case.get("strict_selection"):
+        for selector in case.get("excluded", {}):
+            if not any(selector_matches(selector, nodeid) for nodeid in collected):
+                errors.append(f"{case['id']}: 排除 selector 未收集到用例: {selector}")
         executed = {key.split(":", 2)[2] for key, value in outcomes.items() if value != "skipped"}
         for selector in case["args"]:
             if not any(selector_matches(selector, nodeid) for nodeid in collected):
@@ -339,6 +366,8 @@ def read_timing(path: Path, errors: list, suite: bool = False) -> dict:
 
 
 def summarize(manifest: dict, directory: Path) -> dict:
+    scope = manifest["config"].get("scope", "full")
+    threshold_percent = {"quick": 100, "full": 80}[scope]
     counts = dict.fromkeys(OUTCOME_ORDER, 0)
     errors, failures, groups = [], [], {}
     for case in manifest["unit"].values():
@@ -364,6 +393,7 @@ def summarize(manifest: dict, directory: Path) -> dict:
             "duration_seconds": result["duration_seconds"],
             "timing": timing,
             "errors": group_errors,
+            "excluded": case.get("excluded", {}),
         }
         for nodeid, outcome in result["outcomes"].items():
             group_counts[outcome] += 1
@@ -379,10 +409,11 @@ def summarize(manifest: dict, directory: Path) -> dict:
     total = counts["passed"] + counts["failed"]
     if os.environ.get("PPU_MATRIX_RESULT", "success") != "success":
         errors.append("至少一个调度或产物上传作业未成功")
-    success = not errors and total > 0 and counts["passed"] * 5 >= total * 4
+    success = not errors and total > 0 and counts["passed"] * 100 >= total * threshold_percent
     return {
         **counts,
-        "scope": manifest["config"].get("scope", "full"),
+        "scope": scope,
+        "threshold_percent": threshold_percent,
         "identity": manifest.get("identity", {}),
         "groups": groups,
         "timings": timings,
@@ -399,7 +430,7 @@ def write_summary(result: dict, directory: Path) -> None:
     (directory / "summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     text = (
         f"UT ({result['scope']}): {result['passed']}/{result['total']} = {result['pass_rate']:.2%}，"
-        f"阈值 80%；失败 {result['failed']}，跳过 {result['skipped']}；"
+        f"阈值 {result['threshold_percent']}%；失败 {result['failed']}，跳过 {result['skipped']}；"
         f"结论：{'通过' if result['success'] else '未通过'}\n"
     )
     if result["identity"]:
@@ -412,6 +443,8 @@ def write_summary(result: dict, directory: Path) -> None:
         if group["timing"]:
             text += f"，分组墙钟 {group['timing']['elapsed_seconds']:.1f}s"
         text += "\n"
+        for selector, reason in group["excluded"].items():
+            text += f"  明确排除：{selector}；原因：{reason}\n"
     if result["timings"]:
         text += f"Pod 内计时（不含上传、hosted 配置与汇总）: {result['timings']}\n"
     if result["errors"]:

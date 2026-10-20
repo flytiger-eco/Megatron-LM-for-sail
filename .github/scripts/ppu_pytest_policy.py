@@ -17,6 +17,28 @@ _durations = {}
 _started = 0.0
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--ppu-exclude", action="append", default=[], help="Exclude an exact UT selector"
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    excluded = config.getoption("--ppu-exclude")
+    deselected, kept = [], []
+    for item in items:
+        if any(
+            item.nodeid == selector or item.nodeid.startswith((selector + "::", selector + "["))
+            for selector in excluded
+        ):
+            deselected.append(item)
+        else:
+            kept.append(item)
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = kept
+
+
 def pytest_configure(config):
     global _started
     _started = time.monotonic()
