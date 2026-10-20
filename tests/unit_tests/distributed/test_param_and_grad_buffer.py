@@ -265,17 +265,6 @@ def test_param_to_index_alignment_with_padding():
     Utils.destroy_model_parallel()
 
 
-@pytest.fixture
-def grad_sync_model_parallel(num_distributed_optimizer_instances):
-    Utils.initialize_model_parallel(
-        num_distributed_optimizer_instances=num_distributed_optimizer_instances
-    )
-    try:
-        yield
-    finally:
-        Utils.destroy_model_parallel()
-
-
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
 @pytest.mark.parametrize("average_in_collective", [False, True])
@@ -285,8 +274,10 @@ def test_grad_sync(
     overlap_grad_reduce: bool,
     average_in_collective: bool,
     num_distributed_optimizer_instances: int,
-    grad_sync_model_parallel,
 ):
+    Utils.initialize_model_parallel(
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances
+    )
     # Skip test if num_distributed_optimizer_instances > 1 and not using distributed optimizer
     if num_distributed_optimizer_instances > 1 and not use_distributed_optimizer:
         pytest.skip("Multiple optimizer instances require distributed optimizer to be enabled")
@@ -346,7 +337,6 @@ def test_grad_sync(
         bucket_group = param_to_bucket_group[param]
         bucket_group.reset()
 
-    grad_values = []
     for i, param in enumerate(params):
         assert param in param_to_bucket_group
         bucket_group = param_to_bucket_group[param]
@@ -371,13 +361,13 @@ def test_grad_sync(
         expected_grad_data_value = expected_grad_data_value_after_collective
         if overlap_grad_reduce and i < (len(params) - 1):
             expected_grad_data_value = 1
-        grad_values.append((param_and_grad_buffer.grad_data[0].item(), expected_grad_data_value))
+        assert param_and_grad_buffer.grad_data[0] == expected_grad_data_value
 
         if not overlap_grad_reduce:
             # Reset grad_data for subsequent collectives.
             param_and_grad_buffer.grad_data.data.fill_(1.0)
 
-    assert all(actual == expected for actual, expected in grad_values), grad_values
+    Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("force_all_reduce", [False, True])

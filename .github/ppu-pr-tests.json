@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "groups": [
+    {
+      "id": "dev-pr-01",
+      "name": "data-tp-ddp",
+      "minutes": 5,
+      "coverage": "数据、RNG 恢复、TP8 前后向、并行交叉熵、DDP 梯度同步",
+      "selectors": [
+        "tests/unit_tests/data/test_gpt_dataset.py",
+        "tests/unit_tests/data/test_data_samplers.py",
+        "tests/unit_tests/tensor_parallel/test_layers.py",
+        "tests/unit_tests/tensor_parallel/test_cross_entropy.py",
+        "tests/unit_tests/distributed/test_distributed_data_parallel.py"
+      ]
+    },
+    {
+      "id": "dev-pr-02",
+      "name": "optimizer-checkpoint",
+      "minutes": 4,
+      "coverage": "优化器参数更新、状态恢复、分片 checkpoint 和存储回归",
+      "selectors": [
+        "tests/unit_tests/test_optimizer.py::test_distrib_optimizer_save_load_with_non_tensor_state",
+        "tests/unit_tests/test_optimizer.py::test_optim_sharded_state_dict",
+        "tests/unit_tests/test_optimizer.py::test_optimizer_reload_model_params",
+        "tests/unit_tests/test_optimizer.py::test_get_megatron_optimizer_with_custom_process_groups",
+        "tests/unit_tests/dist_checkpointing/test_torch_dist.py"
+      ]
+    },
+    {
+      "id": "dev-pr-03",
+      "name": "transformer-moe",
+      "minutes": 8,
+      "coverage": "GPT 输出、MLP 分块、EP/TP all-to-all、capacity/padding、FP16/BF16/FP8 重计算",
+      "selectors": [
+        "tests/unit_tests/models/test_gpt_model.py::TestGPTModel::test_post_process_forward",
+        "tests/unit_tests/models/test_gpt_model.py::TestGPTModel::test_output_processor_forward",
+        "tests/unit_tests/transformer/test_transformer_layer.py::TestParallelTransformerLayer::test_gpu_forward",
+        "tests/unit_tests/transformer/test_transformer_layer.py::TestParallelTransformerLayer::test_chunked_mlp",
+        "tests/unit_tests/transformer/moe/test_a2a_token_dispatcher.py::TestAlltoAllDispatcher",
+        "tests/unit_tests/transformer/moe/test_moe_layer.py::TestMoELayerFP16",
+        "tests/unit_tests/transformer/moe/test_moe_layer.py::TestMoELayerRecompute"
+      ]
+    },
+    {
+      "id": "dev-pr-04",
+      "name": "parallel-determinism",
+      "minutes": 6,
+      "coverage": "GPT/Llama 两轮前后向确定性，TP/EP/FSDP/PP/VPP",
+      "selectors": [
+        "tests/unit_tests/determinism/correctness/test_gpt_model.py"
+      ]
+    },
+    {
+      "id": "dev-pr-05",
+      "name": "inference-ssm",
+      "minutes": 5,
+      "coverage": "GPT/Hybrid 生成 token、CUDA Graph、Mamba forward 与推理 cache",
+      "selectors": [
+        "tests/unit_tests/inference/engines/test_dynamic_engine.py::TestDynamicInferenceEngine::test_simple",
+        "tests/unit_tests/ssm/test_mamba_mixer.py"
+      ]
+    },
+    {
+      "id": "dev-pr-06",
+      "name": "rl-context-parallel",
+      "minutes": 7,
+      "coverage": "rollout、packing、logprob、CP2/4/8 和 CP CUDA Graph 回归",
+      "selectors": [
+        "tests/unit_tests/rl/test_context_parallel.py",
+        "tests/unit_tests/rl/test_refit_arguments.py",
+        "tests/unit_tests/rl/test_rl_agents.py",
+        "tests/unit_tests/rl/test_rl_batch_invariant.py",
+        "tests/unit_tests/rl/test_rl_utils.py",
+        "tests/unit_tests/rl/test_rollout_bank.py",
+        "tests/unit_tests/rl/test_rollout_generation.py",
+        "tests/unit_tests/rl/test_sequence_packing_utils.py"
+      ]
+    }
+  ]
+}
