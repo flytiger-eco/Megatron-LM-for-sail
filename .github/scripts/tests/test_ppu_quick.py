@@ -16,6 +16,7 @@ CONTROL_SHA = "b" * 40
 IDENTITY = {"target_sha": SHA, "control_sha": CONTROL_SHA}
 BRANCH = "refs/heads/ci/ppu-validation"
 REPOSITORY = "flytiger-eco/Megatron-LM-for-sail"
+EXCLUDED_UT = "tests/unit_tests/rl/test_rl_utils.py::TestRLUtils::test_prepare_data_for_update"
 
 
 def load_module(name):
@@ -148,8 +149,10 @@ def test_quick_selection_and_single_job(tmp_path, monkeypatch):
     rows = json.loads(output["unit_matrix"])["include"]
     assert len(rows) == 1 and rows[0]["id"] == "quick"
     assert rows[0]["action_minutes"] == 45 and rows[0]["job_minutes"] == 50
+    assert set(cases[-1]["excluded"]) == {EXCLUDED_UT}
+    assert all(not case["excluded"] for case in cases[:-1])
     for case in cases:
-        for selector in case["args"]:
+        for selector in [*case["args"], *case["excluded"]]:
             filename, *symbols = selector.split("::")
             node = ast.parse((ROOT / filename).read_text())
             for symbol in symbols:
@@ -199,6 +202,31 @@ def test_invalid_recipe(tmp_path, monkeypatch, mutation):
         ci.quick_cases({})
 
 
+@pytest.mark.parametrize(
+    "mutation", ["type", "invalid", "reason", "outside", "whole_selector", "overlap"]
+)
+def test_invalid_exclusions(tmp_path, monkeypatch, mutation):
+    recipe = json.loads((ROOT / ".github/ppu-pr-tests.json").read_text())
+    group = recipe["groups"][-1]
+    if mutation == "type":
+        group["excluded"] = [EXCLUDED_UT]
+    elif mutation == "invalid":
+        group["excluded"] = {"../test.py": "invalid"}
+    elif mutation == "reason":
+        group["excluded"][EXCLUDED_UT] = " "
+    elif mutation == "outside":
+        group["excluded"] = {recipe["groups"][0]["selectors"][0]: "outside group"}
+    elif mutation == "whole_selector":
+        group["excluded"] = {group["selectors"][0]: "entire selector"}
+    else:
+        group["excluded"][EXCLUDED_UT.rsplit("::", 1)[0]] = "overlapping class"
+    (tmp_path / ".github").mkdir()
+    (tmp_path / ".github/ppu-pr-tests.json").write_text(json.dumps(recipe))
+    monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
+    with pytest.raises(ValueError):
+        ci.quick_cases({})
+
+
 @pytest.mark.parametrize("repeat", [1, 2])
 def test_full_recipe_parity_with_previous_implementation(repeat):
     original = subprocess.check_output(
@@ -210,6 +238,11 @@ def test_full_recipe_parity_with_previous_implementation(repeat):
     actual = ci.unit_cases(config)
     assert actual == namespace["unit_cases"](config)
     assert len(actual) == 74
+    assert all(not case.get("excluded") for case in actual.values())
+    assert all(
+        not arg.startswith("--ppu-exclude") for case in actual.values() for arg in case["args"]
+    )
+    assert sum(EXCLUDED_UT.split("::")[0] in case["files"] for case in actual.values()) == 2
     for environment in ("dev", "lts"):
         files = [
             path
@@ -372,31 +405,92 @@ def write_reports(directory, case, failed=1, skipped=False):
     (directory.parent / "suite-timing.json").write_text(json.dumps({**timing, "prepared_at": 102}))
 
 
-@pytest.mark.parametrize("failed,success", [(0, True), (1, True), (2, False)])
-def test_gate_counts_unique_tests_and_any_rank_failure(tmp_path, failed, success):
+@pytest.mark.parametrize("scope,threshold", [("quick", 100), ("full", 80)])
+@pytest.mark.parametrize("failed", [0, 1, 2])
+def test_gate_counts_unique_tests_and_any_rank_failure(
+    tmp_path, monkeypatch, capsys, scope, threshold, failed
+):
     case = synthetic_case()
-    manifest = {"config": {"scope": "quick"}, "identity": IDENTITY, "unit": {case["id"]: case}}
+    manifest = {"config": {"scope": scope}, "identity": IDENTITY, "unit": {case["id"]: case}}
     write_reports(ci.result_directory(manifest, tmp_path, case["id"]), case, failed)
     result = ci.summarize(manifest, tmp_path)
+    success = failed == 0 if scope == "quick" else failed <= 1
     assert result["success"] is success
+    assert result["threshold_percent"] == threshold
     assert result["total"] == 5 and result["failed"] == failed
     assert not result["errors"]
     assert result["groups"][case["id"]]["timing"]["elapsed_seconds"] == 10
     assert result["groups"][case["id"]]["executed"] == 5
-    assert result["timings"]["suite"]["prepare_seconds"] == 2
-    assert result["timings"]["suite"]["execution_seconds"] == 8
+    if scope == "quick":
+        assert result["timings"]["suite"]["prepare_seconds"] == 2
+        assert result["timings"]["suite"]["execution_seconds"] == 8
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["ppu_ci.py", "summarize", "--output", str(tmp_path), "--results", str(tmp_path)],
+    )
+    with pytest.raises(SystemExit) as exc:
+        ci.main()
+    assert exc.value.code == (0 if success else 1)
+    assert json.loads((tmp_path / "summary.json").read_text())["threshold_percent"] == threshold
+    assert f"阈值 {threshold}%" in capsys.readouterr().out
 
 
-def test_no_per_group_pass_rate_gate(tmp_path):
+@pytest.mark.parametrize("scope,success", [("quick", False), ("full", True)])
+def test_scope_gate_across_groups(tmp_path, scope, success):
     cases = {f"dev-pr-{i:02d}": synthetic_case(f"dev-pr-{i:02d}") for i in (1, 2)}
-    manifest = {"config": {"scope": "quick"}, "identity": IDENTITY, "unit": cases}
+    manifest = {"config": {"scope": scope}, "identity": IDENTITY, "unit": cases}
     for index, case in enumerate(cases.values()):
         write_reports(
             ci.result_directory(manifest, tmp_path, case["id"]), case, failed=2 if index == 0 else 0
         )
     result = ci.summarize(manifest, tmp_path)
-    assert result["success"] and result["pass_rate"] == 0.8
+    assert result["success"] is success and result["pass_rate"] == 0.8
     assert result["groups"]["dev-pr-01"]["counts"]["failed"] == 2
+
+
+@pytest.mark.parametrize("scope", ["quick", "full"])
+def test_existing_partial_skips_are_not_counted_as_passes(tmp_path, scope):
+    case = synthetic_case()
+    manifest = {"config": {"scope": scope}, "identity": IDENTITY, "unit": {case["id"]: case}}
+    directory = ci.result_directory(manifest, tmp_path, case["id"])
+    write_reports(directory, case, failed=0)
+    for path in directory.glob("prod-*-rank-*.json"):
+        report = json.loads(path.read_text())
+        report["tests"][report["selected"][0]] = "skipped"
+        path.write_text(json.dumps(report))
+    result = ci.summarize(manifest, tmp_path)
+    assert result["success"] and result["pass_rate"] == 1
+    assert result["passed"] == result["total"] == 4 and result["skipped"] == 1
+
+
+@pytest.mark.parametrize("mutation", ["none", "executed", "missing", "all_excluded"])
+def test_exclusion_report_integrity(tmp_path, capsys, mutation):
+    case = synthetic_case()
+    nodes = [f"{case['args'][0]}::test_{i}" for i in range(5)]
+    case["excluded"] = {nodes[0]: "Known PP mock contract defect"}
+    if mutation == "missing":
+        case["excluded"] = {case["args"][0] + "::test_missing": "stale exclusion"}
+    elif mutation == "all_excluded":
+        case["excluded"] = dict.fromkeys(nodes, "nothing left to run")
+    manifest = {"config": {"scope": "quick"}, "identity": IDENTITY, "unit": {case["id"]: case}}
+    directory = ci.result_directory(manifest, tmp_path, case["id"])
+    write_reports(directory, case, failed=0)
+    if mutation != "executed":
+        for path in directory.glob("prod-*-rank-*.json"):
+            report = json.loads(path.read_text())
+            report["selected"] = [n for n in report["selected"] if n not in case["excluded"]]
+            report["tests"] = {n: v for n, v in report["tests"].items() if n in report["selected"]}
+            path.write_text(json.dumps(report))
+    result = ci.summarize(manifest, tmp_path)
+    assert result["success"] is (mutation == "none")
+    assert bool(result["errors"]) is (mutation != "none")
+    assert result["groups"][case["id"]]["excluded"] == case["excluded"]
+    if mutation == "none":
+        assert result["passed"] == result["total"] == 4 and result["skipped"] == 0
+        ci.write_summary(result, tmp_path)
+        assert nodes[0] in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -532,6 +626,23 @@ def test_matrix_failure_blocks_success(tmp_path, monkeypatch):
         ("def test_ok(): pass\n", False, ["--keep-duplicates", "test_sample.py"]),
         ("def test_ok(): pass\n", True, ["-m", "experimental"]),
         (
+            "import pytest\nclass TestExample:\n"
+            "    @pytest.mark.parametrize('value', [1, 2])\n"
+            "    def test_excluded(self, value): assert False\n"
+            "    def test_excluded_extra(self): pass\n"
+            "class TestOther:\n    def test_excluded(self): pass\n",
+            True,
+            ["--ppu-exclude=test_sample.py::TestExample::test_excluded"],
+        ),
+        (
+            "class TestExample:\n"
+            "    def test_excluded(self): assert False\n"
+            "    def test_excluded_extra(self): pass\n"
+            "class TestOther:\n    def test_excluded(self): pass\n",
+            True,
+            ["--ppu-exclude=test_sample.py::TestExample::test_excluded"],
+        ),
+        (
             "def setup_function(): raise RuntimeError('setup failed')\ndef test_ok(): pass\n",
             False,
             [],
@@ -565,6 +676,8 @@ def test_real_pytest_plugin_reports(tmp_path, source, complete, extra):
             "/dev/null",
             "-p",
             "no:cacheprovider",
+            "--rootdir",
+            str(tmp_path),
             "-q",
             "test_sample.py",
             *extra,
@@ -580,6 +693,12 @@ def test_real_pytest_plugin_reports(tmp_path, source, complete, extra):
     assert report["duration_seconds"] >= 0
     assert set(report["selected"]) == set(report["tests"])
     assert set(report["selected"]) <= set(report["collected"])
+    if any(arg.startswith("--ppu-exclude=") for arg in extra):
+        assert report["tests"] == {
+            "test_sample.py::TestExample::test_excluded_extra": "passed",
+            "test_sample.py::TestOther::test_excluded": "passed",
+        }
+        assert len(report["collected"]) == (4 if "parametrize" in source else 3)
 
 
 def test_workflow_trust_and_resource_boundaries():
@@ -595,6 +714,7 @@ def test_workflow_trust_and_resource_boundaries():
         assert "github.run_attempt == 1" in build["jobs"][name]["if"]
     assert "github.run_attempt == 1" in ut["jobs"]["test"]["if"]
     assert ut["jobs"]["test"]["strategy"]["max-parallel"] == 1
+    assert ut["jobs"]["result"]["name"] == "UT Gate (quick 100%, full 80%)"
     assert "GH_TOKEN" not in build["jobs"]["build"].get("env", {})
     for workflow in (build, ut):
         for job in workflow["jobs"].values():
@@ -638,11 +758,13 @@ elif name in ('python', 'python3'):
     if args[:3] == ['-m','torch.distributed.run','--standalone']:
         case_id, phase = os.environ['PPU_CASE_ID'], os.environ['PPU_TEST_PHASE']
         manifest = json.loads(pathlib.Path('.ppu-ci/manifest.json').read_text())
-        node = manifest['unit'][case_id]['args'][0] + '::test_example'
+        case = manifest['unit'][case_id]
+        node = case['args'][0] + '::test_example'
+        collected = [node] + [s + '[0]' for s in case.get('excluded', {})]
         nodes = [node] if phase == 'prod' else []
         for rank in range(8):
             report = {'rank':rank,'case_id':case_id,'phase':phase,'iteration':1,'complete':True,
-                      'collection_errors':[],'exitstatus':0,'collected':[node],'selected':nodes,
+                      'collection_errors':[],'exitstatus':0,'collected':collected,'selected':nodes,
                       'tests':{n:'passed' for n in nodes},'duration_seconds':0.01,**manifest['identity']}
             path = pathlib.Path(os.environ['PPU_REPORT_DIR']) / f'{phase}-1-rank-{rank}.json'
             path.write_text(json.dumps(report))
@@ -661,6 +783,9 @@ def test_suite_runner_with_fake_hardware(tmp_path, failure):
     (artifacts / "data").mkdir()
     (artifacts / "data/.ready").touch()
     cases = {f"dev-pr-{i:02d}": synthetic_case(f"dev-pr-{i:02d}") for i in range(1, 7)}
+    cases["dev-pr-06"]["excluded"] = {
+        "tests/unit_tests/test_example.py::test_excluded": "known defect"
+    }
     (artifacts / "build-timing.json").write_text(
         json.dumps({"started_at": 1, "completed_at": 2, "elapsed_seconds": 1})
     )
@@ -722,6 +847,11 @@ def test_suite_runner_with_fake_hardware(tmp_path, failure):
             else 'not experimental and not flaky_in_dev'
         )
         assert marker in args
+        exclusions = [arg for arg in args if arg.startswith('--ppu-exclude=')]
+        if '/dev-pr-06/' in args[args.index('--log-dir') + 1]:
+            assert exclusions == ['--ppu-exclude=tests/unit_tests/test_example.py::test_excluded']
+        else:
+            assert exclusions == []
         assert args[args.index('--nproc-per-node') + 1] == '8'
         assert args[args.index('--log-dir') + 1].endswith(
             '/experimental' if experimental else '/prod'

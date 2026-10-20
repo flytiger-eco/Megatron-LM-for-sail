@@ -148,6 +148,8 @@ print(case['minutes'] * 60)
 print(case['repeat'])
 print('not flaky' if case['environment'] == 'lts' else 'not flaky_in_dev')
 print('\n'.join(case['args']))
+for selector in case.get('excluded', {}):
+    print(f'--ppu-exclude={selector}')
 PY
     settings=()
     while IFS= read -r setting; do settings+=("$setting"); done < .ppu-ci/settings.txt

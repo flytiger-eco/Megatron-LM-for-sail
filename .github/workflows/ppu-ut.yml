@@ -78,7 +78,7 @@ jobs:
           PPU_OUTCOME: ${{ steps.ppu.outcome }}
         run: '[[ "$PPU_OUTCOME" == success && "$PPU_STATUS" == succeeded ]]'
   result:
-    name: UT Pass Rate >= 80%
+    name: UT Gate (quick 100%, full 80%)
     needs: test
     if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-latest
@@ -91,7 +91,7 @@ jobs:
         with:
           pattern: ppu-ut-*
           path: results
-      - name: 汇总全部用例并应用 80% 通过率门禁
+      - name: 汇总全部用例并应用 quick 100% / full 80% 门禁
         env:
           PPU_MATRIX_RESULT: ${{ needs.test.result }}
         run: python3 -I .ppu-ci/control/ppu_ci.py summarize --results results
