@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[3]
 SCRIPTS = ROOT / ".github/scripts"
 SHA = "a" * 40
 CONTROL_SHA = "b" * 40
+BASE_SHA = "c" * 40
+MERGE_SHA = "d" * 40
 IDENTITY = {"target_sha": SHA, "control_sha": CONTROL_SHA}
 BRANCH = "refs/heads/ci/ppu-validation"
 REPOSITORY = "flytiger-eco/Megatron-LM-for-sail"
@@ -33,8 +35,12 @@ auth = load_module("ppu_pr_authorize")
 def pr(fork=False):
     return {
         "state": "open",
+        "draft": False,
+        "changed_files": 1,
+        "mergeable": True,
+        "merge_commit_sha": MERGE_SHA,
         "head": {"sha": SHA, "repo": {"full_name": "someone/fork" if fork else REPOSITORY}},
-        "base": {"ref": "ci/ppu-validation", "repo": {"full_name": REPOSITORY}},
+        "base": {"ref": "ci/ppu-validation", "sha": BASE_SHA, "repo": {"full_name": REPOSITORY}},
     }
 
 
@@ -57,13 +63,17 @@ def api_for(pull=None, permission="write"):
     def api(path):
         if path.startswith("collaborators/"):
             return {"permission": permission}
+        if path.startswith("pulls/7/files?"):
+            return [{"filename": "megatron/core/utils.py", "status": "modified"}]
+        if path == f"git/commits/{MERGE_SHA}":
+            return {"parents": [{"sha": BASE_SHA}, {"sha": SHA}]}
         assert path == "pulls/7"
         return pull or pr()
 
     return api
 
 
-@pytest.mark.parametrize("ref,scope", [(BRANCH, "quick"), ("refs/tags/v1.2.3", "full")])
+@pytest.mark.parametrize("ref,scope", [(BRANCH, "full"), ("refs/tags/v1.2.3", "full")])
 def test_automatic_scope_cannot_be_downgraded(ref, scope):
     result = ci.select_config(
         {"ref": ref}, "push", {"scope": "quick", "build": False, "unit_test": False, "repeat": 0}
@@ -75,7 +85,7 @@ def test_automatic_scope_cannot_be_downgraded(ref, scope):
 @pytest.mark.parametrize("fork", [False, True])
 def test_automatic_pr_filter(fork):
     result = ci.select_config({"pull_request": pr(fork)}, "pull_request_target", {"scope": "full"})
-    assert result["scope"] == "quick"
+    assert result["scope"] == "full"
     assert result["build"] is not fork
     assert result["unit_test"] is not fork
 
@@ -87,7 +97,7 @@ def test_manual_diagnostic_skip(inputs):
     assert not ci.select_config({"ref": BRANCH}, "workflow_dispatch", inputs)["unit_test"]
 
 
-def test_manual_pr_forces_quick_and_complete_execution():
+def test_manual_pr_full_requires_complete_execution():
     result = ci.select_config(
         {"ref": BRANCH},
         "workflow_dispatch",
@@ -95,12 +105,13 @@ def test_manual_pr_forces_quick_and_complete_execution():
             "scope": "full",
             "pr_number": "7",
             "pr_sha": SHA,
+            "pr_base_sha": BASE_SHA,
             "build": False,
             "unit_test": False,
             "repeat": 0,
         },
     )
-    assert result["scope"] == "quick"
+    assert result["scope"] == "full" and result["threshold_percent"] == 100
     assert result["unit_test"] and result["build"] and result["repeat"] == 1
 
 
@@ -192,7 +203,7 @@ def test_invalid_recipe(tmp_path, monkeypatch, mutation):
     elif mutation == "budget":
         group["minutes"] += 1
     elif mutation == "version":
-        recipe["schema_version"] = 2
+        recipe["schema_version"] = 3
     else:
         group["id"] = "../../oops"
     (tmp_path / ".github").mkdir()
@@ -209,17 +220,17 @@ def test_invalid_exclusions(tmp_path, monkeypatch, mutation):
     recipe = json.loads((ROOT / ".github/ppu-pr-tests.json").read_text())
     group = recipe["groups"][-1]
     if mutation == "type":
-        group["excluded"] = [EXCLUDED_UT]
+        recipe["excluded"] = [EXCLUDED_UT]
     elif mutation == "invalid":
-        group["excluded"] = {"../test.py": "invalid"}
+        recipe["excluded"] = {"../test.py": "invalid"}
     elif mutation == "reason":
-        group["excluded"][EXCLUDED_UT] = " "
+        recipe["excluded"][EXCLUDED_UT] = " "
     elif mutation == "outside":
-        group["excluded"] = {recipe["groups"][0]["selectors"][0]: "outside group"}
+        group["excluded"] = {EXCLUDED_UT: "must use common exclusions"}
     elif mutation == "whole_selector":
-        group["excluded"] = {group["selectors"][0]: "entire selector"}
+        recipe["excluded"] = {group["selectors"][0]: "entire file"}
     else:
-        group["excluded"][EXCLUDED_UT.rsplit("::", 1)[0]] = "overlapping class"
+        recipe["excluded"][EXCLUDED_UT.rsplit("::", 1)[0]] = "overlapping class"
     (tmp_path / ".github").mkdir()
     (tmp_path / ".github/ppu-pr-tests.json").write_text(json.dumps(recipe))
     monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
@@ -236,9 +247,11 @@ def test_full_recipe_parity_with_previous_implementation(repeat):
     exec(compile(original, "baseline_ppu_ci", "exec"), namespace)
     config = {"repeat": repeat, "timeout": 30}
     actual = ci.unit_cases(config)
-    assert actual == namespace["unit_cases"](config)
+    assert {
+        key: {k: v for k, v in row.items() if k != "excluded"} for key, row in actual.items()
+    } == namespace["unit_cases"](config)
     assert len(actual) == 74
-    assert all(not case.get("excluded") for case in actual.values())
+    assert sum(EXCLUDED_UT in case["excluded"] for case in actual.values()) == 2
     assert all(
         not arg.startswith("--ppu-exclude") for case in actual.values() for arg in case["args"]
     )
@@ -260,11 +273,16 @@ def test_full_recipe_parity_with_previous_implementation(repeat):
 def test_configure_cli_separates_control_and_source(tmp_path):
     source, output = tmp_path / "source", tmp_path / "output"
     output.mkdir()
-    for case in ci.quick_cases({}).values():
-        for filename in case["files"]:
-            path = source / filename
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("raise RuntimeError('configure must not import source')\n")
+    for original in (ROOT / "tests/unit_tests").rglob("*.py"):
+        path = source / original.relative_to(ROOT)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("raise RuntimeError('configure must not import source')\n")
+    recipe = source / ci.RECIPE_PATH
+    recipe.parent.mkdir(parents=True)
+    recipe.write_bytes((ROOT / ci.RECIPE_PATH).read_bytes())
+    parser = source / "tests/test_utils/python_scripts/recipe_parser.py"
+    parser.parent.mkdir(parents=True)
+    parser.write_text("raise RuntimeError('untrusted parser imported')\n")
     control_override = source / ".github/ppu-pr-tests.json"
     control_override.parent.mkdir()
     control_override.write_text("{}")
@@ -291,15 +309,42 @@ def test_configure_cli_separates_control_and_source(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     manifest = json.loads((output / "manifest.json").read_text())
-    assert manifest["identity"] == IDENTITY
-    assert manifest["config"]["scope"] == "quick" and len(manifest["unit"]) == 6
+    assert manifest["identity"] == {**IDENTITY, "pr_head_sha": "", "base_sha": ""}
+    assert manifest["config"]["scope"] == "full" and len(manifest["unit"]) == 37
 
 
 @pytest.mark.parametrize("state", ["pending", "success", "failure"])
 def test_commit_status_uses_pr_head_sha(tmp_path, monkeypatch, state):
-    (tmp_path / "authorization.json").write_text(json.dumps({"pr_number": 7, **IDENTITY}))
+    (tmp_path / "authorization.json").write_text(
+        json.dumps(
+            {
+                "pr_number": 7,
+                "pr_head_sha": SHA,
+                "base_sha": BASE_SHA,
+                "decision": "run",
+                "run_id": "123",
+                **IDENTITY,
+            }
+        )
+    )
     calls = []
-    monkeypatch.setattr(auth, "github_api", lambda path, payload: calls.append((path, payload)))
+
+    def api(path, payload=None):
+        if payload is not None:
+            calls.append((path, payload))
+            return {}
+        if path == "pulls/7":
+            return pr()
+        if path == "actions/runs/123":
+            return {"status": "in_progress", "run_attempt": 1}
+        return [
+            {
+                "context": auth.STATUS_CONTEXT,
+                "target_url": f"https://github.com/{REPOSITORY}/actions/runs/123",
+            }
+        ]
+
+    monkeypatch.setattr(auth, "github_api", api)
     monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
     monkeypatch.setenv("GITHUB_RUN_ID", "123")
     monkeypatch.setattr(
@@ -314,23 +359,30 @@ def test_commit_status_uses_pr_head_sha(tmp_path, monkeypatch, state):
 
 
 def test_manual_fork_authorization():
-    result = auth.authorize({}, {"pr_number": "7", "pr_sha": SHA}, context(), api_for(pr(True)))
+    result = auth.authorize(
+        {}, {"pr_number": "7", "pr_sha": SHA, "pr_base_sha": BASE_SHA}, context(), api_for(pr(True))
+    )
     assert result["allowed"] and result["manual_pr"]
-    assert result["target_sha"] == SHA and result["control_sha"] == CONTROL_SHA
+    assert result["target_sha"] == MERGE_SHA and result["control_sha"] == CONTROL_SHA
+    assert result["pr_head_sha"] == SHA and result["base_sha"] == BASE_SHA
     assert result["pr_number"] == 7
 
 
 def test_fork_event_never_authorizes_ppu():
     event = {"number": 7, "pull_request": pr(True)}
     result = auth.authorize(event, {}, context("pull_request_target"), api_for(pr(True)))
-    assert not result["allowed"] and result["target_sha"] == SHA
+    assert not result["allowed"] and result["pr_head_sha"] == SHA
+    assert result["decision"] == "authorization_required"
 
 
 @pytest.mark.parametrize("permission", ["read", "triage", "none"])
 def test_authorization_requires_write(permission):
     with pytest.raises(ValueError):
         auth.authorize(
-            {}, {"pr_number": "7", "pr_sha": SHA}, context(), api_for(permission=permission)
+            {},
+            {"pr_number": "7", "pr_sha": SHA, "pr_base_sha": BASE_SHA},
+            context(),
+            api_for(permission=permission),
         )
 
 
@@ -338,7 +390,11 @@ def test_authorization_requires_write(permission):
     "mutation", ["rerun", "ref", "workflow", "sha", "closed", "base", "repo", "head", "pair"]
 )
 def test_authorization_rejects_stale_or_untrusted_inputs(mutation):
-    ctx, pull, inputs = context(), pr(True), {"pr_number": "7", "pr_sha": SHA}
+    ctx, pull, inputs = (
+        context(),
+        pr(True),
+        {"pr_number": "7", "pr_sha": SHA, "pr_base_sha": BASE_SHA},
+    )
     if mutation == "rerun":
         ctx["run_attempt"] = "2"
     elif mutation == "ref":
@@ -376,6 +432,7 @@ def synthetic_case(case_id="dev-pr-01"):
 def write_reports(directory, case, failed=1, skipped=False):
     directory.mkdir(parents=True, exist_ok=True)
     nodes = [f"{case['args'][0]}::test_{i}" for i in range(5)]
+    collected = nodes + [selector + "[0]" for selector in case.get("excluded", {})]
     for phase in ("prod", "experimental"):
         for rank in range(8):
             selected = nodes if phase == "prod" else []
@@ -392,9 +449,10 @@ def write_reports(directory, case, failed=1, skipped=False):
                 "phase": phase,
                 "iteration": 1,
                 "tests": tests,
-                "collected": nodes,
+                "collected": collected,
                 "selected": selected,
                 "duration_seconds": 1.0,
+                "collection_seconds": 0.1,
                 **IDENTITY,
             }
             (directory / f"{phase}-1-rank-{rank}.json").write_text(json.dumps(report))
@@ -477,6 +535,11 @@ def test_exclusion_report_integrity(tmp_path, capsys, mutation):
     manifest = {"config": {"scope": "quick"}, "identity": IDENTITY, "unit": {case["id"]: case}}
     directory = ci.result_directory(manifest, tmp_path, case["id"])
     write_reports(directory, case, failed=0)
+    if mutation == "missing":
+        for path in directory.glob("*-rank-*.json"):
+            report = json.loads(path.read_text())
+            report["collected"] = nodes
+            path.write_text(json.dumps(report))
     if mutation != "executed":
         for path in directory.glob("prod-*-rank-*.json"):
             report = json.loads(path.read_text())
@@ -705,7 +768,7 @@ def test_workflow_trust_and_resource_boundaries():
     build = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
     ut = yaml.safe_load((ROOT / ".github/workflows/ppu-ut.yml").read_text())
     events = build.get("on", build.get(True))
-    assert set(events) == {"push", "pull_request_target", "workflow_dispatch"}
+    assert set(events) == {"push", "pull_request_target", "workflow_dispatch", "merge_group"}
     assert events["push"]["tags"] == ["v*"]
     assert events["pull_request_target"]["branches"] == ["ci/ppu-validation"]
     assert build["jobs"]["authorize"]["runs-on"] == "ubuntu-latest"
@@ -714,7 +777,7 @@ def test_workflow_trust_and_resource_boundaries():
         assert "github.run_attempt == 1" in build["jobs"][name]["if"]
     assert "github.run_attempt == 1" in ut["jobs"]["test"]["if"]
     assert ut["jobs"]["test"]["strategy"]["max-parallel"] == 1
-    assert ut["jobs"]["result"]["name"] == "UT Gate (quick 100%, full 80%)"
+    assert "inputs.threshold_percent" in ut["jobs"]["result"]["name"]
     assert "GH_TOKEN" not in build["jobs"]["build"].get("env", {})
     for workflow in (build, ut):
         for job in workflow["jobs"].values():
@@ -732,7 +795,7 @@ def test_workflow_trust_and_resource_boundaries():
     assert "secrets: inherit" not in (ROOT / ".github/workflows/ppu-build.yml").read_text()
     assert "release-{0}" in build["concurrency"]["group"]
     assert "full-{0}" in build["concurrency"]["group"]
-    assert "inputs.scope == 'full'" in build["concurrency"]["cancel-in-progress"]
+    assert "inputs.pr_number == ''" in build["concurrency"]["cancel-in-progress"]
 
 
 TOOL_STUB = r'''

@@ -1,6 +1,7 @@
 """PPU Build/UT."""
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import math
@@ -14,6 +15,30 @@ CONTROL_ROOT = Path(os.environ.get("PPU_CONTROL_ROOT", Path(__file__).resolve().
 ROOT = Path(os.environ.get("PPU_SOURCE_ROOT", CONTROL_ROOT)).resolve()
 ENVIRONMENTS = ("dev", "lts")
 OUTCOME_ORDER = {"skipped": 0, "passed": 1, "failed": 2}
+RECIPE_PATH = "tests/test_utils/recipes/h100/unit-tests.yaml"
+POLICY_PATH = ".github/ppu-pr-tests.json"
+
+
+def load_policy() -> dict:
+    policy = json.loads((CONTROL_ROOT / POLICY_PATH).read_text())
+    if policy.get("schema_version") != 2 or policy.get("daily_scope") not in ("full", "quick"):
+        raise ValueError("UT 策略版本或日常范围无效")
+    state = policy.get("quick_state")
+    if state not in ("unavailable", "candidate", "validated"):
+        raise ValueError("quick 验证状态无效")
+    if state != "unavailable" and not policy.get("baseline"):
+        raise ValueError("quick 缺少全量基线证据")
+    if policy["daily_scope"] == "quick" and (
+        state != "validated" or len(set(policy.get("validation_runs", []))) < 2
+    ):
+        raise ValueError("日常 quick 必须先完成两轮验收")
+    return policy
+
+
+def threshold(config: dict) -> int:
+    if config["scope"] == "quick" or config.get("trigger_kind") in ("pr", "push", "merge_group"):
+        return 100
+    return 80
 
 
 def positive(value: object, name: str, maximum: int = 10000) -> int:
@@ -24,7 +49,7 @@ def positive(value: object, name: str, maximum: int = 10000) -> int:
 
 
 def select_config(event: dict, event_name: str, inputs: dict) -> dict:
-    if event_name not in {"pull_request_target", "push", "workflow_dispatch"}:
+    if event_name not in {"pull_request_target", "push", "workflow_dispatch", "merge_group"}:
         raise ValueError(f"不支持的触发事件: {event_name}")
     config = {"build": inputs.get("build", True), "unit_test": inputs.get("unit_test", True)}
     for key, value in config.items():
@@ -35,21 +60,29 @@ def select_config(event: dict, event_name: str, inputs: dict) -> dict:
     repeat = inputs.get("repeat", 1)
     config["repeat"] = 0 if str(repeat) == "0" else positive(repeat, "repeat", 10)
     config["timeout"] = positive(inputs.get("timeout", 30), "timeout", 1380)
-    scope = inputs.get("scope", "quick")
-    if scope not in ("quick", "full"):
-        raise ValueError("scope 必须为 quick 或 full")
+    policy = load_policy()
+    scope = inputs.get("scope", "auto")
+    family = inputs.get("suite_family", "nvidia-dev")
+    if scope not in ("auto", "quick", "full") or family not in ("nvidia-dev", "release-dev-lts"):
+        raise ValueError("scope 或 suite_family 非法")
+    trigger = "manual"
     ref = event.get("ref", "")
     if event_name == "push":
         if ref.startswith("refs/tags/v"):
-            scope = "full"
+            scope, family, trigger = "full", "release-dev-lts", "release"
             config.update(build=True, unit_test=True, repeat=1)
         elif ref == "refs/heads/ci/ppu-validation":
-            scope = "quick"
+            scope, family, trigger = "auto", "nvidia-dev", "push"
             config.update(build=True, unit_test=True, repeat=1)
         else:
             raise ValueError("不支持的 push ref")
+    if event_name == "merge_group":
+        if event["merge_group"]["base_ref"] != "refs/heads/ci/ppu-validation":
+            raise ValueError("合并队列 base 必须为验证分支")
+        scope, family, trigger = "full", "nvidia-dev", "merge_group"
+        config.update(build=True, unit_test=True, repeat=1)
     if event_name == "pull_request_target":
-        scope = "quick"
+        scope, family, trigger = "auto", "nvidia-dev", "pr"
         pr = event["pull_request"]
         if pr["base"]["ref"] != "ci/ppu-validation":
             raise ValueError("PR base 必须为验证分支")
@@ -61,26 +94,29 @@ def select_config(event: dict, event_name: str, inputs: dict) -> dict:
     if event_name == "workflow_dispatch":
         if ref != "refs/heads/ci/ppu-validation":
             raise ValueError("手动入口仅允许验证分支")
-        number, sha = inputs.get("pr_number", ""), inputs.get("pr_sha", "")
-        if bool(number) != bool(sha):
-            raise ValueError("PR 编号与完整 SHA 必须同时填写")
+        number, sha, base = (inputs.get(key, "") for key in ("pr_number", "pr_sha", "pr_base_sha"))
+        if any((number, sha, base)) and not all((number, sha, base)):
+            raise ValueError("PR 编号与完整 head/base SHA 必须同时填写")
         if number:
             positive(number, "PR number", 10**9)
-            if not re.fullmatch(r"[0-9a-fA-F]{40}", str(sha)):
+            if any(not re.fullmatch(r"[0-9a-fA-F]{40}", str(value)) for value in (sha, base)):
                 raise ValueError("PR SHA 必须为完整的 40 位十六进制字符串")
-            scope = "quick"
+            family, trigger = "nvidia-dev", "pr"
             config.update(build=True, unit_test=True, repeat=1)
+    if scope == "auto":
+        scope = "full" if family == "release-dev-lts" else policy["daily_scope"]
     if scope == "quick":
+        if family != "nvidia-dev" or policy["quick_state"] == "unavailable":
+            raise ValueError("对应 quick 尚无有效全量基线，不能执行")
         config["repeat"] = 1
-    config["scope"] = scope
+    config.update(scope=scope, suite_family=family, trigger_kind=trigger)
+    config["threshold_percent"] = threshold(config)
     config["unit_test"] = config["unit_test"] and config["build"] and config["repeat"] > 0
     return config
 
 
-def load_bucket_helper() -> ModuleType:
-    spec = importlib.util.spec_from_file_location(
-        "ppu_bucket_helper", ROOT / "tests/unit_tests/find_test_cases.py"
-    )
+def load_control_module(name: str, path: str) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(name, CONTROL_ROOT / path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -89,35 +125,63 @@ def load_bucket_helper() -> ModuleType:
 def unit_cases(config: dict) -> dict:
     import yaml
 
-    sys.path.insert(0, str(ROOT))
-    from tests.test_utils.python_scripts import recipe_parser
-
-    helper = load_bucket_helper()
-    recipe = yaml.safe_load((ROOT / "tests/test_utils/recipes/h100/unit-tests.yaml").read_text())
+    helper = load_control_module("ppu_bucket_helper", "tests/unit_tests/find_test_cases.py")
+    recipe_parser = load_control_module(
+        "ppu_recipe_parser", "tests/test_utils/python_scripts/recipe_parser.py"
+    )
+    recipe_file = (ROOT / RECIPE_PATH).resolve()
+    if not recipe_file.is_relative_to(ROOT):
+        raise ValueError("recipe 路径越界")
+    recipe = yaml.safe_load(recipe_file.read_text())
+    if recipe.get("format_version") != 1 or recipe.get("type") != "basic":
+        raise ValueError("不支持的 UT recipe 结构")
+    for product in recipe["products"]:
+        if len(product["test_case"]) != 1 or not product.get("products"):
+            raise ValueError("需要显式适配的 recipe product")
+    workloads = recipe_parser.load_and_flatten(str(recipe_file))
     buckets = [bucket for product in recipe["products"] for bucket in product["test_case"]]
+    if len(buckets) != len(set(buckets)):
+        raise ValueError("重复 UT bucket")
+    for bucket in buckets:
+        if not re.fullmatch(
+            r"tests/unit_tests/(?:[A-Za-z0-9_]+/)*(?:[A-Za-z0-9_]+\.py|\*\*/\*\.py)", bucket
+        ):
+            raise ValueError(f"不支持的 UT bucket，不能静默跳过: {bucket}")
+    excluded = policy_exclusions()
     cases = {}
-    for environment in ENVIRONMENTS:
-        workloads = recipe_parser.load_workloads(
-            container_tag="ppu-ci",
-            container_image="unused",
-            scope="unit-tests",
-            environment=environment,
-            tag="latest",
-            platform="dgx_h100",
-            n_repeat=config["repeat"],
-            time_limit=config["timeout"] * 60,
-        )
-        specs = [workload.spec for workload in workloads if workload.type != "build"]
+    environments = (
+        ("dev",) if config.get("suite_family", "release-dev-lts") == "nvidia-dev" else ENVIRONMENTS
+    )
+    for environment in environments:
+        specs = [
+            workload.spec
+            for workload in workloads
+            if all(
+                workload.spec.get(key) == value
+                for key, value in {
+                    "scope": "unit-tests",
+                    "environment": environment,
+                    "tag": "latest",
+                    "platforms": "dgx_h100",
+                    "model": "unit-tests",
+                }.items()
+            )
+        ]
+        selected_buckets = [spec["test_case"] for spec in specs]
+        if len(selected_buckets) != len(set(selected_buckets)):
+            raise ValueError(f"{environment} UT recipe 存在重复匹配")
+        if set(selected_buckets) != set(buckets):
+            raise ValueError(f"{environment} UT recipe 有未匹配 bucket，需要显式适配")
         if not specs:
             raise ValueError(f"{environment} UT recipe 为空")
         for index, spec in enumerate(sorted(specs, key=lambda row: row["test_case"])):
             bucket = spec["test_case"]
-            if not bucket.startswith("tests/unit_tests/") or ".." in bucket.split("/"):
-                raise ValueError(f"不支持的 UT bucket，不能静默跳过: {bucket}")
             target = helper.get_base_path(bucket)
-            if not (ROOT / target).exists():
+            if not (ROOT / target).exists() or not (ROOT / target).resolve().is_relative_to(
+                ROOT / "tests/unit_tests"
+            ):
                 raise ValueError(f"UT 路径不存在: {target}")
-            if int(spec["nodes"]) != 1 or int(spec["gpus"]) != 8:
+            if positive(spec["nodes"], "nodes") != 1 or positive(spec["gpus"], "gpus") != 8:
                 raise ValueError(f"需要显式适配的 UT 拓扑: {bucket}")
             files = {
                 path.relative_to(ROOT).as_posix() for path in ROOT.glob(bucket) if path.is_file()
@@ -130,8 +194,15 @@ def unit_cases(config: dict) -> dict:
                         for path in ROOT.glob(child)
                         if path.is_file()
                     )
+            if any(
+                not (ROOT / path).resolve().is_relative_to(ROOT / "tests/unit_tests")
+                for path in files
+            ):
+                raise ValueError("UT 文件路径越界")
+            if not files - ignored:
+                raise ValueError(f"空 UT bucket: {bucket}")
             case_id = f"{environment}-{index:03d}"
-            minutes = (int(spec["time_limit"]) + 59) // 60
+            minutes = (int(spec.get("time_limit_override", config["timeout"] * 60)) + 59) // 60
             positive(minutes, "bucket timeout", 1380)
             cases[case_id] = {
                 "id": case_id,
@@ -144,7 +215,15 @@ def unit_cases(config: dict) -> dict:
                 "repeat": config["repeat"],
                 "args": [target] + [f"--ignore={path}" for path in sorted(files & ignored)],
                 "files": sorted(files - ignored),
+                "excluded": {
+                    selector: reason
+                    for selector, reason in excluded.items()
+                    if selector.split("::")[0] in files - ignored
+                },
             }
+    for selector in excluded:
+        if not any(selector in case["excluded"] for case in cases.values()):
+            raise ValueError(f"排除项不属于测试全集: {selector}")
     return cases
 
 
@@ -166,9 +245,22 @@ def validate_selector(selector: str) -> str:
     return filename
 
 
+def policy_exclusions() -> dict:
+    excluded = load_policy().get("excluded", {})
+    if not isinstance(excluded, dict):
+        raise ValueError("排除清单必须包含 selector 与原因")
+    for selector, reason in excluded.items():
+        validate_selector(selector)
+        if "::" not in selector or not isinstance(reason, str) or not reason.strip():
+            raise ValueError("排除项必须为明确方法/类并说明原因")
+        if any(old != selector and selector_matches(old, selector) for old in excluded):
+            raise ValueError("排除 selector 重叠")
+    return excluded
+
+
 def quick_cases(config: dict) -> dict:
-    recipe = json.loads((CONTROL_ROOT / ".github/ppu-pr-tests.json").read_text())
-    if recipe.get("schema_version") != 1 or not recipe.get("groups"):
+    recipe = load_policy()
+    if not recipe.get("groups"):
         raise ValueError("quick 清单版本错误或没有分组")
     cases, seen = {}, []
     for group in recipe["groups"]:
@@ -187,7 +279,13 @@ def quick_cases(config: dict) -> dict:
                 raise ValueError(f"重复或重叠 selector: {selector}")
             seen.append(selector)
             files.add(filename)
-        excluded = group.get("excluded", {})
+        excluded = {
+            selector: reason
+            for selector, reason in policy_exclusions().items()
+            if selector.split("::")[0] in files
+        }
+        if group.get("excluded"):
+            raise ValueError("排除项必须在公共排除表声明")
         if not isinstance(excluded, dict):
             raise ValueError(f"quick 排除清单必须包含 selector 与原因: {case_id}")
         for selector, reason in excluded.items():
@@ -223,7 +321,32 @@ def generate(config: dict, output: Path, identity: dict | None = None) -> dict:
     output.mkdir(parents=True, exist_ok=True)
     quick = config.get("scope", "full") == "quick"
     cases = (quick_cases(config) if quick else unit_cases(config)) if config["unit_test"] else {}
-    manifest = {"schema_version": 2, "config": config, "identity": identity or {}, "unit": cases}
+    if quick and cases:
+        full = unit_cases({**config, "suite_family": "nvidia-dev", "repeat": 1, "timeout": 30})
+        for case in cases.values():
+            case["source_buckets"] = {}
+            for selector in case["args"]:
+                matches = [
+                    row["bucket"]
+                    for row in full.values()
+                    if selector.split("::")[0] in row["files"]
+                ]
+                if len(matches) != 1:
+                    raise ValueError(f"quick selector 不属于唯一上游 bucket: {selector}")
+                case["source_buckets"][selector] = matches[0]
+    provenance = {
+        "recipe_path": RECIPE_PATH,
+        "recipe_sha256": hashlib.sha256((ROOT / RECIPE_PATH).read_bytes()).hexdigest(),
+        "policy_sha256": hashlib.sha256((CONTROL_ROOT / POLICY_PATH).read_bytes()).hexdigest(),
+        "excluded": policy_exclusions(),
+    }
+    manifest = {
+        "schema_version": 3,
+        "config": config,
+        "identity": identity or {},
+        "provenance": provenance,
+        "unit": cases,
+    }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     keys = ("id", "environment", "bucket", "cards", "action_minutes", "job_minutes")
     if quick and cases:
@@ -245,12 +368,15 @@ def generate(config: dict, output: Path, identity: dict | None = None) -> dict:
     return manifest
 
 
-def case_results(case: dict, directory: Path, identity: dict | None = None) -> dict:
+def case_results(
+    case: dict, directory: Path, identity: dict | None = None, require_timing: bool = False
+) -> dict:
     outcomes, errors, collected, selected = {}, [], set(), set()
+    durations, phase_timings = {}, []
     elapsed = 0.0
     for iteration in range(1, case["repeat"] + 1):
         for phase in ("prod", "experimental"):
-            phase_seconds = 0.0
+            phase_seconds, collection_seconds = 0.0, 0.0
             for rank in range(case["cards"]):
                 filename = f"{phase}-{iteration}-rank-{rank}.json"
                 try:
@@ -291,10 +417,39 @@ def case_results(case: dict, directory: Path, identity: dict | None = None) -> d
                             raise ValueError("收集、选中与执行的用例不一致")
                         collected.update(report["collected"])
                         selected.update(report["selected"])
+                    if require_timing and any(
+                        key not in report
+                        for key in (
+                            "selected",
+                            "duration_seconds",
+                            "collection_seconds",
+                            "durations",
+                        )
+                    ):
+                        raise ValueError("逐 rank 报告缺少选集或计时字段")
                     duration = float(report.get("duration_seconds", 0))
                     if not math.isfinite(duration) or duration < 0:
                         raise ValueError("报告耗时非法")
                     phase_seconds = max(phase_seconds, duration)
+                    collection = float(report.get("collection_seconds", 0))
+                    if not math.isfinite(collection) or not 0 <= collection <= duration:
+                        raise ValueError("非法 collection 耗时")
+                    collection_seconds = max(collection_seconds, collection)
+                    node_durations = report.get("durations", {})
+                    if not isinstance(node_durations, dict):
+                        raise ValueError("非法用例耗时映射")
+                    if require_timing and set(node_durations) != set(report["tests"]):
+                        raise ValueError("逐 rank 用例耗时不完整")
+                    for nodeid, seconds in node_durations.items():
+                        if (
+                            nodeid not in report["tests"]
+                            or type(seconds) not in (int, float)
+                            or not math.isfinite(seconds)
+                            or seconds < 0
+                        ):
+                            raise ValueError("非法用例耗时")
+                        key = f"{iteration}:{phase}:{nodeid}"
+                        durations[key] = max(durations.get(key, 0), seconds)
                     for nodeid, outcome in report["tests"].items():
                         if not isinstance(nodeid, str) or outcome not in OUTCOME_ORDER:
                             raise ValueError("非法 nodeid 或测试结果")
@@ -313,11 +468,21 @@ def case_results(case: dict, directory: Path, identity: dict | None = None) -> d
                 except (OSError, ValueError, KeyError, TypeError) as exc:
                     errors.append(f"{case['id']}/{filename}: {exc}")
             elapsed += phase_seconds
+            phase_timings.append(
+                {
+                    "iteration": iteration,
+                    "phase": phase,
+                    "duration_seconds": phase_seconds,
+                    "collection_seconds": collection_seconds,
+                }
+            )
+    for selector in case.get("excluded", {}):
+        if not any(selector_matches(selector, nodeid) for nodeid in collected):
+            errors.append(f"{case['id']}: 排除 selector 未收集到用例: {selector}")
+    executed = {key.split(":", 2)[2] for key, value in outcomes.items() if value != "skipped"}
+    if not executed:
+        errors.append(f"{case['id']}: 整组没有实际执行用例")
     if case.get("strict_selection"):
-        for selector in case.get("excluded", {}):
-            if not any(selector_matches(selector, nodeid) for nodeid in collected):
-                errors.append(f"{case['id']}: 排除 selector 未收集到用例: {selector}")
-        executed = {key.split(":", 2)[2] for key, value in outcomes.items() if value != "skipped"}
         for selector in case["args"]:
             if not any(selector_matches(selector, nodeid) for nodeid in collected):
                 errors.append(f"{case['id']}: selector 未收集到用例: {selector}")
@@ -330,6 +495,11 @@ def case_results(case: dict, directory: Path, identity: dict | None = None) -> d
         "errors": errors,
         "complete": not errors,
         "duration_seconds": elapsed,
+        "durations": durations,
+        "phase_timings": phase_timings,
+        "excluded_count": sum(
+            any(selector_matches(s, node) for s in case.get("excluded", {})) for node in collected
+        ),
     }
 
 
@@ -367,17 +537,24 @@ def read_timing(path: Path, errors: list, suite: bool = False) -> dict:
 
 def summarize(manifest: dict, directory: Path) -> dict:
     scope = manifest["config"].get("scope", "full")
-    threshold_percent = {"quick": 100, "full": 80}[scope]
+    threshold_percent = threshold(manifest["config"])
+    if manifest["config"].get("threshold_percent", threshold_percent) != threshold_percent:
+        raise ValueError("manifest 门禁与触发场景不一致")
     counts = dict.fromkeys(OUTCOME_ORDER, 0)
     errors, failures, groups = [], [], {}
     for case in manifest["unit"].values():
         result_dir = result_directory(manifest, directory, case["id"])
-        result = case_results(case, result_dir, manifest.get("identity"))
+        result = case_results(
+            case,
+            result_dir,
+            manifest.get("identity"),
+            require_timing=manifest.get("schema_version", 2) >= 3,
+        )
         group_errors = result["errors"]
         timing_path = result_dir / "timing.json"
         timing = (
             read_timing(timing_path, group_errors)
-            if manifest["config"].get("scope") == "quick" or timing_path.exists()
+            if manifest.get("schema_version", 2) >= 3 or scope == "quick" or timing_path.exists()
             else {}
         )
         try:
@@ -386,15 +563,30 @@ def summarize(manifest: dict, directory: Path) -> dict:
                 raise ValueError("bucket 执行未完整结束")
         except (OSError, ValueError, KeyError, TypeError) as exc:
             group_errors.append(f"{case['id']}: {exc}")
-        errors.extend(f"{case['id']}: {error}" for error in group_errors)
         group_counts = dict.fromkeys(OUTCOME_ORDER, 0)
+        methods = {}
+        for node, seconds in result["durations"].items():
+            selector = node.split(":", 2)[2].split("[", 1)[0]
+            methods[selector] = methods.get(selector, 0) + seconds
+        suite_timing = {}
+        if scope == "full" and manifest.get("schema_version", 2) >= 3:
+            suite_timing = read_timing(result_dir / "suite-timing.json", group_errors, suite=True)
+            if set(result["durations"]) != set(result["outcomes"]):
+                group_errors.append("全量基线缺少完整逐用例耗时")
         groups[case["id"]] = {
             "counts": group_counts,
+            "bucket": case.get("bucket", case["id"]),
+            "environment": case.get("environment"),
+            "suite_timing": suite_timing,
+            "method_durations": methods,
+            "phase_timings": result["phase_timings"],
+            "excluded_count": result["excluded_count"],
             "duration_seconds": result["duration_seconds"],
             "timing": timing,
             "errors": group_errors,
             "excluded": case.get("excluded", {}),
         }
+        errors.extend(f"{case['id']}: {error}" for error in group_errors)
         for nodeid, outcome in result["outcomes"].items():
             group_counts[outcome] += 1
             counts[outcome] += 1
@@ -406,6 +598,12 @@ def summarize(manifest: dict, directory: Path) -> dict:
         for name in ("build", "suite"):
             path = directory / "ppu-ut-quick" / f"{name}-timing.json"
             timings[name] = read_timing(path, errors, suite=name == "suite")
+    if scope == "full" and manifest.get("schema_version", 2) >= 3:
+        first = next(iter(manifest["unit"]), None)
+        if first:
+            timings["build"] = read_timing(
+                result_directory(manifest, directory, first) / "build-timing.json", errors
+            )
     total = counts["passed"] + counts["failed"]
     if os.environ.get("PPU_MATRIX_RESULT", "success") != "success":
         errors.append("至少一个调度或产物上传作业未成功")
@@ -413,6 +611,10 @@ def summarize(manifest: dict, directory: Path) -> dict:
     return {
         **counts,
         "scope": scope,
+        "suite_family": manifest["config"].get("suite_family"),
+        "trigger_kind": manifest["config"].get("trigger_kind"),
+        "provenance": manifest.get("provenance", {}),
+        "baseline_complete": not errors and total > 0,
         "threshold_percent": threshold_percent,
         "identity": manifest.get("identity", {}),
         "groups": groups,
@@ -434,7 +636,8 @@ def write_summary(result: dict, directory: Path) -> None:
         f"结论：{'通过' if result['success'] else '未通过'}\n"
     )
     if result["identity"]:
-        text += f"待测 SHA: {result['identity']['target_sha']}；控制 SHA: {result['identity']['control_sha']}\n"
+        text += f"提交身份: {result['identity']}\n"
+    text += f"触发: {result.get('trigger_kind')}；全集: {result.get('suite_family')}；来源: {result.get('provenance', {})}\n"
     for case_id, group in result["groups"].items():
         text += (
             f"{case_id}: {group['counts']}，实际执行 {group['executed']}，"
@@ -442,7 +645,9 @@ def write_summary(result: dict, directory: Path) -> None:
         )
         if group["timing"]:
             text += f"，分组墙钟 {group['timing']['elapsed_seconds']:.1f}s"
-        text += "\n"
+        if group["suite_timing"]:
+            text += f"，环境准备 {group['suite_timing']['prepare_seconds']:.1f}s"
+        text += f"，排除 nodeid {group['excluded_count']} 个\n"
         for selector, reason in group["excluded"].items():
             text += f"  明确排除：{selector}；原因：{reason}\n"
     if result["timings"]:
@@ -481,11 +686,16 @@ def main() -> None:
         authorization = json.loads((args.output / "authorization.json").read_text())
         if authorization["allowed"] is not True:
             config.update(build=False, unit_test=False)
-        identity = {key: authorization[key] for key in ("target_sha", "control_sha")}
+        identity = {
+            key: authorization.get(key, "")
+            for key in ("target_sha", "control_sha", "pr_head_sha", "base_sha")
+        }
         emit("config", json.dumps(config))
         emit("build", config["build"])
         emit("unit_test", config["unit_test"])
         emit("scope", config["scope"])
+        emit("threshold_percent", config["threshold_percent"])
+        emit("suite_family", config["suite_family"])
         if not config["unit_test"]:
             print("诊断运行：UT 已跳过，不提供 PR 成功门禁。")
         generate(config, args.output, identity)
@@ -493,7 +703,10 @@ def main() -> None:
         manifest = json.loads((args.output / "manifest.json").read_text())
         if args.mode == "case-result":
             result = case_results(
-                manifest["unit"][args.case_id], args.results, manifest.get("identity")
+                manifest["unit"][args.case_id],
+                args.results,
+                manifest.get("identity"),
+                require_timing=manifest.get("schema_version", 2) >= 3,
             )
             result["exit_code"] = args.runner_exit
             result["complete"] = result["complete"] and args.runner_exit == 0

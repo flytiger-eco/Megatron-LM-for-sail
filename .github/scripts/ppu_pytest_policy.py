@@ -15,6 +15,7 @@ _execution_errors = []
 _collected = set()
 _durations = {}
 _started = 0.0
+_collection_seconds = 0.0
 
 
 def pytest_addoption(parser):
@@ -40,8 +41,9 @@ def pytest_collection_modifyitems(config, items):
 
 
 def pytest_configure(config):
-    global _started
+    global _started, _collection_seconds
     _started = time.monotonic()
+    _collection_seconds = 0.0
     _collected.clear()
     _durations.clear()
     _tests.clear()
@@ -58,6 +60,8 @@ def pytest_itemcollected(item):
 
 
 def pytest_collection_finish(session):
+    global _collection_seconds
+    _collection_seconds = time.monotonic() - _started
     _selected.update(item.nodeid for item in session.items)
 
 
@@ -101,6 +105,7 @@ def pytest_sessionfinish(session, exitstatus):
         "target_sha": os.environ.get("PPU_TARGET_SHA", ""),
         "control_sha": os.environ.get("PPU_CONTROL_SHA", ""),
         "duration_seconds": time.monotonic() - _started,
+        "collection_seconds": _collection_seconds,
         "durations": _durations,
         "collected": sorted(_collected),
         "selected": sorted(_selected),

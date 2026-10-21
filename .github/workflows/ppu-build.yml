@@ -5,20 +5,32 @@ on:
     tags: ['v*']
   pull_request_target:
     branches: [ci/ppu-validation]
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, edited, closed]
+  merge_group:
+    types: [checks_requested]
+    branches: [ci/ppu-validation]
   workflow_dispatch:
     inputs:
       scope:
-        description: quick 为 PR 代表性检查，full 为 DEV/LTS 全量
+        description: auto 按已验收策略选择；full 强制完整范围；quick 需有效基线
         type: choice
-        options: [quick, full]
-        default: quick
+        options: [auto, quick, full]
+        default: auto
+      suite_family:
+        description: NVIDIA DEV 范围或版本 DEV/LTS 范围（PR 强制前者）
+        type: choice
+        options: [nvidia-dev, release-dev-lts]
+        default: nvidia-dev
       pr_number:
         description: 维护者授权的 PR 编号（与完整 SHA 同时填写）
         type: string
         default: ''
       pr_sha:
         description: 已审核的 PR head 完整 40 位 SHA，新提交需重新授权
+        type: string
+        default: ''
+      pr_base_sha:
+        description: 已审核的目标分支完整 40 位 SHA（授权 PR 时必填）
         type: string
         default: ''
       build:
@@ -45,14 +57,16 @@ env:
   PIP_EXTRA_INDEX_URL: ''
   PIP_FIND_LINKS: ''
 concurrency:
-  group: ppu-build-${{ startsWith(github.ref, 'refs/tags/v') && format('release-{0}', github.ref) || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full' && inputs.pr_number == '' && format('full-{0}', github.run_id)) || format('quick-{0}', github.event.pull_request.number || inputs.pr_number || github.ref) }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') && !(github.event_name == 'workflow_dispatch' && inputs.scope == 'full' && inputs.pr_number == '') }}
+  group: ppu-build-${{ (github.event_name == 'pull_request_target' && github.event.action == 'edited' && !github.event.changes.base && format('metadata-{0}', github.run_id)) || (startsWith(github.ref, 'refs/tags/v') && format('release-{0}', github.ref)) || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '' && format('full-{0}', github.run_id)) || format('daily-{0}', github.event.pull_request.number || inputs.pr_number || github.ref) }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') && !(github.event_name == 'workflow_dispatch' && inputs.pr_number == '') }}
 jobs:
   authorize:
     if: >-
       vars.PPU_CI_ENABLED == 'true' &&
       (github.ref == 'refs/heads/ci/ppu-validation' ||
-       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')))
+       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+       (github.event_name == 'merge_group' && github.event.merge_group.base_ref == 'refs/heads/ci/ppu-validation')) &&
+      !(github.event_name == 'pull_request_target' && github.event.action == 'edited' && !github.event.changes.base)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -63,17 +77,18 @@ jobs:
       control_sha: ${{ steps.authorize.outputs.control_sha }}
       pr_number: ${{ steps.authorize.outputs.pr_number }}
       manual_pr: ${{ steps.authorize.outputs.manual_pr }}
+      decision: ${{ steps.authorize.outputs.decision }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.workflow_sha }}
+          ref: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.workflow_sha }}
           path: control
           persist-credentials: false
       - id: authorize
         env:
           GH_TOKEN: ${{ github.token }}
           PPU_INPUTS: ${{ toJSON(inputs) }}
-          PPU_CONTROL_SHA: ${{ github.workflow_sha }}
+          PPU_CONTROL_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.workflow_sha }}
           PPU_WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
           python3 -I control/.github/scripts/ppu_pr_authorize.py authorize
@@ -91,6 +106,9 @@ jobs:
     if: needs.authorize.outputs.pr_number != '0'
     runs-on: ubuntu-latest
     permissions:
+      contents: read
+      pull-requests: read
+      actions: read
       statuses: write
     steps:
       - uses: actions/download-artifact@v4
@@ -99,8 +117,24 @@ jobs:
           path: .ppu-ci
       - env:
           GH_TOKEN: ${{ github.token }}
-          DESCRIPTION: ${{ needs.authorize.outputs.allowed == 'true' && 'PPU quick 检查进行中' || '等待维护者授权完整 PR SHA' }}
-        run: python3 -I .ppu-ci/control/ppu_pr_authorize.py status --state pending --description "$DESCRIPTION"
+        run: python3 -I .ppu-ci/control/ppu_pr_authorize.py status
+  invalidate-base:
+    needs: authorize
+    if: github.event_name == 'push' && github.ref == 'refs/heads/ci/ppu-validation'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      statuses: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-authorization
+          path: .ppu-ci
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .ppu-ci/control/ppu_pr_authorize.py invalidate-base
   configure:
     needs: authorize
     if: needs.authorize.outputs.allowed == 'true'
@@ -111,6 +145,8 @@ jobs:
       unit_test: ${{ steps.config.outputs.unit_test }}
       unit_matrix: ${{ steps.config.outputs.unit_matrix }}
       scope: ${{ steps.config.outputs.scope }}
+      threshold_percent: ${{ steps.config.outputs.threshold_percent }}
+      suite_family: ${{ steps.config.outputs.suite_family }}
       target_sha: ${{ needs.authorize.outputs.target_sha }}
       control_sha: ${{ needs.authorize.outputs.control_sha }}
       manual_pr: ${{ needs.authorize.outputs.manual_pr }}
@@ -143,7 +179,7 @@ jobs:
             {"build":"${{ vars.PPU_BUILD || 'yes' }}","unit_test":"${{ vars.PPU_UNIT_TEST || 'yes' }}",
             "repeat":"${{ vars.PPU_UNIT_TEST_REPEAT || '1' }}","timeout":"${{ vars.PPU_UNIT_TEST_TIMEOUT || '30' }}"}
         run: |
-          python3 control/.github/scripts/ppu_ci.py configure
+          python3 -I control/.github/scripts/ppu_ci.py configure
           cp control/.github/scripts/{ppu_ci.py,ppu_ci_build.sh,ppu_ci_run.sh,ppu_pytest_policy.py} .ppu-ci/control/
       - uses: actions/upload-artifact@v4
         with:
@@ -260,14 +296,19 @@ jobs:
       target_sha: ${{ needs.configure.outputs.target_sha }}
       control_sha: ${{ needs.configure.outputs.control_sha }}
       manual_pr: ${{ needs.configure.outputs.manual_pr == 'true' }}
+      threshold_percent: ${{ needs.configure.outputs.threshold_percent }}
+      scope: ${{ needs.configure.outputs.scope }}
   pr-result:
     needs: [authorize, pr-pending, configure, build, unit-tests]
     if: >-
-      always() && needs.authorize.result == 'success' &&
+      always() && !cancelled() && needs.authorize.result == 'success' &&
       needs.authorize.outputs.allowed == 'true' && needs.authorize.outputs.pr_number != '0' &&
       (needs.authorize.outputs.manual_pr != 'true' || github.run_attempt == 1)
     runs-on: ubuntu-latest
     permissions:
+      contents: read
+      pull-requests: read
+      actions: read
       statuses: write
     steps:
       - uses: actions/download-artifact@v4
@@ -277,4 +318,5 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
           STATE: ${{ needs.pr-pending.result == 'success' && needs.configure.result == 'success' && needs.build.result == 'success' && needs.unit-tests.result == 'success' && 'success' || 'failure' }}
-        run: python3 -I .ppu-ci/control/ppu_pr_authorize.py status --state "$STATE" --description 'PPU quick 检查已结束，详见运行报告'
+          DESCRIPTION: PPU ${{ needs.configure.outputs.scope }} 检查结束，门禁 ${{ needs.configure.outputs.threshold_percent }}%
+        run: python3 -I .ppu-ci/control/ppu_pr_authorize.py status --state "$STATE" --description "$DESCRIPTION"
