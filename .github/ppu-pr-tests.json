@@ -1,5 +1,12 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "daily_scope": "full",
+  "quick_state": "unavailable",
+  "baseline": null,
+  "validation_runs": [],
+  "excluded": {
+    "tests/unit_tests/rl/test_rl_utils.py::TestRLUtils::test_prepare_data_for_update": "Excluded from all PPU UT scopes by maintainer request: MockModel violates the PP activation shape/dtype contract (run 39373032797)."
+  },
   "groups": [
     {
       "id": "dev-pr-01",
@@ -66,9 +73,6 @@
       "name": "rl-context-parallel",
       "minutes": 7,
       "coverage": "rollout、packing、logprob、CP2/4/8 和 CP CUDA Graph 回归",
-      "excluded": {
-        "tests/unit_tests/rl/test_rl_utils.py::TestRLUtils::test_prepare_data_for_update": "Excluded from PR quick by maintainer request: MockModel violates the PP activation shape/dtype contract (run 39373032797). Full retains this test."
-      },
       "selectors": [
         "tests/unit_tests/rl/test_context_parallel.py",
         "tests/unit_tests/rl/test_refit_arguments.py",
