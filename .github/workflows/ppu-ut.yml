@@ -43,7 +43,7 @@ jobs:
         with:
           name: ppu-plan
           path: .ppu-ci
-      - name: 执行 PPU UT bucket
+      - name: Run PPU UT bucket
         id: ppu
         uses: flytiger-eco/ppu-distributed-action@main
         with:
@@ -74,7 +74,7 @@ jobs:
             mkdir source
             tar -xzf "$PPU_ARTIFACT_DIR/source.tar.gz" -C source
             bash "$PPU_CONTROL_DIR/ppu_ci_run.sh" '${{ matrix.id }}'
-      - name: 上传每个 rank 的真实结果、日志与覆盖率
+      - name: Upload actual results, logs, and coverage for each rank
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -83,7 +83,7 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
-      - name: 检查执行完整性
+      - name: Check execution completeness
         if: ${{ always() && !cancelled() }}
         shell: bash
         env:
@@ -104,7 +104,7 @@ jobs:
         with:
           pattern: ppu-ut-*
           path: results
-      - name: 按可信触发场景汇总范围、门禁和耗时
+      - name: Summarize scope, gate, and timing for the trusted trigger context
         env:
           PPU_MATRIX_RESULT: ${{ needs.test.result }}
         run: python3 -I .ppu-ci/control/ppu_ci.py summarize --results results

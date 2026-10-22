@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
-selection_id="${1:?缺少 UT bucket 或 suite 标识}"
+selection_id="${1:?Missing UT bucket or suite ID}"
 [[ "$selection_id" == quick || "$selection_id" =~ ^(dev|lts)-[0-9]+$ ]]
-: "${PPU_RESULTS_DIR:?缺少本次作业结果目录}"
-: "${PPU_SOURCE_ROOT:?缺少待测源码目录}"
-: "${PPU_CONTROL_DIR:?缺少可信控制脚本目录}"
-: "${PPU_ARTIFACT_DIR:?缺少构建产物目录}"
+: "${PPU_RESULTS_DIR:?Missing results directory for this job}"
+: "${PPU_SOURCE_ROOT:?Missing source directory under test}"
+: "${PPU_CONTROL_DIR:?Missing trusted control script directory}"
+: "${PPU_ARTIFACT_DIR:?Missing build artifact directory}"
 results_root="$PPU_RESULTS_DIR"
 suite_started=$(date +%s)
 cd "$PPU_SOURCE_ROOT"
@@ -16,7 +16,7 @@ prepare_results_for_upload() {
     trap - EXIT
     if [[ -d "$results_root" ]]; then
         if ! chmod -R -- a+rX "$results_root"; then
-            printf '::error::无法设置 UT 结果目录的上传读取权限: %s\n' "$PPU_RESULTS_DIR" >&2
+            printf '::error::Unable to grant read permissions for uploading the UT results directory: %s\n' "$PPU_RESULTS_DIR" >&2
             if ((exit_code == 0)); then
                 exit_code=1
             fi
@@ -41,13 +41,13 @@ from pathlib import Path
 
 version = md.version('pla')
 if version != '1.0.0+v0.1.0.ppu2.2.0':
-    raise RuntimeError(f'PLA 版本不符合 PPU 约束: {version}')
+    raise RuntimeError(f'PLA version does not match the PPU constraint: {version}')
 for name in ('pla', 'pla.decode', 'pla.prefill.flashqla', 'pla.prefill.flashkdapro'):
     module = importlib.import_module(name)
     path = Path(module.__file__).resolve()
     if not path.is_relative_to(Path(sys.prefix).resolve()):
-        raise RuntimeError(f'PLA 模块未从构建虚拟环境加载: {name}: {path}')
-    print('PLA 导入检查通过:', name, version, path)
+        raise RuntimeError(f'PLA module was not loaded from the build virtual environment: {name}: {path}')
+    print('PLA import check passed:', name, version, path)
 PY
 python -I - <<'PY'
 import importlib
@@ -58,7 +58,7 @@ from pathlib import Path
 
 version = md.version('fla-core')
 if version != '0.4.1+v0.1.0.ppu2.2.0':
-    raise RuntimeError(f'FLA Core 版本不符合 PPU 约束: {version}')
+    raise RuntimeError(f'FLA Core version does not match the PPU constraint: {version}')
 required = {
     'fla': (),
     'fla.modules.convolution': ('causal_conv1d', 'causal_conv1d_update'),
@@ -69,13 +69,13 @@ for name, symbols in required.items():
     module = importlib.import_module(name)
     path = Path(module.__file__).resolve()
     if not path.is_relative_to(Path(sys.prefix).resolve()):
-        raise RuntimeError(f'FLA Core 模块未从构建虚拟环境加载: {name}: {path}')
+        raise RuntimeError(f'FLA Core module was not loaded from the build virtual environment: {name}: {path}')
     for symbol in symbols:
         if not callable(getattr(module, symbol, None)):
-            raise RuntimeError(f'FLA Core 缺少可调用接口: {name}.{symbol}')
+            raise RuntimeError(f'FLA Core is missing a callable interface: {name}.{symbol}')
     if name == 'fla.modules.l2norm':
         inspect.signature(module.l2norm).bind(object(), dim=-1, eps=1e-6)
-    print('FLA Core 导入检查通过:', name, version, path)
+    print('FLA Core import check passed:', name, version, path)
 PY
 export PYTHONPATH="$PPU_CONTROL_DIR:$PWD"
 export PYTHONSAFEPATH=1
@@ -84,13 +84,13 @@ export TORCH_CPP_LOG_LEVEL=ERROR
 export NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1
 export GPUS_PER_NODE="${NPROC_PER_NODE:?}" NUM_NODES="${NNODES:?}" SLURM_NODEID="${NODE_RANK:-0}"
 unset WORLD_SIZE RANK LOCAL_RANK
-printf '=== PPU 环境自检 ===\n'
+printf '=== PPU environment check ===\n'
 printf 'hostname=%s node=%s suite=%s\n' "$(hostname)" "${NODE_NAME:-unknown}" "$selection_id"
 python --version
 if command -v ppu-smi >/dev/null 2>&1; then
-    ppu-smi || printf '%s\n' '警告：ppu-smi 执行失败，继续检查 torch 设备状态' >&2
+    ppu-smi || printf '%s\n' 'Warning: ppu-smi failed; continuing with the torch device check' >&2
 else
-    printf '%s\n' '警告：镜像中没有 ppu-smi，继续检查 torch 设备状态' >&2
+    printf '%s\n' 'Warning: ppu-smi is not in the image; continuing with the torch device check' >&2
 fi
 python - <<'PY'
 import os
@@ -99,30 +99,30 @@ import torch
 expected = int(os.environ['NPROC_PER_NODE'])
 available = torch.cuda.is_available()
 count = torch.cuda.device_count()
-print('Python:', sys.version, '解释器:', sys.executable, flush=True)
-print('torch:', torch.__version__, '路径:', torch.__file__, flush=True)
-print('CUDA/PPU 可用:', available, '可见卡数:', count, '要求卡数:', expected, flush=True)
+print('Python:', sys.version, 'interpreter:', sys.executable, flush=True)
+print('torch:', torch.__version__, 'path:', torch.__file__, flush=True)
+print('CUDA/PPU available:', available, 'visible device count:', count, 'required device count:', expected, flush=True)
 if not available:
-    raise RuntimeError('torch 无法使用 CUDA/PPU 设备')
+    raise RuntimeError('torch cannot access CUDA/PPU devices')
 if count < expected:
-    raise RuntimeError(f'可见卡数不足: {count} < {expected}')
+    raise RuntimeError(f'Insufficient visible devices: {count} < {expected}')
 import megatron.core
 from megatron.core.datasets import helpers_cpp
 from megatron.core.ssm import gated_delta_net
-assert gated_delta_net.HAVE_FLA, 'Megatron 未启用 PPU FLA Core'
-print('Megatron FLA 能力:', 'GDN=', gated_delta_net.HAVE_FLA, 'GDN2=', gated_delta_net.HAVE_FLA_GDN2)
+assert gated_delta_net.HAVE_FLA, 'Megatron did not enable PPU FLA Core'
+print('Megatron FLA capabilities:', 'GDN=', gated_delta_net.HAVE_FLA, 'GDN2=', gated_delta_net.HAVE_FLA_GDN2)
 import google.protobuf
 from importlib.metadata import version
 from pathlib import Path
 assert Path(google.protobuf.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
 assert google.protobuf.__version__ == version('protobuf')
 print('protobuf:', google.protobuf.__version__, google.protobuf.__file__)
-print('megatron.core:', megatron.core.__version__, '路径:', megatron.core.__file__)
-print('预编译扩展:', helpers_cpp.__file__)
+print('megatron.core:', megatron.core.__version__, 'path:', megatron.core.__file__)
+print('Precompiled extension:', helpers_cpp.__file__)
 PY
 make -q -C megatron/core/datasets
 if [[ ! -f .ppu-ci/data/.ready ]]; then
-    echo '缺少 Build 阶段生成的 UT 数据就绪标记' >&2
+    echo 'Missing UT data readiness marker generated by the Build stage' >&2
     exit 1
 fi
 cp -a .ppu-ci/data/. /opt/data/
@@ -135,7 +135,7 @@ from transformers import AutoTokenizer
 for name in json.loads(Path('/opt/data/hf-tokenizers.json').read_text()):
     tokenizer = AutoTokenizer.from_pretrained(name, local_files_only=True, trust_remote_code=False)
     assert tokenizer.encode('PPU CI tokenizer cache')
-    print('UT tokenizer 离线检查通过:', name)
+    print('UT tokenizer offline check passed:', name)
 PY
 install -D -m 0644 /opt/data/tokenizers/megatron/gpt2-vocab.json \
     /home/gitlab-runner/data/gpt3_data/gpt2-vocab.json
@@ -169,7 +169,7 @@ overall=0
 run_with_budget() {
     local remaining=$((deadline - SECONDS))
     if ((remaining <= 0)); then
-        echo '测试总时间预算已耗尽' >&2
+        echo 'The total test time budget has been exhausted' >&2
         return 124
     fi
     timeout --signal=TERM --kill-after=30s "$remaining" "$@"

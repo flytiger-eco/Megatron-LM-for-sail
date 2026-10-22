@@ -111,7 +111,7 @@ def test_manual_pr_full_requires_complete_execution():
             "repeat": 0,
         },
     )
-    assert result["scope"] == "full" and result["threshold_percent"] == 100
+    assert result["scope"] == "full" and result["threshold_percent"] == 90
     assert result["unit_test"] and result["build"] and result["repeat"] == 1
 
 
@@ -182,7 +182,8 @@ def test_quick_selection_and_single_job(tmp_path, monkeypatch):
     ],
 )
 def test_bad_selector(tmp_path, monkeypatch, bad):
-    recipe = {"schema_version": 1, "groups": [{"id": "dev-pr-01", "selectors": [bad]}]}
+    recipe = json.loads((ROOT / ci.POLICY_PATH).read_text())
+    recipe["groups"][0]["selectors"] = [bad]
     (tmp_path / ".github").mkdir()
     (tmp_path / ".github/ppu-pr-tests.json").write_text(json.dumps(recipe))
     monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
@@ -429,9 +430,9 @@ def synthetic_case(case_id="dev-pr-01"):
     }
 
 
-def write_reports(directory, case, failed=1, skipped=False):
+def write_reports(directory, case, failed=1, skipped=False, total=5):
     directory.mkdir(parents=True, exist_ok=True)
-    nodes = [f"{case['args'][0]}::test_{i}" for i in range(5)]
+    nodes = [f"{case['args'][0]}::test_{i}" for i in range(total)]
     collected = nodes + [selector + "[0]" for selector in case.get("excluded", {})]
     for phase in ("prod", "experimental"):
         for rank in range(8):
@@ -463,22 +464,22 @@ def write_reports(directory, case, failed=1, skipped=False):
     (directory.parent / "suite-timing.json").write_text(json.dumps({**timing, "prepared_at": 102}))
 
 
-@pytest.mark.parametrize("scope,threshold", [("quick", 100), ("full", 80)])
+@pytest.mark.parametrize("scope,threshold", [("quick", 100), ("full", 90), ("diagnostic", 90)])
 @pytest.mark.parametrize("failed", [0, 1, 2])
 def test_gate_counts_unique_tests_and_any_rank_failure(
     tmp_path, monkeypatch, capsys, scope, threshold, failed
 ):
     case = synthetic_case()
     manifest = {"config": {"scope": scope}, "identity": IDENTITY, "unit": {case["id"]: case}}
-    write_reports(ci.result_directory(manifest, tmp_path, case["id"]), case, failed)
+    write_reports(ci.result_directory(manifest, tmp_path, case["id"]), case, failed, total=10)
     result = ci.summarize(manifest, tmp_path)
     success = failed == 0 if scope == "quick" else failed <= 1
     assert result["success"] is success
     assert result["threshold_percent"] == threshold
-    assert result["total"] == 5 and result["failed"] == failed
+    assert result["total"] == 10 and result["failed"] == failed
     assert not result["errors"]
     assert result["groups"][case["id"]]["timing"]["elapsed_seconds"] == 10
-    assert result["groups"][case["id"]]["executed"] == 5
+    assert result["groups"][case["id"]]["executed"] == 10
     if scope == "quick":
         assert result["timings"]["suite"]["prepare_seconds"] == 2
         assert result["timings"]["suite"]["execution_seconds"] == 8
@@ -492,23 +493,23 @@ def test_gate_counts_unique_tests_and_any_rank_failure(
         ci.main()
     assert exc.value.code == (0 if success else 1)
     assert json.loads((tmp_path / "summary.json").read_text())["threshold_percent"] == threshold
-    assert f"阈值 {threshold}%" in capsys.readouterr().out
+    assert f"threshold {threshold}%" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("scope,success", [("quick", False), ("full", True)])
+@pytest.mark.parametrize("scope,success", [("quick", False), ("full", True), ("diagnostic", True)])
 def test_scope_gate_across_groups(tmp_path, scope, success):
     cases = {f"dev-pr-{i:02d}": synthetic_case(f"dev-pr-{i:02d}") for i in (1, 2)}
     manifest = {"config": {"scope": scope}, "identity": IDENTITY, "unit": cases}
     for index, case in enumerate(cases.values()):
         write_reports(
-            ci.result_directory(manifest, tmp_path, case["id"]), case, failed=2 if index == 0 else 0
+            ci.result_directory(manifest, tmp_path, case["id"]), case, failed=1 if index == 0 else 0
         )
     result = ci.summarize(manifest, tmp_path)
-    assert result["success"] is success and result["pass_rate"] == 0.8
-    assert result["groups"]["dev-pr-01"]["counts"]["failed"] == 2
+    assert result["success"] is success and result["pass_rate"] == 0.9
+    assert result["groups"]["dev-pr-01"]["counts"]["failed"] == 1
 
 
-@pytest.mark.parametrize("scope", ["quick", "full"])
+@pytest.mark.parametrize("scope", ["quick", "full", "diagnostic"])
 def test_existing_partial_skips_are_not_counted_as_passes(tmp_path, scope):
     case = synthetic_case()
     manifest = {"config": {"scope": scope}, "identity": IDENTITY, "unit": {case["id"]: case}}
@@ -606,9 +607,10 @@ def test_timing_integrity(tmp_path, filename, mutation):
         "missing_selector",
     ],
 )
-def test_integrity_errors_cannot_be_hidden_by_pass_rate(tmp_path, mutation):
+@pytest.mark.parametrize("scope", ["quick", "full", "diagnostic"])
+def test_integrity_errors_cannot_be_hidden_by_pass_rate(tmp_path, mutation, scope):
     case = synthetic_case()
-    manifest = {"config": {"scope": "quick"}, "identity": IDENTITY, "unit": {case["id"]: case}}
+    manifest = {"config": {"scope": scope}, "identity": IDENTITY, "unit": {case["id"]: case}}
     directory = ci.result_directory(manifest, tmp_path, case["id"])
     write_reports(directory, case, failed=0, skipped=mutation == "skipped")
     path = directory / "prod-1-rank-7.json"
@@ -666,15 +668,17 @@ def test_full_matrix_report_parity(tmp_path):
     for case in cases.values():
         write_reports(ci.result_directory(manifest, tmp_path, case["id"]), case)
     result = ci.summarize(manifest, tmp_path)
-    assert result["success"] and not result["errors"]
+    assert not result["success"] and not result["errors"]
+    assert result["threshold_percent"] == 90
     assert result["total"] == len(cases) * 5
     assert result["failed"] == len(cases)
     assert len(result["groups"]) == 74 and result["pass_rate"] == 0.8
 
 
-def test_matrix_failure_blocks_success(tmp_path, monkeypatch):
+@pytest.mark.parametrize("scope", ["quick", "full", "diagnostic"])
+def test_matrix_failure_blocks_success(tmp_path, monkeypatch, scope):
     case = synthetic_case()
-    manifest = {"config": {"scope": "quick"}, "identity": IDENTITY, "unit": {case["id"]: case}}
+    manifest = {"config": {"scope": scope}, "identity": IDENTITY, "unit": {case["id"]: case}}
     write_reports(ci.result_directory(manifest, tmp_path, case["id"]), case, failed=0)
     monkeypatch.setenv("PPU_MATRIX_RESULT", "failure")
     assert not ci.summarize(manifest, tmp_path)["success"]
@@ -778,6 +782,17 @@ def test_workflow_trust_and_resource_boundaries():
     assert "github.run_attempt == 1" in ut["jobs"]["test"]["if"]
     assert ut["jobs"]["test"]["strategy"]["max-parallel"] == 1
     assert "inputs.threshold_percent" in ut["jobs"]["result"]["name"]
+    for field in ("scope", "threshold_percent"):
+        assert build["jobs"]["configure"]["outputs"][field] == (
+            "${{ steps.config.outputs." + field + " }}"
+        )
+        assert build["jobs"]["unit-tests"]["with"][field] == (
+            "${{ needs.configure.outputs." + field + " }}"
+        )
+        assert (
+            "needs.configure.outputs." + field
+            in build["jobs"]["pr-result"]["steps"][-1]["env"]["DESCRIPTION"]
+        )
     assert "GH_TOKEN" not in build["jobs"]["build"].get("env", {})
     for workflow in (build, ut):
         for job in workflow["jobs"].values():

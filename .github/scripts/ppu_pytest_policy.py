@@ -55,7 +55,7 @@ def pytest_configure(config):
 
 def pytest_itemcollected(item):
     if item.nodeid in _collected:
-        _collection_errors.append(f"重复 nodeid: {item.nodeid}")
+        _collection_errors.append(f"Duplicate nodeid: {item.nodeid}")
     _collected.add(item.nodeid)
 
 

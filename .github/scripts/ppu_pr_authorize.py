@@ -29,7 +29,7 @@ def github_api(path: str, payload: dict | None = None) -> dict:
 
 def full_sha(value: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", value):
-        raise ValueError("必须使用完整的 40 位提交 SHA")
+        raise ValueError("A full 40-character commit SHA is required")
     return value.lower()
 
 
@@ -76,7 +76,7 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
     result = {
         "allowed": True,
         "decision": "run",
-        "reason": "已授权，等待测试",
+        "reason": "Authorized; awaiting tests",
         "target_sha": full_sha(context["sha"]),
         "control_sha": full_sha(context["control_sha"]),
         "pr_head_sha": "",
@@ -90,20 +90,22 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
     if event_name == "workflow_dispatch":
         expected_workflow = f"{repository}/.github/workflows/ppu-build.yml@{BRANCH}"
         if ref != BRANCH or context["workflow_ref"] != expected_workflow:
-            raise ValueError("授权入口必须来自可信验证分支")
+            raise ValueError("Authorization must originate from the trusted validation branch")
         for actor in {context["actor"], context["triggering_actor"]}:
             if not re.fullmatch(r"[A-Za-z0-9_\[\]-]+", actor):
-                raise ValueError("非法触发者")
+                raise ValueError("Invalid actor")
             permission = api(f"collaborators/{actor}/permission")["permission"]
             if permission not in ("write", "maintain", "admin"):
-                raise ValueError("触发者必须具有 write/maintain/admin 权限")
+                raise ValueError("The actor must have write/maintain/admin permission")
         if manual_pr:
             if str(context["run_attempt"]) != "1":
-                raise ValueError("授权 PR 不允许 rerun，请重新提交 PR 编号和 SHA")
+                raise ValueError(
+                    "Authorized PR runs cannot be rerun; resubmit the PR number and SHAs"
+                )
             requested_sha, requested_base = full_sha(requested_sha), full_sha(requested_base)
     elif event_name == "pull_request_target":
         if ref != BRANCH:
-            raise ValueError("仅允许面向验证分支的 PR")
+            raise ValueError("Only PRs targeting the validation branch are allowed")
         number = str(event["number"])
         requested_sha, requested_base = snapshot(event["pull_request"])
     elif event_name == "merge_group":
@@ -115,52 +117,56 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
             or group["head_ref"] != ref
             or not ref.startswith("refs/heads/gh-readonly-queue/")
         ):
-            raise ValueError("不支持的合并队列事件")
+            raise ValueError("Unsupported merge queue event")
         result.update(target_sha=full_sha(group["head_sha"]), base_sha=full_sha(group["base_sha"]))
         if result["target_sha"] != full_sha(context["sha"]):
-            raise ValueError("合并队列 SHA 不一致")
+            raise ValueError("Merge queue SHA mismatch")
     elif event_name == "push":
         if event.get("deleted") or not (ref == BRANCH or ref.startswith("refs/tags/v")):
-            raise ValueError("不支持的 push 事件")
+            raise ValueError("Unsupported push event")
     else:
-        raise ValueError("不支持的授权事件")
+        raise ValueError("Unsupported authorization event")
 
     if not (manual_pr or event_name == "pull_request_target"):
         return result
     if not re.fullmatch(r"[1-9][0-9]{0,8}", number):
-        raise ValueError("非法 PR 编号")
+        raise ValueError("Invalid PR number")
     pr = api(f"pulls/{number}")
     if pr["base"]["repo"]["full_name"] != repository or pr["base"]["ref"] != BRANCH.removeprefix(
         "refs/heads/"
     ):
-        raise ValueError("PR 必须面向本仓库验证分支")
+        raise ValueError("The PR must target this repository's validation branch")
     if not pr["head"].get("repo"):
-        raise ValueError("PR head 仓库不存在")
+        raise ValueError("The PR head repository does not exist")
     if snapshot(pr) != (requested_sha, requested_base):
-        raise ValueError("PR head/base 已更新，必须重新验证完整快照")
+        raise ValueError("PR head/base changed; revalidate the full snapshot")
     result.update(pr_number=int(number), pr_head_sha=requested_sha, base_sha=requested_base)
     if pr["state"] != "open":
         if manual_pr:
-            raise ValueError("授权 PR 必须 open")
-        return blocked(result, "closed", "PR 已关闭，未执行测试")
+            raise ValueError("The authorized PR must be open")
+        return blocked(result, "closed", "PR closed; tests not run")
     if pr.get("draft"):
-        return blocked(result, "draft", "等待 PR Ready，未执行测试")
+        return blocked(result, "draft", "Awaiting a ready PR; tests not run")
     if (
         event_name == "pull_request_target"
         and event.get("action") == "edited"
         and "base" not in event.get("changes", {})
     ):
-        return blocked(result, "ignore", "标题或正文变更不重复测试")
+        return blocked(result, "ignore", "Title or body edits do not rerun tests")
     only_docs = docs_only(int(number), pr, api)
     checked = api(f"pulls/{number}")
     if snapshot(checked) != snapshot(pr):
-        raise ValueError("预检期间 PR 快照已变化")
+        raise ValueError("PR snapshot changed during preflight")
     if checked["state"] != "open" or checked.get("draft"):
-        return blocked(result, "changed", "预检期间 PR 状态已变化，请重新验证")
+        return blocked(result, "changed", "PR state changed during preflight; revalidate")
     if only_docs and inputs.get("scope", "auto") == "auto":
-        return blocked(result, "docs_only", "纯文档变更，按策略免跑 UT")
+        return blocked(result, "docs_only", "Docs-only changes; UT exempt under policy")
     if pr["head"]["repo"]["full_name"] != repository and not manual_pr:
-        return blocked(result, "authorization_required", "等待维护者授权完整 head/base SHA")
+        return blocked(
+            result,
+            "authorization_required",
+            "Awaiting maintainer authorization of full head/base SHAs",
+        )
     for attempt in range(3):
         current = api(f"pulls/{number}")
         if (
@@ -168,9 +174,9 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
             or current["state"] != "open"
             or current.get("draft")
         ):
-            raise ValueError("解析合成提交期间 PR 已变化")
+            raise ValueError("PR changed while resolving the synthetic merge commit")
         if current.get("mergeable") is False:
-            return blocked(result, "conflict", "PR 存在合并冲突，未启动 PPU")
+            return blocked(result, "conflict", "PR has merge conflicts; PPU not started")
         merge = current.get("merge_commit_sha")
         if current.get("mergeable") is True and merge:
             merge = full_sha(merge)
@@ -186,12 +192,14 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
                     or checked.get("draft")
                     or checked.get("merge_commit_sha") != merge
                 ):
-                    raise ValueError("合成提交校验期间 PR 已变化")
+                    raise ValueError("PR changed during verification of the synthetic merge commit")
                 result["target_sha"] = merge
                 return result
         if attempt < 2:
             sleep(2)
-    return blocked(result, "merge_unavailable", "合成提交尚未就绪，请稍后重新验证")
+    return blocked(
+        result, "merge_unavailable", "Synthetic merge commit not ready; revalidate later"
+    )
 
 
 def run_url(run_id: str) -> str:
@@ -206,7 +214,7 @@ def latest_status(sha: str, api=github_api) -> dict:
                 return row
         if len(rows) < 100:
             return {}
-    raise ValueError("状态分页超限，拒绝覆盖未知状态")
+    raise ValueError("Status pagination limit exceeded; refusing to overwrite unknown status")
 
 
 def publish_status(authorization: dict, state: str, description: str, api=github_api) -> None:
@@ -291,13 +299,13 @@ def invalidate_base(base_sha: str, api=github_api) -> None:
                 {
                     "state": "pending",
                     "context": STATUS_CONTEXT,
-                    "description": f"目标分支已推进，等待重新验证 base={base_sha}",
+                    "description": f"Target branch advanced; awaiting revalidation base={base_sha}",
                     "target_url": run_url(os.environ["GITHUB_RUN_ID"]),
                 },
             )
         if len(rows) < 100:
             return
-    raise ValueError("open PR 分页超限")
+    raise ValueError("Open PR pagination limit exceeded")
 
 
 def main() -> None:
@@ -305,7 +313,7 @@ def main() -> None:
     parser.add_argument("mode", choices=("authorize", "status", "invalidate-base"))
     parser.add_argument("--output", type=Path, default=Path(".ppu-ci"))
     parser.add_argument("--state", choices=("pending", "success", "failure", "error"))
-    parser.add_argument("--description", default="PPU PR 检查")
+    parser.add_argument("--description", default="PPU PR check")
     args = parser.parse_args()
     path = args.output / "authorization.json"
     if args.mode == "invalidate-base":
@@ -354,7 +362,7 @@ def main() -> None:
     print(json.dumps(result, ensure_ascii=False))
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
-            stream.write(f"PPU 预检：{result['decision']} — {result['reason']}\n")
+            stream.write(f"PPU preflight: {result['decision']} - {result['reason']}\n")
 
 
 if __name__ == "__main__":

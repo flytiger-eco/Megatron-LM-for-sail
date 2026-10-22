@@ -154,7 +154,7 @@ def test_snapshot_drift_during_docs_check():
             pull["base"]["sha"] = CONTROL_SHA
         return pull
 
-    with pytest.raises(ValueError, match="快照"):
+    with pytest.raises(ValueError, match="snapshot"):
         auth.authorize(pr_event(), {}, context("pull_request_target"), api)
 
 
@@ -174,7 +174,7 @@ def test_merge_group_identity_and_routes():
     assert result["allowed"] and result["target_sha"] == CONTROL_SHA
     config = ci.select_config(event, "merge_group", {"scope": "quick", "unit_test": False})
     assert config["scope"] == "full" and config["suite_family"] == "nvidia-dev"
-    assert config["threshold_percent"] == 100 and config["unit_test"]
+    assert config["threshold_percent"] == 90 and config["unit_test"]
     for key, value in (
         ("base_ref", "refs/heads/main"),
         ("head_sha", SHA),
@@ -189,32 +189,44 @@ def test_merge_group_identity_and_routes():
 @pytest.mark.parametrize(
     "trigger,scope,expected",
     [
-        ("pr", "full", 100),
-        ("push", "full", 100),
-        ("merge_group", "full", 100),
-        ("release", "full", 80),
-        ("manual", "full", 80),
+        ("pr", "full", 90),
+        ("push", "full", 90),
+        ("merge_group", "full", 90),
+        ("release", "full", 90),
+        ("manual", "full", 90),
+        ("pr", "quick", 100),
+        ("push", "quick", 100),
         ("manual", "quick", 100),
+        ("manual", "diagnostic", 90),
     ],
 )
-def test_gate_is_independent_of_selection(tmp_path, trigger, scope, expected):
+@pytest.mark.parametrize("total,failed", [(10, 0), (10, 1), (10, 2), (100, 11)])
+def test_gate_depends_on_scope_not_trigger(tmp_path, trigger, scope, expected, total, failed):
     case = synthetic_case()
     config = {"scope": scope, "trigger_kind": trigger, "threshold_percent": expected}
     manifest = {"config": config, "unit": {case["id"]: case}, "identity": IDENTITY}
-    write_reports(ci.result_directory(manifest, tmp_path, case["id"]), case)
+    write_reports(
+        ci.result_directory(manifest, tmp_path, case["id"]), case, failed=failed, total=total
+    )
     result = ci.summarize(manifest, tmp_path)
     assert result["threshold_percent"] == expected
-    assert result["success"] is (expected == 80)
-    manifest["config"]["threshold_percent"] = 1
-    with pytest.raises(ValueError):
-        ci.summarize(manifest, tmp_path)
+    assert result["success"] is (failed == 0 or expected == 90 and total == 10 and failed == 1)
+    assert result["total"] == total and result["failed"] == failed
+    for invalid in (1, 80, 90 if expected == 100 else 100):
+        manifest["config"]["threshold_percent"] = invalid
+        with pytest.raises(ValueError, match="gate"):
+            ci.summarize(manifest, tmp_path)
 
 
-def test_quick_not_available_before_baseline():
-    with pytest.raises(ValueError, match="基线"):
-        ci.select_config({"ref": BRANCH}, "workflow_dispatch", {"scope": "quick"})
-    result = ci.select_config({"ref": BRANCH}, "push", {"scope": "quick"})
-    assert result["scope"] == "full" and result["threshold_percent"] == 100
+def test_candidate_quick_is_manual_without_full_baseline():
+    policy = ci.load_policy()
+    assert policy["require_full_baseline"] is False and policy["baseline"] is None
+    assert policy["quick_state"] == "candidate" and not policy["validation_runs"]
+    manual = ci.select_config({"ref": BRANCH}, "workflow_dispatch", {"scope": "quick"})
+    assert manual["scope"] == "quick" and manual["threshold_percent"] == 100
+    for event, name in (({"ref": BRANCH}, "push"), (pr_event(), "pull_request_target")):
+        result = ci.select_config(event, name, {"scope": "quick"})
+        assert result["scope"] == "full" and result["threshold_percent"] == 90
 
 
 def test_nvidia_full_is_dev_half_of_release():
@@ -226,16 +238,190 @@ def test_nvidia_full_is_dev_half_of_release():
     assert sum(EXCLUDED_UT in row["excluded"] for row in dev.values()) == 1
 
 
-@pytest.mark.parametrize("state", ["candidate", "validated"])
-def test_daily_quick_requires_two_validation_runs(tmp_path, monkeypatch, state):
+@pytest.mark.parametrize(
+    "state,runs",
+    [
+        ("candidate", []),
+        ("candidate", ["124", "125"]),
+        ("validated", []),
+        ("validated", ["124"]),
+        ("validated", ["124", "124"]),
+    ],
+)
+@pytest.mark.parametrize("baseline", [None, {"run_id": "123"}])
+def test_daily_quick_requires_two_validation_runs(tmp_path, monkeypatch, state, runs, baseline):
     policy = json.loads((ROOT / ci.POLICY_PATH).read_text())
-    policy.update(daily_scope="quick", quick_state=state, baseline={"run_id": "123"})
+    policy.update(
+        daily_scope="quick",
+        quick_state=state,
+        require_full_baseline=False,
+        baseline=baseline,
+        validation_runs=runs,
+    )
     path = tmp_path / ci.POLICY_PATH
     path.parent.mkdir()
     path.write_text(json.dumps(policy))
     monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
-    with pytest.raises(ValueError, match="两轮"):
+    with pytest.raises(ValueError, match="two validation runs"):
         ci.load_policy()
+
+
+@pytest.mark.parametrize("state", ["candidate", "validated"])
+@pytest.mark.parametrize("require_baseline", [True, False, "missing"])
+def test_quick_full_baseline_requirement_is_explicit(
+    tmp_path, monkeypatch, state, require_baseline
+):
+    policy = json.loads((ROOT / ci.POLICY_PATH).read_text())
+    policy.update(quick_state=state, baseline=None, validation_runs=["124", "125"])
+    if require_baseline == "missing":
+        policy.pop("require_full_baseline")
+    else:
+        policy["require_full_baseline"] = require_baseline
+    path = tmp_path / ci.POLICY_PATH
+    path.parent.mkdir()
+    path.write_text(json.dumps(policy))
+    monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
+    if require_baseline is False:
+        assert ci.load_policy()["baseline"] is None
+    else:
+        with pytest.raises(ValueError, match="full baseline"):
+            ci.load_policy()
+
+
+@pytest.mark.parametrize("value", [None, "false", 0, 1, [], {}])
+def test_baseline_requirement_rejects_non_boolean(tmp_path, monkeypatch, value):
+    policy = json.loads((ROOT / ci.POLICY_PATH).read_text())
+    policy["require_full_baseline"] = value
+    path = tmp_path / ci.POLICY_PATH
+    path.parent.mkdir()
+    path.write_text(json.dumps(policy))
+    monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
+    with pytest.raises(ValueError, match="must be a boolean"):
+        ci.load_policy()
+
+
+@pytest.mark.parametrize("runs", [[], ["124"], ["124", "124"]])
+def test_validated_state_requires_two_runs_even_with_daily_full(tmp_path, monkeypatch, runs):
+    policy = json.loads((ROOT / ci.POLICY_PATH).read_text())
+    policy.update(daily_scope="full", quick_state="validated", validation_runs=runs)
+    path = tmp_path / ci.POLICY_PATH
+    path.parent.mkdir()
+    path.write_text(json.dumps(policy))
+    monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
+    with pytest.raises(ValueError, match="two validation runs"):
+        ci.load_policy()
+
+
+@pytest.mark.parametrize("require_baseline", [True, False])
+@pytest.mark.parametrize("stage", ["unavailable", "candidate", "validated"])
+@pytest.mark.parametrize(
+    "route",
+    [
+        "pr",
+        "fork",
+        "push",
+        "merge_group",
+        "release",
+        "manual_auto",
+        "manual_quick",
+        "manual_full",
+        "manual_pr_quick",
+    ],
+)
+def test_quick_lifecycle_routes_and_upstream_scope(
+    tmp_path, monkeypatch, stage, route, require_baseline
+):
+    policy = json.loads((ROOT / ci.POLICY_PATH).read_text())
+    policy.update(
+        daily_scope="quick" if stage == "validated" else "full",
+        quick_state=stage,
+        require_full_baseline=require_baseline,
+        baseline={"run_id": "123"} if require_baseline and stage != "unavailable" else None,
+        validation_runs=["124", "125"] if stage == "validated" else [],
+    )
+    control = tmp_path / "control"
+    for relative in (
+        "tests/unit_tests/find_test_cases.py",
+        "tests/test_utils/python_scripts/recipe_parser.py",
+    ):
+        path = control / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((ROOT / relative).read_bytes())
+    policy_path = control / ci.POLICY_PATH
+    policy_path.parent.mkdir()
+    policy_path.write_text(json.dumps(policy))
+    monkeypatch.setattr(ci, "CONTROL_ROOT", control)
+    outputs = {}
+    monkeypatch.setattr(ci, "emit", lambda key, value: outputs.update({key: value}))
+
+    event_name, event = "workflow_dispatch", {"ref": BRANCH}
+    inputs = {"scope": "quick", "repeat": 3}
+    if route in ("pr", "fork"):
+        event_name, event = "pull_request_target", pr_event(pr(route == "fork"), "synchronize")
+    elif route in ("push", "release"):
+        event_name = "push"
+        if route == "release":
+            event["ref"] = "refs/tags/v1.2.3"
+    elif route == "merge_group":
+        event_name = "merge_group"
+        event = {"merge_group": {"base_ref": BRANCH}}
+    elif route == "manual_auto":
+        inputs["scope"] = "auto"
+    elif route == "manual_full":
+        inputs["scope"] = "full"
+    elif route == "manual_pr_quick":
+        inputs.update(pr_number="7", pr_sha=SHA, pr_base_sha=BASE_SHA)
+
+    if route in ("pr", "fork", "push", "merge_group", "release", "manual_pr_quick"):
+        inputs.update(build=False, unit_test=False, repeat=0, suite_family="release-dev-lts")
+    if route in ("pr", "fork", "manual_pr_quick"):
+        decision = auth.authorize(event, inputs, context(event_name), api_for(pr(route != "pr")))
+        assert decision["allowed"] is (route != "fork")
+        if decision["allowed"]:
+            assert decision["target_sha"] == MERGE_SHA
+            assert decision["pr_head_sha"] == SHA and decision["base_sha"] == BASE_SHA
+
+    if stage == "unavailable" and route in ("manual_quick", "manual_pr_quick"):
+        with pytest.raises(ValueError, match="unavailable"):
+            ci.select_config(event, event_name, inputs)
+        return
+    if stage == "candidate" and route == "manual_pr_quick":
+        with pytest.raises(ValueError, match="non-PR manual validation"):
+            ci.select_config(event, event_name, inputs)
+        return
+    config = ci.select_config(event, event_name, inputs)
+    if route in ("merge_group", "release", "manual_full"):
+        expected_scope = "full"
+    elif route in ("manual_quick", "manual_pr_quick") or stage == "validated":
+        expected_scope = "quick"
+    else:
+        expected_scope = "full"
+    assert config["scope"] == expected_scope
+    assert config["threshold_percent"] == (100 if expected_scope == "quick" else 90)
+    assert config["suite_family"] == ("release-dev-lts" if route == "release" else "nvidia-dev")
+    assert config["build"] is (route != "fork")
+    assert config["unit_test"] is (route != "fork")
+    if expected_scope == "quick":
+        assert config["repeat"] == 1
+    manifest = ci.generate(config, tmp_path / "plan", IDENTITY)
+    cases = manifest["unit"]
+    rows = json.loads(outputs["unit_matrix"])["include"]
+    if route == "fork":
+        assert cases == {} and rows == [{"id": "unused"}]
+    elif expected_scope == "full":
+        assert len(cases) == len(rows) == (74 if route == "release" else 37)
+        assert set(cases) == set(ci.unit_cases(config))
+    else:
+        assert len(cases) == 6 and len(rows) == 1 and rows[0]["id"] == "quick"
+        assert sum(len(case["args"]) for case in cases.values()) == 28
+        full = ci.unit_cases({"suite_family": "nvidia-dev", "repeat": 1, "timeout": 30})
+        for case in cases.values():
+            assert case["environment"] == "dev" and case["cards"] == 8
+            assert case["strict_selection"] and case["repeat"] == 1
+            for selector, bucket in case["source_buckets"].items():
+                matches = [row for row in full.values() if selector.split("::")[0] in row["files"]]
+                assert len(matches) == 1 and matches[0]["bucket"] == bucket
+        assert sum(EXCLUDED_UT in case["excluded"] for case in cases.values()) == 1
 
 
 @pytest.mark.parametrize(
@@ -328,6 +514,9 @@ def test_base_invalidation_preserves_fresh_checks(monkeypatch, mode):
 
     auth.invalidate_base(BASE_SHA, api)
     assert bool(writes) is (mode == "old")
+    if writes:
+        assert len(writes[0]["description"]) <= 140
+        assert writes[0]["description"].endswith(f"base={BASE_SHA}")
 
 
 def test_full_timing_and_rank_duration_aggregation(tmp_path):
@@ -377,11 +566,11 @@ def test_each_rank_requires_complete_timing(tmp_path, field):
 @pytest.mark.parametrize(
     "mutation,reason",
     [
-        ("duplicate", "重复匹配"),
-        ("missing", "未匹配"),
-        ("nodes", "拓扑"),
-        ("fraction", "整数"),
-        ("glob", "不支持的 UT bucket"),
+        ("duplicate", "duplicate matches"),
+        ("missing", "unmatched"),
+        ("nodes", "topology"),
+        ("fraction", "integer"),
+        ("glob", "Unsupported UT bucket"),
     ],
 )
 def test_recipe_changes_cannot_silently_drop_workloads(tmp_path, monkeypatch, mutation, reason):
@@ -457,7 +646,7 @@ def test_merge_snapshot_rechecked_after_parent_lookup(mutation):
             return pull
         return underlying(path)
 
-    with pytest.raises(ValueError, match="校验期间"):
+    with pytest.raises(ValueError, match="during verification"):
         auth.authorize(pr_event(), {}, context("pull_request_target"), api)
 
 
@@ -497,7 +686,7 @@ def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch):
     assert script.index("export PIP_CONSTRAINT=") < install
     assert (
         install
-        < script.index("PLA 导入检查通过:")
+        < script.index("PLA import check passed:")
         < script.index("tar -czf .ppu-ci/environment.tar.gz")
     )
 
@@ -537,9 +726,9 @@ def test_pla_probe_checks_version_origin_and_native_imports(monkeypatch, script_
         assert name in modules
         imported.append(name)
         if mode == "missing_module" and name == "pla.decode":
-            raise ImportError("PLA 模块缺失")
+            raise ImportError("PLA module is missing")
         if mode == "native_error" and name == "pla.prefill.flashqla":
-            raise OSError("PLA 原生扩展加载失败")
+            raise OSError("PLA native extension failed to load")
         root = Path(sys.prefix).parent if mode == "external_path" else Path(sys.prefix)
         return SimpleNamespace(__file__=str(root / "site-packages" / name / "__init__.py"))
 
@@ -646,7 +835,7 @@ def test_fla_l2norm_dependency_patch_is_restricted(tmp_path, monkeypatch, mode):
         assert calls[-1] == (tensor, 1e-4, dtype)
     count = len(calls)
     for dim in (-2, 0, 4, 1.0, True, None, "-1"):
-        with pytest.raises(ValueError, match="最后一维"):
+        with pytest.raises(ValueError, match="last dimension"):
             l2norm(tensor, dim=dim)
     assert len(calls) == count
 
@@ -686,9 +875,9 @@ def test_fla_probe_checks_real_dependency_contract(monkeypatch, script_name, mod
         assert name in modules
         imported.append(name)
         if mode == "missing_module" and name == "fla.modules.convolution":
-            raise ImportError("FLA 模块缺失")
+            raise ImportError("FLA module is missing")
         if mode == "native_error" and name == "fla.ops.gated_delta_rule":
-            raise OSError("FLA 原生加载失败")
+            raise OSError("FLA native module failed to load")
         root = Path(sys.prefix).parent if mode == "external_path" else Path(sys.prefix)
         module = SimpleNamespace(
             __file__=str(root / "site-packages" / name / "__init__.py"),
@@ -721,14 +910,14 @@ def test_fla_patch_and_probes_preserve_ut_and_restore_contract():
     run = (ROOT / ".github/scripts/ppu_ci_run.sh").read_text()
     assert (
         build.index("python -m pip check")
-        < build.index("FLA Core l2norm 最后一维参数适配:")
-        < build.index("FLA Core 导入检查通过:")
+        < build.index("FLA Core l2norm last dimension argument adaptation:")
+        < build.index("FLA Core import check passed:")
         < build.index("assert gated_delta_net.HAVE_FLA")
         < build.index("tar -czf .ppu-ci/environment.tar.gz")
     )
     assert (
         run.index("tar -xzf .ppu-ci/environment.tar.gz")
-        < run.index("FLA Core 导入检查通过:")
+        < run.index("FLA Core import check passed:")
         < run.index("export PYTHONPATH=")
         < run.index("assert gated_delta_net.HAVE_FLA")
         < run.index("python -m torch.distributed.run")
@@ -773,7 +962,7 @@ def diagnostic_config(**inputs):
 def test_diagnostic_generates_one_unchanged_upstream_bucket(tmp_path, capsys):
     config = diagnostic_config()
     assert config["scope"] == "diagnostic" and config["trigger_kind"] == "manual"
-    assert config["threshold_percent"] == 80
+    assert config["threshold_percent"] == 90
     full = ci.unit_cases(config)
     manifest = ci.generate(config, tmp_path, IDENTITY)
     assert list(manifest["unit"]) == ["dev-023"]
@@ -827,7 +1016,7 @@ def test_diagnostic_rejects_incompatible_manual_inputs(inputs):
     ],
 )
 def test_diagnostic_cannot_reduce_automatic_coverage(event_name, event):
-    with pytest.raises(ValueError, match="仅允许非 PR 手动"):
+    with pytest.raises(ValueError, match="only allowed for non-PR manual"):
         ci.select_config(event, event_name, {"scope": "full", "unit_bucket": GDN_BUCKET})
 
 
@@ -843,7 +1032,7 @@ def test_diagnostic_cannot_reduce_automatic_coverage(event_name, event):
     ],
 )
 def test_diagnostic_requires_exact_recipe_bucket(tmp_path, bucket):
-    with pytest.raises(ValueError, match="精确匹配"):
+    with pytest.raises(ValueError, match="exactly match"):
         ci.generate(diagnostic_config(unit_bucket=bucket), tmp_path)
 
 
@@ -870,7 +1059,7 @@ def test_diagnostic_results_never_count_as_full_baseline(tmp_path, capsys, state
     assert not result["baseline_complete"]
     assert result["scope"] == "diagnostic"
     ci.write_summary(result, tmp_path / "summary")
-    assert "仅单 bucket 诊断" in capsys.readouterr().out
+    assert "Single-bucket diagnostic only" in capsys.readouterr().out
 
 
 def test_diagnostic_runner_selects_only_requested_group(tmp_path, monkeypatch, capsys):
@@ -929,7 +1118,7 @@ def bundle_digest(bundle):
 def test_bundle_seal_and_verify_preserve_all_payloads(sealed_bundle, capsys):
     plan, bundle = sealed_bundle
     ci.verify_bundle(bundle, plan, bundle_digest(bundle))
-    assert "构建产物完整性校验通过" in capsys.readouterr().out
+    assert "Build artifact integrity verification passed" in capsys.readouterr().out
     files = json.loads((bundle / "bundle-integrity.json").read_text())["files"]
     assert files["data/blob"] == files["data/tokenizer"]
     assert "data/.ready" in files
@@ -1009,7 +1198,7 @@ def test_bundle_verify_rejects_partial_or_untrusted_payload(sealed_bundle, tmp_p
 def test_bundle_seal_rejects_empty_required_payload(sealed_bundle, name):
     _, bundle = sealed_bundle
     (bundle / name).write_bytes(b"")
-    with pytest.raises(ValueError, match="缺少或为空"):
+    with pytest.raises(ValueError, match="Missing or empty"):
         ci.seal_bundle(bundle)
 
 

@@ -1,7 +1,8 @@
 {
   "schema_version": 2,
   "daily_scope": "full",
-  "quick_state": "unavailable",
+  "quick_state": "candidate",
+  "require_full_baseline": false,
   "baseline": null,
   "validation_runs": [],
   "excluded": {
@@ -12,7 +13,7 @@
       "id": "dev-pr-01",
       "name": "data-tp-ddp",
       "minutes": 5,
-      "coverage": "数据、RNG 恢复、TP8 前后向、并行交叉熵、DDP 梯度同步",
+      "coverage": "Data, RNG restoration, TP8 forward/backward, parallel cross-entropy, DDP gradient synchronization",
       "selectors": [
         "tests/unit_tests/data/test_gpt_dataset.py",
         "tests/unit_tests/data/test_data_samplers.py",
@@ -25,7 +26,7 @@
       "id": "dev-pr-02",
       "name": "optimizer-checkpoint",
       "minutes": 4,
-      "coverage": "优化器参数更新、状态恢复、分片 checkpoint 和存储回归",
+      "coverage": "Optimizer parameter updates, state restoration, sharded checkpoints, and storage regressions",
       "selectors": [
         "tests/unit_tests/test_optimizer.py::test_distrib_optimizer_save_load_with_non_tensor_state",
         "tests/unit_tests/test_optimizer.py::test_optim_sharded_state_dict",
@@ -38,7 +39,7 @@
       "id": "dev-pr-03",
       "name": "transformer-moe",
       "minutes": 8,
-      "coverage": "GPT 输出、MLP 分块、EP/TP all-to-all、capacity/padding、FP16/BF16/FP8 重计算",
+      "coverage": "GPT outputs, chunked MLP, EP/TP all-to-all, capacity/padding, FP16/BF16/FP8 recomputation",
       "selectors": [
         "tests/unit_tests/models/test_gpt_model.py::TestGPTModel::test_post_process_forward",
         "tests/unit_tests/models/test_gpt_model.py::TestGPTModel::test_output_processor_forward",
@@ -53,7 +54,7 @@
       "id": "dev-pr-04",
       "name": "parallel-determinism",
       "minutes": 6,
-      "coverage": "GPT/Llama 两轮前后向确定性，TP/EP/FSDP/PP/VPP",
+      "coverage": "GPT/Llama forward/backward determinism across two iterations, TP/EP/FSDP/PP/VPP",
       "selectors": [
         "tests/unit_tests/determinism/correctness/test_gpt_model.py"
       ]
@@ -62,7 +63,7 @@
       "id": "dev-pr-05",
       "name": "inference-ssm",
       "minutes": 5,
-      "coverage": "GPT/Hybrid 生成 token、CUDA Graph、Mamba forward 与推理 cache",
+      "coverage": "GPT/Hybrid token generation, CUDA Graph, Mamba forward, and inference cache",
       "selectors": [
         "tests/unit_tests/inference/engines/test_dynamic_engine.py::TestDynamicInferenceEngine::test_simple",
         "tests/unit_tests/ssm/test_mamba_mixer.py"
@@ -72,7 +73,7 @@
       "id": "dev-pr-06",
       "name": "rl-context-parallel",
       "minutes": 7,
-      "coverage": "rollout、packing、logprob、CP2/4/8 和 CP CUDA Graph 回归",
+      "coverage": "Rollout, packing, logprob, CP2/4/8, and CP CUDA Graph regressions",
       "selectors": [
         "tests/unit_tests/rl/test_context_parallel.py",
         "tests/unit_tests/rl/test_refit_arguments.py",
