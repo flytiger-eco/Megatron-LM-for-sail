@@ -5,6 +5,9 @@ on:
       matrix:
         type: string
         required: true
+      bundle_digest:
+        type: string
+        required: true
       target_sha:
         type: string
         required: true
@@ -38,7 +41,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-bundle
+          name: ppu-plan
           path: .ppu-ci
       - name: 执行 PPU UT bucket
         id: ppu
@@ -57,15 +60,19 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_RESULTS_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/unit/${{ matrix.id }}
+          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_RESULTS_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/unit/${{ matrix.id }}
           command: |
             set -euo pipefail
             cd /opt/megatron-lm
-            [[ "$(< .ppu-ci/commit.txt)" == "$PPU_TARGET_SHA" ]]
-            [[ "$(< .ppu-ci/.complete)" == "$PPU_TARGET_SHA" ]]
-            [[ "$(< .ppu-ci/control.txt)" == "$PPU_CONTROL_SHA" ]]
+            [[ -d "$PPU_BUNDLE_DIR" ]]
+            mkdir .ppu-bundle
+            cp -a "$PPU_BUNDLE_DIR/." .ppu-bundle/
+            python3 -I "$PPU_CONTROL_DIR/ppu_ci.py" verify-bundle \
+              --output "$PPU_ARTIFACT_DIR" --plan .ppu-ci --bundle-digest "$PPU_BUNDLE_DIGEST"
+            [[ "$(< "$PPU_ARTIFACT_DIR/commit.txt")" == "$PPU_TARGET_SHA" ]]
+            [[ "$(< "$PPU_ARTIFACT_DIR/control.txt")" == "$PPU_CONTROL_SHA" ]]
             mkdir source
-            tar -xzf .ppu-ci/source.tar.gz -C source
+            tar -xzf "$PPU_ARTIFACT_DIR/source.tar.gz" -C source
             bash "$PPU_CONTROL_DIR/ppu_ci_run.sh" '${{ matrix.id }}'
       - name: 上传每个 rank 的真实结果、日志与覆盖率
         if: always()

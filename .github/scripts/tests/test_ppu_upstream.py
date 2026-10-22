@@ -1,9 +1,14 @@
 import copy
+import hashlib
 import importlib
 import importlib.metadata as metadata
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -688,3 +693,193 @@ def test_diagnostic_runner_selects_only_requested_group(tmp_path, monkeypatch, c
         str(manifest["unit"]["dev-023"]["minutes"] * 60),
         "dev-023",
     ]
+
+
+@pytest.fixture
+def sealed_bundle(tmp_path):
+    plan = tmp_path / "plan"
+    control = plan / "control"
+    control.mkdir(parents=True)
+    (plan / "manifest.json").write_text(json.dumps({"identity": IDENTITY}))
+    shutil.copyfile(ROOT / ".github/scripts/ppu_ci.py", control / "ppu_ci.py")
+    (control / "ppu_ci_run.sh").write_text('printf "UT_STARTED:%s\\n" "$1"\n')
+    (control / "ppu_pytest_policy.py").write_text("POLICY = True\n")
+    bundle = tmp_path / "nas" / "run-1" / "build"
+    shutil.copytree(plan, bundle)
+    payload = tmp_path / "source.py"
+    payload.write_text("VALUE = 1\n")
+    with tarfile.open(bundle / "source.tar.gz", "w:gz") as archive:
+        archive.add(payload, arcname="source.py")
+    (bundle / "environment.tar.gz").write_bytes(b"environment archive")
+    (bundle / "commit.txt").write_text(SHA + "\n")
+    (bundle / "control.txt").write_text(CONTROL_SHA + "\n")
+    (bundle / "image.txt").write_text("fixed-image\n")
+    (bundle / "build-timing.json").write_text('{"elapsed_seconds":1}')
+    (bundle / "data").mkdir()
+    (bundle / "data/blob").write_bytes(b"tokenizer data")
+    (bundle / "data/tokenizer").symlink_to("blob")
+    (bundle / "data/.ready").touch()
+    ci.seal_bundle(bundle)
+    (bundle / ".complete").write_text(SHA + "\n")
+    return plan, bundle
+
+
+def bundle_digest(bundle):
+    return hashlib.sha256((bundle / "bundle-integrity.json").read_bytes()).hexdigest()
+
+
+def test_bundle_seal_and_verify_preserve_all_payloads(sealed_bundle, capsys):
+    plan, bundle = sealed_bundle
+    ci.verify_bundle(bundle, plan, bundle_digest(bundle))
+    assert "构建产物完整性校验通过" in capsys.readouterr().out
+    files = json.loads((bundle / "bundle-integrity.json").read_text())["files"]
+    assert files["data/blob"] == files["data/tokenizer"]
+    assert "data/.ready" in files
+    assert ".complete" not in files and "bundle-integrity.json" not in files
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing_source",
+        "truncated_environment",
+        "missing_data",
+        "changed_control",
+        "extra_control",
+        "wrong_digest",
+        "wrong_complete",
+        "missing_complete",
+        "changed_plan",
+        "external_symlink",
+        "symlink_directory",
+        "altered_integrity",
+        "wrong_commit",
+        "wrong_control_sha",
+        "sealed_control",
+        "sealed_extra_control",
+        "sealed_manifest",
+        "traversal_inventory",
+    ],
+)
+def test_bundle_verify_rejects_partial_or_untrusted_payload(sealed_bundle, tmp_path, damage):
+    plan, bundle = sealed_bundle
+    digest = bundle_digest(bundle)
+    if damage.startswith("missing_"):
+        name = {
+            "missing_source": "source.tar.gz",
+            "missing_data": "data/tokenizer",
+            "missing_complete": ".complete",
+        }[damage]
+        (bundle / name).rename(tmp_path / "missing")
+    elif damage == "truncated_environment":
+        (bundle / "environment.tar.gz").write_bytes(b"part")
+    elif damage in ("changed_control", "sealed_control"):
+        (bundle / "control/ppu_ci_run.sh").write_text("exit 0\n")
+    elif damage in ("extra_control", "sealed_extra_control"):
+        (bundle / "control/extra.py").write_text("EXTRA = True\n")
+    elif damage == "wrong_digest":
+        digest = "0" * 64
+    elif damage == "wrong_complete":
+        (bundle / ".complete").write_text(CONTROL_SHA)
+    elif damage in ("changed_plan", "sealed_manifest"):
+        root = plan if damage == "changed_plan" else bundle
+        (root / "manifest.json").write_text(
+            json.dumps({"identity": {**IDENTITY, "target_sha": CONTROL_SHA}})
+        )
+    elif damage == "external_symlink":
+        (bundle / "external").symlink_to(tmp_path / "source.py")
+    elif damage == "symlink_directory":
+        (bundle / "linked-data").symlink_to("data", target_is_directory=True)
+    elif damage == "altered_integrity":
+        (bundle / "bundle-integrity.json").write_text("{}")
+    elif damage in ("wrong_commit", "wrong_control_sha"):
+        name = "commit.txt" if damage == "wrong_commit" else "control.txt"
+        (bundle / name).write_text("f" * 40)
+    elif damage == "traversal_inventory":
+        seal = json.loads((bundle / "bundle-integrity.json").read_text())
+        seal["files"]["../../source.py"] = seal["files"]["source.tar.gz"]
+        (bundle / "bundle-integrity.json").write_text(json.dumps(seal))
+        digest = bundle_digest(bundle)
+    if damage.startswith("sealed_") or damage in ("wrong_commit", "wrong_control_sha"):
+        ci.seal_bundle(bundle)
+        digest = bundle_digest(bundle)
+    with pytest.raises((ValueError, OSError)):
+        ci.verify_bundle(bundle, plan, digest)
+
+
+@pytest.mark.parametrize("name", ["source.tar.gz", "environment.tar.gz", "control/ppu_ci.py"])
+def test_bundle_seal_rejects_empty_required_payload(sealed_bundle, name):
+    _, bundle = sealed_bundle
+    (bundle / name).write_bytes(b"")
+    with pytest.raises(ValueError, match="缺少或为空"):
+        ci.seal_bundle(bundle)
+
+
+@pytest.mark.parametrize("damage", ["none", "missing_source", "wrong_digest", "other_run"])
+def test_ut_workflow_restores_same_run_bundle_before_execution(sealed_bundle, tmp_path, damage):
+    plan, bundle = sealed_bundle
+    digest = bundle_digest(bundle)
+    workspace = tmp_path / "pod"
+    workspace.mkdir()
+    shutil.copytree(plan, workspace / ".ppu-ci")
+    if damage == "missing_source":
+        (bundle / "source.tar.gz").rename(tmp_path / "missing-source")
+    elif damage == "wrong_digest":
+        digest = "0" * 64
+    elif damage == "other_run":
+        bundle = bundle.parent.parent / "other-run" / "build"
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-ut.yml").read_text())
+    action = next(step for step in workflow["jobs"]["test"]["steps"] if step.get("id") == "ppu")
+    command = (
+        action["with"]["command"]
+        .replace("cd /opt/megatron-lm", 'cd "$TEST_WORKSPACE"')
+        .replace("${{ matrix.id }}", "dev-023")
+    )
+    env = {
+        **os.environ,
+        "TEST_WORKSPACE": str(workspace),
+        "PPU_BUNDLE_DIR": str(bundle),
+        "PPU_ARTIFACT_DIR": str(workspace / ".ppu-bundle"),
+        "PPU_CONTROL_DIR": str(workspace / ".ppu-ci/control"),
+        "PPU_BUNDLE_DIGEST": digest,
+        "PPU_TARGET_SHA": SHA,
+        "PPU_CONTROL_SHA": CONTROL_SHA,
+    }
+    result = subprocess.run(["bash", "-c", command], env=env, capture_output=True, text=True)
+    assert (result.returncode == 0) is (damage == "none"), result.stdout + result.stderr
+    assert ("UT_STARTED:dev-023" in result.stdout) is (damage == "none")
+    if damage == "none":
+        assert (workspace / "source/source.py").read_text() == "VALUE = 1\n"
+        assert (workspace / ".ppu-bundle/data/tokenizer").is_symlink()
+        assert not (bundle / "source").exists()
+
+
+def test_bundle_workflow_digest_and_run_scoping():
+    build = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
+    ut = yaml.safe_load((ROOT / ".github/workflows/ppu-ut.yml").read_text())
+    assert (
+        build["jobs"]["build"]["outputs"]["bundle_digest"]
+        == "${{ steps.bundle.outputs.bundle_digest }}"
+    )
+    assert (
+        build["jobs"]["unit-tests"]["with"]["bundle_digest"]
+        == "${{ needs.build.outputs.bundle_digest }}"
+    )
+    downloads = [
+        step["with"]["name"]
+        for step in ut["jobs"]["test"]["steps"]
+        if step.get("uses") == "actions/download-artifact@v4"
+    ]
+    assert downloads == ["ppu-plan"]
+    action = next(step for step in ut["jobs"]["test"]["steps"] if step.get("id") == "ppu")
+    assert (
+        "PPU_BUNDLE_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build"
+        in action["with"]["extra_env"]
+    )
+    assert "PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }}" in action["with"]["extra_env"]
+    command = action["with"]["command"]
+    assert (
+        command.index("verify-bundle") < command.index("tar -xzf") < command.index("ppu_ci_run.sh")
+    )
+    script = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
+    assert script.index("seal-bundle") > script.index("tar -czf .ppu-ci/environment.tar.gz")
