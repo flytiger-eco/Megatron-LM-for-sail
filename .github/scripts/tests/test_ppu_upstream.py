@@ -483,6 +483,7 @@ def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch):
     requirements = (artifact / "ppu-requirements.txt").read_text().splitlines()
     constraints = (artifact / "constraints.txt").read_text().splitlines()
     assert requirements.count("pla==1.0.0+v0.1.0.ppu2.2.0") == 1
+    assert requirements.count("fla-core==0.4.1+v0.1.0.ppu2.2.0") == 1
     assert set(requirements) <= set(constraints)
     assert {f"{name}=={version}" for name, version in runtimes.items()} <= set(constraints)
     assert {"numpy==1.26.4", "pyarrow==21.0.0"} <= set(constraints)
@@ -550,6 +551,203 @@ def test_pla_probe_checks_version_origin_and_native_imports(monkeypatch, script_
     else:
         with pytest.raises((RuntimeError, ImportError, OSError)):
             exec(compile(probe, script_name, "exec"), {})
+
+
+FLA_L2NORM_SOURCE = '''from __future__ import annotations
+
+def l2norm(
+    x: torch.Tensor,
+    eps: float = 1e-6,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    return L2NormFunction.apply(x, eps, output_dtype)
+
+l2_norm = l2norm
+'''
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "valid",
+        "wrong_version",
+        "external_path",
+        "symlink_escape",
+        "missing_target",
+        "duplicate_target",
+        "syntax_error",
+        "already_patched",
+    ],
+)
+def test_fla_l2norm_dependency_patch_is_restricted(tmp_path, monkeypatch, mode):
+    script = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
+    block = next(
+        block
+        for block in re.findall(r"python -I - <<'PY'\n(.*?)\nPY", script, re.S)
+        if "distribution = md.distribution('fla-core')" in block
+    )
+    prefix = tmp_path / "venv"
+    target = prefix / "fla/modules/l2norm.py"
+    target.parent.mkdir(parents=True)
+    source = FLA_L2NORM_SOURCE
+    if mode == "missing_target":
+        source = source.replace("def l2norm(", "def other(")
+    elif mode == "duplicate_target":
+        source += source[source.index("def l2norm(") :]
+    elif mode == "syntax_error":
+        source += "\nif:\n"
+    target.write_text(source)
+    if mode in ("external_path", "symlink_escape"):
+        outside = tmp_path / "outside.py"
+        outside.write_text(source)
+        if mode == "external_path":
+            target = outside
+        else:
+            link = target.with_name("link.py")
+            link.symlink_to(outside)
+            target = link
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+
+    def distribution(name):
+        assert name == "fla-core"
+        return SimpleNamespace(
+            version="0.4.1" if mode == "wrong_version" else "0.4.1+v0.1.0.ppu2.2.0",
+            locate_file=lambda name: target if name == "fla/modules/l2norm.py" else None,
+        )
+
+    monkeypatch.setattr(metadata, "distribution", distribution)
+    if mode == "already_patched":
+        exec(compile(block, "fla-patch", "exec"), {})
+        source = target.read_text()
+    if mode != "valid":
+        with pytest.raises((RuntimeError, SyntaxError)):
+            exec(compile(block, "fla-patch", "exec"), {})
+        assert target.read_text() == source
+        return
+    exec(compile(block, "fla-patch", "exec"), {})
+    calls = []
+    result = object()
+
+    def apply(*args):
+        calls.append(args)
+        return result
+
+    namespace = {"L2NormFunction": SimpleNamespace(apply=apply)}
+    exec(compile(target.read_text(), str(target), "exec"), namespace)
+    l2norm = namespace["l2norm"]
+    assert namespace["l2_norm"] is l2norm
+    tensor, dtype = SimpleNamespace(ndim=4), object()
+    assert l2norm(tensor) is result
+    assert calls[-1] == (tensor, 1e-6, None)
+    assert l2norm(tensor, 1e-5, dtype) is result
+    assert calls[-1] == (tensor, 1e-5, dtype)
+    for dim in (-1, 3):
+        assert l2norm(tensor, eps=1e-4, output_dtype=dtype, dim=dim) is result
+        assert calls[-1] == (tensor, 1e-4, dtype)
+    count = len(calls)
+    for dim in (-2, 0, 4, 1.0, True, None, "-1"):
+        with pytest.raises(ValueError, match="最后一维"):
+            l2norm(tensor, dim=dim)
+    assert len(calls) == count
+
+
+@pytest.mark.parametrize("script_name", ["ppu_ci_build.sh", "ppu_ci_run.sh"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "valid",
+        "wrong_version",
+        "external_path",
+        "missing_package",
+        "missing_module",
+        "native_error",
+        "missing_symbol",
+        "noncallable_symbol",
+        "unpatched_signature",
+    ],
+)
+def test_fla_probe_checks_real_dependency_contract(monkeypatch, script_name, mode):
+    script = (ROOT / ".github/scripts" / script_name).read_text()
+    probe = next(
+        block
+        for block in re.findall(r"python -I - <<'PY'\n(.*?)\nPY", script, re.S)
+        if "md.version('fla-core')" in block
+    )
+    modules = ("fla", "fla.modules.convolution", "fla.modules.l2norm", "fla.ops.gated_delta_rule")
+    imported = []
+
+    def version(name):
+        assert name == "fla-core"
+        if mode == "missing_package":
+            raise metadata.PackageNotFoundError(name)
+        return "0.4.1" if mode == "wrong_version" else "0.4.1+v0.1.0.ppu2.2.0"
+
+    def import_module(name):
+        assert name in modules
+        imported.append(name)
+        if mode == "missing_module" and name == "fla.modules.convolution":
+            raise ImportError("FLA 模块缺失")
+        if mode == "native_error" and name == "fla.ops.gated_delta_rule":
+            raise OSError("FLA 原生加载失败")
+        root = Path(sys.prefix).parent if mode == "external_path" else Path(sys.prefix)
+        module = SimpleNamespace(
+            __file__=str(root / "site-packages" / name / "__init__.py"),
+            causal_conv1d=lambda: None,
+            causal_conv1d_update=lambda: None,
+            l2norm=lambda x, eps=1e-6, output_dtype=None, *, dim=-1: None,
+            chunk_gated_delta_rule=lambda: None,
+            fused_recurrent_gated_delta_rule=lambda: None,
+        )
+        if mode == "missing_symbol":
+            del module.chunk_gated_delta_rule
+        elif mode == "noncallable_symbol":
+            module.causal_conv1d = None
+        elif mode == "unpatched_signature":
+            module.l2norm = lambda x, eps=1e-6, output_dtype=None: None
+        return module
+
+    monkeypatch.setattr(metadata, "version", version)
+    monkeypatch.setattr(importlib, "import_module", import_module)
+    if mode == "valid":
+        exec(compile(probe, script_name, "exec"), {})
+        assert tuple(imported) == modules
+    else:
+        with pytest.raises((RuntimeError, ImportError, OSError, TypeError)):
+            exec(compile(probe, script_name, "exec"), {})
+
+
+def test_fla_patch_and_probes_preserve_ut_and_restore_contract():
+    build = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
+    run = (ROOT / ".github/scripts/ppu_ci_run.sh").read_text()
+    assert (
+        build.index("python -m pip check")
+        < build.index("FLA Core l2norm 最后一维参数适配:")
+        < build.index("FLA Core 导入检查通过:")
+        < build.index("assert gated_delta_net.HAVE_FLA")
+        < build.index("tar -czf .ppu-ci/environment.tar.gz")
+    )
+    assert (
+        run.index("tar -xzf .ppu-ci/environment.tar.gz")
+        < run.index("FLA Core 导入检查通过:")
+        < run.index("export PYTHONPATH=")
+        < run.index("assert gated_delta_net.HAVE_FLA")
+        < run.index("python -m torch.distributed.run")
+    )
+    assert "pip install" not in run and "path.write_text(patched)" not in run
+    for script in (build, run):
+        assert "'GDN2=', gated_delta_net.HAVE_FLA_GDN2" in script
+        assert "gated_delta_net.HAVE_FLA =" not in script
+        assert "gated_delta_net.HAVE_FLA_GDN2 =" not in script
+        assert "sys.modules['fla']" not in script
+    probes = [
+        next(
+            block
+            for block in re.findall(r"python -I - <<'PY'\n(.*?)\nPY", script, re.S)
+            if "md.version('fla-core')" in block
+        )
+        for script in (build, run)
+    ]
+    assert probes[0] == probes[1]
 
 
 @pytest.mark.parametrize("script_name", ["ppu_ci_build.sh", "ppu_ci_run.sh"])

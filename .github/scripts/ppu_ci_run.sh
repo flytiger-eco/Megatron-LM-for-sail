@@ -49,6 +49,34 @@ for name in ('pla', 'pla.decode', 'pla.prefill.flashqla', 'pla.prefill.flashkdap
         raise RuntimeError(f'PLA 模块未从构建虚拟环境加载: {name}: {path}')
     print('PLA 导入检查通过:', name, version, path)
 PY
+python -I - <<'PY'
+import importlib
+import importlib.metadata as md
+import inspect
+import sys
+from pathlib import Path
+
+version = md.version('fla-core')
+if version != '0.4.1+v0.1.0.ppu2.2.0':
+    raise RuntimeError(f'FLA Core 版本不符合 PPU 约束: {version}')
+required = {
+    'fla': (),
+    'fla.modules.convolution': ('causal_conv1d', 'causal_conv1d_update'),
+    'fla.modules.l2norm': ('l2norm',),
+    'fla.ops.gated_delta_rule': ('chunk_gated_delta_rule', 'fused_recurrent_gated_delta_rule'),
+}
+for name, symbols in required.items():
+    module = importlib.import_module(name)
+    path = Path(module.__file__).resolve()
+    if not path.is_relative_to(Path(sys.prefix).resolve()):
+        raise RuntimeError(f'FLA Core 模块未从构建虚拟环境加载: {name}: {path}')
+    for symbol in symbols:
+        if not callable(getattr(module, symbol, None)):
+            raise RuntimeError(f'FLA Core 缺少可调用接口: {name}.{symbol}')
+    if name == 'fla.modules.l2norm':
+        inspect.signature(module.l2norm).bind(object(), dim=-1, eps=1e-6)
+    print('FLA Core 导入检查通过:', name, version, path)
+PY
 export PYTHONPATH="$PPU_CONTROL_DIR:$PWD"
 export PYTHONSAFEPATH=1
 export UV_NO_BUILD=1 PIP_ONLY_BINARY=:all: UV_PYTHON_DOWNLOADS=never
@@ -80,6 +108,9 @@ if count < expected:
     raise RuntimeError(f'可见卡数不足: {count} < {expected}')
 import megatron.core
 from megatron.core.datasets import helpers_cpp
+from megatron.core.ssm import gated_delta_net
+assert gated_delta_net.HAVE_FLA, 'Megatron 未启用 PPU FLA Core'
+print('Megatron FLA 能力:', 'GDN=', gated_delta_net.HAVE_FLA, 'GDN2=', gated_delta_net.HAVE_FLA_GDN2)
 import google.protobuf
 from importlib.metadata import version
 from pathlib import Path
