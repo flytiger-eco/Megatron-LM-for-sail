@@ -73,19 +73,23 @@ def api_for(pull=None, permission="write"):
     return api
 
 
-@pytest.mark.parametrize("ref,scope", [(BRANCH, "full"), ("refs/tags/v1.2.3", "full")])
-def test_automatic_scope_cannot_be_downgraded(ref, scope):
+@pytest.mark.parametrize("ref", [BRANCH, "refs/tags/v1.2.3"])
+@pytest.mark.parametrize("requested_scope", ["quick", "full"])
+def test_automatic_scope_cannot_be_downgraded(ref, requested_scope):
     result = ci.select_config(
-        {"ref": ref}, "push", {"scope": "quick", "build": False, "unit_test": False, "repeat": 0}
+        {"ref": ref},
+        "push",
+        {"scope": requested_scope, "build": False, "unit_test": False, "repeat": 0},
     )
-    assert result["scope"] == scope
+    expected_scope = ci.load_policy()["daily_scope"] if ref == BRANCH else "full"
+    assert result["scope"] == expected_scope
     assert result["build"] and result["unit_test"] and result["repeat"] == 1
 
 
 @pytest.mark.parametrize("fork", [False, True])
 def test_automatic_pr_filter(fork):
     result = ci.select_config({"pull_request": pr(fork)}, "pull_request_target", {"scope": "full"})
-    assert result["scope"] == "full"
+    assert result["scope"] == ci.load_policy()["daily_scope"]
     assert result["build"] is not fork
     assert result["unit_test"] is not fork
 
@@ -311,7 +315,9 @@ def test_configure_cli_separates_control_and_source(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["identity"] == {**IDENTITY, "pr_head_sha": "", "base_sha": ""}
-    assert manifest["config"]["scope"] == "full" and len(manifest["unit"]) == 37
+    expected_scope = ci.load_policy()["daily_scope"]
+    assert manifest["config"]["scope"] == expected_scope
+    assert len(manifest["unit"]) == (6 if expected_scope == "quick" else 37)
 
 
 @pytest.mark.parametrize("state", ["pending", "success", "failure"])

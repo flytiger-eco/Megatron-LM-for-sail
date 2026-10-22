@@ -218,10 +218,19 @@ def test_gate_depends_on_scope_not_trigger(tmp_path, trigger, scope, expected, t
             ci.summarize(manifest, tmp_path)
 
 
-def test_candidate_quick_is_manual_without_full_baseline():
+def test_candidate_quick_is_manual_without_full_baseline(tmp_path, monkeypatch):
     policy = ci.load_policy()
-    assert policy["require_full_baseline"] is False and policy["baseline"] is None
-    assert policy["quick_state"] == "candidate" and not policy["validation_runs"]
+    policy.update(
+        daily_scope="full",
+        quick_state="candidate",
+        require_full_baseline=False,
+        baseline=None,
+        validation_runs=[],
+    )
+    path = tmp_path / ci.POLICY_PATH
+    path.parent.mkdir()
+    path.write_text(json.dumps(policy))
+    monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
     manual = ci.select_config({"ref": BRANCH}, "workflow_dispatch", {"scope": "quick"})
     assert manual["scope"] == "quick" and manual["threshold_percent"] == 100
     for event, name in (({"ref": BRANCH}, "push"), (pr_event(), "pull_request_target")):
@@ -272,7 +281,9 @@ def test_quick_full_baseline_requirement_is_explicit(
     tmp_path, monkeypatch, state, require_baseline
 ):
     policy = json.loads((ROOT / ci.POLICY_PATH).read_text())
-    policy.update(quick_state=state, baseline=None, validation_runs=["124", "125"])
+    policy.update(
+        daily_scope="full", quick_state=state, baseline=None, validation_runs=["124", "125"]
+    )
     if require_baseline == "missing":
         policy.pop("require_full_baseline")
     else:
