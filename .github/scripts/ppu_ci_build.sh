@@ -335,3 +335,4 @@ printf '%s\n' "$PPU_CONTROL_SHA" > .ppu-ci/control.txt
 ended_at=$(date +%s)
 printf '{"started_at":%s,"completed_at":%s,"elapsed_seconds":%s}\n' \
     "$started_at" "$ended_at" "$((ended_at - started_at))" > .ppu-ci/build-timing.json
+python -I "$PPU_CONTROL_DIR/ppu_ci.py" seal-bundle --output "$PPU_ARTIFACT_DIR"

@@ -700,14 +700,103 @@ def emit(key: str, value: object) -> None:
             stream.write(f"{key}={value}\n")
 
 
+def bundle_inventory(directory: Path) -> dict:
+    directory = directory.resolve(strict=True)
+    inventory = {}
+    for path in sorted(directory.rglob("*")):
+        name = path.relative_to(directory).as_posix()
+        if name in ("bundle-integrity.json", ".complete"):
+            continue
+        if not path.resolve(strict=True).is_relative_to(directory):
+            raise ValueError(f"构建产物路径越界: {name}")
+        if path.is_dir():
+            if path.is_symlink():
+                raise ValueError(f"构建产物目录不能是符号链接: {name}")
+            continue
+        if not path.is_file():
+            raise ValueError(f"构建产物不是普通文件: {name}")
+        with path.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        inventory[name] = {"size": path.stat().st_size, "sha256": digest}
+    for name in (
+        "source.tar.gz",
+        "environment.tar.gz",
+        "manifest.json",
+        "commit.txt",
+        "control.txt",
+        "image.txt",
+        "build-timing.json",
+        "control/ppu_ci.py",
+        "control/ppu_ci_run.sh",
+        "control/ppu_pytest_policy.py",
+    ):
+        if name not in inventory or inventory[name]["size"] == 0:
+            raise ValueError(f"缺少或为空的构建产物: {name}")
+    return inventory
+
+
+def seal_bundle(directory: Path) -> None:
+    inventory = bundle_inventory(directory)
+    (directory / "bundle-integrity.json").write_text(
+        json.dumps({"schema_version": 1, "files": inventory}, sort_keys=True), encoding="utf-8"
+    )
+
+
+def verify_bundle(directory: Path, plan: Path, digest: str) -> None:
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("缺少可信 Build 作业提供的产物摘要")
+    raw = (directory / "bundle-integrity.json").read_bytes()
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError("构建产物清单与可信 Build 摘要不一致")
+    sealed = json.loads(raw)
+    if sealed.get("schema_version") != 1 or sealed.get("files") != bundle_inventory(directory):
+        raise ValueError("构建产物缺失、截断或内容校验失败")
+    if (directory / "manifest.json").read_bytes() != (plan / "manifest.json").read_bytes():
+        raise ValueError("构建产物与可信测试计划不一致")
+    identity = json.loads((plan / "manifest.json").read_text())["identity"]
+    for filename, key in (
+        (".complete", "target_sha"),
+        ("commit.txt", "target_sha"),
+        ("control.txt", "control_sha"),
+    ):
+        expected = identity[key]
+        if (
+            not re.fullmatch(r"[0-9a-f]{40}", expected)
+            or (directory / filename).read_text().strip() != expected
+        ):
+            raise ValueError(f"构建产物提交身份不一致: {filename}")
+    trusted = {
+        path.relative_to(plan).as_posix(): path.read_bytes()
+        for path in (plan / "control").rglob("*")
+        if path.is_file()
+    }
+    actual = {name for name in sealed["files"] if name.startswith("control/")}
+    if not trusted or actual != set(trusted):
+        raise ValueError("构建产物控制脚本清单不一致")
+    for name, content in trusted.items():
+        if (directory / name).read_bytes() != content:
+            raise ValueError(f"构建产物控制脚本与可信计划不一致: {name}")
+    print(f"构建产物完整性校验通过: {len(sealed['files'])} 个文件，target={identity['target_sha']}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["configure", "summarize", "case-result"])
+    parser.add_argument(
+        "mode", choices=["configure", "summarize", "case-result", "seal-bundle", "verify-bundle"]
+    )
     parser.add_argument("--output", type=Path, default=Path(".ppu-ci"))
+    parser.add_argument("--plan", type=Path, default=Path(".ppu-ci"))
+    parser.add_argument("--bundle-digest", default="")
     parser.add_argument("--results", type=Path, default=Path("results"))
     parser.add_argument("--case-id")
     parser.add_argument("--runner-exit", type=int, default=0)
     args = parser.parse_args()
+    if args.mode == "seal-bundle":
+        seal_bundle(args.output)
+        return
+    if args.mode == "verify-bundle":
+        verify_bundle(args.output, args.plan, args.bundle_digest)
+        return
     if args.mode == "configure":
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
         event_name = os.environ["GITHUB_EVENT_NAME"]

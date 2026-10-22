@@ -198,6 +198,8 @@ jobs:
     runs-on: k8s-runner-group-cpu-flytiger
     environment: ppu-ci
     timeout-minutes: 210
+    outputs:
+      bundle_digest: ${{ steps.bundle.outputs.bundle_digest }}
     container:
       image: ghcr.io/actions/actions-runner:latest
     env:
@@ -265,6 +267,7 @@ jobs:
             chmod -R a+rX "$PPU_BUNDLE_DIR"
             printf '%s\n' "$PPU_TARGET_SHA" > "$PPU_BUNDLE_DIR/.complete"
       - name: 检查 PPU 构建状态与回传产物
+        id: bundle
         if: ${{ always() && !cancelled() }}
         shell: bash
         env:
@@ -283,6 +286,10 @@ jobs:
           [[ "$(< "$PPU_BUNDLE_DIR/image.txt")" == "$PPU_IMAGE" ]] || exit 1
           [[ -s "$PPU_BUNDLE_DIR/source.tar.gz" && -s "$PPU_BUNDLE_DIR/environment.tar.gz" ]] || exit 1
           cmp .ppu-ci/manifest.json "$PPU_BUNDLE_DIR/manifest.json"
+          digest=$(sha256sum "$PPU_BUNDLE_DIR/bundle-integrity.json")
+          digest=${digest%% *}
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          printf 'bundle_digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: ppu-bundle
@@ -297,6 +304,7 @@ jobs:
     uses: ./.github/workflows/ppu-ut.yml
     with:
       matrix: ${{ needs.configure.outputs.unit_matrix }}
+      bundle_digest: ${{ needs.build.outputs.bundle_digest }}
       target_sha: ${{ needs.configure.outputs.target_sha }}
       control_sha: ${{ needs.configure.outputs.control_sha }}
       manual_pr: ${{ needs.configure.outputs.manual_pr == 'true' }}
