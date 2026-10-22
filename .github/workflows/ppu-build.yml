@@ -12,45 +12,45 @@ on:
   workflow_dispatch:
     inputs:
       scope:
-        description: auto 按已验收策略选择；full 强制完整范围；quick 需有效基线
+        description: auto follows the validated policy; full uses a 90% gate; candidate quick uses a 100% gate for non-PR manual validation
         type: choice
         options: [auto, quick, full]
         default: auto
       suite_family:
-        description: NVIDIA DEV 范围或版本 DEV/LTS 范围（PR 强制前者）
+        description: NVIDIA DEV scope or release DEV/LTS scope (PRs always use NVIDIA DEV)
         type: choice
         options: [nvidia-dev, release-dev-lts]
         default: nvidia-dev
       unit_bucket:
-        description: 仅非 PR 手动 DEV/full 诊断可填完整 bucket；留空保持原范围
+        description: Exact bucket for non-PR manual DEV/full diagnostics only; leave empty to preserve the original scope
         type: string
         default: ''
       pr_number:
-        description: 维护者授权的 PR 编号（与完整 SHA 同时填写）
+        description: Maintainer-authorized PR number (provide with full SHAs)
         type: string
         default: ''
       pr_sha:
-        description: 已审核的 PR head 完整 40 位 SHA，新提交需重新授权
+        description: Reviewed full 40-character PR head SHA; new commits require reauthorization
         type: string
         default: ''
       pr_base_sha:
-        description: 已审核的目标分支完整 40 位 SHA（授权 PR 时必填）
+        description: Reviewed full 40-character target branch SHA (required for PR authorization)
         type: string
         default: ''
       build:
-        description: 是否构建（关闭则同时跳过 UT）
+        description: Build artifacts (disabling also skips UT)
         type: boolean
         default: true
       unit_test:
-        description: 是否执行 UT
+        description: Run UT
         type: boolean
         default: true
       repeat:
-        description: full 重复次数（0 表示跳过 UT；quick 固定 1 次）
+        description: Full-suite repetitions (0 skips UT; quick always runs once)
         type: number
         default: 1
       timeout:
-        description: full 每个 bucket 总分钟数（quick 使用固定分组预算）
+        description: Total minutes per full-suite bucket (quick uses fixed group budgets)
         type: number
         default: 30
 permissions:
@@ -169,7 +169,7 @@ jobs:
         with:
           name: ppu-authorization
           path: .ppu-ci
-      - name: 准备隔离的配置环境
+      - name: Prepare isolated configuration environment
         run: |
           python3 -m venv "$RUNNER_TEMP/ppu-configure-venv"
           "$RUNNER_TEMP/ppu-configure-venv/bin/python" -m pip install --index-url "$PIP_INDEX_URL" click pyyaml
@@ -206,7 +206,7 @@ jobs:
       PPU_IMAGE: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
       MAX_JOBS: '16'
     steps:
-      - name: 检出待测源码
+      - name: Check out source under test
         id: checkout
         continue-on-error: true
         uses: actions/checkout@v4
@@ -216,11 +216,11 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
           submodules: recursive
-      - name: checkout 失败后等待
+      - name: Wait after checkout failure
         if: steps.checkout.outcome == 'failure'
         shell: bash
         run: sleep 15
-      - name: 重试检出待测源码（最后一次）
+      - name: Retry source checkout (final attempt)
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
@@ -233,7 +233,7 @@ jobs:
         with:
           name: ppu-plan
           path: .ppu-ci
-      - name: 在 890P 八卡 Pod 中构建 DEV/LTS 共用产物
+      - name: Build shared DEV/LTS artifacts in an eight-card 890P Pod
         id: ppu-build
         uses: flytiger-eco/ppu-distributed-action@main
         with:
@@ -266,7 +266,7 @@ jobs:
             cp -R .ppu-ci/. "$PPU_BUNDLE_DIR/"
             chmod -R a+rX "$PPU_BUNDLE_DIR"
             printf '%s\n' "$PPU_TARGET_SHA" > "$PPU_BUNDLE_DIR/.complete"
-      - name: 检查 PPU 构建状态与回传产物
+      - name: Check PPU build status and returned artifacts
         id: bundle
         if: ${{ always() && !cancelled() }}
         shell: bash
@@ -330,5 +330,5 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
           STATE: ${{ needs.pr-pending.result == 'success' && needs.configure.result == 'success' && needs.build.result == 'success' && needs.unit-tests.result == 'success' && 'success' || 'failure' }}
-          DESCRIPTION: PPU ${{ needs.configure.outputs.scope }} 检查结束，门禁 ${{ needs.configure.outputs.threshold_percent }}%
+          DESCRIPTION: PPU ${{ needs.configure.outputs.scope }} check finished; gate ${{ needs.configure.outputs.threshold_percent }}%
         run: python3 -I .ppu-ci/control/ppu_pr_authorize.py status --state "$STATE" --description "$DESCRIPTION"

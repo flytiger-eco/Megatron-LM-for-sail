@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
-: "${PPU_SOURCE_ROOT:?缺少待测源码目录}"
-: "${PPU_ARTIFACT_DIR:?缺少构建产物目录}"
-: "${PPU_CONTROL_DIR:?缺少可信控制脚本目录}"
-: "${PPU_TARGET_SHA:?缺少待测提交 SHA}"
-: "${PPU_CONTROL_SHA:?缺少可信控制提交 SHA}"
+: "${PPU_SOURCE_ROOT:?Missing source directory under test}"
+: "${PPU_ARTIFACT_DIR:?Missing build artifact directory}"
+: "${PPU_CONTROL_DIR:?Missing trusted control script directory}"
+: "${PPU_TARGET_SHA:?Missing target commit SHA}"
+: "${PPU_CONTROL_SHA:?Missing trusted control commit SHA}"
 started_at=$(date +%s)
 cd "$PPU_SOURCE_ROOT"
 [[ "$(git rev-parse HEAD)" == "$PPU_TARGET_SHA" ]]
@@ -31,7 +31,7 @@ for package in packages:
         lines.append(f'{package}=={md.version(package)}')
     except md.PackageNotFoundError:
         if package in ('torch', 'triton'):
-            raise RuntimeError(f'基础镜像缺少必需的 PPU runtime: {package}') from None
+            raise RuntimeError(f'Base image is missing a required PPU runtime: {package}') from None
 native_requirements = [
     'transformer-engine==2.16+v0.1.0.ppu2.2.0',
     'flash-attn==2.8.2+v0.2.0.ppu2.2.0',
@@ -74,13 +74,13 @@ from pathlib import Path
 
 version = md.version('pla')
 if version != '1.0.0+v0.1.0.ppu2.2.0':
-    raise RuntimeError(f'PLA 版本不符合 PPU 约束: {version}')
+    raise RuntimeError(f'PLA version does not match the PPU constraint: {version}')
 for name in ('pla', 'pla.decode', 'pla.prefill.flashqla', 'pla.prefill.flashkdapro'):
     module = importlib.import_module(name)
     path = Path(module.__file__).resolve()
     if not path.is_relative_to(Path(sys.prefix).resolve()):
-        raise RuntimeError(f'PLA 模块未从构建虚拟环境加载: {name}: {path}')
-    print('PLA 导入检查通过:', name, version, path)
+        raise RuntimeError(f'PLA module was not loaded from the build virtual environment: {name}: {path}')
+    print('PLA import check passed:', name, version, path)
 PY
 python -I - <<'PY'
 import hashlib
@@ -89,10 +89,10 @@ import sys
 from pathlib import Path
 distribution = md.distribution('fla-core')
 if distribution.version != '0.4.1+v0.1.0.ppu2.2.0':
-    raise RuntimeError(f'FLA Core 版本不符合 PPU 约束: {distribution.version}')
+    raise RuntimeError(f'FLA Core version does not match the PPU constraint: {distribution.version}')
 path = Path(distribution.locate_file('fla/modules/l2norm.py')).resolve()
 if not path.is_relative_to(Path(sys.prefix).resolve()):
-    raise RuntimeError(f'FLA Core 补丁目标不在构建虚拟环境内: {path}')
+    raise RuntimeError(f'FLA Core patch target is outside the build virtual environment: {path}')
 source = path.read_text()
 original = '''def l2norm(
     x: torch.Tensor,
@@ -108,14 +108,14 @@ replacement = '''def l2norm(
     dim: int = -1,
 ) -> torch.Tensor:
     if not isinstance(dim, int) or isinstance(dim, bool) or dim not in (-1, x.ndim - 1):
-        raise ValueError("PPU FLA Core l2norm 仅支持最后一维")
+        raise ValueError("PPU FLA Core l2norm only supports the last dimension")
     return L2NormFunction.apply(x, eps, output_dtype)'''
 if source.count(original) != 1:
-    raise RuntimeError('FLA Core l2norm 补丁目标不唯一或源码已变化')
+    raise RuntimeError('FLA Core l2norm patch target is not unique or the source has changed')
 patched = source.replace(original, replacement)
 compile(patched, str(path), 'exec')
 path.write_text(patched)
-print('FLA Core l2norm 最后一维参数适配:', path, 'sha256:', hashlib.sha256(patched.encode()).hexdigest())
+print('FLA Core l2norm last dimension argument adaptation:', path, 'sha256:', hashlib.sha256(patched.encode()).hexdigest())
 PY
 python -I - <<'PY'
 import importlib
@@ -126,7 +126,7 @@ from pathlib import Path
 
 version = md.version('fla-core')
 if version != '0.4.1+v0.1.0.ppu2.2.0':
-    raise RuntimeError(f'FLA Core 版本不符合 PPU 约束: {version}')
+    raise RuntimeError(f'FLA Core version does not match the PPU constraint: {version}')
 required = {
     'fla': (),
     'fla.modules.convolution': ('causal_conv1d', 'causal_conv1d_update'),
@@ -137,13 +137,13 @@ for name, symbols in required.items():
     module = importlib.import_module(name)
     path = Path(module.__file__).resolve()
     if not path.is_relative_to(Path(sys.prefix).resolve()):
-        raise RuntimeError(f'FLA Core 模块未从构建虚拟环境加载: {name}: {path}')
+        raise RuntimeError(f'FLA Core module was not loaded from the build virtual environment: {name}: {path}')
     for symbol in symbols:
         if not callable(getattr(module, symbol, None)):
-            raise RuntimeError(f'FLA Core 缺少可调用接口: {name}.{symbol}')
+            raise RuntimeError(f'FLA Core is missing a callable interface: {name}.{symbol}')
     if name == 'fla.modules.l2norm':
         inspect.signature(module.l2norm).bind(object(), dim=-1, eps=1e-6)
-    print('FLA Core 导入检查通过:', name, version, path)
+    print('FLA Core import check passed:', name, version, path)
 PY
 python - <<'PY'
 import hashlib
@@ -163,8 +163,8 @@ original = '''            dq[cu_seqlens_q_padded[-1] :].fill_(0)
 replacement = '''            _ppu_zero_cp_padding(dq, cu_seqlens_q_padded)
             _ppu_zero_cp_padding(dk, cu_seqlens_kv_padded)
             _ppu_zero_cp_padding(dv, cu_seqlens_kv_padded)'''
-assert source.count(original) == 1, 'TE CP 补丁目标不唯一或源码已变化'
-assert '_ppu_zero_cp_padding' not in source, 'TE CP 补丁已经存在'
+assert source.count(original) == 1, 'TE CP patch target is not unique or the source has changed'
+assert '_ppu_zero_cp_padding' not in source, 'TE CP patch is already present'
 patched = source.replace(original, replacement) + '''
 
 def _ppu_zero_cp_padding(gradient, cu_seqlens):
@@ -174,7 +174,7 @@ def _ppu_zero_cp_padding(gradient, cu_seqlens):
 '''
 compile(patched, str(path), 'exec')
 path.write_text(patched)
-print('TE CP 捕获补零修复:', path, 'sha256:', hashlib.sha256(patched.encode()).hexdigest())
+print('TE CP graph-capture zero-padding fix:', path, 'sha256:', hashlib.sha256(patched.encode()).hexdigest())
 PY
 cat > .ppu-ci/import_diagnostics.py <<'PY'
 import sys
@@ -258,7 +258,7 @@ for line in Path('.ppu-ci/constraints.txt').read_text().splitlines():
     requirement = Requirement(line)
     installed = md.version(requirement.name)
     if not requirement.specifier.contains(installed, prereleases=True):
-        raise RuntimeError(f'依赖版本偏离约束: {requirement}, 实际安装 {installed}')
+        raise RuntimeError(f'Dependency version violates constraint: {requirement}, installed {installed}')
     print(f'{requirement.name}=={installed}')
 for name in (
     'numpy', 'scipy.linalg', 'sklearn.utils.murmurhash',
@@ -269,7 +269,7 @@ for name in (
 ):
     ppu_import_snapshot('before ' + name)
     module = importlib.import_module(name)
-    print('依赖导入检查通过:', name, module.__file__)
+    print('Dependency import check passed:', name, module.__file__)
     ppu_import_snapshot('after ' + name)
 import numpy as np
 import pyarrow as pa
@@ -277,7 +277,7 @@ from datasets import Dataset
 values = np.arange(4, dtype=np.int64)
 np.testing.assert_array_equal(pa.array(values).to_numpy(), values)
 assert Dataset.from_dict({'value': values}).to_dict() == {'value': values.tolist()}
-print('NumPy、Arrow 和 datasets 数据转换检查通过')
+print('NumPy, Arrow, and datasets conversion check passed')
 import torch
 from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import _ppu_zero_cp_padding
 for dtype in (torch.float32, torch.bfloat16):
@@ -306,7 +306,7 @@ for dtype in (torch.float32, torch.bfloat16):
             expected = original.clone()
             expected[end:].zero_()
             torch.testing.assert_close(gradient, expected, rtol=0, atol=0, equal_nan=True)
-        print('TE CP 补零图捕获及动态边界重放检查通过:', dtype, 'noncontiguous=', noncontiguous)
+        print('TE CP zero-padding graph capture and dynamic-boundary replay checks passed:', dtype, 'noncontiguous=', noncontiguous)
 PY
 install -m 0644 "$PPU_CONTROL_DIR/ppu_pytest_policy.py" \
     "$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/ppu_pytest_policy.py"
@@ -336,17 +336,17 @@ from importlib.metadata import version
 assert Path(google.protobuf.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
 assert google.protobuf.__version__ == version('protobuf')
 print('protobuf:', google.protobuf.__version__, google.protobuf.__file__)
-assert transformer_engine.HAVE_TE, 'Megatron 未启用 Transformer Engine'
-assert mamba_mixer.HAVE_MAMBA_SSM, 'Megatron 未启用 Mamba SSM'
-assert mamba_mixer.causal_conv1d_fn is not None, 'Megatron 未启用 causal-conv1d'
-assert gated_delta_net.HAVE_FLA, 'Megatron 未启用 PPU FLA Core'
-print('Megatron FLA 能力:', 'GDN=', gated_delta_net.HAVE_FLA, 'GDN2=', gated_delta_net.HAVE_FLA_GDN2)
-assert dynamic_engine.HAVE_ZMQ and dynamic_engine.HAVE_MSGPACK, '推理引擎通信依赖不完整'
+assert transformer_engine.HAVE_TE, 'Megatron did not enable Transformer Engine'
+assert mamba_mixer.HAVE_MAMBA_SSM, 'Megatron did not enable Mamba SSM'
+assert mamba_mixer.causal_conv1d_fn is not None, 'Megatron did not enable causal-conv1d'
+assert gated_delta_net.HAVE_FLA, 'Megatron did not enable PPU FLA Core'
+print('Megatron FLA capabilities:', 'GDN=', gated_delta_net.HAVE_FLA, 'GDN2=', gated_delta_net.HAVE_FLA_GDN2)
+assert dynamic_engine.HAVE_ZMQ and dynamic_engine.HAVE_MSGPACK, 'Inference engine communication dependencies are incomplete'
 assert Path(megatron.core.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
 assert Path(helpers_cpp.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
 print('megatron.core:', megatron.core.__version__, megatron.core.__file__)
-print('torch:', torch.__version__, '构建 Pod 可见 PPU 卡数:', torch.cuda.device_count())
-print('PPU 构建及导入检查通过:', helpers_cpp.__file__)
+print('torch:', torch.__version__, 'PPU device count visible to the build Pod:', torch.cuda.device_count())
+print('PPU build and import checks passed:', helpers_cpp.__file__)
 PY
 python - <<'PY'
 from pathlib import Path
@@ -354,7 +354,7 @@ import megatron.post_training.model_builder
 import megatron.rl.rl_utils
 for module in (megatron.post_training.model_builder, megatron.rl.rl_utils):
     assert Path(module.__file__).resolve().is_relative_to(Path.cwd().resolve())
-    print('UT 源码导入检查通过:', module.__name__, module.__file__)
+    print('UT source import check passed:', module.__name__, module.__file__)
 PY
 mkdir -p .ppu-ci/data
 if python -c 'import json; raise SystemExit(not json.load(open(".ppu-ci/manifest.json"))["config"]["unit_test"])'; then
@@ -372,7 +372,7 @@ for name in names:
     for attempt in range(3):
         try:
             AutoTokenizer.from_pretrained(name, trust_remote_code=False)
-            print('UT tokenizer 缓存就绪:', name, flush=True)
+            print('UT tokenizer cache is ready:', name, flush=True)
             break
         except (OSError, RuntimeError):
             if attempt == 2:
@@ -387,7 +387,7 @@ from transformers import AutoTokenizer
 for name in json.loads(Path('.ppu-ci/data/hf-tokenizers.json').read_text()):
     tokenizer = AutoTokenizer.from_pretrained(name, local_files_only=True, trust_remote_code=False)
     assert tokenizer.encode('PPU CI tokenizer cache')
-    print('UT tokenizer 离线检查通过:', name)
+    print('UT tokenizer offline check passed:', name)
 PY
     touch .ppu-ci/data/.ready
 fi
