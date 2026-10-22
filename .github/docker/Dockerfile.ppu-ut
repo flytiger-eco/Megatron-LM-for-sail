@@ -1,0 +1,274 @@
+# syntax=docker/dockerfile:1
+FROM pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001 AS dependencies
+
+USER root
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+ENV PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
+    PIP_CONFIG_FILE=/dev/null \
+    PIP_EXTRA_INDEX_URL="" \
+    PIP_FIND_LINKS="" \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_INPUT=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    TORCH_CPP_LOG_LEVEL=ERROR \
+    MAX_JOBS=16
+
+RUN python3 -m pip uninstall --yes megatron-core cloud-tpu-client protobuf \
+    && python3 -m venv --system-site-packages /opt/ppu-ci-venv
+ENV VIRTUAL_ENV=/opt/ppu-ci-venv \
+    UV_PROJECT_ENVIRONMENT=/opt/ppu-ci-venv \
+    UV_PYTHON_DOWNLOADS=never \
+    PATH="/opt/ppu-ci-venv/bin:${PATH}"
+WORKDIR /opt/ppu-ut
+COPY pyproject.toml ./pyproject.toml
+
+RUN python - <<'PY'
+import importlib.metadata as md
+from pathlib import Path
+packages = ('torch', 'torchvision', 'triton', 'scipy', 'scikit-learn')
+lines = []
+for package in packages:
+    try:
+        lines.append(f'{package}=={md.version(package)}')
+    except md.PackageNotFoundError:
+        if package in ('torch', 'triton'):
+            raise RuntimeError(f'Base image is missing a required PPU runtime: {package}') from None
+native_requirements = [
+    'transformer-engine==2.16+v0.1.0.ppu2.2.0',
+    'flash-attn==2.8.2+v0.2.0.ppu2.2.0',
+    'mamba-ssm==2.3.1+v0.1.0.ppu2.2.0',
+    'causal-conv1d==1.7.0+v0.1.0.ppu2.2.0',
+    'pla==1.0.0+v0.1.0.ppu2.2.0',
+    'fla-core==0.4.1+v0.1.0.ppu2.2.0',
+]
+Path('ppu-requirements.txt').write_text('\n'.join(native_requirements) + '\n')
+Path('constraints.txt').write_text(
+    '\n'.join(lines + native_requirements + ['numpy==1.26.4', 'pyarrow==21.0.0']) + '\n'
+)
+PY
+ENV PIP_CONSTRAINT=/opt/ppu-ut/constraints.txt
+RUN python -m pip install --index-url "$PIP_INDEX_URL" --upgrade 'packaging>=24.2' \
+    && python -m pip install --index-url "$PIP_INDEX_URL" 'setuptools>=80' wheel pybind11 ninja click pyyaml numpy
+RUN python - <<'PY'
+import tomllib
+from pathlib import Path
+project = tomllib.loads(Path('pyproject.toml').read_text())
+requirements = (
+    project['project']['dependencies']
+    + project['dependency-groups']['test']
+    + project['project']['optional-dependencies']['training']
+)
+Path('test-requirements.txt').write_text('\n'.join(requirements) + '\n')
+PY
+RUN python -m pip install --index-url "$PIP_INDEX_URL" --no-build-isolation \
+    -r test-requirements.txt -r ppu-requirements.txt \
+    pytest-timeout click wrapt requests tensorstore scipy scikit-learn \
+    'pydantic<2.14' boto3 'multi-storage-client~=0.50' 'einops~=0.8' 'uv==0.13.0' \
+    'google-api-python-client>=2' pyzmq msgpack 'openai[aiohttp]' fastapi uvicorn datasets \
+    'nvidia-modelopt==0.45.0' \
+    && python -m pip check
+
+RUN python -I - <<'PY'
+import hashlib
+import importlib.metadata as md
+import sys
+from pathlib import Path
+distribution = md.distribution('fla-core')
+if distribution.version != '0.4.1+v0.1.0.ppu2.2.0':
+    raise RuntimeError(f'FLA Core version does not match the PPU constraint: {distribution.version}')
+path = Path(distribution.locate_file('fla/modules/l2norm.py')).resolve()
+if not path.is_relative_to(Path(sys.prefix).resolve()):
+    raise RuntimeError(f'FLA Core patch target is outside the build virtual environment: {path}')
+source = path.read_text()
+original = '''def l2norm(
+    x: torch.Tensor,
+    eps: float = 1e-6,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    return L2NormFunction.apply(x, eps, output_dtype)'''
+replacement = '''def l2norm(
+    x: torch.Tensor,
+    eps: float = 1e-6,
+    output_dtype: torch.dtype | None = None,
+    *,
+    dim: int = -1,
+) -> torch.Tensor:
+    if not isinstance(dim, int) or isinstance(dim, bool) or dim not in (-1, x.ndim - 1):
+        raise ValueError("PPU FLA Core l2norm only supports the last dimension")
+    return L2NormFunction.apply(x, eps, output_dtype)'''
+if source.count(original) != 1:
+    raise RuntimeError('FLA Core l2norm patch target is not unique or the source has changed')
+patched = source.replace(original, replacement)
+compile(patched, str(path), 'exec')
+path.write_text(patched)
+print('FLA Core l2norm last dimension argument adaptation:', path, 'sha256:', hashlib.sha256(patched.encode()).hexdigest())
+PY
+RUN python - <<'PY'
+import hashlib
+import importlib.metadata as md
+import sys
+from pathlib import Path
+distribution = md.distribution('transformer-engine')
+assert distribution.version == '2.16+v0.1.0.ppu2.2.0', distribution.version
+path = Path(distribution.locate_file(
+    'transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py'
+)).resolve()
+assert path.is_relative_to(Path(sys.prefix).resolve()), path
+source = path.read_text()
+original = '''            dq[cu_seqlens_q_padded[-1] :].fill_(0)
+            dk[cu_seqlens_kv_padded[-1] :].fill_(0)
+            dv[cu_seqlens_kv_padded[-1] :].fill_(0)'''
+replacement = '''            _ppu_zero_cp_padding(dq, cu_seqlens_q_padded)
+            _ppu_zero_cp_padding(dk, cu_seqlens_kv_padded)
+            _ppu_zero_cp_padding(dv, cu_seqlens_kv_padded)'''
+assert source.count(original) == 1, 'TE CP patch target is not unique or the source has changed'
+assert '_ppu_zero_cp_padding' not in source, 'TE CP patch is already present'
+patched = source.replace(original, replacement) + '''
+
+def _ppu_zero_cp_padding(gradient, cu_seqlens):
+    indices = torch.arange(gradient.shape[0], device=gradient.device)
+    mask = (indices >= cu_seqlens[-1]).view(-1, *([1] * (gradient.ndim - 1)))
+    gradient.masked_fill_(mask, 0)
+'''
+compile(patched, str(path), 'exec')
+path.write_text(patched)
+print('TE CP graph-capture zero-padding fix:', path, 'sha256:', hashlib.sha256(patched.encode()).hexdigest())
+PY
+RUN python -m pip check \
+    && python -m pip list --format=json > /opt/ppu-ut/installed-packages.json
+
+COPY <<'PY' /opt/ppu-ut/check_runtime.py
+import argparse
+import importlib
+import importlib.metadata as md
+import inspect
+import sys
+from pathlib import Path
+
+from packaging.requirements import Requirement
+
+parser = argparse.ArgumentParser(description='Check the runtime environment in a container with eight PPU devices')
+parser.add_argument('--dependencies-only', action='store_true', help='Check dependencies only, without checking the Megatron build')
+args = parser.parse_args()
+for line in Path(__file__).with_name('constraints.txt').read_text().splitlines():
+    requirement = Requirement(line)
+    installed = md.version(requirement.name)
+    if not requirement.specifier.contains(installed, prereleases=True):
+        raise RuntimeError(f'Dependency version violates constraint: {requirement}, installed {installed}')
+    print(f'{requirement.name}=={installed}', flush=True)
+
+import torch
+
+if not torch.cuda.is_available() or torch.cuda.device_count() < 8:
+    raise RuntimeError(f'At least eight available PPU devices are required; currently visible: {torch.cuda.device_count()}')
+for name in ('pla', 'pla.decode', 'pla.prefill.flashqla', 'pla.prefill.flashkdapro'):
+    module = importlib.import_module(name)
+    path = Path(module.__file__).resolve()
+    if not path.is_relative_to(Path(sys.prefix).resolve()):
+        raise RuntimeError(f'PLA module was not loaded from the build virtual environment: {name}: {path}')
+    print('PLA import check passed:', name, path, flush=True)
+required = {
+    'fla': (),
+    'fla.modules.convolution': ('causal_conv1d', 'causal_conv1d_update'),
+    'fla.modules.l2norm': ('l2norm',),
+    'fla.ops.gated_delta_rule': ('chunk_gated_delta_rule', 'fused_recurrent_gated_delta_rule'),
+}
+for name, symbols in required.items():
+    module = importlib.import_module(name)
+    path = Path(module.__file__).resolve()
+    if not path.is_relative_to(Path(sys.prefix).resolve()):
+        raise RuntimeError(f'FLA Core module was not loaded from the build virtual environment: {name}: {path}')
+    for symbol in symbols:
+        if not callable(getattr(module, symbol, None)):
+            raise RuntimeError(f'FLA Core is missing a callable interface: {name}.{symbol}')
+    if name == 'fla.modules.l2norm':
+        inspect.signature(module.l2norm).bind(object(), dim=-1, eps=1e-6)
+    print('FLA Core import check passed:', name, path, flush=True)
+for name in (
+    'numpy', 'scipy.linalg', 'sklearn.utils.murmurhash',
+    'transformer_engine.pytorch', 'flash_attn.flash_attn_interface', 'flash_attn_2_cuda',
+    'mamba_ssm.ops.triton.layernorm_gated', 'mamba_ssm.ops.triton.ssd_combined',
+    'selective_scan_cuda', 'causal_conv1d', 'causal_conv1d_cuda',
+    'zmq', 'msgpack', 'openai', 'fastapi', 'uvicorn', 'pyarrow', 'pyarrow.parquet', 'datasets', 'modelopt.torch',
+):
+    module = importlib.import_module(name)
+    print('Dependency import check passed:', name, module.__file__, flush=True)
+
+import google.protobuf
+import numpy as np
+import pyarrow as pa
+from datasets import Dataset
+
+assert Path(google.protobuf.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+assert google.protobuf.__version__ == md.version('protobuf')
+values = np.arange(4, dtype=np.int64)
+np.testing.assert_array_equal(pa.array(values).to_numpy(), values)
+assert Dataset.from_dict({'value': values}).to_dict() == {'value': values.tolist()}
+if not args.dependencies_only:
+    import megatron.core
+    import megatron.training
+    from megatron.core.datasets import helpers_cpp
+    from megatron.core.extensions import transformer_engine
+    from megatron.core.inference.engines import dynamic_engine
+    from megatron.core.ssm import gated_delta_net, mamba_mixer
+
+    assert transformer_engine.HAVE_TE, 'Megatron did not enable Transformer Engine'
+    assert mamba_mixer.HAVE_MAMBA_SSM, 'Megatron did not enable Mamba SSM'
+    assert mamba_mixer.causal_conv1d_fn is not None, 'Megatron did not enable causal-conv1d'
+    assert gated_delta_net.HAVE_FLA, 'Megatron did not enable PPU FLA Core'
+    assert dynamic_engine.HAVE_ZMQ and dynamic_engine.HAVE_MSGPACK, 'Inference engine communication dependencies are incomplete'
+    assert Path(megatron.core.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+    assert Path(helpers_cpp.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+    print('Megatron FLA capabilities:', 'GDN=', gated_delta_net.HAVE_FLA, 'GDN2=', gated_delta_net.HAVE_FLA_GDN2)
+print('PPU UT runtime environment check passed; UT has not been executed')
+PY
+
+WORKDIR /opt/megatron-lm
+ENTRYPOINT []
+CMD ["bash"]
+
+FROM dependencies AS ut
+COPY *.py pyproject.toml README.md LICENSE MANIFEST.in ./
+COPY megatron/ ./megatron/
+COPY tests/ ./tests/
+COPY tools/ ./tools/
+COPY examples/ ./examples/
+COPY tasks/ ./tasks/
+RUN python -m pip wheel --index-url "$PIP_INDEX_URL" --no-build-isolation --no-deps --wheel-dir /opt/ppu-ut/wheels . \
+    && python setup.py build_ext --inplace \
+    && make -C megatron/core/datasets \
+    && make -q -C megatron/core/datasets \
+    && python -m pip install --no-index --no-deps --ignore-installed /opt/ppu-ut/wheels/*.whl \
+    && python -m pip check \
+    && python -m pip list --format=json > /opt/ppu-ut/installed-packages.json
+RUN python - <<'PY'
+import importlib.metadata as md
+import sys
+from pathlib import Path
+
+distribution = md.distribution('megatron-core')
+files = [path for path in distribution.files if str(path).startswith('megatron/core/datasets/helpers_cpp') and str(path).endswith('.so')]
+if len(files) != 1:
+    raise RuntimeError('Megatron wheel must contain exactly one helpers_cpp native extension')
+path = Path(distribution.locate_file(files[0])).resolve()
+if not path.is_relative_to(Path(sys.prefix).resolve()) or not path.is_file():
+    raise RuntimeError(f'helpers_cpp was not installed in the UT virtual environment: {path}')
+if not list(Path('megatron/core/datasets').glob('helpers_cpp*.so')):
+    raise RuntimeError('UT source directory is missing the in-place helpers_cpp extension')
+print('Megatron wheel and in-place extension builds completed:', path)
+PY
+RUN mkdir -p /opt/data /workspace/data/cache /tmp/checkpoints /home/gitlab-runner/data/gpt3_data \
+    && ln -sfn /opt/data/tokenizers/megatron/gpt2-vocab.json /home/gitlab-runner/data/gpt3_data/gpt2-vocab.json \
+    && ln -sfn /opt/data/tokenizers/megatron/gpt2-merges.txt /home/gitlab-runner/data/gpt3_data/gpt2-merges.txt
+ENV PYTHONPATH=/opt/megatron-lm \
+    PYTHONSAFEPATH=1 \
+    NCCL_P2P_DISABLE=1 \
+    NCCL_SHM_DISABLE=1 \
+    GPUS_PER_NODE=8 \
+    NUM_NODES=1 \
+    HF_HOME=/opt/data/huggingface-cache \
+    HF_HUB_CACHE=/opt/data/huggingface-cache/hub \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    ONE_LOGGER_JOB_CATEGORY=test
+CMD ["bash"]
