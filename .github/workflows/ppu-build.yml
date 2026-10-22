@@ -21,6 +21,10 @@ on:
         type: choice
         options: [nvidia-dev, release-dev-lts]
         default: nvidia-dev
+      unit_bucket:
+        description: 仅非 PR 手动 DEV/full 诊断可填完整 bucket；留空保持原范围
+        type: string
+        default: ''
       pr_number:
         description: 维护者授权的 PR 编号（与完整 SHA 同时填写）
         type: string

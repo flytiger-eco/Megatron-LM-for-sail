@@ -110,6 +110,21 @@ def select_config(event: dict, event_name: str, inputs: dict) -> dict:
             raise ValueError("对应 quick 尚无有效全量基线，不能执行")
         config["repeat"] = 1
     config.update(scope=scope, suite_family=family, trigger_kind=trigger)
+    bucket = inputs.get("unit_bucket", "")
+    if not isinstance(bucket, str):
+        raise ValueError("unit_bucket 必须是完整 bucket 字符串")
+    if bucket:
+        if (
+            event_name != "workflow_dispatch"
+            or trigger != "manual"
+            or inputs.get("scope") != "full"
+            or family != "nvidia-dev"
+            or not config["build"]
+            or not config["unit_test"]
+            or config["repeat"] != 1
+        ):
+            raise ValueError("单 bucket 仅允许非 PR 手动 DEV/full 诊断，必须构建并执行 1 次")
+        config.update(scope="diagnostic", unit_bucket=bucket)
     config["threshold_percent"] = threshold(config)
     config["unit_test"] = config["unit_test"] and config["build"] and config["repeat"] > 0
     return config
@@ -321,6 +336,21 @@ def generate(config: dict, output: Path, identity: dict | None = None) -> dict:
     output.mkdir(parents=True, exist_ok=True)
     quick = config.get("scope", "full") == "quick"
     cases = (quick_cases(config) if quick else unit_cases(config)) if config["unit_test"] else {}
+    diagnostic = config.get("scope") == "diagnostic"
+    if diagnostic or config.get("unit_bucket"):
+        if (
+            not diagnostic
+            or config.get("trigger_kind") != "manual"
+            or config.get("suite_family") != "nvidia-dev"
+            or not config["build"]
+            or config["repeat"] != 1
+        ):
+            raise ValueError("单 bucket 诊断配置非法")
+        cases = {
+            key: case for key, case in cases.items() if case["bucket"] == config.get("unit_bucket")
+        }
+        if len(cases) != 1:
+            raise ValueError("unit_bucket 必须精确匹配一个上游 DEV bucket，拒绝空跑或扩展范围")
     if quick and cases:
         full = unit_cases({**config, "suite_family": "nvidia-dev", "repeat": 1, "timeout": 30})
         for case in cases.values():
@@ -569,7 +599,7 @@ def summarize(manifest: dict, directory: Path) -> dict:
             selector = node.split(":", 2)[2].split("[", 1)[0]
             methods[selector] = methods.get(selector, 0) + seconds
         suite_timing = {}
-        if scope == "full" and manifest.get("schema_version", 2) >= 3:
+        if scope in ("full", "diagnostic") and manifest.get("schema_version", 2) >= 3:
             suite_timing = read_timing(result_dir / "suite-timing.json", group_errors, suite=True)
             if set(result["durations"]) != set(result["outcomes"]):
                 group_errors.append("全量基线缺少完整逐用例耗时")
@@ -598,7 +628,7 @@ def summarize(manifest: dict, directory: Path) -> dict:
         for name in ("build", "suite"):
             path = directory / "ppu-ut-quick" / f"{name}-timing.json"
             timings[name] = read_timing(path, errors, suite=name == "suite")
-    if scope == "full" and manifest.get("schema_version", 2) >= 3:
+    if scope in ("full", "diagnostic") and manifest.get("schema_version", 2) >= 3:
         first = next(iter(manifest["unit"]), None)
         if first:
             timings["build"] = read_timing(
@@ -614,7 +644,7 @@ def summarize(manifest: dict, directory: Path) -> dict:
         "suite_family": manifest["config"].get("suite_family"),
         "trigger_kind": manifest["config"].get("trigger_kind"),
         "provenance": manifest.get("provenance", {}),
-        "baseline_complete": not errors and total > 0,
+        "baseline_complete": scope != "diagnostic" and not errors and total > 0,
         "threshold_percent": threshold_percent,
         "identity": manifest.get("identity", {}),
         "groups": groups,
@@ -635,6 +665,8 @@ def write_summary(result: dict, directory: Path) -> None:
         f"阈值 {result['threshold_percent']}%；失败 {result['failed']}，跳过 {result['skipped']}；"
         f"结论：{'通过' if result['success'] else '未通过'}\n"
     )
+    if result["scope"] == "diagnostic":
+        text += "仅单 bucket 诊断，不代表全量通过，不作为 quick 全量基线或 PR 成功门禁。\n"
     if result["identity"]:
         text += f"提交身份: {result['identity']}\n"
     text += f"触发: {result.get('trigger_kind')}；全集: {result.get('suite_family')}；来源: {result.get('provenance', {})}\n"
