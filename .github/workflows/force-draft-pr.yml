@@ -3,10 +3,11 @@
 name: Force Draft PR
 
 on:
-  pull_request_target:
-    types: [opened]
-    branches:
-      - main
+  # pull_request_target:
+  #   types: [opened]
+  #   branches:
+  #     - main
+  workflow_dispatch:
 
 permissions:
   pull-requests: write

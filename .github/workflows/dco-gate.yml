@@ -15,8 +15,8 @@
 name: DCO gate publisher
 
 on:
-  check_run:
-    types: [completed]
+  # check_run:
+  #   types: [completed]
   workflow_dispatch:
     inputs:
       sha:
