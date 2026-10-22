@@ -1,10 +1,10 @@
 {
   "schema_version": 2,
-  "daily_scope": "full",
-  "quick_state": "candidate",
+  "daily_scope": "quick",
+  "quick_state": "validated",
   "require_full_baseline": false,
   "baseline": null,
-  "validation_runs": [],
+  "validation_runs": ["39745613841", "39750021168"],
   "excluded": {
     "tests/unit_tests/rl/test_rl_utils.py::TestRLUtils::test_prepare_data_for_update": "Excluded from all PPU UT scopes by maintainer request: MockModel violates the PP activation shape/dtype contract (run 39373032797)."
   },
