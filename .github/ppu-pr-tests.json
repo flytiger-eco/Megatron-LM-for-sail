@@ -1,0 +1,89 @@
+{
+  "schema_version": 2,
+  "daily_scope": "quick",
+  "quick_state": "validated",
+  "require_full_baseline": false,
+  "baseline": null,
+  "validation_runs": ["39745613841", "39750021168"],
+  "excluded": {
+    "tests/unit_tests/rl/test_rl_utils.py::TestRLUtils::test_prepare_data_for_update": "Excluded from all PPU UT scopes by maintainer request: MockModel violates the PP activation shape/dtype contract (run 39373032797)."
+  },
+  "groups": [
+    {
+      "id": "dev-pr-01",
+      "name": "data-tp-ddp",
+      "minutes": 5,
+      "coverage": "Data, RNG restoration, TP8 forward/backward, parallel cross-entropy, DDP gradient synchronization",
+      "selectors": [
+        "tests/unit_tests/data/test_gpt_dataset.py",
+        "tests/unit_tests/data/test_data_samplers.py",
+        "tests/unit_tests/tensor_parallel/test_layers.py",
+        "tests/unit_tests/tensor_parallel/test_cross_entropy.py",
+        "tests/unit_tests/distributed/test_distributed_data_parallel.py"
+      ]
+    },
+    {
+      "id": "dev-pr-02",
+      "name": "optimizer-checkpoint",
+      "minutes": 4,
+      "coverage": "Optimizer parameter updates, state restoration, sharded checkpoints, and storage regressions",
+      "selectors": [
+        "tests/unit_tests/test_optimizer.py::test_distrib_optimizer_save_load_with_non_tensor_state",
+        "tests/unit_tests/test_optimizer.py::test_optim_sharded_state_dict",
+        "tests/unit_tests/test_optimizer.py::test_optimizer_reload_model_params",
+        "tests/unit_tests/test_optimizer.py::test_get_megatron_optimizer_with_custom_process_groups",
+        "tests/unit_tests/dist_checkpointing/test_torch_dist.py"
+      ]
+    },
+    {
+      "id": "dev-pr-03",
+      "name": "transformer-moe",
+      "minutes": 8,
+      "coverage": "GPT outputs, chunked MLP, EP/TP all-to-all, capacity/padding, FP16/BF16/FP8 recomputation",
+      "selectors": [
+        "tests/unit_tests/models/test_gpt_model.py::TestGPTModel::test_post_process_forward",
+        "tests/unit_tests/models/test_gpt_model.py::TestGPTModel::test_output_processor_forward",
+        "tests/unit_tests/transformer/test_transformer_layer.py::TestParallelTransformerLayer::test_gpu_forward",
+        "tests/unit_tests/transformer/test_transformer_layer.py::TestParallelTransformerLayer::test_chunked_mlp",
+        "tests/unit_tests/transformer/moe/test_a2a_token_dispatcher.py::TestAlltoAllDispatcher",
+        "tests/unit_tests/transformer/moe/test_moe_layer.py::TestMoELayerFP16",
+        "tests/unit_tests/transformer/moe/test_moe_layer.py::TestMoELayerRecompute"
+      ]
+    },
+    {
+      "id": "dev-pr-04",
+      "name": "parallel-determinism",
+      "minutes": 6,
+      "coverage": "GPT/Llama forward/backward determinism across two iterations, TP/EP/FSDP/PP/VPP",
+      "selectors": [
+        "tests/unit_tests/determinism/correctness/test_gpt_model.py"
+      ]
+    },
+    {
+      "id": "dev-pr-05",
+      "name": "inference-ssm",
+      "minutes": 5,
+      "coverage": "GPT/Hybrid token generation, CUDA Graph, Mamba forward, and inference cache",
+      "selectors": [
+        "tests/unit_tests/inference/engines/test_dynamic_engine.py::TestDynamicInferenceEngine::test_simple",
+        "tests/unit_tests/ssm/test_mamba_mixer.py"
+      ]
+    },
+    {
+      "id": "dev-pr-06",
+      "name": "rl-context-parallel",
+      "minutes": 7,
+      "coverage": "Rollout, packing, logprob, CP2/4/8, and CP CUDA Graph regressions",
+      "selectors": [
+        "tests/unit_tests/rl/test_context_parallel.py",
+        "tests/unit_tests/rl/test_refit_arguments.py",
+        "tests/unit_tests/rl/test_rl_agents.py",
+        "tests/unit_tests/rl/test_rl_batch_invariant.py",
+        "tests/unit_tests/rl/test_rl_utils.py",
+        "tests/unit_tests/rl/test_rollout_bank.py",
+        "tests/unit_tests/rl/test_rollout_generation.py",
+        "tests/unit_tests/rl/test_sequence_packing_utils.py"
+      ]
+    }
+  ]
+}

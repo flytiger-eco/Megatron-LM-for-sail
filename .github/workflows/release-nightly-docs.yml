@@ -15,8 +15,9 @@
 name: Release Nightly Docs
 
 on:
-  schedule:
-    - cron: "0 10 * * *"
+  # schedule:
+  #   - cron: "0 10 * * *"
+  workflow_dispatch:
 
 jobs:
   call-release-docs:

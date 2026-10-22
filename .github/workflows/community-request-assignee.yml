@@ -15,8 +15,9 @@
 name: Community Request Assignee
 
 on:
-  issue_comment:
-    types: [created]
+  # issue_comment:
+  #   types: [created]
+  workflow_dispatch:
 
 permissions: {}
 

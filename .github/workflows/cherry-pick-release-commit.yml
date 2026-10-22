@@ -14,9 +14,10 @@
 name: Create PR to main with cherry-pick from release
 
 on:
-  push:
-    branches:
-      - main
+  # push:
+  #   branches:
+  #     - main
+  workflow_dispatch:
 
 jobs:
   cherry-pick:

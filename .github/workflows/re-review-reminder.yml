@@ -15,10 +15,11 @@
 name: Re-review Reminder
 
 on:
-  pull_request_target:
-    types: [review_requested]
-    branches:
-      - main
+  # pull_request_target:
+  #   types: [review_requested]
+  #   branches:
+  #     - main
+  workflow_dispatch:
 
 permissions:
   contents: read
