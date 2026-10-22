@@ -37,6 +37,7 @@ native_requirements = [
     'flash-attn==2.8.2+v0.2.0.ppu2.2.0',
     'mamba-ssm==2.3.1+v0.1.0.ppu2.2.0',
     'causal-conv1d==1.7.0+v0.1.0.ppu2.2.0',
+    'pla==1.0.0+v0.1.0.ppu2.2.0',
 ]
 Path('.ppu-ci/ppu-requirements.txt').write_text('\n'.join(native_requirements) + '\n')
 Path('.ppu-ci/constraints.txt').write_text(
@@ -64,6 +65,22 @@ python -m pip install --index-url "$PIP_INDEX_URL" --no-build-isolation \
     'google-api-python-client>=2' pyzmq msgpack 'openai[aiohttp]' fastapi uvicorn datasets \
     'nvidia-modelopt==0.45.0'
 python -m pip check
+python -I - <<'PY'
+import importlib
+import importlib.metadata as md
+import sys
+from pathlib import Path
+
+version = md.version('pla')
+if version != '1.0.0+v0.1.0.ppu2.2.0':
+    raise RuntimeError(f'PLA 版本不符合 PPU 约束: {version}')
+for name in ('pla', 'pla.decode', 'pla.prefill.flashqla', 'pla.prefill.flashkdapro'):
+    module = importlib.import_module(name)
+    path = Path(module.__file__).resolve()
+    if not path.is_relative_to(Path(sys.prefix).resolve()):
+        raise RuntimeError(f'PLA 模块未从构建虚拟环境加载: {name}: {path}')
+    print('PLA 导入检查通过:', name, version, path)
+PY
 python - <<'PY'
 import hashlib
 import importlib.metadata as md

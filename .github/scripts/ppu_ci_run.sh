@@ -33,6 +33,22 @@ tar -xzf .ppu-ci/environment.tar.gz -C /opt
 export PATH="/opt/ppu-ci-venv/bin:$PATH"
 export VIRTUAL_ENV=/opt/ppu-ci-venv UV_PROJECT_ENVIRONMENT=/opt/ppu-ci-venv
 python -m pip check
+python -I - <<'PY'
+import importlib
+import importlib.metadata as md
+import sys
+from pathlib import Path
+
+version = md.version('pla')
+if version != '1.0.0+v0.1.0.ppu2.2.0':
+    raise RuntimeError(f'PLA 版本不符合 PPU 约束: {version}')
+for name in ('pla', 'pla.decode', 'pla.prefill.flashqla', 'pla.prefill.flashkdapro'):
+    module = importlib.import_module(name)
+    path = Path(module.__file__).resolve()
+    if not path.is_relative_to(Path(sys.prefix).resolve()):
+        raise RuntimeError(f'PLA 模块未从构建虚拟环境加载: {name}: {path}')
+    print('PLA 导入检查通过:', name, version, path)
+PY
 export PYTHONPATH="$PPU_CONTROL_DIR:$PWD"
 export PYTHONSAFEPATH=1
 export UV_NO_BUILD=1 PIP_ONLY_BINARY=:all: UV_PYTHON_DOWNLOADS=never
@@ -108,7 +124,7 @@ if sys.argv[1] == 'quick':
     assert manifest['config']['scope'] == 'quick'
     cases = list(manifest['unit'].values())
 else:
-    assert manifest['config']['scope'] == 'full'
+    assert manifest['config']['scope'] in ('full', 'diagnostic')
     cases = [manifest['unit'][sys.argv[1]]]
 assert cases
 print(sum(case['minutes'] for case in cases) * 60)
