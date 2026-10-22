@@ -38,6 +38,7 @@ native_requirements = [
     'mamba-ssm==2.3.1+v0.1.0.ppu2.2.0',
     'causal-conv1d==1.7.0+v0.1.0.ppu2.2.0',
     'pla==1.0.0+v0.1.0.ppu2.2.0',
+    'fla-core==0.4.1+v0.1.0.ppu2.2.0',
 ]
 Path('.ppu-ci/ppu-requirements.txt').write_text('\n'.join(native_requirements) + '\n')
 Path('.ppu-ci/constraints.txt').write_text(
@@ -80,6 +81,69 @@ for name in ('pla', 'pla.decode', 'pla.prefill.flashqla', 'pla.prefill.flashkdap
     if not path.is_relative_to(Path(sys.prefix).resolve()):
         raise RuntimeError(f'PLA 模块未从构建虚拟环境加载: {name}: {path}')
     print('PLA 导入检查通过:', name, version, path)
+PY
+python -I - <<'PY'
+import hashlib
+import importlib.metadata as md
+import sys
+from pathlib import Path
+distribution = md.distribution('fla-core')
+if distribution.version != '0.4.1+v0.1.0.ppu2.2.0':
+    raise RuntimeError(f'FLA Core 版本不符合 PPU 约束: {distribution.version}')
+path = Path(distribution.locate_file('fla/modules/l2norm.py')).resolve()
+if not path.is_relative_to(Path(sys.prefix).resolve()):
+    raise RuntimeError(f'FLA Core 补丁目标不在构建虚拟环境内: {path}')
+source = path.read_text()
+original = '''def l2norm(
+    x: torch.Tensor,
+    eps: float = 1e-6,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    return L2NormFunction.apply(x, eps, output_dtype)'''
+replacement = '''def l2norm(
+    x: torch.Tensor,
+    eps: float = 1e-6,
+    output_dtype: torch.dtype | None = None,
+    *,
+    dim: int = -1,
+) -> torch.Tensor:
+    if not isinstance(dim, int) or isinstance(dim, bool) or dim not in (-1, x.ndim - 1):
+        raise ValueError("PPU FLA Core l2norm 仅支持最后一维")
+    return L2NormFunction.apply(x, eps, output_dtype)'''
+if source.count(original) != 1:
+    raise RuntimeError('FLA Core l2norm 补丁目标不唯一或源码已变化')
+patched = source.replace(original, replacement)
+compile(patched, str(path), 'exec')
+path.write_text(patched)
+print('FLA Core l2norm 最后一维参数适配:', path, 'sha256:', hashlib.sha256(patched.encode()).hexdigest())
+PY
+python -I - <<'PY'
+import importlib
+import importlib.metadata as md
+import inspect
+import sys
+from pathlib import Path
+
+version = md.version('fla-core')
+if version != '0.4.1+v0.1.0.ppu2.2.0':
+    raise RuntimeError(f'FLA Core 版本不符合 PPU 约束: {version}')
+required = {
+    'fla': (),
+    'fla.modules.convolution': ('causal_conv1d', 'causal_conv1d_update'),
+    'fla.modules.l2norm': ('l2norm',),
+    'fla.ops.gated_delta_rule': ('chunk_gated_delta_rule', 'fused_recurrent_gated_delta_rule'),
+}
+for name, symbols in required.items():
+    module = importlib.import_module(name)
+    path = Path(module.__file__).resolve()
+    if not path.is_relative_to(Path(sys.prefix).resolve()):
+        raise RuntimeError(f'FLA Core 模块未从构建虚拟环境加载: {name}: {path}')
+    for symbol in symbols:
+        if not callable(getattr(module, symbol, None)):
+            raise RuntimeError(f'FLA Core 缺少可调用接口: {name}.{symbol}')
+    if name == 'fla.modules.l2norm':
+        inspect.signature(module.l2norm).bind(object(), dim=-1, eps=1e-6)
+    print('FLA Core 导入检查通过:', name, version, path)
 PY
 python - <<'PY'
 import hashlib
@@ -264,7 +328,7 @@ ppu_import_snapshot('after megatron.core')
 import megatron.training
 from megatron.core.datasets import helpers_cpp
 from megatron.core.extensions import transformer_engine
-from megatron.core.ssm import mamba_mixer
+from megatron.core.ssm import gated_delta_net, mamba_mixer
 from megatron.core.inference.engines import dynamic_engine
 import megatron.core.inference.inference_client
 import google.protobuf
@@ -275,6 +339,8 @@ print('protobuf:', google.protobuf.__version__, google.protobuf.__file__)
 assert transformer_engine.HAVE_TE, 'Megatron 未启用 Transformer Engine'
 assert mamba_mixer.HAVE_MAMBA_SSM, 'Megatron 未启用 Mamba SSM'
 assert mamba_mixer.causal_conv1d_fn is not None, 'Megatron 未启用 causal-conv1d'
+assert gated_delta_net.HAVE_FLA, 'Megatron 未启用 PPU FLA Core'
+print('Megatron FLA 能力:', 'GDN=', gated_delta_net.HAVE_FLA, 'GDN2=', gated_delta_net.HAVE_FLA_GDN2)
 assert dynamic_engine.HAVE_ZMQ and dynamic_engine.HAVE_MSGPACK, '推理引擎通信依赖不完整'
 assert Path(megatron.core.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
 assert Path(helpers_cpp.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
