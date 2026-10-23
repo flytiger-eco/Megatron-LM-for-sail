@@ -1,0 +1,255 @@
+name: PPU Execute
+on:
+  workflow_call:
+    inputs:
+      allowed:
+        type: boolean
+        required: true
+      target_sha:
+        type: string
+        required: true
+      control_sha:
+        type: string
+        required: true
+      manual_pr:
+        type: boolean
+        default: false
+      request_inputs:
+        type: string
+        required: true
+    outputs:
+      scope:
+        value: ${{ jobs.configure.outputs.scope }}
+      threshold_percent:
+        value: ${{ jobs.configure.outputs.threshold_percent }}
+      execution_success:
+        value: ${{ jobs.result.outputs.execution_success }}
+permissions:
+  contents: read
+env:
+  PIP_INDEX_URL: https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
+  PIP_CONFIG_FILE: /dev/null
+  PIP_EXTRA_INDEX_URL: ''
+  PIP_FIND_LINKS: ''
+jobs:
+  lifecycle:
+    if: ${{ !inputs.allowed }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo 'PR lifecycle updated; PPU execution is not authorized.'
+  configure:
+    if: inputs.allowed
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      config: ${{ steps.config.outputs.config }}
+      build: ${{ steps.config.outputs.build }}
+      unit_test: ${{ steps.config.outputs.unit_test }}
+      unit_matrix: ${{ steps.config.outputs.unit_matrix }}
+      scope: ${{ steps.config.outputs.scope }}
+      threshold_percent: ${{ steps.config.outputs.threshold_percent }}
+      suite_family: ${{ steps.config.outputs.suite_family }}
+      target_sha: ${{ inputs.target_sha }}
+      control_sha: ${{ inputs.control_sha }}
+      manual_pr: ${{ inputs.manual_pr }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.control_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-authorization
+          path: .ppu-ci
+      - name: Verify current PR ownership before configuration
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I control/.github/scripts/ppu_pr_authorize.py guard
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha }}
+          path: source
+          persist-credentials: false
+      - name: Prepare isolated configuration environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ppu-configure-venv"
+          "$RUNNER_TEMP/ppu-configure-venv/bin/python" -m pip install --index-url "$PIP_INDEX_URL" click pyyaml
+          printf '%s\n' "$RUNNER_TEMP/ppu-configure-venv/bin" >> "$GITHUB_PATH"
+      - id: config
+        env:
+          PPU_INPUTS: ${{ inputs.request_inputs }}
+          PPU_SOURCE_ROOT: ${{ github.workspace }}/source
+          PPU_CONTROL_ROOT: ${{ github.workspace }}/control
+          PPU_DEFAULTS: >-
+            {"build":"${{ vars.PPU_BUILD || 'yes' }}","unit_test":"${{ vars.PPU_UNIT_TEST || 'yes' }}",
+            "repeat":"${{ vars.PPU_UNIT_TEST_REPEAT || '1' }}","timeout":"${{ vars.PPU_UNIT_TEST_TIMEOUT || '30' }}"}
+        run: |
+          python3 -I control/.github/scripts/ppu_ci.py configure
+          cp control/.github/scripts/{ppu_ci.py,ppu_ci_build.sh,ppu_ci_run.sh,ppu_pytest_policy.py} .ppu-ci/control/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppu-plan
+          path: .ppu-ci/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+  admit-build:
+    needs: configure
+    if: needs.configure.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-authorization
+          path: .ppu-ci
+      - name: Verify current PR ownership before requesting PPU
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .ppu-ci/control/ppu_pr_authorize.py guard
+  build:
+    needs: [configure, admit-build]
+    if: needs.configure.outputs.build == 'true' && (needs.configure.outputs.manual_pr != 'true' || github.run_attempt == 1)
+    runs-on: k8s-runner-group-cpu-flytiger
+    environment: ppu-ci
+    timeout-minutes: 210
+    outputs:
+      bundle_digest: ${{ steps.bundle.outputs.bundle_digest }}
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    env:
+      PPU_IMAGE: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+      MAX_JOBS: '16'
+    steps:
+      - name: Check out source under test
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.configure.outputs.target_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+      - name: Wait after checkout failure
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 15
+      - name: Retry source checkout (final attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.configure.outputs.target_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-plan
+          path: .ppu-ci
+      - name: Build shared DEV/LTS artifacts in an eight-card 890P Pod
+        id: ppu-build
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+          nnodes: 0
+          nproc_per_node: 8
+          namespace: ${{ vars.PPU_NAMESPACE || 'ppu-sched' }}
+          node_selector: "board-type=ZW-M890P"
+          host_volumes: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
+          source_dir: /opt/megatron-lm
+          artifact_paths: .ppu-ci
+          timeout_minutes: 180
+          cleanup_policy: always
+          dmesg_policy: on_failure
+          container_options: |
+            shm_size: "64Gi"
+          extra_env: PPU_TARGET_SHA=${{ needs.configure.outputs.target_sha }},PPU_CONTROL_SHA=${{ needs.configure.outputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_BUNDLE_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build
+          command: |
+            set -euo pipefail
+            umask 022
+            cd /opt/megatron-lm
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends git ca-certificates wget
+            chown -R "$(id -u):$(id -g)" .
+            [[ "$(git -C source rev-parse HEAD)" == "$PPU_TARGET_SHA" ]] || exit 1
+            unset WORLD_SIZE RANK LOCAL_RANK
+            bash "$PPU_CONTROL_DIR/ppu_ci_build.sh"
+            mkdir -p "$PPU_BUNDLE_DIR"
+            cp -R .ppu-ci/. "$PPU_BUNDLE_DIR/"
+            chmod -R a+rX "$PPU_BUNDLE_DIR"
+            printf '%s\n' "$PPU_TARGET_SHA" > "$PPU_BUNDLE_DIR/.complete"
+      - name: Check PPU build status and returned artifacts
+        id: bundle
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        env:
+          PPU_STATUS: ${{ steps.ppu-build.outputs.job_status }}
+          PPU_OUTCOME: ${{ steps.ppu-build.outcome }}
+          PPU_BUNDLE_DIR: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build
+          PPU_TARGET_SHA: ${{ needs.configure.outputs.target_sha }}
+          PPU_CONTROL_SHA: ${{ needs.configure.outputs.control_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$PPU_OUTCOME" == success && "$PPU_STATUS" == succeeded ]] || exit 1
+          [[ "$(< "$PPU_BUNDLE_DIR/.complete")" == "$PPU_TARGET_SHA" ]] || exit 1
+          [[ "$(< "$PPU_BUNDLE_DIR/commit.txt")" == "$PPU_TARGET_SHA" ]] || exit 1
+          [[ "$(< "$PPU_BUNDLE_DIR/control.txt")" == "$PPU_CONTROL_SHA" ]] || exit 1
+          diff -r .ppu-ci/control "$PPU_BUNDLE_DIR/control"
+          [[ "$(< "$PPU_BUNDLE_DIR/image.txt")" == "$PPU_IMAGE" ]] || exit 1
+          [[ -s "$PPU_BUNDLE_DIR/source.tar.gz" && -s "$PPU_BUNDLE_DIR/environment.tar.gz" ]] || exit 1
+          cmp .ppu-ci/manifest.json "$PPU_BUNDLE_DIR/manifest.json"
+          digest=$(sha256sum "$PPU_BUNDLE_DIR/bundle-integrity.json")
+          digest=${digest%% *}
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          printf 'bundle_digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppu-bundle
+          path: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build/
+          include-hidden-files: true
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+  unit-tests:
+    needs: [configure, build]
+    if: needs.configure.outputs.unit_test == 'true' && (needs.configure.outputs.manual_pr != 'true' || github.run_attempt == 1)
+    uses: ./.github/workflows/ppu-ut.yml
+    with:
+      matrix: ${{ needs.configure.outputs.unit_matrix }}
+      bundle_digest: ${{ needs.build.outputs.bundle_digest }}
+      target_sha: ${{ needs.configure.outputs.target_sha }}
+      control_sha: ${{ needs.configure.outputs.control_sha }}
+      manual_pr: ${{ needs.configure.outputs.manual_pr == 'true' }}
+      threshold_percent: ${{ needs.configure.outputs.threshold_percent }}
+      scope: ${{ needs.configure.outputs.scope }}
+  result:
+    needs: [configure, admit-build, build, unit-tests]
+    if: always() && !cancelled() && inputs.allowed
+    runs-on: ubuntu-latest
+    outputs:
+      execution_success: ${{ steps.result.outputs.execution_success }}
+    steps:
+      - id: result
+        env:
+          SUCCESS: ${{ needs.configure.result == 'success' && needs.admit-build.result == 'success' && needs.build.result == 'success' && needs.unit-tests.result == 'success' }}
+          CONFIGURE_RESULT: ${{ needs.configure.result }}
+          BUILD_ENABLED: ${{ needs.configure.outputs.build }}
+          UT_ENABLED: ${{ needs.configure.outputs.unit_test }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          printf 'execution_success=%s\n' "$SUCCESS" >> "$GITHUB_OUTPUT"
+          [[ "$SUCCESS" == true ]] && exit 0
+          [[ "$CONFIGURE_RESULT" == success && "$BUILD_ENABLED" == false ]] && exit 0
+          [[ "$CONFIGURE_RESULT" == success && "$UT_ENABLED" == false && "$BUILD_RESULT" == success ]] && exit 0
+          exit 1
