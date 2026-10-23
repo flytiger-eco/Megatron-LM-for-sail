@@ -479,7 +479,16 @@ def test_final_status_cannot_overwrite_new_snapshot(monkeypatch, mutation):
                 "status": "completed" if mutation == "cancelled" else "in_progress",
                 "run_attempt": 2 if mutation == "rerun" else 1,
             }
-        return [{"context": auth.STATUS_CONTEXT, "target_url": url}]
+        if path == f"git/commits/{MERGE_SHA}":
+            return {"parents": [{"sha": BASE_SHA}, {"sha": SHA}]}
+        return [
+            {
+                "context": auth.STATUS_CONTEXT,
+                "target_url": url,
+                "state": "pending",
+                "description": f"attempt=1 base={BASE_SHA}",
+            }
+        ]
 
     auth.publish_status(
         {
@@ -622,7 +631,16 @@ def test_status_snapshot_is_rechecked_before_write(monkeypatch, decision):
             return pull
         if path == "actions/runs/123":
             return {"status": "in_progress", "run_attempt": 1}
-        return [{"context": auth.STATUS_CONTEXT, "target_url": auth.run_url("123")}]
+        if path == f"git/commits/{MERGE_SHA}":
+            return {"parents": [{"sha": BASE_SHA}, {"sha": SHA}]}
+        return [
+            {
+                "context": auth.STATUS_CONTEXT,
+                "target_url": auth.run_url("123"),
+                "state": "pending",
+                "description": f"attempt=1 base={BASE_SHA}",
+            }
+        ]
 
     auth.publish_status(
         {
@@ -631,6 +649,7 @@ def test_status_snapshot_is_rechecked_before_write(monkeypatch, decision):
             "base_sha": BASE_SHA,
             "run_id": "123",
             "decision": decision,
+            "target_sha": MERGE_SHA,
         },
         "success",
         "completed",
@@ -1253,7 +1272,7 @@ def test_ut_workflow_restores_same_run_bundle_before_execution(sealed_bundle, tm
 
 
 def test_bundle_workflow_digest_and_run_scoping():
-    build = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
+    build = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())
     ut = yaml.safe_load((ROOT / ".github/workflows/ppu-ut.yml").read_text())
     assert (
         build["jobs"]["build"]["outputs"]["bundle_digest"]
