@@ -1,5 +1,6 @@
 {
   "purpose": "Temporary PPU PR lifecycle validation; do not merge",
-  "sequence": 2,
-  "validation": "Manual full-SHA authorization; automatic PR events remain unverified"
+  "sequence": 3,
+  "validation": "Manual full-SHA authorization; automatic PR events remain unverified",
+  "validation_control_sha": "4c8a2f3d4ed08920f5a79647922eabd3f8eb6885"
 }
