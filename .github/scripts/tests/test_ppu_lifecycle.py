@@ -349,6 +349,58 @@ def test_status_api_failure_is_not_success(github, tmp_path, monkeypatch):
     assert not github.writes
 
 
+@pytest.mark.parametrize("terminal", ["success", "failure", "error"])
+def test_manual_dispatch_reclaims_terminal_status_with_fresh_run(github, monkeypatch, terminal):
+    previous = pending(github)
+    assert auth.publish_status(previous, terminal, "Finished", github) == "published"
+    ctx = context()
+    ctx["run_id"] = "124"
+    inputs = {"pr_number": "7", "pr_sha": SHA, "pr_base_sha": BASE_SHA}
+    current = auth.authorize({}, inputs, ctx, github)
+    assert current["manual_pr"] and current["allowed"]
+    assert auth.publish_status(current, "pending", current["reason"], github) == "published"
+    monkeypatch.setenv("GITHUB_RUN_ID", "124")
+    assert auth.execution_guard(current, github)
+    assert auth.publish_status(previous, "error", "Late cancel", github, cancelled=True) == "stale"
+    assert github.statuses[0]["target_url"].endswith("/124")
+
+
+def test_manual_draft_takeover_preserves_waiting_status_after_old_cancel(github):
+    previous = pending(github)
+    github.pull["draft"] = True
+    ctx = context()
+    ctx["run_id"] = "124"
+    inputs = {"pr_number": "7", "pr_sha": SHA, "pr_base_sha": BASE_SHA}
+    draft = auth.authorize({}, inputs, ctx, github)
+    assert draft["decision"] == "draft" and not draft["allowed"]
+    assert auth.publish_status(draft, "pending", draft["reason"], github) == "published"
+    assert not auth.execution_guard(draft, github)
+    assert auth.publish_status(previous, "error", "Late cancel", github, cancelled=True) == "stale"
+    assert github.statuses[0]["description"].startswith("Awaiting a ready PR")
+    assert github.statuses[0]["target_url"].endswith("/124")
+
+
+def test_base_invalidation_requires_new_full_sha_dispatch(github, monkeypatch):
+    previous = pending(github)
+    github.pull["base"]["sha"] = CONTROL_SHA
+    github.parents = [{"sha": CONTROL_SHA}, {"sha": SHA}]
+    monkeypatch.setenv("GITHUB_RUN_ID", "124")
+    auth.invalidate_base(CONTROL_SHA, github)
+    assert github.statuses[0]["description"].endswith(f"base={CONTROL_SHA}")
+    assert not auth.execution_guard(previous, github)
+    ctx = context()
+    ctx["run_id"] = "125"
+    inputs = {"pr_number": "7", "pr_sha": SHA, "pr_base_sha": BASE_SHA}
+    with pytest.raises(ValueError, match="head/base changed"):
+        auth.authorize({}, inputs, ctx, github)
+    inputs["pr_base_sha"] = CONTROL_SHA
+    current = auth.authorize({}, inputs, ctx, github)
+    assert auth.publish_status(current, "pending", current["reason"], github) == "published"
+    monkeypatch.setenv("GITHUB_RUN_ID", "125")
+    assert auth.execution_guard(current, github)
+    assert auth.publish_status(previous, "success", "Late success", github) == "stale"
+
+
 def test_workflow_authorized_concurrency_and_cancellation_contract():
     parent = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
     execute = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())
