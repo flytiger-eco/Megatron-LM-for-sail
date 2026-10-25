@@ -63,6 +63,8 @@ def api_for(pull=None, permission="write"):
     def api(path):
         if path.startswith("collaborators/"):
             return {"permission": permission}
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": (pull or pr())["base"]["sha"]}}
         if path.startswith("pulls/7/files?"):
             return [{"filename": "megatron/core/utils.py", "status": "modified"}]
         if path == f"git/commits/{MERGE_SHA}":
@@ -347,6 +349,8 @@ def test_commit_status_uses_pr_head_sha(tmp_path, monkeypatch, state):
             return {"status": "in_progress", "run_attempt": 1}
         if path == f"git/commits/{MERGE_SHA}":
             return {"parents": [{"sha": BASE_SHA}, {"sha": SHA}]}
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": BASE_SHA}}
         return [
             {
                 "context": auth.STATUS_CONTEXT,

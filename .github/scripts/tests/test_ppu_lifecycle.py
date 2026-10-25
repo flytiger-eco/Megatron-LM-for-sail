@@ -22,6 +22,7 @@ from test_ppu_quick import (
 class FakeGitHub:
     def __init__(self):
         self.pull = pr()
+        self.base_ref_sha = BASE_SHA
         self.statuses = []
         self.run = {"status": "in_progress", "conclusion": None, "run_attempt": 1}
         self.parents = [{"sha": BASE_SHA}, {"sha": SHA}]
@@ -51,7 +52,7 @@ class FakeGitHub:
         if path.startswith("collaborators/"):
             return {"permission": self.permission}
         if path.startswith("git/ref/"):
-            return {"object": {"sha": self.pull["base"]["sha"]}}
+            return {"object": {"sha": self.base_ref_sha}}
         if path.startswith("pulls?"):
             return [{"number": 7}]
         raise AssertionError(path)
@@ -349,6 +350,60 @@ def test_status_api_failure_is_not_success(github, tmp_path, monkeypatch):
     assert not github.writes
 
 
+@pytest.mark.parametrize("draft", [False, True])
+def test_base_invalidation_handles_cached_pr_base(github, monkeypatch, draft):
+    previous = pending(github)
+    github.pull["draft"] = draft
+    github.base_ref_sha = CONTROL_SHA
+    monkeypatch.setenv("GITHUB_RUN_ID", "124")
+    auth.invalidate_base(CONTROL_SHA, github)
+    assert github.pull["base"]["sha"] == BASE_SHA
+    assert github.statuses[0]["state"] == "pending"
+    assert github.statuses[0]["description"].endswith(f"base={CONTROL_SHA}")
+    assert github.statuses[0]["target_url"].endswith("/124")
+    assert auth.publish_status(previous, "error", "Old cancel", github, cancelled=True) == "stale"
+    for requested_base in (BASE_SHA, CONTROL_SHA):
+        with pytest.raises(auth.StaleSnapshot):
+            auth.authorize(
+                {},
+                {"pr_number": "7", "pr_sha": SHA, "pr_base_sha": requested_base},
+                context(),
+                github,
+            )
+
+
+@pytest.mark.parametrize("state", ["pending", "success", "failure", "error"])
+def test_cached_pr_base_cannot_hide_branch_advance(github, state):
+    previous = pending(github)
+    github.base_ref_sha = CONTROL_SHA
+    writes = len(github.writes)
+    assert auth.publish_status(previous, state, "Late result", github) == "stale"
+    assert not auth.execution_guard(previous, github)
+    assert len(github.writes) == writes
+
+
+@pytest.mark.parametrize("phase", ["preflight", "parents", "publish", "guard"])
+def test_branch_advance_rechecked_without_pr_api_refresh(github, phase):
+    previous = pending(github) if phase in ("publish", "guard") else None
+    refs = 0
+
+    def mutate(path):
+        nonlocal refs
+        if path.startswith("git/ref/"):
+            refs += 1
+            if refs == (4 if phase == "parents" else 2):
+                github.base_ref_sha = CONTROL_SHA
+
+    github.mutate = mutate
+    if phase in ("preflight", "parents"):
+        with pytest.raises(auth.StaleSnapshot):
+            authorization(github)
+    elif phase == "publish":
+        assert auth.publish_status(previous, "success", "Late success", github) == "stale"
+    else:
+        assert not auth.execution_guard(previous, github)
+
+
 @pytest.mark.parametrize("terminal", ["success", "failure", "error"])
 def test_manual_dispatch_reclaims_terminal_status_with_fresh_run(github, monkeypatch, terminal):
     previous = pending(github)
@@ -383,6 +438,7 @@ def test_manual_draft_takeover_preserves_waiting_status_after_old_cancel(github)
 def test_base_invalidation_requires_new_full_sha_dispatch(github, monkeypatch):
     previous = pending(github)
     github.pull["base"]["sha"] = CONTROL_SHA
+    github.base_ref_sha = CONTROL_SHA
     github.parents = [{"sha": CONTROL_SHA}, {"sha": SHA}]
     monkeypatch.setenv("GITHUB_RUN_ID", "124")
     auth.invalidate_base(CONTROL_SHA, github)

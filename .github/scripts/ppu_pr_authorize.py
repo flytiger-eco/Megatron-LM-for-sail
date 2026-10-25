@@ -87,6 +87,11 @@ def current_pr(pr: dict, authorization: dict, repository: str) -> bool:
     )
 
 
+def base_is_current(base_sha: str, api) -> bool:
+    branch = BRANCH.removeprefix("refs/heads/")
+    return full_sha(api(f"git/ref/heads/{branch}")["object"]["sha"]) == base_sha
+
+
 def blocked(result: dict, decision: str, reason: str) -> dict:
     return {**result, "allowed": False, "decision": decision, "reason": reason}
 
@@ -167,8 +172,8 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
         raise ValueError("The PR must target this repository's validation branch")
     if not pr["head"].get("repo"):
         raise ValueError("The PR head repository does not exist")
-    if snapshot(pr) != (requested_sha, requested_base):
-        raise ValueError("PR head/base changed; revalidate the full snapshot")
+    if snapshot(pr) != (requested_sha, requested_base) or not base_is_current(requested_base, api):
+        raise StaleSnapshot("PR head/base changed; revalidate the full snapshot")
     if event_name == "pull_request_target" and pr_identity(pr) != pr_identity(
         event["pull_request"]
     ):
@@ -206,7 +211,7 @@ def resolve_pr(result: dict, pr: dict, inputs: dict, repository: str, api, sleep
     requested_sha, requested_base = result["pr_head_sha"], result["base_sha"]
     only_docs = docs_only(number, pr, api)
     checked = api(f"pulls/{number}")
-    if pr_identity(checked) != pr_identity(pr):
+    if pr_identity(checked) != pr_identity(pr) or not base_is_current(requested_base, api):
         raise StaleSnapshot("PR snapshot changed during preflight")
     if only_docs and inputs.get("scope", "auto") == "auto":
         return blocked(result, "docs_only", "Docs-only changes; UT exempt under policy")
@@ -218,7 +223,7 @@ def resolve_pr(result: dict, pr: dict, inputs: dict, repository: str, api, sleep
         )
     for attempt in range(3):
         current = api(f"pulls/{number}")
-        if pr_identity(current) != pr_identity(pr):
+        if pr_identity(current) != pr_identity(pr) or not base_is_current(requested_base, api):
             raise StaleSnapshot("PR changed while resolving the synthetic merge commit")
         if current.get("mergeable") is False:
             return blocked(result, "conflict", "PR has merge conflicts; PPU not started")
@@ -234,6 +239,7 @@ def resolve_pr(result: dict, pr: dict, inputs: dict, repository: str, api, sleep
                 if (
                     pr_identity(checked) != pr_identity(pr)
                     or checked.get("merge_commit_sha") != merge
+                    or not base_is_current(requested_base, api)
                 ):
                     raise StaleSnapshot(
                         "PR changed during verification of the synthetic merge commit"
@@ -337,8 +343,10 @@ def publish_status(
         return "rejected"
     sha = full_sha(authorization["pr_head_sha"])
     pr = api(f"pulls/{number}")
-    if not current_pr(pr, authorization, os.environ["GITHUB_REPOSITORY"]) or not valid_lifecycle(
-        pr, decision
+    if (
+        not current_pr(pr, authorization, os.environ["GITHUB_REPOSITORY"])
+        or not valid_lifecycle(pr, decision)
+        or not base_is_current(authorization["base_sha"], api)
     ):
         return "stale"
     if not run_is_current(authorization, api, cancelled):
@@ -385,6 +393,7 @@ def publish_status(
         )
         or latest_status(sha, api) != latest
         or not run_is_current(authorization, api, cancelled)
+        or not base_is_current(authorization["base_sha"], api)
     ):
         return "stale"
     api(f"statuses/{sha}", payload)
@@ -405,6 +414,7 @@ def execution_guard(authorization: dict, api=github_api) -> bool:
     if (
         not current_pr(pr, authorization, os.environ["GITHUB_REPOSITORY"])
         or not valid_lifecycle(pr, "run")
+        or not base_is_current(authorization["base_sha"], api)
         or not run_is_current(authorization, api)
         or not owns_pending(latest_status(authorization["pr_head_sha"], api), authorization)
         or pr.get("mergeable") is not True
@@ -421,6 +431,7 @@ def execution_guard(authorization: dict, api=github_api) -> bool:
         and checked.get("mergeable") is True
         and owns_pending(latest_status(authorization["pr_head_sha"], api), authorization)
         and run_is_current(authorization, api)
+        and base_is_current(authorization["base_sha"], api)
     )
 
 
@@ -432,10 +443,9 @@ def invalidate_base(base_sha: str, api=github_api) -> None:
         rows = api(f"pulls?state=open&base={branch}&per_page=100&page={page}")
         for pull in rows:
             pr = api(f"pulls/{pull['number']}")
-            sha, current_base = snapshot(pr)
+            sha, _ = snapshot(pr)
             if (
                 pr["state"] != "open"
-                or current_base != base_sha
                 or pr["base"]["ref"] != branch
                 or pr["base"]["repo"]["full_name"] != os.environ["GITHUB_REPOSITORY"]
                 or not pr["head"].get("repo")
