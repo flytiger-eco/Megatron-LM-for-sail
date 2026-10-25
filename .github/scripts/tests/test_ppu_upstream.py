@@ -486,7 +486,7 @@ def test_final_status_cannot_overwrite_new_snapshot(monkeypatch, mutation):
         if path == f"git/commits/{MERGE_SHA}":
             return {"parents": [{"sha": BASE_SHA}, {"sha": SHA}]}
         if path.startswith("git/ref/"):
-            return {"object": {"sha": BASE_SHA}}
+            return {"object": {"sha": pull["base"]["sha"]}}
         return [
             {
                 "context": auth.STATUS_CONTEXT,
