@@ -193,6 +193,8 @@ def test_every_boundary_rechecks_pr_identity(github, mutation, phase):
             return
         if mutation in ("head", "base"):
             github.pull[mutation]["sha"] = CONTROL_SHA
+            if mutation == "base":
+                github.base_ref_sha = CONTROL_SHA
         elif mutation == "retarget":
             github.pull["base"]["ref"] = "main"
         elif mutation == "base_repo":
@@ -362,14 +364,36 @@ def test_base_invalidation_handles_cached_pr_base(github, monkeypatch, draft):
     assert github.statuses[0]["description"].endswith(f"base={CONTROL_SHA}")
     assert github.statuses[0]["target_url"].endswith("/124")
     assert auth.publish_status(previous, "error", "Old cancel", github, cancelled=True) == "stale"
-    for requested_base in (BASE_SHA, CONTROL_SHA):
-        with pytest.raises(auth.StaleSnapshot):
-            auth.authorize(
-                {},
-                {"pr_number": "7", "pr_sha": SHA, "pr_base_sha": requested_base},
-                context(),
-                github,
-            )
+    with pytest.raises(auth.StaleSnapshot):
+        auth.authorize(
+            {}, {"pr_number": "7", "pr_sha": SHA, "pr_base_sha": BASE_SHA}, context(), github
+        )
+    current = auth.authorize(
+        {},
+        {"pr_number": "7", "pr_sha": SHA, "pr_base_sha": CONTROL_SHA},
+        context(),
+        github,
+        lambda _: None,
+    )
+    assert current["decision"] == ("draft" if draft else "merge_unavailable")
+    assert not current["allowed"] and current["base_sha"] == CONTROL_SHA
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_current_merge_can_use_live_base_with_cached_pr_metadata(github, manual):
+    github.base_ref_sha = CONTROL_SHA
+    github.parents = [{"sha": CONTROL_SHA}, {"sha": SHA}]
+    if manual:
+        current = auth.authorize(
+            {}, {"pr_number": "7", "pr_sha": SHA, "pr_base_sha": CONTROL_SHA}, context(), github
+        )
+    else:
+        current = authorization(github)
+    assert current["allowed"] and current["base_sha"] == CONTROL_SHA
+    assert github.pull["base"]["sha"] == BASE_SHA
+    assert auth.publish_status(current, "pending", current["reason"], github) == "published"
+    assert auth.execution_guard(current, github)
+    assert auth.publish_status(current, "success", "Finished", github) == "published"
 
 
 @pytest.mark.parametrize("state", ["pending", "success", "failure", "error"])

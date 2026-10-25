@@ -78,7 +78,7 @@ def pr_identity(pr: dict) -> tuple:
 
 def current_pr(pr: dict, authorization: dict, repository: str) -> bool:
     return (
-        snapshot(pr) == (authorization["pr_head_sha"], authorization["base_sha"])
+        full_sha(pr["head"]["sha"]) == authorization["pr_head_sha"]
         and pr["base"]["repo"]["full_name"] == repository
         and pr["base"]["ref"] == BRANCH.removeprefix("refs/heads/")
         and bool(pr["head"].get("repo"))
@@ -87,9 +87,13 @@ def current_pr(pr: dict, authorization: dict, repository: str) -> bool:
     )
 
 
-def base_is_current(base_sha: str, api) -> bool:
+def current_base_sha(api) -> str:
     branch = BRANCH.removeprefix("refs/heads/")
-    return full_sha(api(f"git/ref/heads/{branch}")["object"]["sha"]) == base_sha
+    return full_sha(api(f"git/ref/heads/{branch}")["object"]["sha"])
+
+
+def base_is_current(base_sha: str, api) -> bool:
+    return current_base_sha(api) == base_sha
 
 
 def blocked(result: dict, decision: str, reason: str) -> dict:
@@ -172,12 +176,13 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
         raise ValueError("The PR must target this repository's validation branch")
     if not pr["head"].get("repo"):
         raise ValueError("The PR head repository does not exist")
-    if snapshot(pr) != (requested_sha, requested_base) or not base_is_current(requested_base, api):
-        raise StaleSnapshot("PR head/base changed; revalidate the full snapshot")
-    if event_name == "pull_request_target" and pr_identity(pr) != pr_identity(
-        event["pull_request"]
-    ):
-        raise StaleSnapshot("PR identity or lifecycle state changed since the event")
+    if manual_pr:
+        if full_sha(pr["head"]["sha"]) != requested_sha or not base_is_current(requested_base, api):
+            raise StaleSnapshot("PR head/base changed; revalidate the full snapshot")
+    else:
+        if pr_identity(pr) != pr_identity(event["pull_request"]):
+            raise StaleSnapshot("PR identity or lifecycle state changed since the event")
+        requested_base = current_base_sha(api)
     result.update(
         pr_number=int(number),
         pr_head_sha=requested_sha,
