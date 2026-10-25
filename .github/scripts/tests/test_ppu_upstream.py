@@ -134,6 +134,8 @@ def test_docs_only_pr_skips_without_merge_or_source(fork):
     def api(path):
         if "/files?" in path:
             return [{"filename": "README.md"}]
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": BASE_SHA}}
         assert path == "pulls/7"
         return pull
 
@@ -148,6 +150,8 @@ def test_snapshot_drift_during_docs_check():
         nonlocal calls
         if "/files?" in path:
             return [{"filename": "README.md"}]
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": BASE_SHA}}
         calls += 1
         pull = pr()
         if calls > 1:
@@ -481,6 +485,8 @@ def test_final_status_cannot_overwrite_new_snapshot(monkeypatch, mutation):
             }
         if path == f"git/commits/{MERGE_SHA}":
             return {"parents": [{"sha": BASE_SHA}, {"sha": SHA}]}
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": BASE_SHA}}
         return [
             {
                 "context": auth.STATUS_CONTEXT,
@@ -633,6 +639,8 @@ def test_status_snapshot_is_rechecked_before_write(monkeypatch, decision):
             return {"status": "in_progress", "run_attempt": 1}
         if path == f"git/commits/{MERGE_SHA}":
             return {"parents": [{"sha": BASE_SHA}, {"sha": SHA}]}
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": BASE_SHA}}
         return [
             {
                 "context": auth.STATUS_CONTEXT,
