@@ -1,6 +1,7 @@
 """PPU PR."""
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -103,6 +104,16 @@ def blocked(result: dict, decision: str, reason: str) -> dict:
 def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=time.sleep) -> dict:
     repository = context["repository"]
     event_name, ref = context["event_name"], context["ref"]
+    spec = importlib.util.spec_from_file_location(
+        "ppu_functional_route", Path(__file__).with_name("ppu_functional.py")
+    )
+    functional = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(functional)
+    test_kind = functional.validate_route(event_name, ref, inputs)
+    if test_kind == "functional":
+        functional.select_config(inputs)
+        if full_sha(context["sha"]) != full_sha(context["control_sha"]):
+            raise ValueError("Functional dispatch must use the same trusted source/control commit")
     number = str(inputs.get("pr_number", ""))
     requested_sha, requested_base = inputs.get("pr_sha", ""), inputs.get("pr_base_sha", "")
     manual_pr = event_name == "workflow_dispatch" and bool(
@@ -122,6 +133,7 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
         "run_id": context["run_id"],
         "run_attempt": int(context["run_attempt"]),
         "event_name": event_name,
+        "test_kind": test_kind,
     }
     if event_name == "workflow_dispatch":
         expected_workflow = f"{repository}/.github/workflows/ppu-build.yml@{BRANCH}"
@@ -331,6 +343,8 @@ def publish_status(
     authorization: dict, state: str, description: str, api=github_api, *, cancelled: bool = False
 ) -> str:
     number, decision = authorization["pr_number"], authorization.get("decision")
+    if authorization.get("test_kind", "unit") != "unit":
+        return "rejected"
     if not number or decision not in (
         "run",
         "docs_only",
@@ -547,6 +561,7 @@ def main() -> None:
                 "pr_number",
                 "manual_pr",
                 "decision",
+                "test_kind",
             ):
                 value = result[key]
                 stream.write(f"{key}={str(value).lower() if isinstance(value, bool) else value}\n")
