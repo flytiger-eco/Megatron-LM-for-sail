@@ -14,8 +14,8 @@ from pathlib import Path
 BRANCH = "refs/heads/ci/ppu-validation"
 BASELINES = Path("tests/functional_tests/zhenwu_test_cases")
 LOCK = Path(".github/ppu-functional-baselines.json")
-POD_ASSETS = "ppu://redacted/history-root-000/anyunge.ayg/megatron-functional-ci"
-CPU_ASSETS = "ppu://redacted/history-root-004/anyunge.ayg/megatron-functional-ci"
+POD_ASSETS = "ppu://redacted/history-root-001"
+CPU_ASSETS = "ppu://redacted/history-root-005"
 IMAGE = "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
 TIERS = ("L0", "L1", "L2", "L3")
 DEFAULTS = {
