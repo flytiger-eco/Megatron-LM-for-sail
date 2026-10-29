@@ -53,6 +53,9 @@ jobs:
       scope: ${{ steps.config.outputs.scope }}
       threshold_percent: ${{ steps.config.outputs.threshold_percent }}
       suite_family: ${{ steps.config.outputs.suite_family }}
+      test_kind: ${{ steps.config.outputs.test_kind }}
+      functional_mode: ${{ steps.config.outputs.functional_mode }}
+      functional_matrix: ${{ steps.config.outputs.functional_matrix }}
       target_sha: ${{ inputs.target_sha }}
       control_sha: ${{ inputs.control_sha }}
       manual_pr: ${{ inputs.manual_pr }}
@@ -89,7 +92,14 @@ jobs:
             {"build":"${{ vars.PPU_BUILD || 'yes' }}","unit_test":"${{ vars.PPU_UNIT_TEST || 'yes' }}",
             "repeat":"${{ vars.PPU_UNIT_TEST_REPEAT || '1' }}","timeout":"${{ vars.PPU_UNIT_TEST_TIMEOUT || '30' }}"}
         run: |
-          python3 -I control/.github/scripts/ppu_ci.py configure
+          if [[ "$(python3 -c 'import json,os; print(json.loads(os.environ["PPU_INPUTS"]).get("test_kind", "unit"))')" == functional ]]; then
+            python3 -I control/.github/scripts/ppu_functional.py configure
+            cp control/.github/scripts/ppu_functional*.py .ppu-ci/control/
+            cp control/.github/scripts/ppu_functional_run.sh .ppu-ci/control/
+          else
+            python3 -I control/.github/scripts/ppu_ci.py configure
+            echo 'test_kind=unit' >> "$GITHUB_OUTPUT"
+          fi
           cp control/.github/scripts/{ppu_ci.py,ppu_ci_build.sh,ppu_ci_run.sh,ppu_pytest_policy.py} .ppu-ci/control/
       - uses: actions/upload-artifact@v4
         with:
@@ -98,9 +108,37 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
-  admit-build:
+  functional-assets:
     needs: configure
-    if: needs.configure.outputs.build == 'true'
+    if: needs.configure.outputs.test_kind == 'functional'
+    runs-on: k8s-runner-group-cpu-flytiger
+    environment: ppu-ci
+    timeout-minutes: 15
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-plan
+          path: .ppu-ci
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Read-only NAS asset preflight (no PPU requested)
+        run: python3 -I .ppu-ci/control/ppu_functional.py assets --output .ppu-ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ppu-functional-assets
+          path: .ppu-ci/assets-report.json
+          if-no-files-found: error
+          retention-days: 7
+  admit-build:
+    needs: [configure, functional-assets]
+    if: >-
+      always() && !cancelled() && needs.configure.result == 'success' &&
+      needs.configure.outputs.build == 'true' &&
+      (needs.configure.outputs.test_kind != 'functional' || needs.functional-assets.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -117,7 +155,10 @@ jobs:
         run: python3 -I .ppu-ci/control/ppu_pr_authorize.py guard
   build:
     needs: [configure, admit-build]
-    if: needs.configure.outputs.build == 'true' && (needs.configure.outputs.manual_pr != 'true' || github.run_attempt == 1)
+    if: >-
+      always() && !cancelled() && needs.configure.result == 'success' &&
+      needs.admit-build.result == 'success' && needs.configure.outputs.build == 'true' &&
+      (needs.configure.outputs.manual_pr != 'true' || github.run_attempt == 1)
     runs-on: k8s-runner-group-cpu-flytiger
     environment: ppu-ci
     timeout-minutes: 210
@@ -223,7 +264,10 @@ jobs:
           retention-days: 7
   unit-tests:
     needs: [configure, build]
-    if: needs.configure.outputs.unit_test == 'true' && (needs.configure.outputs.manual_pr != 'true' || github.run_attempt == 1)
+    if: >-
+      always() && !cancelled() && needs.configure.result == 'success' &&
+      needs.build.result == 'success' && needs.configure.outputs.unit_test == 'true' &&
+      (needs.configure.outputs.manual_pr != 'true' || github.run_attempt == 1)
     uses: ./.github/workflows/ppu-ut.yml
     with:
       matrix: ${{ needs.configure.outputs.unit_matrix }}
@@ -233,8 +277,20 @@ jobs:
       manual_pr: ${{ needs.configure.outputs.manual_pr == 'true' }}
       threshold_percent: ${{ needs.configure.outputs.threshold_percent }}
       scope: ${{ needs.configure.outputs.scope }}
+  functional-tests:
+    needs: [configure, functional-assets, build]
+    if: >-
+      always() && !cancelled() && needs.configure.result == 'success' &&
+      needs.functional-assets.result == 'success' && needs.build.result == 'success' &&
+      needs.configure.outputs.test_kind == 'functional' && needs.configure.outputs.functional_mode == 'regression'
+    uses: ./.github/workflows/ppu-functional.yml
+    with:
+      matrix: ${{ needs.configure.outputs.functional_matrix }}
+      bundle_digest: ${{ needs.build.outputs.bundle_digest }}
+      target_sha: ${{ needs.configure.outputs.target_sha }}
+      control_sha: ${{ needs.configure.outputs.control_sha }}
   result:
-    needs: [configure, admit-build, build, unit-tests]
+    needs: [configure, functional-assets, admit-build, build, unit-tests, functional-tests]
     if: always() && !cancelled() && inputs.allowed
     runs-on: ubuntu-latest
     outputs:
@@ -247,7 +303,22 @@ jobs:
           BUILD_ENABLED: ${{ needs.configure.outputs.build }}
           UT_ENABLED: ${{ needs.configure.outputs.unit_test }}
           BUILD_RESULT: ${{ needs.build.result }}
+          TEST_KIND: ${{ needs.configure.outputs.test_kind }}
+          FUNCTIONAL_MODE: ${{ needs.configure.outputs.functional_mode }}
+          ASSETS_RESULT: ${{ needs.functional-assets.result }}
+          FUNCTIONAL_SUCCESS: ${{ needs.configure.result == 'success' && needs.functional-assets.result == 'success' && needs.admit-build.result == 'success' && needs.build.result == 'success' && needs.functional-tests.result == 'success' }}
         run: |
+          if [[ "$TEST_KIND" == functional ]]; then
+            if [[ "$FUNCTIONAL_MODE" == assets ]]; then
+              echo 'execution_success=false' >> "$GITHUB_OUTPUT"
+              echo 'Asset preflight only; numerical regression has not been executed.' >> "$GITHUB_STEP_SUMMARY"
+              [[ "$CONFIGURE_RESULT" == success && "$ASSETS_RESULT" == success ]]
+            else
+              printf 'execution_success=%s\n' "$FUNCTIONAL_SUCCESS" >> "$GITHUB_OUTPUT"
+              [[ "$FUNCTIONAL_SUCCESS" == true ]]
+            fi
+            exit $?
+          fi
           printf 'execution_success=%s\n' "$SUCCESS" >> "$GITHUB_OUTPUT"
           [[ "$SUCCESS" == true ]] && exit 0
           [[ "$CONFIGURE_RESULT" == success && "$BUILD_ENABLED" == false ]] && exit 0

@@ -315,6 +315,11 @@ python setup.py build_ext --inplace
 make -C megatron/core/datasets
 make -q -C megatron/core/datasets
 python -m pip install --no-index --no-deps --ignore-installed dist/*.whl
+if python -c 'import json; raise SystemExit(json.load(open(".ppu-ci/manifest.json")).get("test_kind") != "functional")'; then
+    apt-get update
+    apt-get install -y --no-install-recommends gettext-base
+    python -I "$PPU_CONTROL_DIR/ppu_functional_environment.py" prepare --bundle "$PPU_ARTIFACT_DIR"
+fi
 python -m pip check
 python -m pip list --format=json > .ppu-ci/installed-packages.json
 python -I - <<'PY'

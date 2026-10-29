@@ -1021,7 +1021,7 @@ def test_diagnostic_generates_one_unchanged_upstream_bucket(tmp_path, capsys):
     workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
     events = workflow.get("on", workflow.get(True))
     assert events["workflow_dispatch"]["inputs"]["unit_bucket"]["default"] == ""
-    assert len(events["workflow_dispatch"]["inputs"]) <= 10
+    assert len(events["workflow_dispatch"]["inputs"]) <= 25
 
 
 @pytest.mark.parametrize(

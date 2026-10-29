@@ -1,0 +1,901 @@
+{
+  "files": {
+    "bert/bert_mcore_tp1_pp2/golden_values_dev_ppu.json": {
+      "sha256": "b7a2d38cd21f56205f04d45644a40e234bf449d9dfa4cc67c1d34a066783231f",
+      "size": 7868
+    },
+    "bert/bert_mcore_tp1_pp2/model_config.yaml": {
+      "sha256": "d5d32d990f084e85384030fead96d64aab645718e3dbe31d207e4859debb885f",
+      "size": 1306
+    },
+    "bert/bert_mcore_tp1_pp4_vp2/golden_values_dev_ppu.json": {
+      "sha256": "a3a758cba3cedb5569188161c19a0b25587fd23178489b8cd750e38a077214e1",
+      "size": 7868
+    },
+    "bert/bert_mcore_tp1_pp4_vp2/model_config.yaml": {
+      "sha256": "db0da7bc84225c9a89d595699f444caffcb2d680f674d7bd5ad3cfa9dbf744a5",
+      "size": 1351
+    },
+    "bert/bert_mcore_tp2_pp2/golden_values_dev_ppu.json": {
+      "sha256": "fb6c7c7d31625187962938591404bf2ac887ea4d93b6d739bb82b25fe3d20322",
+      "size": 7862
+    },
+    "bert/bert_mcore_tp2_pp2/model_config.yaml": {
+      "sha256": "9d4e4a2468c4d40ffec3581a57ad9def4914f6f70aa47cc0557d5815745d1af7",
+      "size": 1306
+    },
+    "bert/bert_mcore_tp2_pp2_local_spec/golden_values_dev_ppu.json": {
+      "sha256": "8b3c0a927e80e7d375d4289707585d92066d92efede4a0bfca49d3f44ee4157d",
+      "size": 7871
+    },
+    "bert/bert_mcore_tp2_pp2_local_spec/model_config.yaml": {
+      "sha256": "0d73c28a760639fc18840872b9cb81aae3e5aecc418594bb2e6253b8ef527138",
+      "size": 1320
+    },
+    "bert/bert_mcore_tp2_pp2_resume_torch_dist/golden_values_dev_ppu.json": {
+      "sha256": "21c6c0d81fb5c5397863c4c1c5560e616f688288e3f1d8c474f53cd1d350c62f",
+      "size": 15063
+    },
+    "bert/bert_mcore_tp2_pp2_resume_torch_dist/golden_values_dev_ppu_2nd.json": {
+      "sha256": "8438080d61ee8269e7f0f2723e83050d66995c7e0fa308057af15ee9848f1f7e",
+      "size": 14090
+    },
+    "bert/bert_mcore_tp2_pp2_resume_torch_dist/model_config.yaml": {
+      "sha256": "ded08070de220f5f6ee74c6b326cb1a363409e7b07e71ca43a7baca3518ab3e6",
+      "size": 1457
+    },
+    "bert/bert_mcore_tp2_pp2_resume_torch_dist_local_spec/golden_values_dev_ppu.json": {
+      "sha256": "769aea10d861b6845204955a37399d43982308dbb9528ea4ea09aacd5d44c403",
+      "size": 15072
+    },
+    "bert/bert_mcore_tp2_pp2_resume_torch_dist_local_spec/golden_values_dev_ppu_2nd.json": {
+      "sha256": "05d22e515fe5f9ff0acd1c2f73b8a8c5596c804c04f44943ce65ae7f973707c7",
+      "size": 14096
+    },
+    "bert/bert_mcore_tp2_pp2_resume_torch_dist_local_spec/model_config.yaml": {
+      "sha256": "cd91c779f5a543f00a5a171fd798f5a3326219cbebf5d8f017cf285eb68a2bd1",
+      "size": 1471
+    },
+    "bert/bert_mcore_tp4_pp1/golden_values_dev_ppu.json": {
+      "sha256": "7d2ee7ae901582fbf83a291c77b5e88b1de07b13bd691c83523f1e759c3525e0",
+      "size": 7874
+    },
+    "bert/bert_mcore_tp4_pp1/model_config.yaml": {
+      "sha256": "abcf173424a334e77f9918f3f899a29513301c3e9935bfe305d894ac15955392",
+      "size": 1306
+    },
+    "gpt/gpt3_7b_tp1_pp4_memory_speed/golden_values_dev_ppu.json": {
+      "sha256": "5048f3788ece9f3865b072f53c508b84de40e77d9e0092e99c1ff32da3acbba4",
+      "size": 4415
+    },
+    "gpt/gpt3_7b_tp1_pp4_memory_speed/model_config.yaml": {
+      "sha256": "3b7df82d05854fae1832dd9761a70a44f31cfb3fc4f8e3511ba1ac5d90c4e99a",
+      "size": 1939
+    },
+    "gpt/gpt3_7b_tp4_pp1_memory_speed/golden_values_dev_ppu.json": {
+      "sha256": "8989b02b925d91c071c593cebf500bd94194361f28907eb3fbcfb242d6792d1c",
+      "size": 4429
+    },
+    "gpt/gpt3_7b_tp4_pp1_memory_speed/model_config.yaml": {
+      "sha256": "751e48df72ece36f87eab2f4cdc7bc6a5e60dbcc7317826713f8b878c0224ce9",
+      "size": 1872
+    },
+    "gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_fim_dataset/golden_values_dev_ppu.json": {
+      "sha256": "ae5443d64fea5a49c9d6ef4369faf64bc531c39768c0ec83480c204addb2dca9",
+      "size": 7829
+    },
+    "gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_fim_dataset/model_config.yaml": {
+      "sha256": "b29567656ca41865ce3108a701e7cff0c28d686c2295de9b3e56bfde49322284",
+      "size": 1793
+    },
+    "gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files/golden_values_dev_ppu.json": {
+      "sha256": "f9e8d24649c1de8de446c2fec51b1d3fe586517d65a828f40e21f49529c5d4c4",
+      "size": 7833
+    },
+    "gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files/model_config.yaml": {
+      "sha256": "6b47dd7f30732062d6ed399d0b14ddf6f1f3af9d635e5fca4e2803d93727c406",
+      "size": 1762
+    },
+    "gpt/gpt3_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer/golden_values_dev_ppu.json": {
+      "sha256": "3d2fc72d834c9a7ff062d7c17d1cacc761a1ee51243b2bd749f3b2eaa20a65bd",
+      "size": 14992
+    },
+    "gpt/gpt3_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer/golden_values_dev_ppu_2nd.json": {
+      "sha256": "c15ca6c8836c964a3da6eb0686b4765ff4938880f9ae601140abada47ddd3b6b",
+      "size": 14050
+    },
+    "gpt/gpt3_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer/model_config.yaml": {
+      "sha256": "05b6f029772b427db3d69aaca0e8b92617a02e24bff17ae9f65d6600df0af238",
+      "size": 1788
+    },
+    "gpt/gpt3_mcore_te_tp1_pp1_resume_torch_dist_uniform_full_recompute/golden_values_dev_ppu.json": {
+      "sha256": "9e41f0985952978e92cbf369e5fa81ea5958f8b15258ff21d46e544b4ecf9142",
+      "size": 15086
+    },
+    "gpt/gpt3_mcore_te_tp1_pp1_resume_torch_dist_uniform_full_recompute/golden_values_dev_ppu_2nd.json": {
+      "sha256": "39394e2873a31e9a179ae0f4a7fd0a27eb9768ea6f407e61ca949c63682a1b80",
+      "size": 14101
+    },
+    "gpt/gpt3_mcore_te_tp1_pp1_resume_torch_dist_uniform_full_recompute/model_config.yaml": {
+      "sha256": "267f4c84984c94b6586d5182f9c1f038b9ef4e10e78d492fb545390f6592ab1f",
+      "size": 1804
+    },
+    "gpt/gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings/golden_values_dev_ppu.json": {
+      "sha256": "a44277fdc5867cec0907e99364f23f9420032b1c6fb58d4143426552b6152e5a",
+      "size": 14991
+    },
+    "gpt/gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings/golden_values_dev_ppu_2nd.json": {
+      "sha256": "e0c9d8ee7c9f111e4dca266c12a31b4fc0f90e0273cccf9c6245a72e4cb97af3",
+      "size": 14050
+    },
+    "gpt/gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings/model_config.yaml": {
+      "sha256": "ddfcb2d9e66a931b2334fcb789227865d631b6e971e4d55cfea915f48bc1d684",
+      "size": 1748
+    },
+    "gpt/gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_interleaved_no_fusion/golden_values_dev_ppu.json": {
+      "sha256": "ad2ad9148b4256fc80f1aa1f26d5970a34025573d11d8fbcdcd44d731fa5ae02",
+      "size": 14989
+    },
+    "gpt/gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_interleaved_no_fusion/golden_values_dev_ppu_2nd.json": {
+      "sha256": "a25746fd0f960afdd3473232df766cdd37c3123e6586bcf5b06f0af83781e04a",
+      "size": 14052
+    },
+    "gpt/gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_interleaved_no_fusion/model_config.yaml": {
+      "sha256": "9e7e29deaca8e42646cc1f3390ee3af4f2a442b85939a1f92b15baa2e94b8707",
+      "size": 1802
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_resume_torch_dist_disable_bias_linear/golden_values_dev_ppu.json": {
+      "sha256": "bab8b0b7fff352a91c8ee85425ffd93cb9735ba717f4c6bb44ee110e8e37ec00",
+      "size": 14998
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_resume_torch_dist_disable_bias_linear/golden_values_dev_ppu_2nd.json": {
+      "sha256": "92d7725084c4ed70861f2210b8fed31bb5abd280ef48328e51784112f111b4e2",
+      "size": 14060
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_resume_torch_dist_disable_bias_linear/model_config.yaml": {
+      "sha256": "0224afcf9dd26a0bf89da7f60f5b1cc249da1c9115e8131bfd34f7c47673fc48",
+      "size": 1744
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_resume_torch_dist_persistent_disable_bias_linear/golden_values_dev_ppu.json": {
+      "sha256": "17694cd64cbaab141d6fb87d65f3523da72abd2eef5e496799f2d159e0db8e64",
+      "size": 15005
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_resume_torch_dist_persistent_disable_bias_linear/golden_values_dev_ppu_2nd.json": {
+      "sha256": "4325e4b4464cbd1f8116a2cd1b1c28a47f56287040131f75d6427b2b41be0189",
+      "size": 14060
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_resume_torch_dist_persistent_disable_bias_linear/model_config.yaml": {
+      "sha256": "d6cfe3bb4f5f5ef11208c8f6dd7b4028f8f8c6c4dd76d0231ee5f4026515e8d5",
+      "size": 1714
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_resume_torch_dist_swiglu/golden_values_dev_ppu.json": {
+      "sha256": "83d6a2e6f7ad9db595b4c4f71066d2751e73d15b1c2b7243d08380d975e99875",
+      "size": 15006
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_resume_torch_dist_swiglu/golden_values_dev_ppu_2nd.json": {
+      "sha256": "42fb1fbd7458b1455e7cccbe6f5e59293112a5cedcd6dafd86fd1b53096acf32",
+      "size": 14066
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_resume_torch_dist_swiglu/model_config.yaml": {
+      "sha256": "3685264b0a12ae85ac03e4285f37bdf3b135d0f2cc11ad8610df3a741be7a380",
+      "size": 1766
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_resume_torch_dist_untie_embeddings_and_outputs/golden_values_dev_ppu.json": {
+      "sha256": "6ff1ef9163090cc70f2f7b4447afe2003552bfedf74802930936312b709486b1",
+      "size": 15393
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_resume_torch_dist_untie_embeddings_and_outputs/golden_values_dev_ppu_2nd.json": {
+      "sha256": "df2ff8b654208fcd2d938fa49587367f805f3f1482fabc9192a434c7d10372ef",
+      "size": 14262
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_resume_torch_dist_untie_embeddings_and_outputs/model_config.yaml": {
+      "sha256": "bab370356d44f78e952dd119043fb6297977541470464a11a130f41280675742",
+      "size": 1760
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp1/golden_values_dev_ppu.json": {
+      "sha256": "5bb406ca222f83a9d1237fd6d862e418bec64a179faf4bb3cb4ee9bf4680262a",
+      "size": 7828
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp1/model_config.yaml": {
+      "sha256": "de951cafe5d0923e9b53dc5b3a96388326f62adcea2040067ddc047e263523cd",
+      "size": 1839
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer/golden_values_dev_ppu.json": {
+      "sha256": "331fb8c371eabdb68b2e015663a2db2c244a1fac5b97a9e9517b96562faa2ca4",
+      "size": 7834
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer/model_config.yaml": {
+      "sha256": "8e2b411b475f0708733bd6f708f3d37c98b6890269e3bcb5626e952054288b3f",
+      "size": 1843
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp1_resume_torch_decoupled_lr/golden_values_dev_ppu.json": {
+      "sha256": "431dea134dd96d096d8f8036425832080bae504cfb9dcaae8d32499452a2efea",
+      "size": 14981
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp1_resume_torch_decoupled_lr/model_config.yaml": {
+      "sha256": "a09b6b5f41b9585a0c66fbf327da94782d53a12e9cb82eb27ae6a34987a4693c",
+      "size": 1801
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_calculate_per_token_loss/golden_values_dev_ppu.json": {
+      "sha256": "c23fc61ce320171691d7d8565c533866907e6f730c1410e87315e189e46d1d3d",
+      "size": 14995
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_calculate_per_token_loss/golden_values_dev_ppu_2nd.json": {
+      "sha256": "a4a3e79c0f57807648bcf48b4b01ebfa15a46ad95f7a060409b562b1bf78b9e8",
+      "size": 14057
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_calculate_per_token_loss/model_config.yaml": {
+      "sha256": "5f50e3f82a09e120a6510c1cb7a3f926bddce13d5d91f513607837dc557cea68",
+      "size": 1838
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce/golden_values_dev_ppu.json": {
+      "sha256": "c9eb985a54f493be8e8369d5529abd8d87fdbe7fa5e520f0b20e50693cac44c9",
+      "size": 14997
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce/golden_values_dev_ppu_2nd.json": {
+      "sha256": "90c5bbf8db7646e1fdc84e53ac7f19e3aa629357a9f3b0e039d509cb1d5d5e69",
+      "size": 14054
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce/model_config.yaml": {
+      "sha256": "013c8017e9d5e35b557919f83b7ff09cf82d614ac157174ad29efecf38bf6bbf",
+      "size": 1825
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp1_tunable_overlap/golden_values_dev_ppu.json": {
+      "sha256": "c64a5633ba944b2bdad7da1f00898871ce21d93f97b728fd793a94283df5405a",
+      "size": 7823
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp1_tunable_overlap/model_config.yaml": {
+      "sha256": "c9db93544ab68f7e5de668003646b556d3ac1ca3db2a2984e8b6191b70b88b5a",
+      "size": 1944
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp1_uneven_pipeline/golden_values_dev_ppu.json": {
+      "sha256": "1da9cf12c79cf2284b459dd4ee9847cd6f474ce91705510135b9c01ec7dcc801",
+      "size": 8032
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp1_uneven_pipeline/model_config.yaml": {
+      "sha256": "f9c4ac04ea9cca46a67ae97787d7c434a65d009b4b23bcda704e2d3966253b16",
+      "size": 1825
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp2_account_for_embedding_loss_in_pipeline_split/golden_values_dev_ppu.json": {
+      "sha256": "0d4b46adb42968bc22b3a68479de41d3c5ab9f372e35dd5f7617c32c2e317e17",
+      "size": 8032
+    },
+    "gpt/gpt3_mcore_te_tp1_pp4_vp2_account_for_embedding_loss_in_pipeline_split/model_config.yaml": {
+      "sha256": "25f07d675bae18ae35db2e6568ff153f0c202768607d289407190cc126c0c8de",
+      "size": 1882
+    },
+    "gpt/gpt3_mcore_te_tp2_pp1_gdn/golden_values_dev_ppu.json": {
+      "sha256": "e2a0072c7f47e696358a39dd1d3124795f40ce0e3f3ad915936c050464169434",
+      "size": 8036
+    },
+    "gpt/gpt3_mcore_te_tp2_pp1_gdn/golden_values_dev_ppu_2nd.json": {
+      "sha256": "570132f2dd11cf836d822dcb79c0a7c6597727a2970b1babe0255a190c0dd4c5",
+      "size": 7464
+    },
+    "gpt/gpt3_mcore_te_tp2_pp1_gdn/model_config.yaml": {
+      "sha256": "5573483b41b48fe67c5e3874eafa7b4ae1a403adcd6fb9a0dd6643035a7119e5",
+      "size": 2573
+    },
+    "gpt/gpt3_mcore_te_tp2_pp1_modelopt_distill_resume/golden_values_dev_ppu.json": {
+      "sha256": "8db5260515abae3fa427ef2328c765b04599c8579f859efa167ad55fa6ebc3b8",
+      "size": 15415
+    },
+    "gpt/gpt3_mcore_te_tp2_pp1_modelopt_distill_resume/golden_values_dev_ppu_2nd.json": {
+      "sha256": "9e2e80195bb5ee6441eafff6c63ea876df09023f5e88a189f69fa56bde5d68e2",
+      "size": 14273
+    },
+    "gpt/gpt3_mcore_te_tp2_pp1_modelopt_distill_resume/model_config.yaml": {
+      "sha256": "101f9668c1b1b541ff43257255c02a37a0a56f474eaeea2da9a0c320ff93e15d",
+      "size": 2618
+    },
+    "gpt/gpt3_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic/golden_values_dev_ppu.json": {
+      "sha256": "110b1bbd6a404f93c35f3a4e881b4e3c32df0b97d415dcf62c6a8b1753bfaeb5",
+      "size": 14934
+    },
+    "gpt/gpt3_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic/golden_values_dev_ppu_2nd.json": {
+      "sha256": "33eae24bea667c0308f50eb203063bf5c7d7190f277377462b724a4ad244fed0",
+      "size": 14042
+    },
+    "gpt/gpt3_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic/model_config.yaml": {
+      "sha256": "a05a9e7cf6a13ef0e3048ec8159ee6ab184c60cf1a624f9b866f910e429df307",
+      "size": 1813
+    },
+    "gpt/gpt3_mcore_te_tp2_pp1_resume_torch_dist_multi_dist_optimizer_instances/golden_values_dev_ppu.json": {
+      "sha256": "3c04796cc84b418c86071f7edeb0d68b088527d41c1784fe15361bd364b099a4",
+      "size": 14997
+    },
+    "gpt/gpt3_mcore_te_tp2_pp1_resume_torch_dist_multi_dist_optimizer_instances/golden_values_dev_ppu_2nd.json": {
+      "sha256": "adef9367eaac22c5b456c15734d918d0864b68df7014f9f78bb02c242326da76",
+      "size": 14061
+    },
+    "gpt/gpt3_mcore_te_tp2_pp1_resume_torch_dist_multi_dist_optimizer_instances/model_config.yaml": {
+      "sha256": "1d6250dfe0c9a92a36954da0100032477dd6a9d348f8da73ae712778a7c567af",
+      "size": 1920
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cp2/golden_values_dev_ppu.json": {
+      "sha256": "923cc12fb7752516246e4b59481cc57e9633080c0209168c14babcc9c79d89b0",
+      "size": 7731
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cp2/model_config.yaml": {
+      "sha256": "e91c3355c3b507acedb9a2877993643348d4ebe62710e6554f49f3058c72c4e4",
+      "size": 1620
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cp2_calculate_per_token_loss/golden_values_dev_ppu.json": {
+      "sha256": "5c14540def4fa70341626493464f42f293da851c4c149a7f902807c542f77f31",
+      "size": 7725
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cp2_calculate_per_token_loss/model_config.yaml": {
+      "sha256": "0128c5b213ada2bbdeb4da70a4e58b1d67129769b0991603f9bdbe698c26e866",
+      "size": 1683
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cp2_calculate_per_token_loss_nondeterministic/golden_values_dev_ppu.json": {
+      "sha256": "695da0128e2a9a71a3e94378ea831f030fd8c65a949dbfc756b8f223c799e9da",
+      "size": 7729
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cp2_calculate_per_token_loss_nondeterministic/model_config.yaml": {
+      "sha256": "6d65527b5d9b66241d30873c006f764f64d63cd3a0f927c631cbc4b96fc126a9",
+      "size": 1683
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_dp_last/golden_values_dev_ppu.json": {
+      "sha256": "72e01ca4d2fe73310249a312db958b47d41de2b07912e11932cd963428961634",
+      "size": 7727
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_dp_last/model_config.yaml": {
+      "sha256": "785fd033d9f90c00cd2f38556882692e04df06d4a3ec5b8bd681eedb7a8ad687",
+      "size": 1793
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_nondeterministic_dp_last/golden_values_dev_ppu.json": {
+      "sha256": "8be3981e1686f0e6d0a182b6da3041a81463af47a18c1be379793813d8ad9b63",
+      "size": 7740
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_nondeterministic_dp_last/model_config.yaml": {
+      "sha256": "e7e48f8e3bcaf11f137151c243fe21052bf256a9a3ad12bdc30bc5b6dd5e8040",
+      "size": 1749
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cp2_etp4_dp_last/golden_values_dev_ppu.json": {
+      "sha256": "bfd048bc9fc0f0a986e0dfe43ea214ca0673fb89ed5f27c70ad5704beb5ea240",
+      "size": 7723
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cp2_etp4_dp_last/model_config.yaml": {
+      "sha256": "bc054e62d5984780c1f95279894c649ecd94a8ec6c9cfc5d2b8ebc8d43ac514e",
+      "size": 1788
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cp2_etp4_nondeterministic_dp_last/golden_values_dev_ppu.json": {
+      "sha256": "36fb1631dfdc1a326dddd1cb1d69590e64a8e3b7c48fe2e47a5a834b9b659a42",
+      "size": 7738
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cp2_etp4_nondeterministic_dp_last/model_config.yaml": {
+      "sha256": "89a26e3a024cef486854736793054f0c235e8c77d3467ce143295418f05e495a",
+      "size": 1788
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cp2_nondeterministic/golden_values_dev_ppu.json": {
+      "sha256": "4bbdb82bb6344c4e792f51776cc1dfd098b8f3202b165b8c97e64c37c79be810",
+      "size": 7732
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cp2_nondeterministic/model_config.yaml": {
+      "sha256": "7e194d2b970e5772aa4ed5f655a5dcc4bd1603cd8444ee86828fc8c708e131df",
+      "size": 1766
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cross_entropy_loss_fusion/golden_values_dev_ppu.json": {
+      "sha256": "51599dd37054aa5bccef59a6dfdcd279766c94b0c8a312e8222472f7aad49b13",
+      "size": 7835
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_cross_entropy_loss_fusion/model_config.yaml": {
+      "sha256": "ed8ce649beef4cd032e9531c6a019805a93c7fe3dde6c07dbfb6fcdb457b5dbd",
+      "size": 1621
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_mla/golden_values_dev_ppu.json": {
+      "sha256": "3abe58eaddcf57fa922f24018d2a9abb249042975ddb7ebd596d37e96ce302cd",
+      "size": 8032
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_mla/golden_values_dev_ppu_2nd.json": {
+      "sha256": "b16455d960a2e694557fd4ce3568db538754bbf181dcbdfe55f70ddf0ad72b91",
+      "size": 7463
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_mla/model_config.yaml": {
+      "sha256": "c080cd896710d152920254c4f849aabad9ecca2d68bb95402a1278e104fe8698",
+      "size": 1839
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist/golden_values_dev_ppu.json": {
+      "sha256": "2a5665252f7c929f8b3e0abfa21e6292fec47299f8c5890fa5612f00c65100e3",
+      "size": 14999
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist/golden_values_dev_ppu_2nd.json": {
+      "sha256": "d06463487e70e8fc876451e5e864e0880c873c652b76225c06971855b85fe85a",
+      "size": 14060
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist/model_config.yaml": {
+      "sha256": "9abf4b944fa38c9b2928e619a43f190b6b89759c825defcb26577211f496b35b",
+      "size": 1741
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic/golden_values_dev_ppu.json": {
+      "sha256": "cdc1a5f9bd274f1ea4051faf2911eb0d4fa964652190fa7b6c9b259713972ac2",
+      "size": 14831
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic/golden_values_dev_ppu_2nd.json": {
+      "sha256": "6d6479543bc92bd64b3b2b69516265439b8e2125f4e06a354295269c921b0620",
+      "size": 14002
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic/model_config.yaml": {
+      "sha256": "1eff72aec5106a5a070a126f18590b02db92f34e194c20bffacb2afdba5cac34",
+      "size": 1796
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist_cross_entropy_loss_fusion/golden_values_dev_ppu.json": {
+      "sha256": "80a143838ebcba1d9dfec80d0d70a436f4b098a7872ebc7379ffd52188fbdb0f",
+      "size": 14999
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist_cross_entropy_loss_fusion/golden_values_dev_ppu_2nd.json": {
+      "sha256": "9896c88c00203dfdbe09f9e5e860cde272fc88133b655f8245c65c49a2aafe8a",
+      "size": 14054
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist_cross_entropy_loss_fusion/model_config.yaml": {
+      "sha256": "d7dae8a2594e616fe73fea57288d22d95a562a9b6b47f3c2148914ba77fd98ff",
+      "size": 1712
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist_ddp_average_in_collective/golden_values_dev_ppu.json": {
+      "sha256": "ade8fc4f8446ed7e1ef14ff6130af9755a360feaf69e6a22c43b2a8cfe46b4d6",
+      "size": 14996
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist_ddp_average_in_collective/golden_values_dev_ppu_2nd.json": {
+      "sha256": "42fc8d0edfd4510c78dbda50db0bb6f2e467b6f20ffddebdaebf25415ed0f741",
+      "size": 14059
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist_ddp_average_in_collective/model_config.yaml": {
+      "sha256": "440398a4d43180e48cd0b26dcc426056aa1c3151b448f4921452c19a32b97e76",
+      "size": 1750
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist_defer_embedding_wgrad_compute/golden_values_dev_ppu.json": {
+      "sha256": "98ca1fbe20f2e519b131b84a6160bfebe93f92e41cf5f7741a7101cc55110a50",
+      "size": 14802
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist_defer_embedding_wgrad_compute/golden_values_dev_ppu_2nd.json": {
+      "sha256": "fae7d82b228884470cbcffe89b75d75d1db7a1745843e40043723e72c48ae802",
+      "size": 13959
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist_defer_embedding_wgrad_compute/model_config.yaml": {
+      "sha256": "7c3f0de3fd525442648c8f38a7c70bbafc6961c85079a50a785878b0da92006f",
+      "size": 1740
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist_reshard_1x4xNone/golden_values_dev_ppu.json": {
+      "sha256": "7979df375fd38bc5bec9400e53cec297b97a909e6a643116fb8852612a416346",
+      "size": 15002
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist_reshard_1x4xNone/golden_values_dev_ppu_2nd.json": {
+      "sha256": "3a0b23c056f5abb12f6bb8a102e4716809fd6ba501fc55fc246601dd544dd98b",
+      "size": 14053
+    },
+    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist_reshard_1x4xNone/model_config.yaml": {
+      "sha256": "022d9676f2bc95f313459b9e5c3dd9ac782c698b944ba4add290843794526e47",
+      "size": 1703
+    },
+    "gpt/gpt3_mcore_te_tp2_zp_z3_resume_fsdp_dtensor/golden_values_dev_ppu.json": {
+      "sha256": "380a9d25e3cc9d43e86d1bc68f78afaf9f1b2ae3b5c98d2eab06d71397f6c51d",
+      "size": 14998
+    },
+    "gpt/gpt3_mcore_te_tp2_zp_z3_resume_fsdp_dtensor/model_config.yaml": {
+      "sha256": "ee8bfb3bcf6aa89ea5f187b58945fb71be4e870b447a7bb0a81572d11fd7c507",
+      "size": 1847
+    },
+    "gpt/gpt3_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather/golden_values_dev_ppu.json": {
+      "sha256": "ae3eed396594e0fcdd7194db9ca945738d1f62a22b898e5e9fdd8e3ded4a82ce",
+      "size": 7826
+    },
+    "gpt/gpt3_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather/model_config.yaml": {
+      "sha256": "12bd95a1dbc3420f9f8f25d89806f80fbd673305bb0694d2ba600a0a7c6068a0",
+      "size": 1795
+    },
+    "gpt/gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce/golden_values_dev_ppu.json": {
+      "sha256": "b97ddd89f715a67f9ccb2b1fc4800d400de37a755c3124cd8d32460ed0cd1f87",
+      "size": 14994
+    },
+    "gpt/gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce/golden_values_dev_ppu_2nd.json": {
+      "sha256": "0b52975bc5e5ddabe997ae87381f6da035f78cd00bffa40e556ff21cb056705d",
+      "size": 14053
+    },
+    "gpt/gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce/model_config.yaml": {
+      "sha256": "e1142adb8b8271321002aad662e269f32c082d7640220b26193e172315955120",
+      "size": 1780
+    },
+    "gpt/gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather/golden_values_dev_ppu.json": {
+      "sha256": "409f54d3a0d3c3ff0c34e6a88e3b30b94ffc2cbf36c7113b00aa06ed59313340",
+      "size": 14988
+    },
+    "gpt/gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather/golden_values_dev_ppu_2nd.json": {
+      "sha256": "b6b11316e5d1047f5b2a83a54a1686d41b4bbaec6177a352656fa8dfacf10518",
+      "size": 14058
+    },
+    "gpt/gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather/model_config.yaml": {
+      "sha256": "54334592c42be801643fb0334b6d3c6253a081afb09fe1e97391d6355939fe1e",
+      "size": 1977
+    },
+    "gpt/gpt3_mcore_te_tp4_pp1_resume_torch_dist_qk_layernorm_test_mode/golden_values_dev_ppu.json": {
+      "sha256": "34db37969157812f827fd2c87ef3b185a4899154f99d25369ff882da58c46a8a",
+      "size": 15002
+    },
+    "gpt/gpt3_mcore_te_tp4_pp1_resume_torch_dist_qk_layernorm_test_mode/golden_values_dev_ppu_2nd.json": {
+      "sha256": "b7d1cd4bf58cd9b5bb34bb220745ab9a7aa941ef2a97fd85848614be79d28c51",
+      "size": 14062
+    },
+    "gpt/gpt3_mcore_te_tp4_pp1_resume_torch_dist_qk_layernorm_test_mode/model_config.yaml": {
+      "sha256": "cd5d6bb93394dee541db92f1561e1a6e2c871137101005875fadb913ec95103c",
+      "size": 1757
+    },
+    "gpt/gpt3_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone/golden_values_dev_ppu.json": {
+      "sha256": "d1c0aed7d9497cfc35000da3884e87dedd2c3973a6d987af563f1a96d16cc67f",
+      "size": 14899
+    },
+    "gpt/gpt3_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone/golden_values_dev_ppu_2nd.json": {
+      "sha256": "0189f0a01e76194350952e46d2ebed8100cb24e2a860523cc70bae4007ce8f4b",
+      "size": 14017
+    },
+    "gpt/gpt3_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone/model_config.yaml": {
+      "sha256": "1646d16deb3bf977c689c4b54fa252a4d599017b4eb6bdd319e904f367afcdd5",
+      "size": 1747
+    },
+    "gpt/gpt3_mcore_tp1_pp2/golden_values_dev_ppu.json": {
+      "sha256": "da7002c26ec03597761a1ff39e4799fc5ad89b530dc9d62511342bf8641cb843",
+      "size": 7829
+    },
+    "gpt/gpt3_mcore_tp1_pp2/model_config.yaml": {
+      "sha256": "2046615b1d23fb3c1c8c0e8a738a57f00f59bcf3f61b665fe1014695cfff6114",
+      "size": 1702
+    },
+    "gpt/gpt3_mcore_tp1_pp4/golden_values_dev_ppu.json": {
+      "sha256": "a289a96fdbe94a11413c28abb14008ee7c21f4acd256618d5997a06b0655608f",
+      "size": 7833
+    },
+    "gpt/gpt3_mcore_tp1_pp4/model_config.yaml": {
+      "sha256": "8acb87a097bbbf29ce216a3c41bf7a4411b1409ea807a81325905f97be983d5a",
+      "size": 1702
+    },
+    "gpt/gpt3_weekly_mcore_tp4_cp2_current_scaling_native_fp8_tp_sp_cp_tp_overlap/golden_values_dev_ppu.json": {
+      "sha256": "e534896912cdf1bed107ee07d76634b02a1eced36020849b0dbc20b036b3b65f",
+      "size": 294932
+    },
+    "gpt/gpt3_weekly_mcore_tp4_cp2_current_scaling_native_fp8_tp_sp_cp_tp_overlap/model_config.yaml": {
+      "sha256": "c5f717845232767f0db1be40fb2585dc7934f948af16259603e8638d489f8996",
+      "size": 1848
+    },
+    "hybrid/hybrid_flextron_nightly_tp2_pp1_ep2_dgx_h100_1N8G/golden_values_dev_ppu.json": {
+      "sha256": "ee1be0a3ff8fa142dfe4734dd340089b05b9ae414bb1df9c2e1547260b3663ed",
+      "size": 3601
+    },
+    "hybrid/hybrid_flextron_nightly_tp2_pp1_ep2_dgx_h100_1N8G/model_config.yaml": {
+      "sha256": "9cf360ff9f8106b08cb8a3562261c4d5f0bf54acef6ee6e806f005365144a98e",
+      "size": 4725
+    },
+    "hybrid/hybrid_mr_mcore_te_tp1_pp1_cp1_dgx_a100_1N8G/golden_values_dev_ppu.json": {
+      "sha256": "3e5a067b2a7c6fc8952976f9585383d3a83f9718f139670c42c6d95086d7dd38",
+      "size": 7963
+    },
+    "hybrid/hybrid_mr_mcore_te_tp1_pp1_cp1_dgx_a100_1N8G/model_config.yaml": {
+      "sha256": "89c00ffd3980427a038dca97b069bcfa9f645830854035f1c11f93bd0ec1f4cd",
+      "size": 1970
+    },
+    "hybrid/hybrid_mr_mcore_te_tp1_pp2_vpp2_cp1_dgx_a100_1N8G/golden_values_dev_ppu.json": {
+      "sha256": "d5ec87d9fe1b961f5f92170dfb6ab134c23e222e7ead239466ff0f50517a12a0",
+      "size": 7919
+    },
+    "hybrid/hybrid_mr_mcore_te_tp1_pp2_vpp2_cp1_dgx_a100_1N8G/model_config.yaml": {
+      "sha256": "e5ad96ced07c2d882a7e9cdd5c71e6e9fe21d5cfaa89ac85d43957b4d45582e9",
+      "size": 2017
+    },
+    "hybrid/hybrid_mr_mcore_te_tp1_pp4_cp1_dgx_a100_1N8G/golden_values_dev_ppu.json": {
+      "sha256": "46e91d481338eee9d9dad82a126676649f1504299d75483d1936944ac3207ed3",
+      "size": 7913
+    },
+    "hybrid/hybrid_mr_mcore_te_tp1_pp4_cp1_dgx_a100_1N8G/model_config.yaml": {
+      "sha256": "07a8f35985003816b543733ea071baab718c93d45965d004ed2837371ae7ea01",
+      "size": 2043
+    },
+    "hybrid/hybrid_mr_mcore_te_tp2_pp1_cp1_dgx_a100_1N8G/golden_values_dev_ppu.json": {
+      "sha256": "0a674bb2eb69e88f4549740b068004fb4ac70b8ed5ed4db89431e2c18b6bc188",
+      "size": 7916
+    },
+    "hybrid/hybrid_mr_mcore_te_tp2_pp1_cp1_dgx_a100_1N8G/model_config.yaml": {
+      "sha256": "278a0a0213c5a678bc057d6775ea6a85c381c2b6f09418b88fbc79fe8630c9d2",
+      "size": 1912
+    },
+    "hybrid/hybrid_mr_mcore_te_tp2_pp1_cp4_dgx_a100_1N8G/golden_values_dev_ppu.json": {
+      "sha256": "20401b43b47d1c72bd4092310ac390fe47908f8db4db99f4ce521f2dcc7cf955",
+      "size": 7869
+    },
+    "hybrid/hybrid_mr_mcore_te_tp2_pp1_cp4_dgx_a100_1N8G/model_config.yaml": {
+      "sha256": "cf9b17fad1882496242d050951a7d58d6915e17e959ff067f9d3a9f0dd33aba9",
+      "size": 2041
+    },
+    "moe/gpt3_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic/golden_values_dev_ppu.json": {
+      "sha256": "6742c10ae1b18be74b2a86e4f5587206035b4936f383cd133dbed103d08da22d",
+      "size": 7881
+    },
+    "moe/gpt3_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic/model_config.yaml": {
+      "sha256": "41b249a89cd5ab579bd9014d4da46c3b57c4baf5ee65edf995402a08f1541a62",
+      "size": 1886
+    },
+    "moe/gpt3_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic_dp_last/golden_values_dev_ppu.json": {
+      "sha256": "e2bd9eac4ec09c91eaa75f0a5d301ea220828075914b7c604ac6bce7914ad040",
+      "size": 7884
+    },
+    "moe/gpt3_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic_dp_last/model_config.yaml": {
+      "sha256": "7d01b1401e7aac7e202544a3c5f088c4eeb13cdab11e6c7fea2524ff58af98b2",
+      "size": 1961
+    },
+    "moe/gpt3_mcore_te_tp1_pp1_te_4experts_groupedGEMM_op_fuser/golden_values_dev_ppu.json": {
+      "sha256": "0836e1ef399f6373b5a49bb0e9db03f5175824a49aea140a3e4d04b3c74b056d",
+      "size": 7880
+    },
+    "moe/gpt3_mcore_te_tp1_pp1_te_4experts_groupedGEMM_op_fuser/model_config.yaml": {
+      "sha256": "69422c0200621becfaec0847d176b07e4deba40625f21adc006b0772784e5c01",
+      "size": 2131
+    },
+    "moe/gpt3_mcore_te_tp1_pp2_resume_torch_dist_reshard_2x1x4_te_8experts2parallel_dist_optimizer/golden_values_dev_ppu.json": {
+      "sha256": "5d8b4761ecf48dde75287d8e09d1873cc5064fb75cf0ed6fcb09373d869b6549",
+      "size": 15112
+    },
+    "moe/gpt3_mcore_te_tp1_pp2_resume_torch_dist_reshard_2x1x4_te_8experts2parallel_dist_optimizer/golden_values_dev_ppu_2nd.json": {
+      "sha256": "ac666d1c852015262f100058b00671c65a951ca37d5ef7eaddc2dae5ea95501d",
+      "size": 14115
+    },
+    "moe/gpt3_mcore_te_tp1_pp2_resume_torch_dist_reshard_2x1x4_te_8experts2parallel_dist_optimizer/model_config.yaml": {
+      "sha256": "be78cda39009462aaae715cb0e53fceac083b9b89adfe281acf90839cec81862",
+      "size": 1938
+    },
+    "moe/gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer/golden_values_dev_ppu.json": {
+      "sha256": "7b688f0b0aaf517ef97c6b467e42943729f054d32152d0366d3dfefb0214984a",
+      "size": 15101
+    },
+    "moe/gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer/golden_values_dev_ppu_2nd.json": {
+      "sha256": "93335a8ae25bfb8a19ddd579602a7963fed39fd1575ff46bb04d8ce803f644c8",
+      "size": 14114
+    },
+    "moe/gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer/model_config.yaml": {
+      "sha256": "e0c2880cdac96f730f8f5ce93050f0db53afb31ac909514a1a08d1c07c62758b",
+      "size": 2106
+    },
+    "moe/gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_multi_dist_optimizer_instances/golden_values_dev_ppu.json": {
+      "sha256": "5110eb86c572d55d8a1e96875352e07ffb2f5995b2b0514eb8f6c2df231d2cc5",
+      "size": 15208
+    },
+    "moe/gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_multi_dist_optimizer_instances/golden_values_dev_ppu_2nd.json": {
+      "sha256": "828e837a49dd04c9a44e42a825b4133c81920cb2dfb43bf44596054c550e6688",
+      "size": 14162
+    },
+    "moe/gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_multi_dist_optimizer_instances/model_config.yaml": {
+      "sha256": "2314a608b316115777f728ed7dd93b6c0c54282e3516fcf3d0e7f73cccc7bff0",
+      "size": 2100
+    },
+    "moe/gpt3_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective/golden_values_dev_ppu.json": {
+      "sha256": "30020050fff958785a1e80482520eb0bdb6d7b885fab649edb5c50f9a25d3416",
+      "size": 7877
+    },
+    "moe/gpt3_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective/model_config.yaml": {
+      "sha256": "98c269556d50641ee5d203c2523607fcd8310572a21454153b3d3782cc9804ed",
+      "size": 2069
+    },
+    "moe/gpt3_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM/golden_values_dev_ppu.json": {
+      "sha256": "b6bc0cd74f22a5bb7375e8b3141f206866d1f4ad51dc15fee8e37e5b0cdb3122",
+      "size": 7882
+    },
+    "moe/gpt3_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM/model_config.yaml": {
+      "sha256": "98c269556d50641ee5d203c2523607fcd8310572a21454153b3d3782cc9804ed",
+      "size": 2069
+    },
+    "moe/gpt3_mcore_te_tp2_pp1_te_a2a_ovlp_8experts_etp1_ep4/golden_values_dev_ppu.json": {
+      "sha256": "a09e7aed23699f84c52c53b464c37a1c38ec9c8ea38e96a5b5dd4ce900085dc3",
+      "size": 7934
+    },
+    "moe/gpt3_mcore_te_tp2_pp1_te_a2a_ovlp_8experts_etp1_ep4/model_config.yaml": {
+      "sha256": "4b95acf7664c804f873539216ecacf7fd35236227ba51c8ef099c2e062cfdd8a",
+      "size": 2118
+    },
+    "moe/gpt3_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel/golden_values_dev_ppu.json": {
+      "sha256": "36947065fd4720b32ce5c45c96a23e840b1d1dc63025c1bd909ddd4394108144",
+      "size": 7829
+    },
+    "moe/gpt3_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel/model_config.yaml": {
+      "sha256": "555c065b54dbaa5bfa55669257c8b4c719d927e7e8bc92b3ab694b8149b07878",
+      "size": 1942
+    },
+    "moe/gpt3_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel_dp_last/golden_values_dev_ppu.json": {
+      "sha256": "67bfd638b1cfc504de3a65ac387ebc201757800b30d78dedf9a6f3644a81cbdf",
+      "size": 7829
+    },
+    "moe/gpt3_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel_dp_last/model_config.yaml": {
+      "sha256": "f96940d49db363e947e5987e0620475f0e3c68dd90e5406e7387095012e07eaf",
+      "size": 1929
+    },
+    "moe/gpt3_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel/golden_values_dev_ppu.json": {
+      "sha256": "d37e82f650caed59b575be771ef61cb2aed703c4418ed7afd07c2b3544286d91",
+      "size": 7833
+    },
+    "moe/gpt3_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel/model_config.yaml": {
+      "sha256": "6c1fdd21278851e5badcdc0826beba8e73f9b572b12e2d4cd0d282aedb6f016c",
+      "size": 1893
+    },
+    "moe/gpt3_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel_dp_last/golden_values_dev_ppu.json": {
+      "sha256": "ebdacc0d6251daeddb57904331be81339c03221709bbc703ba0063af37b4826b",
+      "size": 7835
+    },
+    "moe/gpt3_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel_dp_last/model_config.yaml": {
+      "sha256": "af60fe9f91a417ff788b3ce43b8c04b2af9fc637fe988e192588a6067164b8a7",
+      "size": 1924
+    },
+    "moe/gpt3_mcore_tp2_pp2_ep2_te_4experts2parallel/golden_values_dev_ppu.json": {
+      "sha256": "8af691c50b2acd69d4dcf01e48b2768e714e3736b83b2f7197b27775b2e3c7f8",
+      "size": 7885
+    },
+    "moe/gpt3_mcore_tp2_pp2_ep2_te_4experts2parallel/model_config.yaml": {
+      "sha256": "e3ece9845ac5b04eeb931aa422a61722993563e32efc06e443a2ee1b27ac9f00",
+      "size": 1902
+    },
+    "moe/gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_muon/golden_values_dev_ppu.json": {
+      "sha256": "6314b7e76542f8f9f09a078972add29854d9530663c33cf93d8ba49adba96d60",
+      "size": 15033
+    },
+    "moe/gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_muon/golden_values_dev_ppu_2nd.json": {
+      "sha256": "f9045830be61da8b9848c802f45d9fe2acb6ed3b0a4dff38d09c53cad90b6d04",
+      "size": 14092
+    },
+    "moe/gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_muon/model_config.yaml": {
+      "sha256": "1682376e3cc221d42616cf6e67507c76a0cfabf603ee04df78f45260b6e10aa8",
+      "size": 2164
+    },
+    "moe/gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_optimizer/golden_values_dev_ppu.json": {
+      "sha256": "064861bcbcdc8c2cebc1a5aa54e0ad0dfbb326efbb677ece28a09014773c11d3",
+      "size": 15030
+    },
+    "moe/gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_optimizer/golden_values_dev_ppu_2nd.json": {
+      "sha256": "9674340ef239b8e6c7be473c8a5b4f0990949778b6b62edc47f124e95c7f2f24",
+      "size": 14093
+    },
+    "moe/gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_optimizer/model_config.yaml": {
+      "sha256": "78524f80f69c26746e7c222c875b6b9e3f1b5f41456a15e573c724f367be81fe",
+      "size": 2084
+    },
+    "moe/gpt3_moe_mcore_te_ep8_resume_torch_dist_muon/golden_values_dev_ppu.json": {
+      "sha256": "ebae517ab2e6a01b354985a4df3cdbf26c5c1bd5b31bd110181c5749853d5c19",
+      "size": 15034
+    },
+    "moe/gpt3_moe_mcore_te_ep8_resume_torch_dist_muon/golden_values_dev_ppu_2nd.json": {
+      "sha256": "9fa489bdecadf66da0ff9078c2bbd964c2a74d56061d89e27dce95a567c4fc8d",
+      "size": 14090
+    },
+    "moe/gpt3_moe_mcore_te_ep8_resume_torch_dist_muon/model_config.yaml": {
+      "sha256": "60b10b999da7a63f5c12e6148aae2da3b2f3d35affea9050927a5ae19325c556",
+      "size": 2181
+    },
+    "moe/gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer/golden_values_dev_ppu.json": {
+      "sha256": "924344371aeecfd0a3d3f25577a8a1f4bbaea5854bf95ab5f022ef7d4981566c",
+      "size": 15067
+    },
+    "moe/gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer/golden_values_dev_ppu_2nd.json": {
+      "sha256": "410abd4cf6dcc51f27dda3e7008abec57283c0119bdea07c9cfbe3dde4cb87ca",
+      "size": 14078
+    },
+    "moe/gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer/model_config.yaml": {
+      "sha256": "dbad588146e31d56105bacbbd7a483b4804c87a85f6324ca6cd4940e3b651890",
+      "size": 2220
+    },
+    "multimodal-llava/multimodal_llava_mcore_te_tp1_pp1/golden_values_dev_ppu.json": {
+      "sha256": "f83d53eea3369de1e51f4b6e8f39922b8501036f508f4657e866347c9ee3425c",
+      "size": 8036
+    },
+    "multimodal-llava/multimodal_llava_mcore_te_tp1_pp1/model_config.yaml": {
+      "sha256": "27d4db2ae321ec89ecc1f2e6c26a0828821a274ae84012e3aaed11bfd1a47939",
+      "size": 1392
+    },
+    "multimodal-llava/multimodal_llava_mcore_te_tp4_sp_cp2/golden_values_dev_ppu.json": {
+      "sha256": "2cecf830bcff34147c82e8dd2ffabb3379398d5df9598f61b746c1eea85640b9",
+      "size": 7984
+    },
+    "multimodal-llava/multimodal_llava_mcore_te_tp4_sp_cp2/model_config.yaml": {
+      "sha256": "2f2aa79fe596cb9ce84cf3a239e3f1576b11f46baae46c9556b14b2bfb9a7f84",
+      "size": 1582
+    },
+    "t5/t5_11b_mcore_tp4_pp1/golden_values_dev_ppu.json": {
+      "sha256": "9d7307b68c12c36bf82121ebcab9858e50e54b9a7af7f055fd00fd2b245d55b4",
+      "size": 4348
+    },
+    "t5/t5_11b_mcore_tp4_pp1/model_config.yaml": {
+      "sha256": "f1cdc1402e8cd12a89b760ad2eebf6a21818f3a602d2dcec0c1cb7b570811e9e",
+      "size": 1697
+    },
+    "t5/t5_mcore_te_tp1_pp1_vp1_resume_torch/golden_values_dev_ppu.json": {
+      "sha256": "aea79c8de285448a0fe86e49ed4b7d2b60a188e45f1802d8154e1fd56a77ecad",
+      "size": 15133
+    },
+    "t5/t5_mcore_te_tp1_pp1_vp1_resume_torch/golden_values_dev_ppu_2nd.json": {
+      "sha256": "85bef7695abbca2d208f7b11880771b6d91f43121c5af247498a5d24da08e2d9",
+      "size": 14141
+    },
+    "t5/t5_mcore_te_tp1_pp1_vp1_resume_torch/model_config.yaml": {
+      "sha256": "eaf6b46d22b929ad7009b3af90463e18e11fb69ea761b61842a3c40d5833cac7",
+      "size": 2073
+    },
+    "t5/t5_mcore_te_tp2_pp1_vp1/golden_values_dev_ppu.json": {
+      "sha256": "696118921c77c1daaa37f44a06f3e62ae49def533ec28fcd1e17e274615d2ed0",
+      "size": 15134
+    },
+    "t5/t5_mcore_te_tp2_pp1_vp1/model_config.yaml": {
+      "sha256": "5fc0edb4d0a753594715537c4ea66b80c39b2ecd87d0a077886d8f522b7e338d",
+      "size": 1664
+    },
+    "t5/t5_mcore_te_tp2_pp1_vp1_sequence_parallel/golden_values_dev_ppu.json": {
+      "sha256": "0e3169b6ea804aa6e1ad0c764de0bc3dcac767e4501b48cd7ae16e731e0e6fc2",
+      "size": 15133
+    },
+    "t5/t5_mcore_te_tp2_pp1_vp1_sequence_parallel/model_config.yaml": {
+      "sha256": "0decb4503d0bfa7a5654c48b10c784c872996ec7359f060a20d861a1be4374f9",
+      "size": 1692
+    },
+    "t5/t5_mcore_te_tp4_pp1/golden_values_dev_ppu.json": {
+      "sha256": "e21df6461b81e8f2aa7ea40484797452975a693852128a5f929d1908357f3d3d",
+      "size": 15140
+    },
+    "t5/t5_mcore_te_tp4_pp1/model_config.yaml": {
+      "sha256": "6a25290eb928993f1a04b6fd22d52ba09b24763b86b734493dbfed0429d0a160",
+      "size": 1707
+    },
+    "t5/t5_mcore_te_tp4_pp1_resume_torch_dist/golden_values_dev_ppu.json": {
+      "sha256": "d2b339760375c863054e7b31f1f58c3df2785cfafea58f119b375ee38267a4e1",
+      "size": 15139
+    },
+    "t5/t5_mcore_te_tp4_pp1_resume_torch_dist/golden_values_dev_ppu_2nd.json": {
+      "sha256": "df28979e6f285b2effb3bc18adcc5aa5f1349ad3b0886c78d3eca61d0a1b62a4",
+      "size": 14143
+    },
+    "t5/t5_mcore_te_tp4_pp1_resume_torch_dist/model_config.yaml": {
+      "sha256": "82fda818bbe2557c3a10d45456b6ee6302f9b1fb8ed862ea454f1d3754072b7d",
+      "size": 1708
+    },
+    "t5/t5_mcore_tp1_pp1_vp1/golden_values_dev_ppu.json": {
+      "sha256": "d04d52be5a9ebfcd2c4d5ca73cab26ed267c7889849fcf14800c2b7ecfc70c03",
+      "size": 15138
+    },
+    "t5/t5_mcore_tp1_pp1_vp1/model_config.yaml": {
+      "sha256": "c3da445458e25f63e3e5b322abd3a70c3fddc8cf2e3b94b13688fc412039c81e",
+      "size": 1992
+    },
+    "t5/t5_mcore_tp1_pp1_vp1_resume_torch/golden_values_dev_ppu.json": {
+      "sha256": "01383fb2422588f4b9e914f92579fdca70334edf2c256d60b93342bd4a2a91c5",
+      "size": 15135
+    },
+    "t5/t5_mcore_tp1_pp1_vp1_resume_torch/golden_values_dev_ppu_2nd.json": {
+      "sha256": "ee04a58c1038e03343602b19f3b0c954f05d30496d19de96cabeba190e701d18",
+      "size": 14142
+    },
+    "t5/t5_mcore_tp1_pp1_vp1_resume_torch/model_config.yaml": {
+      "sha256": "ce9953a3519f180a9befcb7f312f437c9c155729aa5c9252e22d8d75ff4776c5",
+      "size": 1993
+    },
+    "t5/t5_mcore_tp2_pp1_vp1/golden_values_dev_ppu.json": {
+      "sha256": "c8d330e6f3c42d3f1c48a83d2eab7f31c6e29861158cba4585daf01e5f71c0c5",
+      "size": 15132
+    },
+    "t5/t5_mcore_tp2_pp1_vp1/model_config.yaml": {
+      "sha256": "056e1194afe62bc8d991d54f702eaf4be01d98a1f85e5aeef47ab066ee71bbd2",
+      "size": 1584
+    },
+    "t5/t5_mcore_tp4_pp1/golden_values_dev_ppu.json": {
+      "sha256": "cad702b53028408a33a5123208ce51dc8c1f11da5b3f741f9bcb80b7056f6f74",
+      "size": 15131
+    },
+    "t5/t5_mcore_tp4_pp1/model_config.yaml": {
+      "sha256": "df6c2e478ca3a07bf985a5e9e02e00c4e94b8c12dd45f182b798d54f57b362f0",
+      "size": 1663
+    },
+    "t5/t5_mcore_tp4_pp1_resume_torch_dist/golden_values_dev_ppu.json": {
+      "sha256": "e6efe4276ac6140e6c6e1b82cd5305796c4fc5835364f1f1fe5af279174bbee7",
+      "size": 15125
+    },
+    "t5/t5_mcore_tp4_pp1_resume_torch_dist/golden_values_dev_ppu_2nd.json": {
+      "sha256": "71248f2dd7c0dc34209ab83397e26390093d4f195e0259178a50c5ded5c77cef",
+      "size": 14136
+    },
+    "t5/t5_mcore_tp4_pp1_resume_torch_dist/model_config.yaml": {
+      "sha256": "aa0031cc270df1d2f78d0c9b5199cd5e5015b250d5f2d72b0abaa2700ae3ae95",
+      "size": 1664
+    }
+  },
+  "schema_version": 1
+}

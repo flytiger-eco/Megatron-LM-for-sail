@@ -11,6 +11,33 @@ on:
     branches: [ci/ppu-validation]
   workflow_dispatch:
     inputs:
+      test_kind:
+        description: Unit tests or independent manual PPU functional validation
+        type: choice
+        options: [unit, functional]
+        default: unit
+      functional_mode:
+        description: Read-only CPU asset preflight or explicitly requested PPU regression
+        type: choice
+        options: [assets, regression]
+        default: assets
+      functional_scope:
+        description: Exact upstream DEV tier, or the deduplicated active L0-L3 union
+        type: choice
+        options: [all, L0, L1, L2, L3]
+        default: all
+      functional_cases:
+        description: all or comma-separated complete model/case identifiers
+        type: string
+        default: all
+      functional_repeat:
+        description: Independent repetitions per numeric case (1-10)
+        type: number
+        default: 5
+      functional_timeout:
+        description: Total training minutes per case including repeats and retries (1-1380)
+        type: number
+        default: 30
       scope:
         description: auto follows the validated policy; full uses a 90% gate; candidate quick uses a 100% gate for non-PR manual validation
         type: choice
@@ -97,7 +124,7 @@ jobs:
         run: |
           python3 -I control/.github/scripts/ppu_pr_authorize.py authorize
           mkdir -p .ppu-ci/control
-          cp control/.github/scripts/ppu_pr_authorize.py .ppu-ci/control/
+          cp control/.github/scripts/{ppu_pr_authorize.py,ppu_functional.py} .ppu-ci/control/
       - uses: actions/upload-artifact@v4
         with:
           name: ppu-authorization

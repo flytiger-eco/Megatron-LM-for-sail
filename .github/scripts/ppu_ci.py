@@ -749,6 +749,22 @@ def bundle_inventory(directory: Path) -> dict:
     ):
         if name not in inventory or inventory[name]["size"] == 0:
             raise ValueError(f"Missing or empty build artifact: {name}")
+    manifest = json.loads((directory / "manifest.json").read_text())
+    if manifest.get("test_kind") == "functional":
+        required = [
+            "functional-tools/yq",
+            "functional-tools/envsubst",
+            "functional-environment.json",
+            "installed-packages.json",
+            "control/ppu_functional_run.sh",
+        ]
+        required += [
+            f"control/ppu_functional{suffix}.py"
+            for suffix in ("", "_results", "_runtime", "_environment", "_pytest", "_snapshot")
+        ]
+        for name in required:
+            if name not in inventory or inventory[name]["size"] == 0:
+                raise ValueError(f"Missing or empty functional build artifact: {name}")
     return inventory
 
 
