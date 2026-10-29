@@ -52,6 +52,11 @@ def test_hard_failure_wins_over_communication_error(message):
     assert results.classify_failure(1, f"DistNetworkError\n{message}") == "hard_failure"
 
 
+@pytest.mark.parametrize("code", [139, -11])
+def test_sigsegv_exit_without_error_text_is_never_retryable(code):
+    assert results.classify_failure(code, "DistNetworkError") == "hard_failure"
+
+
 @pytest.mark.parametrize("code", [130, 137, 143, -2, -9, -15])
 def test_cancellation_is_not_retryable(code):
     assert results.classify_failure(code, "DistNetworkError") == "cancelled"
@@ -286,6 +291,14 @@ def failed_repeat(manifest, case, directory, attempt=1, message="DistNetworkErro
     (path / "driver.log").write_text(message)
     (path / "barriers/repeat_1_run_1_status/node_0").write_text("1\n")
     return path
+
+
+def test_training_sigsegv_status_wins_over_generic_shell_exit(evidence):
+    manifest, case, directory = evidence
+    path = failed_repeat(manifest, case, directory)
+    (path / "barriers/repeat_1_run_1_status/node_0").write_text("139\n")
+    result = results.verify_repeat(manifest, ROOT, case, path, 1, 1)
+    assert result["classification"] == "hard_failure"
 
 
 def test_retry_requires_entire_new_successful_attempt(evidence):

@@ -49,7 +49,9 @@ def classify_failure(
         return "budget_exhausted"
     if integrity_error:
         return "integrity_error"
-    if any(re.search(pattern, text, re.IGNORECASE) for pattern in HARD_FAILURES):
+    if exit_code in (139, -11) or any(
+        re.search(pattern, text, re.IGNORECASE) for pattern in HARD_FAILURES
+    ):
         return "hard_failure"
     if exit_code == 0:
         return "passed"
@@ -211,6 +213,8 @@ def verify_repeat(
         cancelled=execution["cancelled"],
         timed_out=execution["timed_out"],
     )
+    if classification in ("passed", "infrastructure_retryable") and 139 in statuses.values():
+        classification = "hard_failure"
     if classification != "passed":
         if classification == "infrastructure_retryable" and not statuses:
             classification = "integrity_error"
