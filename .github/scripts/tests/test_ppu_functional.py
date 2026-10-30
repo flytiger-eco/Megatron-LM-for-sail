@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPTS = ROOT / ".github/scripts"
@@ -176,6 +177,72 @@ def test_catalogue_real_upstream_intersection(catalogue):
     assert any(row["test_type"] == "regular" and "resume" in row["name"] for row in cases)
     assert any(row["launcher"] == "ft_launcher" for row in cases)
     assert any(row["training_script"].endswith("pretrain_hybrid_flex.py") for row in cases)
+
+
+@pytest.mark.parametrize("async_save", [True, False, "true", "false"])
+@pytest.mark.parametrize("strategy", [None, "nvrx", "mcore"])
+@pytest.mark.parametrize("persistent", [True, False])
+def test_checkpoint_dependencies_follow_original_flags(async_save, strategy, persistent):
+    arguments = {"--async-save": async_save, "--use-persistent-ckpt-worker": persistent}
+    if strategy is not None:
+        arguments["--async-strategy"] = strategy
+    config = {"TEST_TYPE": "regular", "MODEL_ARGS": arguments}
+    before = copy.deepcopy(config)
+    result = functional.nvrx_checkpoint_requirements(config)
+    expected = async_save in (True, "true") and strategy in (None, "nvrx")
+    assert result == (
+        [{"section": "MODEL_ARGS", "persistent_worker": persistent, "cpu_shm": False}]
+        if expected
+        else []
+    )
+    assert config == before
+
+
+@pytest.mark.parametrize("test_type", ["regular", "ckpt-resume"])
+@pytest.mark.parametrize("first_async", [True, False])
+@pytest.mark.parametrize("second_async", [True, False])
+def test_checkpoint_dependencies_cover_reshard_without_merging(
+    test_type, first_async, second_async
+):
+    config = {
+        "TEST_TYPE": test_type,
+        "MODEL_ARGS": {"--async-save": first_async, "--use-persistent-ckpt-worker": True},
+        "MODEL_ARGS_2": {"--async-save": second_async, "--async-ckpt-use-cpu-shm": True},
+    }
+    result = functional.nvrx_checkpoint_requirements(config)
+    expected = []
+    if first_async:
+        expected.append({"section": "MODEL_ARGS", "persistent_worker": True, "cpu_shm": False})
+    if test_type == "ckpt-resume" and second_async:
+        expected.append({"section": "MODEL_ARGS_2", "persistent_worker": False, "cpu_shm": True})
+    assert result == expected
+
+
+@pytest.mark.parametrize("arguments", [None, [], {"--async-strategy": "unknown"}])
+def test_invalid_checkpoint_dependency_config_is_rejected(arguments):
+    with pytest.raises(ValueError):
+        functional.nvrx_checkpoint_requirements(
+            {"TEST_TYPE": "ckpt-resume", "MODEL_ARGS": {}, "MODEL_ARGS_2": arguments}
+        )
+
+
+def test_real_torchrun_case_records_async_dependency_without_changing_baseline(catalogue):
+    case = next(
+        row
+        for row in catalogue["functional"].values()
+        if row["name"] == "gpt/gpt3_mcore_te_tp2_pp2_cp2"
+    )
+    assert case["launcher"] == "torchrun"
+    assert case["nvrx_checkpoint"] == [
+        {"section": "MODEL_ARGS", "persistent_worker": True, "cpu_shm": False}
+    ]
+    assert case["train_iters"] == 50 and case["repeat"] == 5
+    for row in catalogue["functional"].values():
+        path = ROOT / row["config_path"]
+        assert functional.sha256(path) == row["config_sha256"]
+        assert row["nvrx_checkpoint"] == functional.nvrx_checkpoint_requirements(
+            yaml.safe_load(path.read_text())
+        )
 
 
 @pytest.mark.parametrize("tier", functional.TIERS)
