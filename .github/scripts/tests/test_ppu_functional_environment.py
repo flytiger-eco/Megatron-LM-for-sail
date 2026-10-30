@@ -4,9 +4,13 @@ import ast
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
+import subprocess
 import sys
+import sysconfig
+import venv
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -164,6 +168,8 @@ def tool_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("PIP_INDEX_URL", "https://packages.invalid/simple")
     monkeypatch.setenv("NPROC_PER_NODE", "8")
     monkeypatch.setenv("NNODES", "1")
+    monkeypatch.setenv("PPU_SOURCE_ROOT", str(ROOT))
+    monkeypatch.setattr(environment, "check_postprocessing", lambda root: {"event_roundtrip": True})
     manifest = {
         "functional": {"case": {"launcher": "torchrun", "nvrx_checkpoint": []}},
         "identity": {"run_id": "123"},
@@ -260,6 +266,9 @@ def test_prepare_attests_tools_and_installs_selected_dependencies(
     )
     environment.check(bundle, manifest, bundle / "reports")
     report = json.loads((bundle / "reports/functional-environment.json").read_text())
+    assert (site / environment.NAMESPACE_PTH).read_text() == environment.NAMESPACE_BOOTSTRAP
+    assert report["postprocessing"] == {"event_roundtrip": True}
+    assert "protobuf" in report["packages"]
     assert report["identity"] == manifest["identity"] and report["devices"] == 8
     assert report["training_dependencies"]["packages"] == environment.TRAINING_PACKAGES
     assert environment.TRAINING_PACKAGES.items() <= report["packages"].items()
@@ -464,6 +473,224 @@ def test_dependency_report_preserves_actual_sources(tool_environment):
         for item in installation["install"]
         if item["metadata"]["name"] != "tensorboard"
     }
+
+
+@pytest.fixture
+def cold_postprocessing(tmp_path, monkeypatch):
+    """真实独立解释器模拟系统 legacy namespace 钩子，不借用父进程预热。"""
+    prefix = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False).create(prefix)
+    python = prefix / "bin/python"
+    site = Path(
+        subprocess.check_output(
+            [str(python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"], text=True
+        ).strip()
+    )
+    parent_site = Path(sysconfig.get_path("purelib"))
+    # 只复制 CPU protobuf；其余已安装的 CPU 测试依赖由路径提供，不执行父环境启动钩子。
+    shutil.copytree(parent_site / "google/protobuf", site / "google/protobuf")
+    system = tmp_path / "system-site"
+    (system / "google/shared_sibling").mkdir(parents=True)
+    (system / "google/shared_sibling/__init__.py").write_text("VALUE = 'retained'\n")
+    legacy = system / "google_legacy-nspkg.pth"
+    legacy.write_text(
+        "import sys, importlib.util, importlib.machinery; "
+        f"spec = importlib.machinery.PathFinder.find_spec('google', [{str(system)!r}]); "
+        "sys.modules.setdefault('google', importlib.util.module_from_spec(spec))\n"
+    )
+    legacy_bytes = legacy.read_bytes()
+    (site / "90-cpu-dependencies.pth").write_text(
+        f"{parent_site}\nimport site; site.addsitedir({str(system)!r})\n"
+    )
+    startup = site / environment.NAMESPACE_PTH
+    startup.write_text(environment.NAMESPACE_BOOTSTRAP)
+    # uv 是真实工具；没有工具时测试失败，不用 mock 或跳过来冒充启动验证。
+    uv = shutil.which("uv") or str(Path(sys.executable).parent / "uv")
+    assert Path(uv).is_file(), "CPU 冷启动回归需要安装 uv"
+    monkeypatch.setenv("PATH", str(Path(uv).parent) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
+    monkeypatch.setenv("UV_OFFLINE", "1")
+    monkeypatch.setenv("VIRTUAL_ENV", str(prefix))
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
+    monkeypatch.setattr(environment.sys, "prefix", str(prefix))
+    monkeypatch.setattr(environment.sys, "executable", str(python))
+    yield prefix, site, startup, legacy
+    assert legacy.read_bytes() == legacy_bytes
+    assert (system / "google/shared_sibling/__init__.py").read_text() == "VALUE = 'retained'\n"
+
+
+def test_real_cold_uv_imports_original_common_and_extractor(cold_postprocessing):
+    prefix, _, startup, _ = cold_postprocessing
+    report = environment.check_postprocessing(ROOT)
+    assert report["event_roundtrip"]
+    assert report["prefix"] == str(prefix)
+    assert Path(report["protobuf_path"]).is_relative_to(prefix)
+    assert report["namespace_startup_sha256"] == hashlib.sha256(startup.read_bytes()).hexdigest()
+    assert (
+        Path(report["common_path"]) == ROOT / "tests/functional_tests/python_test_utils/common.py"
+    )
+    output = subprocess.check_output(
+        [sys.executable, "-c", "import google.shared_sibling; print(google.shared_sibling.VALUE)"],
+        text=True,
+    )
+    assert output.strip() == "retained"
+
+
+def test_real_uv_extractor_reads_tensorboard_in_fresh_process(cold_postprocessing, tmp_path):
+    prefix, _, _, _ = cold_postprocessing
+    logs = tmp_path / "tensorboard"
+    actual = tmp_path / "actual.json"
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(ROOT),
+        "PYTHONSAFEPATH": "1",
+        "PYTHONNOUSERSITE": "1",
+        "UV_PROJECT_ENVIRONMENT": str(prefix),
+        "UV_PYTHON": sys.executable,
+        "UV_PYTHON_DOWNLOADS": "never",
+    }
+    command = ["uv", "run", "--no-sync", "python"]
+    writer = f'''
+from tensorboard.compat.proto.event_pb2 import Event
+from tensorboard.compat.proto.summary_pb2 import Summary
+from tensorboard.summary.writer.event_file_writer import EventFileWriter
+writer = EventFileWriter({str(logs)!r})
+for step in range(1, 6):
+    writer.add_event(Event(step=step, summary=Summary(value=[
+        Summary.Value(tag="lm loss", simple_value=1.25),
+        Summary.Value(tag="num-zeros", simple_value=0.0),
+    ])))
+writer.close()
+'''
+    subprocess.run(command + ["-c", writer], cwd=ROOT, env=env, check=True, timeout=30)
+    extractor = (
+        ROOT / "tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py"
+    )
+    subprocess.run(
+        command
+        + [
+            str(extractor),
+            "--logs-dir",
+            str(logs),
+            "--train-iters",
+            "5",
+            "--output-path",
+            str(actual),
+            "--is-normal-test",
+            "--step-size",
+            "1",
+        ],
+        cwd=ROOT,
+        env=env,
+        check=True,
+        timeout=30,
+        capture_output=True,
+    )
+    report = json.loads(actual.read_text())
+    assert set(report) == {"lm loss", "num-zeros"}
+    for metric, value in (("lm loss", 1.25), ("num-zeros", 0.0)):
+        assert report[metric]["values"] == {str(step): value for step in range(1, 6)}
+        assert report[metric]["value_precision"] == "full"
+
+
+def test_legacy_namespace_reproduces_missing_protobuf_without_bootstrap(cold_postprocessing):
+    _, _, startup, _ = cold_postprocessing
+    startup.rename(startup.with_suffix(".absent"))
+    # 必须保留 CI 的 safe-path；否则 Python 插入 cwd 会触发 namespace 重算并掩盖缺陷。
+    probe = subprocess.run(
+        [sys.executable, "-c", "from tests.functional_tests.python_test_utils import common"],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT), "PYTHONSAFEPATH": "1", "PYTHONNOUSERSITE": "1"},
+        text=True,
+        capture_output=True,
+    )
+    assert probe.returncode != 0
+    assert "No module named 'google.protobuf'" in probe.stderr
+
+
+@pytest.mark.parametrize("damage", ["missing", "changed", "protobuf", "version", "source"])
+def test_real_cold_postprocessing_rejects_damaged_environment(
+    cold_postprocessing, tmp_path, damage
+):
+    _, site, startup, _ = cold_postprocessing
+    root = ROOT
+    if damage == "missing":
+        startup.rename(startup.with_suffix(".absent"))
+    elif damage == "changed":
+        startup.write_text(environment.NAMESPACE_BOOTSTRAP + "# changed\n")
+    elif damage == "protobuf":
+        (site / "google/protobuf/__init__.py").write_text("raise ImportError('broken protobuf')\n")
+    elif damage == "version":
+        with (site / "google/protobuf/__init__.py").open("a") as stream:
+            stream.write("\n__version__ = 'wrong-version'\n")
+    else:
+        root = tmp_path / "wrong-source"
+        root.mkdir()
+    with pytest.raises((subprocess.CalledProcessError, ValueError)):
+        environment.check_postprocessing(root)
+
+
+@pytest.mark.parametrize("damage", ["prefix", "common_path", "extractor"])
+def test_postprocessing_route_identity_and_extractor_failure(monkeypatch, damage):
+    calls = []
+    report = {
+        "prefix": sys.prefix,
+        "common_path": str(ROOT / "tests/functional_tests/python_test_utils/common.py"),
+    }
+    if damage != "extractor":
+        report[damage] = "/untrusted"
+
+    def output(command, **kwargs):
+        calls.append(command)
+        assert command[:4] == ["uv", "run", "--no-sync", "python"]
+        assert kwargs["cwd"] == ROOT
+        assert kwargs["env"]["UV_PROJECT_ENVIRONMENT"] == sys.prefix
+        assert kwargs["env"]["UV_PYTHON"] == sys.executable
+        assert kwargs["env"]["UV_PYTHON_DOWNLOADS"] == "never"
+        assert kwargs["env"]["PYTHONNOUSERSITE"] == "1"
+        assert kwargs["env"]["PYTHONPATH"] == str(ROOT)
+        return json.dumps(report)
+
+    def run(command, **kwargs):
+        calls.append(command)
+        assert command[:4] == ["uv", "run", "--no-sync", "python"]
+        assert command[4:] == [
+            str(
+                ROOT
+                / "tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py"
+            ),
+            "--help",
+        ]
+        assert kwargs["check"] and kwargs["timeout"] == 60
+        raise subprocess.CalledProcessError(23, command)
+
+    monkeypatch.setattr(environment.subprocess, "check_output", output)
+    monkeypatch.setattr(environment.subprocess, "run", run)
+    with pytest.raises((ValueError, subprocess.CalledProcessError)):
+        environment.check_postprocessing(ROOT)
+    assert len(calls) == (2 if damage == "extractor" else 1)
+
+
+def test_postprocessing_failure_prevents_success_report(tool_environment, monkeypatch):
+    bundle, _, manifest, _, _, _ = tool_environment
+    environment.prepare(bundle, manifest)
+
+    def fail(root):
+        raise subprocess.CalledProcessError(1, ["uv", "run"])
+
+    monkeypatch.setattr(environment, "check_postprocessing", fail)
+    with pytest.raises(subprocess.CalledProcessError):
+        environment.check(bundle, manifest, bundle / "reports")
+    assert not (bundle / "reports/functional-environment.json").exists()
+
+
+def test_namespace_prepare_refuses_to_overwrite_existing_file(tool_environment):
+    bundle, site, manifest, _, _, _ = tool_environment
+    startup = site / environment.NAMESPACE_PTH
+    startup.write_text("existing content\n")
+    with pytest.raises(FileExistsError):
+        environment.prepare(bundle, manifest)
+    assert startup.read_text() == "existing content\n"
 
 
 def test_checkpoint_requirement_is_not_optional():

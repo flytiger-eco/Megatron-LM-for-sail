@@ -15,6 +15,9 @@ import urllib.request
 from pathlib import Path
 
 NVRX_VERSION = "0.6.0"
+NAMESPACE_PTH = "00-ppu-functional-google-namespace.pth"
+# 先建立完整的 PEP 420 namespace，避免继承的 nspkg 启动钩子将 google 固定到系统目录。
+NAMESPACE_BOOTSTRAP = "import importlib; importlib.invalidate_caches(); import google\n"
 TRAINING_PACKAGES = {
     "pla": "1.0.0+v0.1.0.ppu2.2.0",
     "mamba-ssm": "2.3.1+v0.1.0.ppu2.2.0",
@@ -154,6 +157,74 @@ def check_training_dependencies(bundle: Path) -> dict:
     }
 
 
+def check_postprocessing(root: Path) -> dict:
+    """在全新 uv 子进程中先导入原比较器，避免训练依赖的导入顺序掩盖 namespace 缺陷。"""
+    probe = f'''
+import hashlib
+import json
+import sys
+import sysconfig
+from pathlib import Path
+startup = Path(sysconfig.get_path("purelib")) / {NAMESPACE_PTH!r}
+if startup.read_text() != {NAMESPACE_BOOTSTRAP!r}:
+    raise ValueError("Functional namespace startup mismatch")
+from tests.functional_tests.python_test_utils import common
+import google.protobuf
+from importlib.metadata import version
+from tensorboard.compat.proto.event_pb2 import Event
+from tensorboard.compat.proto.summary_pb2 import Summary
+if not Path(google.protobuf.__file__).resolve().is_relative_to(Path(sys.prefix).resolve()):
+    raise ValueError("Functional protobuf must come from the verified venv")
+if google.protobuf.__version__ != version("protobuf"):
+    raise ValueError("Functional protobuf metadata and imported version mismatch")
+event = Event(step=1, summary=Summary(value=[Summary.Value(tag="lm loss", simple_value=1.25)]))
+if Event.FromString(event.SerializeToString()).summary.value[0].simple_value != 1.25:
+    raise ValueError("Functional protobuf event roundtrip failed")
+print(json.dumps({{
+    "python": sys.executable,
+    "prefix": sys.prefix,
+    "protobuf_version": google.protobuf.__version__,
+    "protobuf_path": google.protobuf.__file__,
+    "common_path": common.__file__,
+    "namespace_startup_sha256": hashlib.sha256(startup.read_bytes()).hexdigest(),
+    "event_roundtrip": True,
+}}))
+'''
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(root),
+        "PYTHONSAFEPATH": "1",
+        "PYTHONNOUSERSITE": "1",
+        "UV_PROJECT_ENVIRONMENT": sys.prefix,
+        "UV_PYTHON": sys.executable,
+        "UV_PYTHON_DOWNLOADS": "never",
+        "UV_NO_SYNC": "1",
+    }
+    command = ["uv", "run", "--no-sync", "python"]
+    report = json.loads(
+        subprocess.check_output(command + ["-c", probe], cwd=root, env=env, text=True, timeout=60)
+    )
+    if (
+        Path(report["common_path"]).resolve()
+        != (root / "tests/functional_tests/python_test_utils/common.py").resolve()
+        or Path(report["prefix"]).resolve() != Path(sys.prefix).resolve()
+    ):
+        raise ValueError("Functional postprocessing source or interpreter mismatch")
+    # 原提取器也须独立启动成功；不以父进程预热后的导入结果代替。
+    extractor = (
+        root / "tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py"
+    )
+    subprocess.run(
+        command + [str(extractor), "--help"],
+        cwd=root,
+        env=env,
+        check=True,
+        timeout=60,
+        stdout=subprocess.DEVNULL,
+    )
+    return report
+
+
 def prepare(bundle: Path, manifest: dict):
     tools = bundle / "functional-tools"
     tools.mkdir(exist_ok=False)
@@ -202,6 +273,10 @@ def prepare(bundle: Path, manifest: dict):
     shutil.copy2(
         bundle / "control/ppu_functional_pytest.py", Path(site) / "ppu_functional_pytest.py"
     )
+    startup = Path(site) / NAMESPACE_PTH
+    # 只新增到本次 functional venv，不删除系统 google 目录或其他分发包的启动钩子。
+    with startup.open("x") as stream:
+        stream.write(NAMESPACE_BOOTSTRAP)
 
 
 def check(bundle: Path, manifest: dict, output: Path):
@@ -225,6 +300,7 @@ def check(bundle: Path, manifest: dict, output: Path):
         for name in (
             "torch",
             "tensorboard",
+            "protobuf",
             "uv",
             "pytest",
             "numpy",
@@ -232,6 +308,7 @@ def check(bundle: Path, manifest: dict, output: Path):
             "transformer-engine",
         )
     }
+    postprocessing = check_postprocessing(Path(os.environ["PPU_SOURCE_ROOT"]).resolve())
     for name in ("tensorboard", "yaml", "click", "ppu_functional_pytest"):
         importlib.import_module(name)
     nvrx = check_nvrx(nvrx_requirements(manifest))
@@ -259,6 +336,7 @@ def check(bundle: Path, manifest: dict, output: Path):
                 "packages": packages,
                 "nvrx": nvrx,
                 "training_dependencies": training_dependencies,
+                "postprocessing": postprocessing,
                 "bash": bash,
                 "yq": yq,
                 "envsubst": envsubst,

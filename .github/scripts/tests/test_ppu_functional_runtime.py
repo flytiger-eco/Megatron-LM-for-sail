@@ -41,6 +41,7 @@ class FakeRunner:
         assert cwd == ROOT
         assert env["DATA_PATH"] == self.manifest["config"]["data_path"]
         assert env["N_REPEAT"] == "1" and env["RECORD_CHECKPOINTS"] == "false"
+        assert env["PYTHONNOUSERSITE"] == "1"
         assert env["GPUS_PER_NODE"] == "8" and env["NUM_NODES"] == "1"
         temporary = Path(env["TMPDIR"])
         assert temporary.is_dir() and temporary.stat().st_mode & 0o777 == 0o700
@@ -154,6 +155,7 @@ def test_retry_restarts_all_repeats_with_one_shared_deadline(evidence, tmp_path)
         (1, "DistNetworkError\nOutOfMemoryError"),
         (1, "Segmentation fault"),
         (1, "MissingTensorboardLogsError"),
+        (1, "ModuleNotFoundError: No module named 'google.protobuf'\nConnectionResetError"),
         (1, "OSError: AF_UNIX path too long\nConnectionResetError"),
         (143, "DistNetworkError"),
         (124, "DistNetworkError"),
