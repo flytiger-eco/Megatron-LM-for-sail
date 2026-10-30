@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -416,6 +417,34 @@ def test_missing_or_empty_tensorboard_is_not_success(evidence, content):
         event.write_bytes(content)
     with pytest.raises(ValueError, match="TensorBoard"):
         results.verify_repeat(manifest, ROOT, case, path, 1, 1)
+
+
+@pytest.mark.parametrize("missing", ["phase", "rank"])
+def test_launcher_restarts_cannot_replace_resume_rank_logs(evidence, missing):
+    manifest, case, directory = evidence
+    case["test_type"] = "ckpt-resume"
+    path = successful_repeat(manifest, case, directory, 1, 1)
+    first = path / Path(case["golden_path"]).name
+    first.with_name(f"{first.stem}_2nd.json").write_bytes(first.read_bytes())
+    assert results.verify_repeat(manifest, ROOT, case, path, 1, 1)["success"]
+    shutil.copytree(path / "logs/run-1/attempt_0", path / "logs/run-1/attempt_1")
+    missing_path = path / ("logs/run-2" if missing == "phase" else "logs/run-2/attempt_0/7")
+    missing_path.rename(path / "missing-logs")
+    with pytest.raises(ValueError, match="rank/phase log"):
+        results.verify_repeat(manifest, ROOT, case, path, 1, 1)
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_complete_launcher_restarts_preserve_rank_log_evidence(evidence, resume):
+    manifest, case, directory = evidence
+    if resume:
+        case["test_type"] = "ckpt-resume"
+    path = successful_repeat(manifest, case, directory, 1, 1)
+    if resume:
+        first = path / Path(case["golden_path"]).name
+        first.with_name(f"{first.stem}_2nd.json").write_bytes(first.read_bytes())
+    shutil.copytree(path / "logs/run-1/attempt_0", path / "logs/run-1/attempt_1")
+    assert results.verify_repeat(manifest, ROOT, case, path, 1, 1)["success"]
 
 
 @pytest.mark.parametrize(
