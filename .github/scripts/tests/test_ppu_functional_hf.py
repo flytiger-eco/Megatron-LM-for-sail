@@ -1,4 +1,4 @@
-"""HF 来源、只读资产门禁、逐重复隔离及真实离线调用段的 CPU 回归。"""
+"""HF 来源、只读资产门禁、逐重复隔离及原 tokenizer 离线行为的 CPU 回归。"""
 
 import copy
 import io
@@ -600,6 +600,21 @@ def test_copy_failure_after_preflight_never_trains_or_retries(
     )
 
 
+def offline_environment(cache):
+    return {
+        **os.environ,
+        "HF_HOME": str(cache),
+        "HF_HUB_CACHE": str(cache / "hub"),
+        "HUGGINGFACE_HUB_CACHE": str(cache / "hub"),
+        "TRANSFORMERS_CACHE": str(cache / "hub"),
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONSAFEPATH": "1",
+    }
+
+
 @pytest.mark.parametrize("repository", list(hf.REPOSITORIES))
 @pytest.mark.parametrize("explicit_vocab", [False, True])
 def test_original_auto_tokenizer_call_in_fresh_offline_process(
@@ -640,17 +655,7 @@ ids = tokenizer.encode("hello world")
 assert ids and tokenizer.is_fast
 print(json.dumps(dict(repository=repository, tokens=len(ids), offline=True)))
 '''
-    env = {
-        **os.environ,
-        "HF_HOME": str(cache),
-        "HF_HUB_CACHE": str(cache / "hub"),
-        "HUGGINGFACE_HUB_CACHE": str(cache / "hub"),
-        "TRANSFORMERS_CACHE": str(cache / "hub"),
-        "HF_HUB_OFFLINE": "1",
-        "TRANSFORMERS_OFFLINE": "1",
-        "HF_HUB_DISABLE_TELEMETRY": "1",
-        "PYTHONNOUSERSITE": "1",
-    }
+    env = offline_environment(cache)
     command = [
         sys.executable,
         "-c",
@@ -675,6 +680,143 @@ print(json.dumps(dict(repository=repository, tokens=len(ids), offline=True)))
     assert failed.returncode != 0
     assert "Unable to instantiate HuggingFace AutoTokenizer" in failed.stderr
     assert "offline tokenizer attempted network access" not in failed.stderr
+
+
+@pytest.mark.parametrize("repository", list(hf.REPOSITORIES))
+@pytest.mark.parametrize("include_special_tokens", [False, True])
+def test_complete_original_tokenizer_classes_offline(
+    provisioned, tmp_path, repository, include_special_tokens
+):
+    """执行完整原类与映射，隔离训练栈导入；不替代真实官方资产或 PPU 验收。"""
+    data, _, lock, _ = provisioned
+    cache = tmp_path / "repeat/cache/huggingface"
+    deps = dependencies(lock, [repository])
+    hf.populate(data, cache, deps)
+    before = snapshot(data)
+    cache_before = snapshot(cache)
+    source = ROOT / "megatron/core/tokenizers/text/libraries"
+    program = '''
+import ast, json, logging, socket, sys
+from pathlib import Path
+from typing import List, Optional
+
+network_calls = []
+def no_network(*args, **kwargs):
+    network_calls.append(True)
+    raise AssertionError("offline tokenizer attempted network access")
+socket.socket.connect = no_network
+socket.socket.connect_ex = no_network
+socket.create_connection = no_network
+socket.getaddrinfo = no_network
+from transformers import AutoTokenizer
+source, repository, cache, revision, include_special = sys.argv[1:]
+source, cache = Path(source), Path(cache)
+namespace = dict(AutoTokenizer=AutoTokenizer, List=List, Optional=Optional,
+                 logging=logging, logger=logging.getLogger("original-tokenizer"),
+                 log_single_rank=lambda logger, level, message: logger.log(level, message))
+path = source / "abstract_tokenizer.py"
+exec(compile(path.read_text(), str(path), "exec"), namespace)
+for filename, class_name in [
+    ("huggingface_tokenizer.py", "HuggingFaceTokenizer"),
+    ("megatron_hf_tokenizer.py", "MegatronHFTokenizer"),
+]:
+    path = source / filename
+    module = ast.parse(path.read_text())
+    nodes = [node for node in module.body if
+             (isinstance(node, ast.ClassDef) and node.name == class_name) or
+             (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and
+              target.id == "MEGATRON_CONFIG_MAP" for target in node.targets))]
+    assert sum(isinstance(node, ast.ClassDef) for node in nodes) == 1
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+
+def reject_download(frame, event, arg):
+    if event == "call" and frame.f_code.co_name == "_download" and frame.f_code.co_filename == str(source / "megatron_hf_tokenizer.py"):
+        raise AssertionError("original tokenizer entered download path")
+sys.setprofile(reject_download)
+name = next(name for name, row in namespace["MEGATRON_CONFIG_MAP"].items()
+            if row["tokenizer_name"] == repository)
+files = cache / "hub" / ("models--" + repository) / "snapshots" / revision
+sentinels = ["<extra_id_0>", "<extra_id_1>"]
+kwargs = dict(vocab_file=str(files / ("vocab.json" if repository == "gpt2" else "vocab.txt")),
+              merges_file=str(files / "merges.txt") if repository == "gpt2" else None,
+              include_special_tokens=include_special == "true", additional_special_tokens=sentinels)
+tokenizer = namespace["MegatronHFTokenizer"](name, **kwargs)
+sys.setprofile(None)
+assert tokenizer.tokenizer.is_fast
+assert tokenizer._hf_tokenizer is tokenizer.tokenizer
+assert not tokenizer.use_gigatoken
+assert tokenizer.vocab_size == len(tokenizer.vocab) == len(tokenizer.inv_vocab)
+assert tokenizer.vocab_size == tokenizer.original_vocab_size + len(sentinels)
+ids = tokenizer.text_to_ids("hello world")
+assert ids and tokenizer.ids_to_text(ids, remove_special_tokens=True).strip() == "hello world"
+assert tokenizer.ids_to_text(ids) == tokenizer.ids_to_text(ids, remove_special_tokens=include_special != "true")
+if repository != "gpt2" and include_special == "true":
+    assert ids[0] == tokenizer.cls_id and ids[-1] == tokenizer.sep_id
+    assert "[CLS]" in tokenizer.ids_to_text(ids) and "[SEP]" in tokenizer.ids_to_text(ids)
+tokens = tokenizer.text_to_tokens("hello world")
+assert tokenizer.ids_to_tokens(tokenizer.tokens_to_ids(tokens)) == tokens
+assert tokenizer.tokens_to_text(tokens).strip() == "hello world"
+assert tokenizer.token_to_id(tokens[0]) == tokenizer.tokens_to_ids(tokens)[0]
+expected_ids = tokenizer.tokenizer("hello world").input_ids if include_special == "true" else tokenizer.tokens_to_ids(tokens)
+assert ids == expected_ids
+assert tokenizer.space_sensitive == (tokenizer.text_to_tokens("x y") != tokenizer.text_to_tokens("x") + tokenizer.text_to_tokens("y"))
+assert tokenizer.additional_special_tokens_ids == tokenizer.tokens_to_ids(sentinels)
+assert len(set(tokenizer.additional_special_tokens_ids)) == len(sentinels)
+assert all(index >= tokenizer.original_vocab_size for index in tokenizer.additional_special_tokens_ids)
+assert tokenizer.eod == tokenizer.eos_id == tokenizer.sep_id
+assert tokenizer.bos_id == tokenizer.cls_id
+assert tokenizer.eod is not None and tokenizer.bos_id is not None
+if repository != "gpt2":
+    assert tokenizer.pad_id == tokenizer.token_to_id("[PAD]")
+    assert tokenizer.unk_id == tokenizer.token_to_id("[UNK]")
+    assert tokenizer.mask_id == tokenizer.token_to_id("[MASK]")
+assert tokenizer.ids_to_text(tokenizer.additional_special_tokens_ids, remove_special_tokens=True) == ""
+assert "<extra_id_0>" in tokenizer.ids_to_text(tokenizer.additional_special_tokens_ids, remove_special_tokens=False)
+assert not network_calls
+print(json.dumps(dict(repository=repository, offline=True, full_classes=True)))
+'''
+    command = [
+        sys.executable,
+        "-c",
+        program,
+        str(source),
+        repository,
+        str(cache),
+        REVISION,
+        str(include_special_tokens).lower(),
+    ]
+    process = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=offline_environment(cache),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert process.returncode == 0, process.stderr
+    assert json.loads(process.stdout) == {
+        "repository": repository,
+        "offline": True,
+        "full_classes": True,
+    }
+    assert snapshot(cache) == cache_before
+    assert snapshot(data) == before
+    hf.verify_cache(cache, hf.sources_for(deps))
+    ref = cache / f"hub/models--{repository}/refs/main"
+    ref.rename(ref.with_name("missing"))
+    failed = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=offline_environment(cache),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert failed.returncode != 0
+    assert "Unable to instantiate HuggingFace AutoTokenizer" in failed.stderr
+    assert "offline tokenizer attempted network access" not in failed.stderr
+    assert "original tokenizer entered download path" not in failed.stderr
+    assert snapshot(data) == before
 
 
 @pytest.mark.parametrize(
