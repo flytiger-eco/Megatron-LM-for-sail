@@ -30,7 +30,7 @@ FUNCTIONAL_PAYLOADS = [
     "control/ppu_functional_run.sh",
     *[
         f"control/ppu_functional{suffix}.py"
-        for suffix in ("", "_results", "_runtime", "_environment", "_pytest", "_snapshot")
+        for suffix in ("", "_results", "_runtime", "_environment", "_pytest", "_snapshot", "_hf")
     ],
 ]
 

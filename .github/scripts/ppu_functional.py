@@ -64,6 +64,9 @@ def module_from_path(name: str, path: Path):
     return module
 
 
+hf = module_from_path("ppu_functional_hf", Path(__file__).with_name("ppu_functional_hf.py"))
+
+
 def positive(value, name: str, maximum: int) -> int:
     if not re.fullmatch(r"[1-9][0-9]*", str(value)) or int(value) > maximum:
         raise ValueError(f"{name} must be an integer in 1..{maximum}")
@@ -243,7 +246,7 @@ def tokenizer_dependencies(root: Path, config: dict, entrypoint: str) -> list:
         if kind not in maps[0]:
             raise ValueError(f"Tokenizer assets require explicit adaptation: {section}/{kind}")
         # 提供 vocab/merges 后原实现仍调用 AutoTokenizer.from_pretrained(repository)。
-        # 尚无用户确认的缓存输入映射，不能猜测 NAS 目录或将显式文件就绪当作缓存就绪。
+        # 固定来源由可信 control 的独立锁文件补充；显式 vocab 就绪不代表缓存就绪。
         requirements.append(
             {
                 "section": section,
@@ -495,6 +498,7 @@ def catalogue(root: Path, control: Path, config: dict) -> dict:
         if path.endswith(".json"):
             read_metrics(root / BASELINES / path)
     rows = load_recipes(control)
+    tokenizer_sources = hf.load_sources(control)
     by_name = {}
     for row in rows:
         by_name.setdefault(f"{row.get('model')}/{row.get('test_case')}", []).append(row)
@@ -533,6 +537,12 @@ def catalogue(root: Path, control: Path, config: dict) -> dict:
         if requested != ["all"] and name not in requested:
             continue
         row = describe_case(root, name, eligible, config)
+        for dependency in row["tokenizer_dependencies"]:
+            source = tokenizer_sources.get(dependency["repository"])
+            if source:
+                dependency.update(source=source, status="fixed_source")
+        fixed = [item for item in row["tokenizer_dependencies"] if item.get("source")]
+        row["assets"].extend(hf.asset_requirements(fixed))
         if set(row["metrics"]) - metric_names:
             raise ValueError(f"Unsupported upstream metrics for {name}")
         row["id"] = f"functional-{len(selected):03d}"
@@ -568,6 +578,7 @@ def catalogue(root: Path, control: Path, config: dict) -> dict:
             ],
         },
         "baseline_lock_sha256": sha256(control / LOCK),
+        "tokenizer_lock_sha256": sha256(control / hf.LOCK) if tokenizer_sources else None,
     }
 
 
@@ -666,10 +677,26 @@ def check_asset(root: Path, requirement: dict) -> dict:
                 raise ValueError("Asset directory is empty")
         elif not path.is_file() or stat.st_size == 0:
             raise ValueError("Asset is not a nonempty regular file")
+        if requirement.get("tokenizer_cache"):
+            content = hf.checked_bytes(
+                root,
+                requirement["relative_path"],
+                {"size": requirement["expected_size"], "sha256": requirement["expected_sha256"]},
+            )
+            result["sha256"] = hf.digest(content)
         result["ok"] = True
     except (OSError, ValueError) as exc:
         result["reason"] = str(exc)
     return result
+
+
+def validate_tokenizer_assets(case: dict) -> list:
+    fixed = [item for item in case["tokenizer_dependencies"] if item.get("source")]
+    expected = hf.asset_requirements(fixed)
+    actual = [item for item in case["assets"] if item.get("tokenizer_cache")]
+    if actual != expected:
+        raise ValueError("Tokenizer asset requirements differ from the fixed source lock")
+    return expected
 
 
 def asset_report(
@@ -678,6 +705,8 @@ def asset_report(
     rows = manifest["functional"]
     if case_id:
         rows = {case_id: rows[case_id]}
+    for case in rows.values():
+        validate_tokenizer_assets(case)
     root_check = check_asset(
         root, {"relative_path": ".", "kind": "directory", "purposes": ["asset_root"]}
     )
@@ -697,11 +726,12 @@ def asset_report(
                     "size": None,
                     "ok": False,
                     "reason": (
-                        "HF tokenizer cache source mapping is not confirmed; the isolated offline "
-                        "runtime cache is empty. No source path was guessed or downloaded."
+                        "HF tokenizer fixed-revision source lock is not provisioned; the isolated "
+                        "offline cache cannot be populated. No files were guessed or downloaded."
                     ),
                 }
                 for requirement in case["tokenizer_dependencies"]
+                if requirement.get("status") != "fixed_source" or not requirement.get("source")
             ],
         }
         for key, case in rows.items()

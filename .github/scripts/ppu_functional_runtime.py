@@ -170,6 +170,13 @@ def repeat_environment(
     )
     for name in ("cache", "initial-checkpoints"):
         (directory / name).mkdir()
+    if case["tokenizer_dependencies"]:
+        cache_report = control.hf.populate(
+            Path(manifest["config"]["data_path"]),
+            Path(env["HF_HOME"]),
+            case["tokenizer_dependencies"],
+        )
+        write_json(directory / "tokenizer-cache.json", cache_report)
     # multiprocessing 在 TMPDIR 下创建 AF_UNIX socket；NAS 输出路径会超过地址长度限制。
     # 仅瞬态临时文件使用每次重复专属的短路径，持久缓存、checkpoint 和证据仍留在输出目录。
     with tempfile.TemporaryDirectory(prefix="ppu-fn-", dir="/tmp") as temporary_directory:

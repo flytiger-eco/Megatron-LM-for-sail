@@ -761,7 +761,15 @@ def bundle_inventory(directory: Path) -> dict:
         ]
         required += [
             f"control/ppu_functional{suffix}.py"
-            for suffix in ("", "_results", "_runtime", "_environment", "_pytest", "_snapshot")
+            for suffix in (
+                "",
+                "_results",
+                "_runtime",
+                "_environment",
+                "_pytest",
+                "_snapshot",
+                "_hf",
+            )
         ]
         for name in required:
             if name not in inventory or inventory[name]["size"] == 0:
