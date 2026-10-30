@@ -25,7 +25,7 @@ TRAINING_PACKAGES = {
     "flash-linear-attention": "0.4.1+v0.1.0.ppu2.2.0",
     "fla-core": "0.4.1+v0.1.0.ppu2.2.0",
     "emerging-optimizers": "0.3.0",
-    "apex": "25.9+v0.1.0.ppu2.2.0",
+    "apex": "24.4.1+v0.1.0.ppu2.2.0",
 }
 TRAINING_IMPORTS = {
     "pla": (),

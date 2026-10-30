@@ -425,6 +425,7 @@ def test_training_packages_match_build_constraints(tmp_path, monkeypatch, kind):
     requirements = (bundle / "ppu-requirements.txt").read_text().splitlines()
     constraints = (bundle / "constraints.txt").read_text().splitlines()
     functional_only = {"apex", "flash-linear-attention", "emerging-optimizers"}
+    assert environment.TRAINING_PACKAGES["apex"] == "24.4.1+v0.1.0.ppu2.2.0"
     for name, version in environment.TRAINING_PACKAGES.items():
         expected = int(kind == "functional" or name not in functional_only)
         assert requirements.count(f"{name}=={version}") == expected
