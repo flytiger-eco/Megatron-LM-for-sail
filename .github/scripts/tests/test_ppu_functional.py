@@ -163,20 +163,68 @@ def test_imported_snapshot_matches_source_bytes():
 
 def test_catalogue_real_upstream_intersection(catalogue):
     cases = list(catalogue["functional"].values())
-    assert len(cases) == 85
-    assert len({row["name"] for row in cases}) == 85
+    assert len(cases) == 84
+    assert len({row["name"] for row in cases}) == 84
     assert all(row["environment"] == "dev" and row["cards"] == 8 for row in cases)
-    assert len(catalogue["coverage"]["baseline_not_selected"]) == 8
-    assert {row["observation"] for row in cases if row["observation"]} == {
-        "lightweight",
-        "SKIP_PYTEST",
-    }
+    assert len(catalogue["coverage"]["baseline_not_selected"]) == 9
+    assert sum(not row["observation"] for row in cases) == 83
+    assert {row["observation"] for row in cases if row["observation"]} == {"lightweight"}
     assert all(row["repeat"] == (1 if row["observation"] else 5) for row in cases)
     assert max(row["train_iters"] for row in cases) == 2000
     assert all(row["second_golden_role"] == "provenance_only_not_resume_reference" for row in cases)
     assert any(row["test_type"] == "regular" and "resume" in row["name"] for row in cases)
     assert any(row["launcher"] == "ft_launcher" for row in cases)
     assert any(row["training_script"].endswith("pretrain_hybrid_flex.py") for row in cases)
+
+
+def test_skip_policy_only_removes_teacher_case_without_changing_other_cases(monkeypatch):
+    teacher = "gpt/gpt3_mcore_te_tp2_pp1_modelopt_distill_resume"
+    config = functional.select_config({})
+    current = functional.catalogue(ROOT, ROOT, config)
+    assert functional.SKIPPED_CASES == {teacher: "teacher_checkpoint_unavailable"}
+    skipped = current["coverage"]["skipped_by_policy"]
+    assert len(skipped) == 1
+    assert skipped[0]["name"] == teacher
+    assert skipped[0]["reason"] == "teacher_checkpoint_unavailable"
+    assert any(
+        row["name"] == teacher and row["reason"] == skipped[0]["reason"]
+        for row in current["coverage"]["baseline_not_selected"]
+    )
+    monkeypatch.setattr(functional, "SKIPPED_CASES", {})
+    original = functional.catalogue(ROOT, ROOT, config)
+    expected = {
+        row["name"]: {key: value for key, value in row.items() if key != "id"}
+        for row in original["functional"].values()
+        if row["name"] != teacher
+    }
+    actual = {
+        row["name"]: {key: value for key, value in row.items() if key != "id"}
+        for row in current["functional"].values()
+    }
+    assert actual == expected
+    assert len(original["functional"]) == len(current["functional"]) + 1
+    assert current["baseline_lock_sha256"] == original["baseline_lock_sha256"]
+    assert current["tokenizer_lock_sha256"] == original["tokenizer_lock_sha256"]
+
+
+@pytest.mark.parametrize("mode", ["assets", "regression"])
+@pytest.mark.parametrize("include_runnable", [True, False])
+def test_explicit_teacher_selection_is_skipped_not_silently_green(mode, include_runnable):
+    teacher = "gpt/gpt3_mcore_te_tp2_pp1_modelopt_distill_resume"
+    runnable = "gpt/gpt3_mcore_te_tp2_pp2_cp2"
+    config = functional.select_config(
+        {
+            "functional_mode": mode,
+            "functional_cases": f"{teacher},{runnable}" if include_runnable else teacher,
+        }
+    )
+    if not include_runnable:
+        with pytest.raises(ValueError, match="explicitly skipped.*teacher_checkpoint_unavailable"):
+            functional.catalogue(ROOT, ROOT, config)
+        return
+    result = functional.catalogue(ROOT, ROOT, config)
+    assert [row["name"] for row in result["functional"].values()] == [runnable]
+    assert [row["name"] for row in result["coverage"]["skipped_by_policy"]] == [teacher]
 
 
 @pytest.mark.parametrize("async_save", [True, False, "true", "false"])
@@ -330,11 +378,21 @@ def test_assets_prefixes_and_checkpoint(catalogue):
         for asset in row["assets"]
         if not asset.get("tokenizer_cache")
     }
-    assert len(assets) == 11
+    assert len(assets) == 10
     assert "text/common_pile/v01_filtered_data/my-gpt3_00_text_document.bin" in assets
     assert "text/common_pile/v01_filtered_data/my-gpt3_00_text_document.idx" in assets
-    assert "model/gpt_dummy_pyt/ckpt/24.10.0_bf16_teacher" in assets
+    assert "model/gpt_dummy_pyt/ckpt/24.10.0_bf16_teacher" not in assets
     assert not any("distill_config" in path for path in assets)
+    teacher_config = yaml.safe_load(
+        (
+            ROOT
+            / functional.BASELINES
+            / "gpt/gpt3_mcore_te_tp2_pp1_modelopt_distill_resume/model_config.yaml"
+        ).read_text()
+    )
+    assert "model/gpt_dummy_pyt/ckpt/24.10.0_bf16_teacher" in {
+        row["relative_path"] for row in functional.input_assets(teacher_config)
+    }
 
 
 @pytest.mark.parametrize(
@@ -485,6 +543,46 @@ def test_explicit_assets_cannot_hide_unmapped_tokenizer_cache(tmp_path, location
         str(path.relative_to(tmp_path)): path.stat().st_mode for path in tmp_path.rglob("*")
     }
     assert report["numerical_validation"] is False
+
+
+@pytest.mark.parametrize("missing_other_asset", [False, True])
+def test_skipped_teacher_is_reported_without_weakening_asset_gate(
+    tmp_path, catalogue, monkeypatch, missing_other_asset
+):
+    checked = []
+    missing = "text/common_pile/v01_filtered_data/my-gpt3_00_text_document.bin"
+
+    def check(root, requirement):
+        relative = requirement["relative_path"]
+        checked.append(relative)
+        ok = not (missing_other_asset and relative == missing)
+        return {
+            **requirement,
+            "checked_path": str(root / relative),
+            "exists": ok,
+            "readable": ok,
+            "size": 1 if ok else None,
+            "ok": ok,
+            "reason": "" if ok else "missing",
+        }
+
+    monkeypatch.setattr(functional, "check_asset", check)
+    summary = tmp_path / "step-summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    manifest = {**catalogue, "identity": {}, "config": functional.select_config({})}
+    report = functional.asset_report(manifest, tmp_path)
+    assert len(report["cases"]) == 84
+    assert report["ok"] is not missing_other_asset
+    assert report["result"] == ("asset_layout_error" if missing_other_asset else "assets_ready")
+    assert not report["numerical_validation"]
+    assert missing in checked
+    assert "model/gpt_dummy_pyt/ckpt/24.10.0_bf16_teacher" not in checked
+    functional.write_asset_report(report, tmp_path)
+    saved = json.loads((tmp_path / "assets-report.json").read_text())
+    assert saved["coverage"]["skipped_by_policy"] == catalogue["coverage"]["skipped_by_policy"]
+    assert "Skipped by policy:" in summary.read_text()
+    assert "teacher_checkpoint_unavailable" in summary.read_text()
+    assert "not executed or counted as passed" in summary.read_text()
 
 
 def test_asset_report_success_is_not_numeric_success(tmp_path):

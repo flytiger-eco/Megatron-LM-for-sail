@@ -228,6 +228,50 @@ def completion(manifest, case, directory, attempts=1, **overrides):
     envelope(manifest, case, directory)
 
 
+@pytest.mark.parametrize("passed", [True, False])
+def test_skipped_teacher_is_not_counted_or_allowed_to_hide_failures(evidence, monkeypatch, passed):
+    manifest, case, directory = evidence
+    teacher = "gpt/gpt3_mcore_te_tp2_pp1_modelopt_distill_resume"
+    config = functional.select_config(
+        {"functional_cases": f"{case['name']},{teacher}", "functional_mode": "regression"}
+    )
+    manifest["coverage"] = functional.catalogue(ROOT, ROOT, config)["coverage"]
+    for repeat in ((1, 2) if passed else (1,)):
+        successful_repeat(manifest, case, directory, 1, repeat)
+    completion(manifest, case, directory)
+    manifest_path = directory.parent / "manifest.json"
+    write_json(manifest_path, manifest)
+    summary_path = directory.parent / "step-summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_path))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ppu_functional_results.py",
+            "--manifest",
+            str(manifest_path),
+            "--root",
+            str(ROOT),
+            "--results",
+            str(directory.parent),
+        ],
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        results.main()
+    assert exit_info.value.code == (0 if passed else 1)
+    result = json.loads((directory.parent / "summary.json").read_text())
+    assert result["success"] is passed
+    assert result["numeric_passed"] == int(passed)
+    assert result["numeric_failed"] == int(not passed)
+    assert result["threshold_percent"] == 100
+    assert len(result["cases"]) == 1
+    assert not result["observations"]
+    assert result["coverage"]["skipped_by_policy"][0]["name"] == teacher
+    summary = summary_path.read_text()
+    assert "Skipped by policy: 1; not executed or counted as passed" in summary
+    assert f"{teacher}: teacher_checkpoint_unavailable" in summary
+
+
 def test_all_repeats_are_required_and_numerically_recomputed(evidence):
     manifest, case, directory = evidence
     successful_repeat(manifest, case, directory, 1, 1)

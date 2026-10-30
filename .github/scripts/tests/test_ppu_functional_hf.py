@@ -119,8 +119,8 @@ def test_registered_lock_matches_accepted_nas_digest_and_binds_all_dependencies(
     catalogue = functional.catalogue(ROOT, ROOT, functional.select_config({}))
     assert catalogue["tokenizer_lock_sha256"] == hf.digest(content)
     cases = list(catalogue["functional"].values())
-    assert len(cases) == 85
-    assert sum(bool(case["tokenizer_dependencies"]) for case in cases) == 84
+    assert len(cases) == 84
+    assert sum(bool(case["tokenizer_dependencies"]) for case in cases) == 83
     for case in cases:
         assert all(row["status"] == "fixed_source" for row in case["tokenizer_dependencies"])
         assert functional.validate_tokenizer_assets(case) == hf.asset_requirements(
@@ -485,7 +485,7 @@ def test_catalogue_binds_trusted_lock_for_all_training_phases(provisioned, monke
             assert sources
             assert functional.validate_tokenizer_assets(case)
             purposes.update(row["purpose"] for row in case["tokenizer_dependencies"])
-    assert count == 84
+    assert count == 83
     assert purposes
 
 

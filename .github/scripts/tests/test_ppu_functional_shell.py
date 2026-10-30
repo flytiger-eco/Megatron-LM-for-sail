@@ -206,7 +206,9 @@ def shell_case(tmp_path):
 @pytest.mark.parametrize(
     "kind", ["regular", "resume", "long_run", "approximate", "skip", "lightweight"]
 )
-def test_original_shell_tensorboard_extraction_and_comparison(shell_case, kind):
+def test_original_shell_tensorboard_extraction_and_comparison(shell_case, kind, monkeypatch):
+    if kind == "skip":
+        monkeypatch.setattr(functional, "SKIPPED_CASES", {})
     catalogue = functional.catalogue(ROOT, ROOT, functional.select_config({}))
     cases = list(catalogue["functional"].values())
     if kind == "regular":
