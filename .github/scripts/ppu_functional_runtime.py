@@ -153,6 +153,7 @@ def repeat_environment(
             "RUN_CI_BARRIER_ID": f"{attempt}-{repeat}",
             "PYTHONPATH": str(root),
             "PYTHONSAFEPATH": "1",
+            "PYTHONNOUSERSITE": "1",
             "PYTEST_PLUGINS": "ppu_functional_pytest",
             "PYTEST_ADDOPTS": "",
             "UV_PROJECT_ENVIRONMENT": sys.prefix,
