@@ -16,6 +16,10 @@ on:
         type: choice
         options: [unit, functional]
         default: unit
+      compiler_diagnostic:
+        description: 独立编译诊断（单 Pod 八卡，最多 10 分钟；不运行 Build、UT 或正式回归）
+        type: boolean
+        default: false
       functional_mode:
         description: Read-only CPU asset preflight or explicitly requested PPU regression
         type: choice
@@ -109,6 +113,7 @@ jobs:
       pr_number: ${{ steps.authorize.outputs.pr_number }}
       manual_pr: ${{ steps.authorize.outputs.manual_pr }}
       decision: ${{ steps.authorize.outputs.decision }}
+      test_kind: ${{ steps.authorize.outputs.test_kind }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -170,10 +175,23 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I .ppu-ci/control/ppu_pr_authorize.py invalidate-base
+  compiler-diagnostic:
+    needs: authorize
+    if: >-
+      github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/ci/ppu-validation' &&
+      github.run_attempt == 1 && needs.authorize.outputs.allowed == 'true' &&
+      needs.authorize.outputs.test_kind == 'compiler_diagnostic'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ppu-compiler-diagnostic.yml
+    with:
+      target_sha: ${{ needs.authorize.outputs.target_sha }}
+      control_sha: ${{ needs.authorize.outputs.control_sha }}
   execute:
     needs: [authorize, pr-pending]
     if: >-
       always() && !cancelled() && needs.authorize.result == 'success' &&
+      needs.authorize.outputs.test_kind != 'compiler_diagnostic' &&
       (needs.authorize.outputs.pr_number == '0' ||
        (needs.pr-pending.result == 'success' && needs.pr-pending.outputs.status_result == 'published'))
     concurrency:

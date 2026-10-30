@@ -1,0 +1,89 @@
+name: PPU Compiler Diagnostic
+on:
+  workflow_call:
+    inputs:
+      target_sha:
+        type: string
+        required: true
+      control_sha:
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/ci/ppu-validation' && github.run_attempt == 1
+    runs-on: k8s-runner-group-cpu-flytiger
+    environment: ppu-ci
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.control_sha }}
+          path: source
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-authorization
+          path: .ppu-ci
+      - name: 核验诊断授权与源码身份
+        shell: bash
+        env:
+          PPU_TARGET_SHA: ${{ inputs.target_sha }}
+          PPU_CONTROL_SHA: ${{ inputs.control_sha }}
+        run: |
+          [[ "$(git -C source rev-parse HEAD)" == "$PPU_CONTROL_SHA" ]]
+          python3 -I source/.github/scripts/ppu_compiler_diagnostic.py authorize --authorization .ppu-ci/authorization.json
+      - name: 单 Pod 八卡有界编译诊断
+        id: ppu
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+          nnodes: 0
+          nproc_per_node: 8
+          namespace: ${{ vars.PPU_NAMESPACE || 'ppu-sched' }}
+          node_selector: "board-type=ZW-M890P"
+          host_volumes: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
+          source_dir: /opt/megatron-lm
+          artifact_paths: .ppu-ci
+          timeout_minutes: 10
+          cleanup_policy: always
+          dmesg_policy: on_failure
+          container_options: |
+            shm_size: "64Gi"
+          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_DIAGNOSTIC_RUN_ID=${{ github.run_id }},PPU_DIAGNOSTIC_RUN_ATTEMPT=${{ github.run_attempt }},PPU_DIAGNOSTIC_OUTPUT=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic
+          command: |
+            set -euo pipefail
+            cd /opt/megatron-lm
+            [[ "$(git -c safe.directory="$PWD/source" -C source rev-parse HEAD)" == "$PPU_CONTROL_SHA" ]]
+            timeout --signal=TERM --kill-after=5s 540s python3 -I source/.github/scripts/ppu_compiler_diagnostic.py run \
+              --authorization .ppu-ci/authorization.json --root source --output "$PPU_DIAGNOSTIC_OUTPUT"
+      - name: 记录独立诊断执行状态
+        if: always()
+        shell: bash
+        env:
+          RESULT_DIR: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic
+          ACTION_STATUS: ${{ steps.ppu.outputs.job_status }}
+          ACTION_OUTCOME: ${{ steps.ppu.outcome }}
+        run: |
+          mkdir -p "$RESULT_DIR"
+          printf '{"numerical_validation":false,"action_status":"%s","action_outcome":"%s"}\n' \
+            "$ACTION_STATUS" "$ACTION_OUTCOME" > "$RESULT_DIR/action.json"
+          printf '%s\n' '独立编译诊断；未执行 Build、UT 或正式模型回归，不计入通过率。' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ppu-compiler-diagnostic
+          path: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+      - name: 核验单 Pod 执行状态
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        env:
+          ACTION_STATUS: ${{ steps.ppu.outputs.job_status }}
+          ACTION_OUTCOME: ${{ steps.ppu.outcome }}
+        run: '[[ "$ACTION_OUTCOME" == success && "$ACTION_STATUS" == succeeded ]]'
