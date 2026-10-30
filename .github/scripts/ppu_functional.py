@@ -211,6 +211,51 @@ def input_assets(config: dict) -> list:
     ]
 
 
+def tokenizer_dependencies(root: Path, config: dict, entrypoint: str) -> list:
+    """静态读取原入口默认值及 HF 仓库名；不导入训练栈、不探测或下载缓存。"""
+    defaults = []
+    for node in ast.walk(ast.parse(safe_file(root, entrypoint).read_text())):
+        if isinstance(node, ast.keyword) and node.arg == "args_defaults":
+            value = ast.literal_eval(node.value)
+            if isinstance(value, dict) and "tokenizer_type" in value:
+                defaults.append(value["tokenizer_type"])
+    if len(set(defaults)) != 1:
+        raise ValueError(f"Ambiguous original tokenizer default: {entrypoint}")
+    source = "megatron/core/tokenizers/text/libraries/megatron_hf_tokenizer.py"
+    maps = []
+    for node in ast.parse(safe_file(root, source).read_text()).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "MEGATRON_CONFIG_MAP"
+            for target in node.targets
+        ):
+            maps.append(ast.literal_eval(node.value))
+    if len(maps) != 1 or not isinstance(maps[0], dict):
+        raise ValueError("Unable to read original Megatron tokenizer repository mapping")
+    sections = ["MODEL_ARGS"]
+    if config["TEST_TYPE"] == "ckpt-resume" and "MODEL_ARGS_2" in config:
+        sections.append("MODEL_ARGS_2")
+    requirements = []
+    for section in sections:
+        arguments = config[section]
+        kind = arguments.get("--tokenizer-type", defaults[0])
+        if kind in ("NullTokenizer", "NullMultimodalTokenizer"):
+            continue
+        if kind not in maps[0]:
+            raise ValueError(f"Tokenizer assets require explicit adaptation: {section}/{kind}")
+        # 提供 vocab/merges 后原实现仍调用 AutoTokenizer.from_pretrained(repository)。
+        # 尚无用户确认的缓存输入映射，不能猜测 NAS 目录或将显式文件就绪当作缓存就绪。
+        requirements.append(
+            {
+                "section": section,
+                "tokenizer_type": kind,
+                "repository": maps[0][kind]["tokenizer_name"],
+                "purpose": f"{section}.--tokenizer-type (original AutoTokenizer metadata)",
+                "status": "source_mapping_required",
+            }
+        )
+    return requirements
+
+
 def nvrx_checkpoint_requirements(config: dict) -> list:
     """仅描述原配置实际执行阶段的外部 checkpoint 依赖，不改写训练参数。"""
     sections = ["MODEL_ARGS"]
@@ -431,6 +476,7 @@ def describe_case(root: Path, name: str, specs: list, config: dict) -> dict:
         "launcher": launcher,
         "launcher_internal_max_restarts": 3 if launcher == "ft_launcher" else 0,
         "nvrx_checkpoint": nvrx_checkpoint_requirements(model_config),
+        "tokenizer_dependencies": tokenizer_dependencies(root, model_config, entries[0]),
         "budget_seconds": seconds,
         "action_minutes": math.ceil(seconds / 60) + 30,
         "job_minutes": math.ceil(seconds / 60) + 45,
@@ -547,7 +593,12 @@ def generate(root: Path, control: Path, config: dict, identity: dict, output: Pa
         "identity": identity,
         **catalogue(root, control, config),
     }
-    protected = ["tests/test_utils/python_scripts/recipe_parser.py"]
+    protected = [
+        "tests/test_utils/python_scripts/recipe_parser.py",
+        "megatron/core/tokenizers/utils/build_tokenizer.py",
+        "megatron/core/tokenizers/text/libraries/megatron_hf_tokenizer.py",
+        "megatron/core/tokenizers/text/libraries/huggingface_tokenizer.py",
+    ]
     protected += [
         f"tests/functional_tests/shell_test_utils/{name}"
         for name in ("run_ci_test.sh", "_run_training.sh")
@@ -636,10 +687,29 @@ def asset_report(
             "name": case["name"],
             "observation": case["observation"],
             "assets": [check_asset(root, requirement) for requirement in case["assets"]],
+            "unresolved_dependencies": [
+                {
+                    **requirement,
+                    "relative_path": None,
+                    "checked_path": None,
+                    "exists": None,
+                    "readable": None,
+                    "size": None,
+                    "ok": False,
+                    "reason": (
+                        "HF tokenizer cache source mapping is not confirmed; the isolated offline "
+                        "runtime cache is empty. No source path was guessed or downloaded."
+                    ),
+                }
+                for requirement in case["tokenizer_dependencies"]
+            ],
         }
         for key, case in rows.items()
     ]
-    ok = root_check["ok"] and all(asset["ok"] for case in cases for asset in case["assets"])
+    ok = root_check["ok"] and all(
+        not case["unresolved_dependencies"] and all(asset["ok"] for asset in case["assets"])
+        for case in cases
+    )
     return {
         "schema_version": 1,
         "identity": manifest["identity"],
@@ -656,7 +726,11 @@ def asset_report(
             else (
                 "cpu_preflight_unreachable"
                 if location == "cpu" and not root_check["ok"]
-                else "asset_layout_error"
+                else (
+                    "asset_source_mapping_required"
+                    if any(case["unresolved_dependencies"] for case in cases)
+                    else "asset_layout_error"
+                )
             )
         ),
     }
@@ -676,13 +750,17 @@ def write_asset_report(report: dict, output: Path) -> None:
         "|---|---|---|---|---|---|---|---|",
     ]
     for case in report["cases"]:
-        if not case["assets"]:
+        if not case["assets"] and not case["unresolved_dependencies"]:
             lines.append(
                 f"| {case['name']} | mock data; no input assets | — | — | — | — | — | ready |"
             )
         for asset in case["assets"]:
             lines.append(
                 f"| {case['name']} | {', '.join(asset['purposes'])} | {asset['relative_path']} | {asset['checked_path']} | {asset['exists']} | {asset['readable']} | {asset['size']} | {'ready' if asset['ok'] else asset['reason']} |"
+            )
+        for dependency in case["unresolved_dependencies"]:
+            lines.append(
+                f"| {case['name']} | {dependency['purpose']}: {dependency['repository']} | 未确认 | 未检查 | 未知 | 未知 | — | {dependency['reason']} |"
             )
     lines.append("")
     lines.extend(

@@ -336,6 +336,70 @@ def test_assets_prefixes_and_checkpoint(catalogue):
     assert not any("distill_config" in path for path in assets)
 
 
+@pytest.mark.parametrize(
+    "entrypoint,explicit,repository",
+    [
+        ("examples/bert/pretrain_bert.py", None, "bert-large-uncased"),
+        ("pretrain_gpt.py", None, "gpt2"),
+        ("pretrain_hybrid.py", None, "gpt2"),
+        ("examples/t5/pretrain_t5.py", "BertWordPieceCase", "bert-large-cased"),
+        ("pretrain_gpt.py", "NullTokenizer", None),
+    ],
+)
+def test_tokenizer_dependencies_follow_original_entrypoint(entrypoint, explicit, repository):
+    arguments = {"--mock-data": True, "--vocab-file": "${DATA_PATH}/vocab.txt"}
+    if explicit:
+        arguments["--tokenizer-type"] = explicit
+    config = {"TEST_TYPE": "regular", "MODEL_ARGS": arguments}
+    before = copy.deepcopy(config)
+    dependencies = functional.tokenizer_dependencies(ROOT, config, entrypoint)
+    assert [row["repository"] for row in dependencies] == ([repository] if repository else [])
+    assert all(row["status"] == "source_mapping_required" for row in dependencies)
+    assert config == before
+
+
+@pytest.mark.parametrize("test_type", ["regular", "ckpt-resume"])
+@pytest.mark.parametrize("first", ["NullTokenizer", "BertWordPieceCase"])
+def test_tokenizer_reshard_uses_replacement_args_and_original_default(test_type, first):
+    config = {"TEST_TYPE": test_type, "MODEL_ARGS": {"--tokenizer-type": first}, "MODEL_ARGS_2": {}}
+    result = functional.tokenizer_dependencies(ROOT, config, "pretrain_gpt.py")
+    expected = [] if first == "NullTokenizer" else [("MODEL_ARGS", "bert-large-cased")]
+    if test_type == "ckpt-resume":
+        expected.append(("MODEL_ARGS_2", "gpt2"))
+    assert [(row["section"], row["repository"]) for row in result] == expected
+
+
+def test_unknown_tokenizer_assets_are_not_silently_accepted():
+    with pytest.raises(ValueError, match="explicit adaptation"):
+        functional.tokenizer_dependencies(
+            ROOT,
+            {"TEST_TYPE": "regular", "MODEL_ARGS": {"--tokenizer-type": "UnknownTokenizer"}},
+            "pretrain_gpt.py",
+        )
+
+
+def test_tokenizer_source_is_parsed_without_execution(tmp_path):
+    entry = tmp_path / "entry.py"
+    entry.write_text(
+        "raise RuntimeError('must not execute')\nrun(args_defaults={'tokenizer_type': 'Example'})\n"
+    )
+    source = tmp_path / "megatron/core/tokenizers/text/libraries/megatron_hf_tokenizer.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "raise RuntimeError('must not execute')\nMEGATRON_CONFIG_MAP = {'Example': {'tokenizer_name': 'original-repo'}}\n"
+    )
+    config = {"TEST_TYPE": "regular", "MODEL_ARGS": {}}
+    assert (
+        functional.tokenizer_dependencies(tmp_path, config, "entry.py")[0]["repository"]
+        == "original-repo"
+    )
+    entry.write_text(
+        "run(args_defaults={'tokenizer_type': 'Example'})\nrun(args_defaults={'tokenizer_type': 'Conflicting'})\n"
+    )
+    with pytest.raises(ValueError, match="Ambiguous"):
+        functional.tokenizer_dependencies(tmp_path, config, "entry.py")
+
+
 def test_assets_mock_data_does_not_require_data():
     config = {
         "MODEL_ARGS": {
@@ -390,8 +454,12 @@ def test_asset_report_cpu_unreachable_does_not_assert_ppu_unreachable(tmp_path, 
     assert report["numerical_validation"] is False
 
 
-def test_asset_report_success_is_not_numeric_success(tmp_path, catalogue):
+@pytest.mark.parametrize("location", ["cpu", "pod"])
+def test_explicit_assets_cannot_hide_unmapped_tokenizer_cache(
+    tmp_path, catalogue, location, monkeypatch
+):
     manifest = {**catalogue, "identity": {}, "config": functional.select_config({})}
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "unapproved-inherited-cache"))
     for row in catalogue["functional"].values():
         for requirement in row["assets"]:
             path = tmp_path / requirement["relative_path"]
@@ -401,6 +469,32 @@ def test_asset_report_success_is_not_numeric_success(tmp_path, catalogue):
             else:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"fixture")
+    before = {str(path.relative_to(tmp_path)): path.stat().st_mode for path in tmp_path.rglob("*")}
+    report = functional.asset_report(manifest, tmp_path, location=location)
+    assert not report["ok"] and report["result"] == "asset_source_mapping_required"
+    assert all(asset["ok"] for row in report["cases"] for asset in row["assets"])
+    unresolved = [asset for row in report["cases"] for asset in row["unresolved_dependencies"]]
+    assert {row["repository"] for row in unresolved} == {
+        "gpt2",
+        "bert-large-uncased",
+        "bert-large-cased",
+    }
+    assert all(row["checked_path"] is None and row["exists"] is None for row in unresolved)
+    assert before == {
+        str(path.relative_to(tmp_path)): path.stat().st_mode for path in tmp_path.rglob("*")
+    }
+    assert report["numerical_validation"] is False
+
+
+def test_asset_report_success_is_not_numeric_success(tmp_path):
+    config = functional.select_config({"functional_cases": "gpt/gpt3_mcore_te_tp2_pp2_cp2"})
+    manifest = {**functional.catalogue(ROOT, ROOT, config), "identity": {}, "config": config}
+    for row in manifest["functional"].values():
+        assert not row["tokenizer_dependencies"]
+        for asset in row["assets"]:
+            path = tmp_path / asset["relative_path"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture")
     report = functional.asset_report(manifest, tmp_path)
     assert report["ok"] and report["result"] == "assets_ready"
     assert report["numerical_validation"] is False
