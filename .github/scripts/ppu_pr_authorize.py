@@ -110,8 +110,13 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
     functional = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(functional)
     test_kind = functional.validate_route(event_name, ref, inputs)
-    if test_kind == "functional":
-        functional.select_config(inputs)
+    if test_kind in ("functional", "compiler_diagnostic"):
+        if test_kind == "functional":
+            functional.select_config(inputs)
+        elif str(context["run_attempt"]) != "1":
+            raise ValueError(
+                "Compiler diagnostics cannot be rerun; require a new explicit dispatch"
+            )
         if full_sha(context["sha"]) != full_sha(context["control_sha"]):
             raise ValueError("Functional dispatch must use the same trusted source/control commit")
     number = str(inputs.get("pr_number", ""))
