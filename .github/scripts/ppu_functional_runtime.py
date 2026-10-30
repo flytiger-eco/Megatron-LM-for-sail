@@ -7,7 +7,10 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import yaml
@@ -89,9 +92,10 @@ def write_json(path: Path, value: dict) -> None:
         stream.write("\n")
 
 
+@contextmanager
 def repeat_environment(
     manifest: dict, root: Path, case: dict, directory: Path, attempt: int, repeat: int
-) -> dict:
+) -> Iterator[dict]:
     config = yaml.safe_load((root / case["config_path"]).read_text())
     config.setdefault("ENV_VARS", {})["N_REPEAT"] = 1
     (directory / "model_config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
@@ -122,7 +126,6 @@ def repeat_environment(
             "XDG_CACHE_HOME": str(directory / "cache/xdg"),
             "TRITON_CACHE_DIR": str(directory / "cache/triton"),
             "TORCHINDUCTOR_CACHE_DIR": str(directory / "cache/inductor"),
-            "TMPDIR": str(directory / "tmp"),
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
             "HF_HUB_DISABLE_TELEMETRY": "1",
@@ -155,58 +158,63 @@ def repeat_environment(
             "PPU_FUNCTIONAL_MANIFEST_SHA256": results.manifest_digest(manifest),
         }
     )
-    for name in ("cache", "tmp", "initial-checkpoints"):
+    for name in ("cache", "initial-checkpoints"):
         (directory / name).mkdir()
-    return env
+    # multiprocessing 在 TMPDIR 下创建 AF_UNIX socket；NAS 输出路径会超过地址长度限制。
+    # 仅瞬态临时文件使用每次重复专属的短路径，持久缓存、checkpoint 和证据仍留在输出目录。
+    with tempfile.TemporaryDirectory(prefix="ppu-fn-", dir="/tmp") as temporary_directory:
+        env.update({name: temporary_directory for name in ("TMPDIR", "TMP", "TEMP")})
+        yield env
 
 
 def run_repeat(manifest, root, case, directory, attempt, repeat, runner, deadline):
     directory.mkdir(parents=True)
-    env = repeat_environment(manifest, root, case, directory, attempt, repeat)
+    env = {}
     started = time.monotonic()
     exit_code = 1
     shell_exit_code = None
     extraction_exit_code = None
     error = ""
     try:
-        command = ["bash", str(root / "tests/functional_tests/shell_test_utils/run_ci_test.sh")]
-        exit_code = runner.run(
-            command, cwd=root, env=env, log=directory / "driver.log", deadline=deadline
-        )
-        shell_exit_code = exit_code
-        if exit_code == 0 and case["observation"]:
-            for phase in range(1, results.phase_count(case) + 1):
-                logs = directory / "1/tensorboard"
-                if results.phase_count(case) == 2:
-                    logs /= f"run_{phase}"
-                name = "observation.json" if phase == 1 else "observation_2nd.json"
-                command = [
-                    sys.executable,
-                    str(
-                        root
-                        / "tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py"
-                    ),
-                    "--logs-dir",
-                    str(logs),
-                    "--train-iters",
-                    str(case["effective_train_iters"]),
-                    "--output-path",
-                    str(directory / name),
-                    "--is-normal-test",
-                    "--step-size",
-                    "1",
-                ]
-                extraction_env = {**env, "PYTEST_PLUGINS": ""}
-                exit_code = runner.run(
-                    command,
-                    cwd=root,
-                    env=extraction_env,
-                    log=directory / "driver.log",
-                    deadline=deadline,
-                )
-                extraction_exit_code = exit_code
-                if exit_code != 0:
-                    break
+        with repeat_environment(manifest, root, case, directory, attempt, repeat) as env:
+            command = ["bash", str(root / "tests/functional_tests/shell_test_utils/run_ci_test.sh")]
+            exit_code = runner.run(
+                command, cwd=root, env=env, log=directory / "driver.log", deadline=deadline
+            )
+            shell_exit_code = exit_code
+            if exit_code == 0 and case["observation"]:
+                for phase in range(1, results.phase_count(case) + 1):
+                    logs = directory / "1/tensorboard"
+                    if results.phase_count(case) == 2:
+                        logs /= f"run_{phase}"
+                    name = "observation.json" if phase == 1 else "observation_2nd.json"
+                    command = [
+                        sys.executable,
+                        str(
+                            root
+                            / "tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py"
+                        ),
+                        "--logs-dir",
+                        str(logs),
+                        "--train-iters",
+                        str(case["effective_train_iters"]),
+                        "--output-path",
+                        str(directory / name),
+                        "--is-normal-test",
+                        "--step-size",
+                        "1",
+                    ]
+                    extraction_env = {**env, "PYTEST_PLUGINS": ""}
+                    exit_code = runner.run(
+                        command,
+                        cwd=root,
+                        env=extraction_env,
+                        log=directory / "driver.log",
+                        deadline=deadline,
+                    )
+                    extraction_exit_code = exit_code
+                    if exit_code != 0:
+                        break
     except (OSError, ValueError) as exc:
         error = str(exc)
     finally:
@@ -223,6 +231,7 @@ def run_repeat(manifest, root, case, directory, attempt, repeat, runner, deadlin
                 "runtime_config_sha256": control.sha256(directory / "model_config.yaml"),
                 "launcher": case["launcher"],
                 "launcher_internal_max_restarts": case["launcher_internal_max_restarts"],
+                "temporary_directory": env.get("TMPDIR"),
                 "error": error,
             },
         )

@@ -273,16 +273,16 @@ def test_original_shell_preserves_synthetic_reshard_configuration(tmp_path):
     repeat = tmp_path / "repeat"
     repeat.mkdir()
     case = {**case, "config_path": str(synthetic)}
-    env = runtime.repeat_environment(manifest, ROOT, case, repeat, 1, 1)
     bootstrap = tmp_path / "mock-boundaries.sh"
     bootstrap.write_text(BOOTSTRAP)
-    code = ShellRunner(bootstrap).run(
-        ["bash", str(ROOT / "tests/functional_tests/shell_test_utils/run_ci_test.sh")],
-        cwd=ROOT,
-        env=env,
-        log=repeat / "driver.log",
-        deadline=time.monotonic() + 120,
-    )
+    with runtime.repeat_environment(manifest, ROOT, case, repeat, 1, 1) as env:
+        code = ShellRunner(bootstrap).run(
+            ["bash", str(ROOT / "tests/functional_tests/shell_test_utils/run_ci_test.sh")],
+            cwd=ROOT,
+            env=env,
+            log=repeat / "driver.log",
+            deadline=time.monotonic() + 120,
+        )
     assert code == 0, (repeat / "driver.log").read_text()
     second = json.loads((repeat / "mock-training-2.json").read_text())
     assert second["model_args"] == original["MODEL_ARGS_2"]
