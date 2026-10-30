@@ -18,6 +18,9 @@ POD_ASSETS = "/mnt/wl_nas/anyunge.ayg/megatron-functional-ci/artifacts-base"
 CPU_ASSETS = "/wl_nas/anyunge.ayg/megatron-functional-ci/artifacts-base"
 IMAGE = "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
 TIERS = ("L0", "L1", "L2", "L3")
+SKIPPED_CASES = {
+    "gpt/gpt3_mcore_te_tp2_pp1_modelopt_distill_resume": "teacher_checkpoint_unavailable"
+}
 DEFAULTS = {
     "functional_mode": "assets",
     "functional_scope": "all",
@@ -505,7 +508,7 @@ def catalogue(root: Path, control: Path, config: dict) -> dict:
     unknown = set(names) - by_name.keys()
     if unknown:
         raise ValueError(f"PPU goldens have no DEV recipe match: {sorted(unknown)}")
-    selected, disabled, ignored, outside = {}, [], [], []
+    selected, disabled, ignored, outside, skipped = {}, [], [], [], []
     metric_names = supported_metrics(control)
     requested = config["requested_cases"]
     if requested != ["all"] and set(requested) - by_name.keys():
@@ -536,6 +539,15 @@ def catalogue(root: Path, control: Path, config: dict) -> dict:
             raise ValueError(f"PPU golden has no configuration: {name}")
         if requested != ["all"] and name not in requested:
             continue
+        if name in SKIPPED_CASES:
+            skipped.append(
+                {
+                    "name": name,
+                    "scopes": sorted({row["scope"] for row in eligible}),
+                    "reason": SKIPPED_CASES[name],
+                }
+            )
+            continue
         row = describe_case(root, name, eligible, config)
         for dependency in row["tokenizer_dependencies"]:
             source = tokenizer_sources.get(dependency["repository"])
@@ -553,6 +565,8 @@ def catalogue(root: Path, control: Path, config: dict) -> dict:
             raise ValueError(
                 f"Requested cases outside active selected scope: {sorted(unavailable)}"
             )
+    if not selected and skipped:
+        raise ValueError(f"No runnable functional cases; explicitly skipped: {skipped}")
     if not selected or len(selected) > 256:
         raise ValueError("Functional execution set must contain 1..256 cases with PPU goldens")
     return {
@@ -560,6 +574,7 @@ def catalogue(root: Path, control: Path, config: dict) -> dict:
         "coverage": {
             "ignored_missing_golden": ignored,
             "upstream_disabled": disabled,
+            "skipped_by_policy": skipped,
             "outside_scope": outside,
             "baseline_configs": sum(Path(path).name == "model_config.yaml" for path in files),
             "baseline_files": len(files),
@@ -567,10 +582,13 @@ def catalogue(root: Path, control: Path, config: dict) -> dict:
                 {
                     "name": name,
                     "scopes": sorted({row["scope"] for row in by_name[name]}),
-                    "reason": (
-                        "upstream_disabled"
-                        if name in {row["name"] for row in disabled}
-                        else "outside_requested_scope_or_cases"
+                    "reason": SKIPPED_CASES.get(
+                        name,
+                        (
+                            "upstream_disabled"
+                            if name in {row["name"] for row in disabled}
+                            else "outside_requested_scope_or_cases"
+                        ),
                     ),
                 }
                 for name in names
@@ -806,6 +824,10 @@ def write_asset_report(report: dict, output: Path) -> None:
         )
     lines.append("")
     lines.extend(
+        f"- Skipped by policy: `{case['name']}` ({case['reason']}); not executed or counted as passed."
+        for case in report["coverage"].get("skipped_by_policy", [])
+    )
+    lines.extend(
         f"- Observation only: `{case['name']}` ({case['observation']}); excluded from the numerical pass rate."
         for case in report["cases"]
         if case["observation"]
@@ -818,6 +840,7 @@ def write_asset_report(report: dict, output: Path) -> None:
             {
                 "result": report["result"],
                 "cases": len(report["cases"]),
+                "skipped_by_policy": len(report["coverage"].get("skipped_by_policy", [])),
                 "numerical_validation": False,
             }
         )

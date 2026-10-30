@@ -533,15 +533,23 @@ def main() -> None:
         f"Numeric passed: {result['numeric_passed']}; failed: {result['numeric_failed']}; observations: {len(result['observations'])}.",
         f"Numerical validation: {result['numerical_validation']}. Integrity and execution success: {result['success']}.",
         f"Failure categories: {json.dumps(result['failure_categories'], sort_keys=True)}.",
+        f"Skipped by policy: {len(result['coverage'].get('skipped_by_policy', []))}; not executed or counted as passed.",
         f"Ignored without PPU golden: {len(result['coverage']['ignored_missing_golden'])}; upstream disabled: {len(result['coverage']['upstream_disabled'])}.",
     ]
     summary += [
         f"- {row['name']}: {'passed' if row['success'] else 'failed'}{' (observation only)' if row['observation'] else ''}; queue={row.get('queue_seconds', 'unavailable')}s, training={row.get('duration_seconds', 'unavailable')}s, budget={row.get('budget_seconds', 'unavailable')}s; {'; '.join(row['errors'])}"
         for row in result["cases"]
     ]
-    for key in ("ignored_missing_golden", "upstream_disabled", "baseline_not_selected"):
+    for key in (
+        "skipped_by_policy",
+        "ignored_missing_golden",
+        "upstream_disabled",
+        "baseline_not_selected",
+    ):
         summary.append(f"<details><summary>{key}</summary>\n")
-        summary.extend(f"- {row['name']}: {row['reason']}" for row in result["coverage"][key])
+        summary.extend(
+            f"- {row['name']}: {row['reason']}" for row in result["coverage"].get(key, [])
+        )
         summary.append("</details>")
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as stream:
