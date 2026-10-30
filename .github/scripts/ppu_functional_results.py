@@ -141,6 +141,23 @@ def log_text(directory: Path) -> str:
     return "\n".join(path.read_text(errors="replace") for path in paths if path.is_file())
 
 
+def verify_rank_logs(case: dict, directory: Path) -> None:
+    """按独立 launcher 会话核验阶段，内部重启不能补足另一阶段的日志。"""
+    attempts = sorted((directory / "logs").glob("**/attempt_*"))
+    sessions = {path.parent for path in attempts}
+    if len(sessions) != phase_count(case):
+        raise ValueError("Missing or unexpected rank/phase log sessions")
+    for attempt in attempts:
+        if not attempt.is_dir() or not re.fullmatch(r"attempt_[0-9]+", attempt.name):
+            raise ValueError("Malformed rank/phase log attempt")
+        for rank in range(8):
+            if any(
+                not (attempt / str(rank) / filename).is_file()
+                for filename in ("stdout.log", "stderr.log")
+            ):
+                raise ValueError(f"Missing rank/phase log evidence: {attempt.name}, rank {rank}")
+
+
 def verify_pytest(
     directory: Path, phase: str, manifest: dict, case: dict, attempt: int, repeat: int
 ) -> None:
@@ -236,12 +253,7 @@ def verify_repeat(
         raise ValueError("Training phase or resume phase did not finish successfully")
     if execution["runtime_config_sha256"] != control.sha256(directory / "model_config.yaml"):
         raise ValueError("Runtime configuration digest mismatch")
-    for rank in range(8):
-        logs = list((directory / "logs").glob(f"**/{rank}/stdout.log"))
-        if len(logs) < phase_count(case) or any(
-            not path.with_name("stderr.log").is_file() for path in logs
-        ):
-            raise ValueError(f"Missing rank/phase log evidence: rank {rank}")
+    verify_rank_logs(case, directory)
     for phase in range(1, phase_count(case) + 1):
         tensorboard = directory / "1/tensorboard"
         if phase_count(case) == 2:
