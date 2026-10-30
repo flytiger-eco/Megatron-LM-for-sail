@@ -189,6 +189,20 @@ def test_assets_and_stale_directory_prevent_training(evidence, tmp_path):
         runtime.run_case(manifest, ROOT, case["id"], directory, runner=runner)
 
 
+def test_unmapped_tokenizer_stops_before_any_training(evidence, tmp_path):
+    manifest, case, directory = prepare_case(evidence, tmp_path)
+    case["tokenizer_dependencies"] = functional.tokenizer_dependencies(
+        ROOT, yaml.safe_load((ROOT / case["config_path"]).read_text()), case["training_script"]
+    )
+    runner = FakeRunner(manifest, case)
+    with pytest.raises(ValueError, match="asset preflight"):
+        runtime.run_case(manifest, ROOT, case["id"], directory, runner=runner)
+    assert not runner.calls
+    report = json.loads((directory / "assets-report.json").read_text())
+    assert report["result"] == "asset_source_mapping_required"
+    assert report["cases"][0]["unresolved_dependencies"][0]["repository"] == "bert-large-uncased"
+
+
 def test_assets_mode_never_launches_training(evidence, tmp_path):
     manifest, case, directory = prepare_case(evidence, tmp_path)
     manifest["config"]["functional_mode"] = "assets"
@@ -258,11 +272,29 @@ def test_environment_clears_inherited_shortcuts_and_uses_runtime_copy(
     monkeypatch.setenv("ENABLE_LIGHTWEIGHT_MODE", "true")
     monkeypatch.setenv("SLURM_JOB_END_TIME", "1")
     monkeypatch.setenv("PYTEST_ADDOPTS", "--collect-only")
+    cache_keys = (
+        "HF_HOME",
+        "HF_HUB_CACHE",
+        "HUGGINGFACE_HUB_CACHE",
+        "TRANSFORMERS_CACHE",
+        "PYTORCH_TRANSFORMERS_CACHE",
+        "PYTORCH_PRETRAINED_BERT_CACHE",
+        "HF_ASSETS_CACHE",
+        "HF_MODULES_CACHE",
+        "TORCH_HOME",
+        "CUDA_CACHE_PATH",
+        "XDG_CACHE_HOME",
+        "TRITON_CACHE_DIR",
+        "TORCHINDUCTOR_CACHE_DIR",
+    )
+    for key in cache_keys:
+        monkeypatch.setenv(key, str(tmp_path / "unapproved-shared-cache"))
     directory = tmp_path / "repeat"
     directory.mkdir()
     with runtime.repeat_environment(manifest, ROOT, case, directory, 1, 1) as env:
         assert env["RECORD_CHECKPOINTS"] == "false" and env["ENABLE_LIGHTWEIGHT_MODE"] == "false"
         assert env["PYTEST_ADDOPTS"] == "" and "SLURM_JOB_END_TIME" not in env
+        assert all(Path(env[key]).is_relative_to(directory / "cache") for key in cache_keys)
         expected = yaml.safe_load((ROOT / case["config_path"]).read_text())
         expected.setdefault("ENV_VARS", {})["N_REPEAT"] = 1
         assert yaml.safe_load((directory / "model_config.yaml").read_text()) == expected

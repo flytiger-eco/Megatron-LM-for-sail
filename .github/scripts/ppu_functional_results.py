@@ -321,6 +321,8 @@ def verify_envelope(manifest: dict, case: dict, directory: Path) -> dict:
     rows = assets.get("cases", [])
     if len(rows) != 1 or rows[0]["id"] != case["id"] or rows[0]["name"] != case["name"]:
         raise ValueError("Asset preflight belongs to a different case")
+    if case["tokenizer_dependencies"] or rows[0].get("unresolved_dependencies"):
+        raise ValueError("Unresolved tokenizer cache dependencies cannot pass asset preflight")
     if (
         {row["relative_path"] for row in rows[0]["assets"]}
         != {row["relative_path"] for row in case["assets"]}

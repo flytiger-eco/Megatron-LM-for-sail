@@ -87,6 +87,8 @@ def evidence(tmp_path):
     )
     catalogue = functional.catalogue(ROOT, ROOT, config)
     case = next(iter(catalogue["functional"].values()))
+    # 此夹具生成合成训练/比较证据，不实例化 tokenizer；真实缓存门禁另有独立测试。
+    case["tokenizer_dependencies"] = []
     manifest = {
         **catalogue,
         "schema_version": 1,
@@ -291,6 +293,19 @@ def failed_repeat(manifest, case, directory, attempt=1, message="DistNetworkErro
     (path / "driver.log").write_text(message)
     (path / "barriers/repeat_1_run_1_status/node_0").write_text("1\n")
     return path
+
+
+def test_forged_ready_report_cannot_bypass_unmapped_tokenizer(evidence):
+    manifest, case, directory = evidence
+    case["tokenizer_dependencies"] = functional.tokenizer_dependencies(
+        ROOT, yaml.safe_load((ROOT / case["config_path"]).read_text()), case["training_script"]
+    )
+    for repeat in (1, 2):
+        successful_repeat(manifest, case, directory, 1, repeat)
+    completion(manifest, case, directory)
+    result = results.verify_case(manifest, ROOT, case, directory)
+    assert not result["success"]
+    assert any("Unresolved tokenizer" in error for error in result["errors"])
 
 
 def test_training_sigsegv_status_wins_over_generic_shell_exit(evidence):

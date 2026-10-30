@@ -162,6 +162,8 @@ def shell_case(tmp_path):
         )
         catalogue = functional.catalogue(ROOT, ROOT, config)
         case = next(iter(catalogue["functional"].values()))
+        # training 边界已替换为合成 TensorBoard 生成器，不会实例化原 tokenizer。
+        case["tokenizer_dependencies"] = []
         assets = tmp_path / "assets"
         assets.mkdir()
         for asset in case["assets"]:
