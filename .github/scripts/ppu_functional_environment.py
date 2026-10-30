@@ -15,6 +15,35 @@ import urllib.request
 from pathlib import Path
 
 NVRX_VERSION = "0.6.0"
+TRAINING_PACKAGES = {
+    "pla": "1.0.0+v0.1.0.ppu2.2.0",
+    "mamba-ssm": "2.3.1+v0.1.0.ppu2.2.0",
+    "causal-conv1d": "1.7.0+v0.1.0.ppu2.2.0",
+    "flash-linear-attention": "0.4.1+v0.1.0.ppu2.2.0",
+    "fla-core": "0.4.1+v0.1.0.ppu2.2.0",
+    "emerging-optimizers": "0.3.0",
+}
+TRAINING_IMPORTS = {
+    "pla": (),
+    "pla.decode": (),
+    "pla.prefill.flashqla": (),
+    "pla.prefill.flashkdapro": (),
+    "mamba_ssm.ops.triton.layernorm_gated": ("RMSNorm",),
+    "mamba_ssm.ops.triton.ssd_combined": (
+        "mamba_chunk_scan_combined",
+        "mamba_split_conv1d_scan_combined",
+    ),
+    "selective_scan_cuda": (),
+    "causal_conv1d": ("causal_conv1d_fn", "causal_conv1d_update"),
+    "causal_conv1d_cuda": (),
+    "fla": (),
+    "fla.layers": (),
+    "fla.models": (),
+    "fla.modules.convolution": ("causal_conv1d", "causal_conv1d_update"),
+    "fla.modules.l2norm": ("l2norm",),
+    "fla.ops.gated_delta_rule": ("chunk_gated_delta_rule", "fused_recurrent_gated_delta_rule"),
+    "emerging_optimizers": (),
+}
 YQ_VERSION = "4.47.2"
 YQ = {
     "x86_64": ("amd64", "1bb99e1019e23de33c7e6afc23e93dad72aad6cf2cb03c797f068ea79814ddb0"),
@@ -80,6 +109,49 @@ def check_nvrx(requirements: dict) -> dict:
             raise ValueError("Selected case requires the original ft_launcher")
         command_output(["ft_launcher", "--help"])
     return {"version": version, "requirements": requirements, "signatures": signatures}
+
+
+def check_training_dependencies(bundle: Path) -> dict:
+    """Build 与 Pod 都检查真实导入，不能仅凭包名或被吞掉的 ImportError 放行。"""
+    packages = {}
+    for name, expected in TRAINING_PACKAGES.items():
+        installed = importlib.metadata.version(name)
+        if installed != expected:
+            raise ValueError(
+                f"Functional dependency version mismatch: {name}: {installed} != {expected}"
+            )
+        packages[name] = installed
+    imports = {}
+    for name, symbols in TRAINING_IMPORTS.items():
+        module = importlib.import_module(name)
+        for symbol in symbols:
+            if not callable(getattr(module, symbol, None)):
+                raise ValueError(f"Missing functional dependency API: {name}.{symbol}")
+        if name == "fla.modules.l2norm":
+            # 安装完整 FLA 后仍须保留已有的最后一维参数适配。
+            inspect.signature(module.l2norm).bind(object(), dim=-1, eps=1e-6)
+        imports[name] = str(Path(module.__file__).resolve())
+    optimizer = importlib.import_module("megatron.core.optimizer.emerging_optimizers")
+    if not optimizer.HAVE_EMERGING_OPTIMIZERS:
+        raise ValueError(
+            "Megatron did not enable emerging-optimizers; required original imports failed"
+        )
+    installation = json.loads((bundle / "functional-package-install.json").read_text())
+    if installation.get("version") != "1" or not isinstance(installation.get("install"), list):
+        raise ValueError("Invalid functional package installation report")
+    # 原始 pip 报告随 bundle 一并封存；没有条目只表示本次解析前已满足，不能伪造下载来源。
+    sources = {
+        item["metadata"]["name"].lower().replace("_", "-"): item["download_info"]
+        for item in installation["install"]
+        if item["metadata"]["name"].lower().replace("_", "-") in TRAINING_PACKAGES
+    }
+    return {
+        "packages": packages,
+        "imports": imports,
+        "download_sources": sources,
+        "satisfied_before_install": sorted(packages.keys() - sources.keys()),
+        "emerging_optimizers_enabled": True,
+    }
 
 
 def prepare(bundle: Path, manifest: dict):
@@ -165,6 +237,8 @@ def check(bundle: Path, manifest: dict, output: Path):
     nvrx = check_nvrx(nvrx_requirements(manifest))
     if nvrx:
         packages["nvidia-resiliency-ext"] = nvrx["version"]
+    training_dependencies = check_training_dependencies(bundle)
+    packages.update(training_dependencies["packages"])
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.device_count() != 8:
@@ -184,6 +258,7 @@ def check(bundle: Path, manifest: dict, output: Path):
                 "python": sys.version,
                 "packages": packages,
                 "nvrx": nvrx,
+                "training_dependencies": training_dependencies,
                 "bash": bash,
                 "yq": yq,
                 "envsubst": envsubst,

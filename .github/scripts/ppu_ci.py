@@ -755,6 +755,7 @@ def bundle_inventory(directory: Path) -> dict:
             "functional-tools/yq",
             "functional-tools/envsubst",
             "functional-environment.json",
+            "functional-package-install.json",
             "installed-packages.json",
             "control/ppu_functional_run.sh",
         ]

@@ -4,6 +4,7 @@ import ast
 import hashlib
 import io
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -20,6 +21,7 @@ FUNCTIONAL_PAYLOADS = [
     "functional-tools/yq",
     "functional-tools/envsubst",
     "functional-environment.json",
+    "functional-package-install.json",
     "installed-packages.json",
     "control/ppu_functional_run.sh",
     *[
@@ -78,6 +80,17 @@ def tool_environment(tmp_path, monkeypatch):
     local.mkdir()
     (bundle / "control").mkdir()
     (bundle / "control/ppu_functional_pytest.py").write_text("PLUGIN = True\n")
+    installation = {
+        "version": "1",
+        "install": [
+            {
+                "metadata": {"name": name.replace("-", "_"), "version": version},
+                "download_info": {"url": f"https://pkg.flytiger-eco.com/{name}.whl"},
+            }
+            for name, version in environment.TRAINING_PACKAGES.items()
+        ],
+    }
+    (bundle / "functional-package-install.json").write_text(json.dumps(installation))
     envsubst = tmp_path / "envsubst"
     envsubst.write_text("Mock GNU gettext")
     content = b"Attested mock yq"
@@ -107,7 +120,25 @@ def tool_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(
         environment.importlib.metadata,
         "version",
-        lambda name: "0.6.0" if name == "nvidia-resiliency-ext" else "fixture",
+        lambda name: (
+            "0.6.0"
+            if name == "nvidia-resiliency-ext"
+            else environment.TRAINING_PACKAGES.get(name, "fixture")
+        ),
+    )
+    training_modules = {
+        name: SimpleNamespace(
+            __file__=str(site / name.replace(".", "/") / "__init__.py"),
+            **{
+                symbol: lambda *a, **k: pytest.fail("依赖预检不应执行训练算子")
+                for symbol in symbols
+            },
+        )
+        for name, symbols in environment.TRAINING_IMPORTS.items()
+    }
+    training_modules["fla.modules.l2norm"].l2norm = lambda x, eps=1e-6, *, dim=-1: x
+    training_modules["megatron.core.optimizer.emerging_optimizers"] = SimpleNamespace(
+        HAVE_EMERGING_OPTIMIZERS=True
     )
     original_import = environment.importlib.import_module
     monkeypatch.setattr(
@@ -116,7 +147,7 @@ def tool_environment(tmp_path, monkeypatch):
         lambda name: (
             SimpleNamespace()
             if name in ("tensorboard", "yaml", "click", "ppu_functional_pytest")
-            else original_import(name)
+            else training_modules[name] if name in training_modules else original_import(name)
         ),
     )
     cuda = SimpleNamespace(is_available=lambda: True, device_count=lambda: 8)
@@ -230,6 +261,9 @@ def test_prepare_attests_tools_and_installs_selected_dependencies(
     environment.check(bundle, manifest, bundle / "reports")
     report = json.loads((bundle / "reports/functional-environment.json").read_text())
     assert report["identity"] == manifest["identity"] and report["devices"] == 8
+    assert report["training_dependencies"]["packages"] == environment.TRAINING_PACKAGES
+    assert environment.TRAINING_PACKAGES.items() <= report["packages"].items()
+    assert report["training_dependencies"]["emerging_optimizers_enabled"]
     assert ("nvidia-resiliency-ext" in report["packages"]) == (
         launcher == "ft_launcher" or checkpoint
     )
@@ -314,6 +348,122 @@ def test_incompatible_checkpoint_api_fails_before_training(
     with pytest.raises((ValueError, TypeError)):
         environment.check(bundle, manifest, bundle / "reports")
     assert not (bundle / "reports/functional-environment.json").exists()
+
+
+def test_training_packages_match_build_constraints(tmp_path, monkeypatch):
+    script = (SCRIPTS / "ppu_ci_build.sh").read_text()
+    block = next(
+        block
+        for block in re.findall(r"<<'PY'\n(.*?)\nPY", script, re.S)
+        if "native_requirements =" in block
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(environment.importlib.metadata, "version", lambda name: "fixed-runtime")
+    bundle = tmp_path / ".ppu-ci"
+    bundle.mkdir()
+    (bundle / "manifest.json").write_text(json.dumps({"test_kind": "functional"}))
+    exec(compile(block, "functional-build-requirements", "exec"), {})
+    requirements = (bundle / "ppu-requirements.txt").read_text().splitlines()
+    constraints = (bundle / "constraints.txt").read_text().splitlines()
+    for name, version in environment.TRAINING_PACKAGES.items():
+        assert requirements.count(f"{name}=={version}") == 1
+        assert constraints.count(f"{name}=={version}") == 1
+    assert all(f"{name}==fixed-runtime" in constraints for name in ("torch", "triton"))
+    assert 'functional_pip_args=(--report .ppu-ci/functional-package-install.json)' in script
+
+
+@pytest.mark.parametrize("name", environment.TRAINING_PACKAGES)
+@pytest.mark.parametrize("damage", ["missing", "version"])
+def test_training_dependency_missing_or_wrong_version_fails(
+    tool_environment, monkeypatch, name, damage
+):
+    bundle, _, manifest, _, _, _ = tool_environment
+    environment.prepare(bundle, manifest)
+    version = environment.importlib.metadata.version
+
+    def installed(package):
+        if package != name:
+            return version(package)
+        if damage == "missing":
+            raise environment.importlib.metadata.PackageNotFoundError(package)
+        return "999.9.9"
+
+    monkeypatch.setattr(environment.importlib.metadata, "version", installed)
+    with pytest.raises((ValueError, environment.importlib.metadata.PackageNotFoundError)):
+        environment.check(bundle, manifest, bundle / "reports")
+    assert not (bundle / "reports/functional-environment.json").exists()
+
+
+@pytest.mark.parametrize("name", environment.TRAINING_IMPORTS)
+def test_training_native_import_failure_is_not_ignored(tool_environment, monkeypatch, name):
+    bundle, _, manifest, _, _, _ = tool_environment
+    environment.prepare(bundle, manifest)
+    original_import = environment.importlib.import_module
+
+    def broken_import(module):
+        if module == name:
+            raise ImportError(f"Missing native dependency: {name}")
+        return original_import(module)
+
+    monkeypatch.setattr(environment.importlib, "import_module", broken_import)
+    with pytest.raises(ImportError, match="Missing native dependency"):
+        environment.check(bundle, manifest, bundle / "reports")
+    assert not (bundle / "reports/functional-environment.json").exists()
+
+
+@pytest.mark.parametrize(
+    "name,symbol",
+    [
+        (name, symbol)
+        for name, symbols in environment.TRAINING_IMPORTS.items()
+        for symbol in symbols
+    ],
+)
+def test_training_dependency_api_is_required(tool_environment, monkeypatch, name, symbol):
+    bundle, _, _, _, _, _ = tool_environment
+    module = environment.importlib.import_module(name)
+    monkeypatch.setattr(module, symbol, None)
+    with pytest.raises(ValueError, match="Missing functional dependency API"):
+        environment.check_training_dependencies(bundle)
+
+
+@pytest.mark.parametrize("damage", ["l2norm", "optimizer", "report_missing", "report_invalid"])
+def test_dependency_compatibility_and_provenance_are_required(
+    tool_environment, monkeypatch, damage
+):
+    bundle, _, _, _, _, _ = tool_environment
+    if damage == "l2norm":
+        module = environment.importlib.import_module("fla.modules.l2norm")
+        monkeypatch.setattr(module, "l2norm", lambda x, eps=1e-6: x)
+    elif damage == "optimizer":
+        module = environment.importlib.import_module("megatron.core.optimizer.emerging_optimizers")
+        monkeypatch.setattr(module, "HAVE_EMERGING_OPTIMIZERS", False)
+    elif damage == "report_missing":
+        (bundle / "functional-package-install.json").rename(bundle / "absent-report.json")
+    else:
+        (bundle / "functional-package-install.json").write_text('{}')
+    with pytest.raises((TypeError, ValueError, FileNotFoundError)):
+        environment.check_training_dependencies(bundle)
+
+
+def test_dependency_report_preserves_actual_sources(tool_environment):
+    bundle, _, _, _, _, _ = tool_environment
+    path = bundle / "functional-package-install.json"
+    installation = json.loads(path.read_text())
+    installation["install"] = [
+        item for item in installation["install"] if item["metadata"]["name"] != "pla"
+    ]
+    installation["install"].append({"metadata": {"name": "tensorboard"}})
+    path.write_text(json.dumps(installation))
+    result = environment.check_training_dependencies(bundle)
+    assert result["packages"] == environment.TRAINING_PACKAGES
+    assert set(result["imports"]) == set(environment.TRAINING_IMPORTS)
+    assert result["satisfied_before_install"] == ["pla"]
+    assert result["download_sources"] == {
+        item["metadata"]["name"].replace("_", "-"): item["download_info"]
+        for item in installation["install"]
+        if item["metadata"]["name"] != "tensorboard"
+    }
 
 
 def test_checkpoint_requirement_is_not_optional():

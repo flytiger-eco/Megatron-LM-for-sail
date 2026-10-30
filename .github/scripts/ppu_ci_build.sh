@@ -23,6 +23,7 @@ export VIRTUAL_ENV=/opt/ppu-ci-venv
 
 python - <<'PY'
 import importlib.metadata as md
+import json
 from pathlib import Path
 packages = ('torch', 'torchvision', 'triton', 'scipy', 'scikit-learn')
 lines = []
@@ -40,6 +41,12 @@ native_requirements = [
     'pla==1.0.0+v0.1.0.ppu2.2.0',
     'fla-core==0.4.1+v0.1.0.ppu2.2.0',
 ]
+if json.loads(Path('.ppu-ci/manifest.json').read_text()).get('test_kind') == 'functional':
+    # 六项依赖当前均可从 Flytiger 获取；不混用额外索引或覆盖 PPU runtime。
+    native_requirements += [
+        'flash-linear-attention==0.4.1+v0.1.0.ppu2.2.0',
+        'emerging-optimizers==0.3.0',
+    ]
 Path('.ppu-ci/ppu-requirements.txt').write_text('\n'.join(native_requirements) + '\n')
 Path('.ppu-ci/constraints.txt').write_text(
     '\n'.join(lines + native_requirements + ['numpy==1.26.4', 'pyarrow==21.0.0']) + '\n'
@@ -59,7 +66,11 @@ requirements = (
 )
 Path('.ppu-ci/test-requirements.txt').write_text('\n'.join(requirements) + '\n')
 PY
-python -m pip install --index-url "$PIP_INDEX_URL" --no-build-isolation \
+functional_pip_args=()
+if python -c 'import json; raise SystemExit(json.load(open(".ppu-ci/manifest.json")).get("test_kind") != "functional")'; then
+    functional_pip_args=(--report .ppu-ci/functional-package-install.json)
+fi
+python -m pip install --index-url "$PIP_INDEX_URL" --no-build-isolation "${functional_pip_args[@]}" \
     -r .ppu-ci/test-requirements.txt -r .ppu-ci/ppu-requirements.txt \
     pytest-timeout click wrapt requests tensorstore scipy scikit-learn \
     'pydantic<2.14' boto3 'multi-storage-client~=0.50' 'einops~=0.8' 'uv==0.13.0' \
