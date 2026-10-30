@@ -33,9 +33,11 @@ jobs:
         env:
           PPU_TARGET_SHA: ${{ inputs.target_sha }}
           PPU_CONTROL_SHA: ${{ inputs.control_sha }}
+          RESULT_DIR: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic
         run: |
           [[ "$(git -C source rev-parse HEAD)" == "$PPU_CONTROL_SHA" ]]
           python3 -I source/.github/scripts/ppu_compiler_diagnostic.py authorize --authorization .ppu-ci/authorization.json
+          mkdir -p "$RESULT_DIR"
       - name: 单 Pod 八卡有界编译诊断
         id: ppu
         uses: flytiger-eco/ppu-distributed-action@main
@@ -59,7 +61,7 @@ jobs:
             cd /opt/megatron-lm
             [[ "$(git -c safe.directory="$PWD/source" -C source rev-parse HEAD)" == "$PPU_CONTROL_SHA" ]]
             timeout --signal=TERM --kill-after=5s 540s python3 -I source/.github/scripts/ppu_compiler_diagnostic.py run \
-              --authorization .ppu-ci/authorization.json --root source --output "$PPU_DIAGNOSTIC_OUTPUT"
+              --authorization .ppu-ci/authorization.json --root source --output "$PPU_DIAGNOSTIC_OUTPUT/pod"
       - name: 记录独立诊断执行状态
         if: always()
         shell: bash
@@ -67,10 +69,11 @@ jobs:
           RESULT_DIR: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic
           ACTION_STATUS: ${{ steps.ppu.outputs.job_status }}
           ACTION_OUTCOME: ${{ steps.ppu.outcome }}
+          ACTION_OUTPUTS: ${{ toJSON(steps.ppu.outputs) }}
         run: |
           mkdir -p "$RESULT_DIR"
-          printf '{"numerical_validation":false,"action_status":"%s","action_outcome":"%s"}\n' \
-            "$ACTION_STATUS" "$ACTION_OUTCOME" > "$RESULT_DIR/action.json"
+          printf '{"numerical_validation":false,"action_status":"%s","action_outcome":"%s","outputs":%s}\n' \
+            "$ACTION_STATUS" "$ACTION_OUTCOME" "$ACTION_OUTPUTS" > "$RESULT_DIR/action.json"
           printf '%s\n' '独立编译诊断；未执行 Build、UT 或正式模型回归，不计入通过率。' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()

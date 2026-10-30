@@ -73,6 +73,17 @@ def load_bda(root: Path, torch_module):
     return module.bias_dropout_add_fused_train
 
 
+def verify_runtime(report: dict) -> None:
+    """分别核验安装包与模块版本，厂商后缀不一定出现在 torch.__version__。"""
+    if not (
+        report["device_count"] == 8
+        and report["torch_distribution"] == "2.13.0+v0.1.0.ppu2.2.0"
+        and report["torch"] in ("2.13.0", "2.13.0+v0.1.0.ppu2.2.0")
+        and report["triton"] == "3.7.0+v0.1.0.ppu2.2.0"
+    ):
+        raise ValueError("Diagnostic requires the original eight-card PPU runtime")
+
+
 def probe(root: Path, output: Path, variant: str) -> None:
     """使用原 BDA 的 BF16 形状、dropout、梯度和确定性设置。"""
     import importlib.metadata
@@ -91,6 +102,7 @@ def probe(root: Path, output: Path, variant: str) -> None:
     try:
         report.update(
             torch=torch.__version__,
+            torch_distribution=importlib.metadata.version("torch"),
             triton=importlib.metadata.version("triton"),
             compile_threads=config.compile_threads,
             worker_start_method=config.worker_start_method,
@@ -98,8 +110,7 @@ def probe(root: Path, output: Path, variant: str) -> None:
             numerical_validation=False,
         )
         phase("runtime_verified")
-        if report["device_count"] != 8 or torch.__version__ != "2.13.0+v0.1.0.ppu2.2.0":
-            raise ValueError("Diagnostic requires the original eight-card PPU runtime")
+        verify_runtime(report)
         if variant == "single_thread" and config.compile_threads != 1:
             raise ValueError("Single-thread compiler setting was not applied")
         torch.cuda.set_device(rank)
@@ -176,15 +187,57 @@ def proc_text(path: Path) -> str:
         return f"unavailable: {error}"
 
 
-def capture_processes(session: int, output: Path) -> None:
-    """记录该诊断进程组及其线程的内核栈、等待点和 Python 采样覆盖。"""
-    processes = []
+def process_family(root_pid: int, known: dict) -> dict:
+    """跟踪跨 setsid 的后代；保留会话归属以回收已成为孤儿的编译 worker。"""
+    table = {}
     for path in Path("/proc").glob("[0-9]*"):
+        fields = proc_text(path / "stat").rsplit(")", 1)[-1].split()
         try:
-            if os.getsid(int(path.name)) != session:
-                continue
-        except ProcessLookupError:
+            table[int(path.name)] = {
+                "ppid": int(fields[1]),
+                "pgid": int(fields[2]),
+                "sid": int(fields[3]),
+                "start": int(fields[19]),
+            }
+        except (ValueError, IndexError):
             continue
+    sessions = {root_pid, *(row["sid"] for row in known.values())}
+    selected = {
+        pid: row
+        for pid, row in table.items()
+        if row["sid"] in sessions or (pid in known and known[pid]["start"] == row["start"])
+    }
+    while True:
+        children = {
+            pid: row
+            for pid, row in table.items()
+            if pid not in selected and row["ppid"] in selected
+        }
+        if not children:
+            break
+        selected.update(children)
+    known.update(selected)
+    return selected
+
+
+def signal_family(root_pid: int, known: dict, sig: int) -> None:
+    """只向本次 launcher 及其后代会话的进程组转发终止信号。"""
+    groups = {root_pid, *(row["pgid"] for row in process_family(root_pid, known).values())}
+    for group in groups:
+        if group <= 1 or group == os.getpgrp():
+            raise ValueError("Refusing to signal the controller process group")
+        try:
+            os.killpg(group, sig)
+        except ProcessLookupError:
+            pass
+
+
+def capture_processes(session: int, output: Path, known: dict | None = None) -> None:
+    """记录所有后代会话的线程内核栈、等待点和 Python 采样覆盖。"""
+    processes = []
+    family = process_family(session, {} if known is None else known)
+    for pid in family:
+        path = Path("/proc") / str(pid)
         stack = output / "stacks" / f"python-{path.name}.log"
         status = proc_text(path / "status")
         caught = re.search(r"^SigCgt:\s*([0-9a-fA-F]+)$", status, re.MULTILINE)
@@ -230,32 +283,31 @@ class DiagnosticRunner:
             process = subprocess.Popen(
                 command, env=env, stdout=stream, stderr=stream, start_new_session=True
             )
+            known = {}
             try:
                 next_capture = started + 15
+                next_tracking = started
                 while process.poll() is None:
                     now = time.monotonic()
+                    if now >= next_tracking:
+                        process_family(process.pid, known)
+                        next_tracking = now + 1
                     if now >= next_capture:
-                        capture_processes(process.pid, output)
+                        capture_processes(process.pid, output, known)
                         next_capture = now + 30
                     if self.cancelled or now >= deadline:
                         timed_out = not self.cancelled
-                        capture_processes(process.pid, output)
+                        capture_processes(process.pid, output, known)
                         break
                     time.sleep(0.2)
             finally:
-                # launcher 退出不意味着编译 worker 已退出；始终回收整个会话的进程组。
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+                # torchrun 的 rank 会另建会话；launcher 退出不意味着所有后代已退出。
+                signal_family(process.pid, known, signal.SIGTERM)
                 try:
                     process.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     pass
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                signal_family(process.pid, known, signal.SIGKILL)
                 process.wait(timeout=3)
         return {
             "exit_code": process.returncode,
@@ -360,6 +412,10 @@ def run_diagnostic(root: Path, output: Path, authorization: dict) -> int:
             row["completed"] for row in report["variants"]
         )
         write_json(output / "diagnostic.json", report)
+        # 只开放本次输出的读取权限，CPU 归档不需要输入资产或缓存的写权限。
+        for path in output.rglob("*"):
+            if not path.is_symlink():
+                path.chmod(path.stat().st_mode | 0o444 | (0o111 if path.is_dir() else 0))
         for sig, handler in handlers.items():
             signal.signal(sig, handler)
     return 0 if report["completed"] else 1

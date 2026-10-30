@@ -420,11 +420,78 @@ def test_stack_sampling_signals_only_registered_diagnostic_processes(
     monkeypatch.setattr(
         diagnostic, "Path", lambda value: tmp_path / "proc" if value == "/proc" else Path(value)
     )
-    monkeypatch.setattr(diagnostic.os, "getsid", lambda _: 10 if own else 20)
+    monkeypatch.setattr(diagnostic, "process_family", lambda *_: {123: {}} if own else {})
     signals = []
     monkeypatch.setattr(diagnostic.os, "kill", lambda pid, sig: signals.append((pid, sig)))
     diagnostic.capture_processes(10, tmp_path)
     assert signals == ([(123, signal.SIGUSR1)] if own and ready and caught else [])
+
+
+def runtime_report():
+    return {
+        "device_count": 8,
+        "torch": "2.13.0",
+        "torch_distribution": "2.13.0+v0.1.0.ppu2.2.0",
+        "triton": "3.7.0+v0.1.0.ppu2.2.0",
+    }
+
+
+@pytest.mark.parametrize("module_version", ["2.13.0", "2.13.0+v0.1.0.ppu2.2.0"])
+def test_vendor_distribution_and_module_version_are_distinct(module_version):
+    diagnostic.verify_runtime({**runtime_report(), "torch": module_version})
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("device_count", 4),
+        ("torch", "2.12.0"),
+        ("torch_distribution", "2.13.0"),
+        ("torch_distribution", "2.13.0+v0.2.0.ppu2.2.0"),
+        ("triton", "3.7.0"),
+    ],
+)
+def test_runtime_gate_remains_strict(key, value):
+    with pytest.raises(ValueError, match="original eight-card"):
+        diagnostic.verify_runtime({**runtime_report(), key: value})
+
+
+def test_cross_session_discovery_orphans_and_pid_reuse(tmp_path, monkeypatch):
+    def process(pid, ppid, pgid, sid, start=100):
+        directory = tmp_path / str(pid)
+        directory.mkdir(exist_ok=True)
+        fields = ["S", str(ppid), str(pgid), str(sid)] + ["0"] * 15 + [str(start)]
+        (directory / "stat").write_text(f"{pid} (python worker) " + " ".join(fields))
+
+    monkeypatch.setattr(diagnostic, "Path", lambda _: tmp_path)
+    process(10, 1, 10, 10)
+    process(20, 10, 20, 20)
+    process(30, 20, 20, 20)
+    process(40, 1, 40, 40)
+    known = {}
+    assert set(diagnostic.process_family(10, known)) == {10, 20, 30}
+    process(20, 1, 20, 20)
+    process(31, 1, 20, 20)
+    process(30, 1, 40, 40, start=200)
+    assert set(diagnostic.process_family(10, known)) == {10, 20, 31}
+    assert known[30]["start"] == 100
+    signals = []
+    monkeypatch.setattr(diagnostic.os, "killpg", lambda group, sig: signals.append((group, sig)))
+    monkeypatch.setattr(diagnostic.os, "getpgrp", lambda: 999)
+    diagnostic.signal_family(10, known, signal.SIGTERM)
+    assert set(signals) == {(10, signal.SIGTERM), (20, signal.SIGTERM)}
+
+
+def test_cpu_envelope_and_pod_evidence_have_separate_ownership():
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-compiler-diagnostic.yml").read_text())
+    steps = workflow["jobs"]["diagnose"]["steps"]
+    setup = next(step for step in steps if step.get("name") == "核验诊断授权与源码身份")
+    assert 'mkdir -p "$RESULT_DIR"' in setup["run"]
+    action = next(step for step in steps if step.get("id") == "ppu")
+    assert '--output "$PPU_DIAGNOSTIC_OUTPUT/pod"' in action["with"]["command"]
+    envelope = next(step for step in steps if step.get("name") == "记录独立诊断执行状态")
+    assert envelope["env"]["RESULT_DIR"] == setup["env"]["RESULT_DIR"]
+    assert envelope["env"]["ACTION_OUTPUTS"] == "${{ toJSON(steps.ppu.outputs) }}"
 
 
 def test_kernel_stack_unavailability_is_recorded(tmp_path):
