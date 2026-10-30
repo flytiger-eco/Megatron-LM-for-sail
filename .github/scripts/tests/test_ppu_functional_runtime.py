@@ -295,7 +295,7 @@ python() {
         "$FIXTURE_PYTHON" "$FIXTURE_SCRIPT" "$@"
     fi
 }
-chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]]; }
+chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
 ''')
     output = tmp_path / "output"
     env = {
@@ -332,6 +332,35 @@ chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]]; }
         assert timing["elapsed_seconds"] >= 0
         if not archive_failure:
             assert timing["exit_code"] == process.returncode
+            handoff = output / "action-timing.json"
+            assert handoff.read_text() == ""
+            assert handoff.stat().st_mode & 0o222 == 0o222
+            assert output.stat().st_mode & 0o022 == 0
+            assert (output / "pod-timing.json").stat().st_mode & 0o022 == 0
+            workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-functional.yml").read_text())
+            step = next(
+                step
+                for step in workflow["jobs"]["test"]["steps"]
+                if step.get("name") == "Record execution and scheduling envelope"
+            )
+            outcome = "success" if process.returncode == 0 else "failure"
+            action_status = "succeeded" if process.returncode == 0 else "failed"
+            subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", step["run"]],
+                env={
+                    **os.environ,
+                    "RESULT_DIR": str(output),
+                    "REQUESTED_AT": "1",
+                    "ACTION_OUTCOME": outcome,
+                    "ACTION_STATUS": action_status,
+                    "ACTION_OUTPUTS": "{}",
+                },
+                check=True,
+            )
+            envelope = json.loads(handoff.read_text())
+            assert envelope["action_outcome"] == outcome
+            assert envelope["action_status"] == action_status
+            assert envelope["requested_at"] == 1
     finally:
         if process.poll() is None:
             process.kill()
