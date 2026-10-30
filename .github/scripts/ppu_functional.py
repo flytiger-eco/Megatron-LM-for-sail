@@ -839,6 +839,7 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path, default=Path(".ppu-ci"))
     parser.add_argument("--assets-root", type=Path, default=Path(CPU_ASSETS))
+    parser.add_argument("--tokenizer-receipts", type=Path)
     parser.add_argument("--location", choices=("cpu", "pod"), default="cpu")
     parser.add_argument("--case-id")
     args = parser.parse_args()
@@ -853,6 +854,10 @@ def main() -> None:
             and report["root"]["ok"]
         ):
             report["tokenizer_source_candidate"] = hf.inspect_candidate(args.assets_root)
+            if args.tokenizer_receipts:
+                report["tokenizer_preparation_receipts"] = hf.inspect_receipts(
+                    args.tokenizer_receipts
+                )
         write_asset_report(report, args.output)
         raise SystemExit(0 if report["ok"] else 1)
     inputs = json.loads(os.environ.get("PPU_INPUTS", "{}"))

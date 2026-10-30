@@ -125,7 +125,9 @@ jobs:
         with:
           python-version: '3.12'
       - name: Read-only NAS asset preflight (no PPU requested)
-        run: python3 -I .ppu-ci/control/ppu_functional.py assets --output .ppu-ci
+        run: >-
+          python3 -I .ppu-ci/control/ppu_functional.py assets --output .ppu-ci
+          --tokenizer-receipts /wl_nas/anyunge.ayg/hf-prep
       - uses: actions/upload-artifact@v4
         if: always()
         with:
