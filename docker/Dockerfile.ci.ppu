@@ -1,0 +1,256 @@
+# syntax=docker/dockerfile:1.19
+
+ARG FROM_IMAGE_NAME=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+FROM ${FROM_IMAGE_NAME} AS main
+
+ARG MAX_JOBS=16
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
+    PIP_CONFIG_FILE=/dev/null \
+    PIP_EXTRA_INDEX_URL="" \
+    PIP_FIND_LINKS="" \
+    PIP_CONSTRAINT="" \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_INPUT=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TORCH_CPP_LOG_LEVEL=ERROR \
+    MAX_JOBS=${MAX_JOBS}
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential python3-dev python3-venv git ca-certificates wget && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip uninstall --yes megatron-core cloud-tpu-client protobuf && \
+    python3 -m venv --system-site-packages /opt/ppu-ci-venv
+ENV VIRTUAL_ENV=/opt/ppu-ci-venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+WORKDIR /opt/ppu-build
+COPY pyproject.toml ./
+RUN python - <<'PY'
+import importlib.metadata as md
+import tomllib
+from pathlib import Path
+
+constraints = []
+for package in ('torch', 'torchvision', 'triton', 'scipy', 'scikit-learn'):
+    try:
+        constraints.append(f'{package}=={md.version(package)}')
+    except md.PackageNotFoundError:
+        if package in ('torch', 'triton'):
+            raise RuntimeError(f'Base image is missing a PPU runtime: {package}') from None
+native_requirements = [
+    'transformer-engine==2.16+v0.1.0.ppu2.2.0',
+    'flash-attn==2.8.2+v0.2.0.ppu2.2.0',
+    'mamba-ssm==2.3.1+v0.1.0.ppu2.2.0',
+    'causal-conv1d==1.7.0+v0.1.0.ppu2.2.0',
+    'pla==1.0.0+v0.1.0.ppu2.2.0',
+    'fla-core==0.4.1+v0.1.0.ppu2.2.0',
+]
+Path('ppu-requirements.txt').write_text('\n'.join(native_requirements) + '\n')
+Path('constraints.txt').write_text(
+    '\n'.join(constraints + native_requirements + ['numpy==1.26.4', 'pyarrow==21.0.0']) + '\n'
+)
+project = tomllib.loads(Path('pyproject.toml').read_text())
+requirements = (
+    project['project']['dependencies']
+    + project['dependency-groups']['test']
+    + project['project']['optional-dependencies']['training']
+)
+Path('test-requirements.txt').write_text('\n'.join(requirements) + '\n')
+PY
+ENV PIP_CONSTRAINT=/opt/ppu-build/constraints.txt
+RUN python -m pip install --index-url "$PIP_INDEX_URL" --upgrade 'packaging>=24.2' && \
+    python -m pip install --index-url "$PIP_INDEX_URL" \
+        'setuptools>=80' wheel pybind11 ninja click pyyaml numpy && \
+    python -m pip install --index-url "$PIP_INDEX_URL" --no-build-isolation \
+        --only-binary=transformer-engine,flash-attn,mamba-ssm,causal-conv1d,pla,fla-core \
+        -r test-requirements.txt -r ppu-requirements.txt \
+        pytest-timeout click wrapt requests tensorstore scipy scikit-learn \
+        'pydantic<2.14' boto3 'multi-storage-client~=0.50' 'einops~=0.8' 'uv==0.13.0' \
+        'google-api-python-client>=2' pyzmq msgpack 'openai[aiohttp]' fastapi uvicorn datasets \
+        'nvidia-modelopt==0.45.0' && \
+    python -m pip check
+
+RUN python -I - <<'PY'
+import hashlib
+import importlib.metadata as md
+import sys
+from pathlib import Path
+
+
+def patch_package(package, version, relative_path, original, replacement, suffix=''):
+    distribution = md.distribution(package)
+    if distribution.version != version:
+        raise RuntimeError(f'{package} version mismatch: {distribution.version}')
+    path = Path(distribution.locate_file(relative_path)).resolve()
+    if not path.is_relative_to(Path(sys.prefix).resolve()):
+        raise RuntimeError(f'Patch target is outside the virtual environment: {path}')
+    source = path.read_text()
+    if source.count(original) != 1:
+        raise RuntimeError(f'Patch target is not unique or the source has changed: {path}')
+    patched = source.replace(original, replacement) + suffix
+    compile(patched, str(path), 'exec')
+    path.write_text(patched)
+    print('Applied PPU patch:', path, 'sha256:', hashlib.sha256(patched.encode()).hexdigest())
+
+
+patch_package(
+    'fla-core', '0.4.1+v0.1.0.ppu2.2.0', 'fla/modules/l2norm.py',
+    '''def l2norm(
+    x: torch.Tensor,
+    eps: float = 1e-6,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    return L2NormFunction.apply(x, eps, output_dtype)''',
+    '''def l2norm(
+    x: torch.Tensor,
+    eps: float = 1e-6,
+    output_dtype: torch.dtype | None = None,
+    *,
+    dim: int = -1,
+) -> torch.Tensor:
+    if not isinstance(dim, int) or isinstance(dim, bool) or dim not in (-1, x.ndim - 1):
+        raise ValueError("PPU FLA Core l2norm only supports the last dimension")
+    return L2NormFunction.apply(x, eps, output_dtype)''',
+)
+patch_package(
+    'transformer-engine', '2.16+v0.1.0.ppu2.2.0',
+    'transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py',
+    '''            dq[cu_seqlens_q_padded[-1] :].fill_(0)
+            dk[cu_seqlens_kv_padded[-1] :].fill_(0)
+            dv[cu_seqlens_kv_padded[-1] :].fill_(0)''',
+    '''            _ppu_zero_cp_padding(dq, cu_seqlens_q_padded)
+            _ppu_zero_cp_padding(dk, cu_seqlens_kv_padded)
+            _ppu_zero_cp_padding(dv, cu_seqlens_kv_padded)''',
+    '''
+
+def _ppu_zero_cp_padding(gradient, cu_seqlens):
+    indices = torch.arange(gradient.shape[0], device=gradient.device)
+    mask = (indices >= cu_seqlens[-1]).view(-1, *([1] * (gradient.ndim - 1)))
+    gradient.masked_fill_(mask, 0)
+''',
+)
+PY
+
+WORKDIR /opt/megatron-lm
+COPY --exclude=.git --exclude=.venv --exclude=venv --exclude=.env --exclude=.env.* \
+    --exclude=.ppu-ci --exclude=build --exclude=dist --exclude=**/*.egg-info \
+    --exclude=**/__pycache__ --exclude=**/*.pyc --exclude=**/*.so . ./
+RUN python -m pip wheel --index-url "$PIP_INDEX_URL" --no-build-isolation --no-deps \
+        --wheel-dir /opt/ppu-build/wheels . && \
+    python setup.py build_ext --inplace && \
+    make -C megatron/core/datasets && \
+    make -q -C megatron/core/datasets && \
+    python -m pip install --no-index --no-deps --ignore-installed /opt/ppu-build/wheels/*.whl && \
+    python -m pip check && \
+    python -m pip list --format=json > /opt/ppu-build/installed-packages.json
+
+RUN python -I - <<'PY'
+import importlib.machinery
+import importlib.metadata as md
+import importlib.util
+import sys
+from pathlib import Path
+
+from packaging.requirements import Requirement
+
+for line in Path('/opt/ppu-build/constraints.txt').read_text().splitlines():
+    requirement = Requirement(line)
+    installed = md.version(requirement.name)
+    if not requirement.specifier.contains(installed, prereleases=True):
+        raise RuntimeError(f'Dependency version violates constraint: {requirement}, installed {installed}')
+
+distribution = md.distribution('megatron-core')
+for relative_path in ('megatron/core/__init__.py', 'megatron/training/__init__.py'):
+    path = Path(distribution.locate_file(relative_path)).resolve()
+    if not path.is_file() or not path.is_relative_to(Path(sys.prefix).resolve()):
+        raise RuntimeError(f'Megatron is not correctly installed in the virtual environment: {path}')
+extensions = [
+    Path(distribution.locate_file(entry)).resolve()
+    for entry in distribution.files or ()
+    if str(entry).startswith('megatron/core/datasets/helpers_cpp')
+    and any(str(entry).endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES)
+]
+if len(extensions) != 1 or not extensions[0].is_relative_to(Path(sys.prefix).resolve()):
+    raise RuntimeError(f'Installed wheel does not contain a unique helpers_cpp extension: {extensions}')
+spec = importlib.util.spec_from_file_location('helpers_cpp', extensions[0])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print('Megatron build and installation completed:', distribution.version, extensions[0])
+PY
+
+COPY --chmod=0755 <<'PY' /usr/local/bin/ppu-smoke-test
+#!/opt/ppu-ci-venv/bin/python -I
+import importlib
+import inspect
+import sys
+from pathlib import Path
+
+import torch
+
+if not torch.cuda.is_available():
+    raise RuntimeError('No PPU device detected; configure container device passthrough before running this check')
+for name in (
+    'pla', 'pla.decode', 'pla.prefill.flashqla', 'pla.prefill.flashkdapro',
+    'fla', 'fla.modules.convolution', 'fla.modules.l2norm',
+    'fla.ops.gated_delta_rule', 'transformer_engine.pytorch',
+    'flash_attn.flash_attn_interface', 'flash_attn_2_cuda',
+    'mamba_ssm.ops.triton.layernorm_gated', 'mamba_ssm.ops.triton.ssd_combined',
+    'selective_scan_cuda', 'causal_conv1d', 'causal_conv1d_cuda',
+    'scipy.linalg', 'sklearn.utils.murmurhash', 'pyarrow.parquet', 'datasets',
+    'zmq', 'msgpack', 'openai', 'fastapi', 'uvicorn', 'modelopt.torch',
+    'megatron.core', 'megatron.training', 'megatron.core.datasets.helpers_cpp',
+    'megatron.core.inference.inference_client',
+):
+    module = importlib.import_module(name)
+    print('Import check passed:', name, module.__file__)
+
+from fla.modules.l2norm import l2norm
+from megatron.core.datasets import helpers_cpp
+from megatron.core.extensions import transformer_engine
+from megatron.core.inference.engines import dynamic_engine
+from megatron.core.ssm import gated_delta_net, mamba_mixer
+from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
+    _ppu_zero_cp_padding,
+)
+
+inspect.signature(l2norm).bind(object(), dim=-1, eps=1e-6)
+assert Path(helpers_cpp.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+assert transformer_engine.HAVE_TE, 'Megatron did not enable Transformer Engine'
+assert mamba_mixer.HAVE_MAMBA_SSM, 'Megatron did not enable Mamba SSM'
+assert mamba_mixer.causal_conv1d_fn is not None, 'Megatron did not enable causal-conv1d'
+assert gated_delta_net.HAVE_FLA, 'Megatron did not enable PPU FLA Core'
+assert dynamic_engine.HAVE_ZMQ and dynamic_engine.HAVE_MSGPACK, 'Inference communication dependencies are incomplete'
+
+for dtype in (torch.float32, torch.bfloat16):
+    for noncontiguous in (False, True):
+        original = torch.arange(54, device='cuda', dtype=torch.float32).reshape(9, 2, 3).to(dtype)
+        original[0, 0, 0] = float('nan')
+        original[1, 0, 0] = float('inf')
+        original[8, 0, 0] = float('nan')
+        if noncontiguous:
+            original = original.transpose(1, 2)
+        gradient = original.clone()
+        cu_seqlens = torch.tensor([0, 5], dtype=torch.int32, device='cuda')
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                _ppu_zero_cp_padding(gradient, cu_seqlens)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            _ppu_zero_cp_padding(gradient, cu_seqlens)
+        for end in (0, 1, 5, 9, 12):
+            gradient.copy_(original)
+            cu_seqlens[-1].fill_(end)
+            graph.replay()
+            expected = original.clone()
+            expected[end:].zero_()
+            torch.testing.assert_close(gradient, expected, rtol=0, atol=0, equal_nan=True)
+print('PPU import and TE CP graph checks passed; device count:', torch.cuda.device_count())
+PY
+
+CMD ["/bin/bash"]
