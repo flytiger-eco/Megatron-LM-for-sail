@@ -21,26 +21,27 @@ _spec = importlib.util.spec_from_file_location(
 results = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(results)
 control = results.control
+process_control = control.module_from_path(
+    "ppu_functional_process_control", Path(__file__).with_name("ppu_compiler_diagnostic.py")
+)
 
 
 class ProcessRunner:
-    """Forward cancellation to the entire training process group, including all ranks."""
+    """转发取消并回收所有后代会话，防止 rank 或编译 worker 污染后续重复。"""
 
     def __init__(self):
         self.cancelled = False
         self.timed_out = False
         self.process = None
+        self.known_processes = {}
 
     def cancel(self, signum, frame):
+        # 信号处理器只记状态，避免重入 /proc 枚举或进程启动临界区。
         self.cancelled = True
-        self.terminate()
 
     def terminate(self):
         if self.process is not None:
-            try:
-                os.killpg(self.process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            process_control.signal_family(self.process.pid, self.known_processes, signal.SIGTERM)
 
     def run(self, command, *, cwd, env, log, deadline):
         remaining = deadline - time.monotonic()
@@ -58,32 +59,31 @@ class ProcessRunner:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            self.known_processes = {}
             try:
                 while self.process.poll() is None:
+                    process_control.process_family(self.process.pid, self.known_processes)
                     if self.cancelled or time.monotonic() >= deadline:
                         self.timed_out = not self.cancelled
-                        self.terminate()
-                        try:
-                            self.process.wait(timeout=10)
-                        except subprocess.TimeoutExpired:
-                            pass
-                        # The launcher may exit before all rank processes have stopped.
-                        try:
-                            os.killpg(self.process.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                        self.process.wait()
                         return 143 if self.cancelled else 124
                     time.sleep(0.1)
-                if self.cancelled:
-                    try:
-                        os.killpg(self.process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    return 143
-                return self.process.returncode
+                return 143 if self.cancelled else self.process.returncode
             finally:
-                self.process = None
+                try:
+                    # launcher 提前退出或控制器异常时，也必须清理跨 setsid 的后代。
+                    self.terminate()
+                    try:
+                        self.process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    finally:
+                        process_control.signal_family(
+                            self.process.pid, self.known_processes, signal.SIGKILL
+                        )
+                    self.process.wait(timeout=10)
+                finally:
+                    self.process = None
+                    self.known_processes = {}
 
 
 def write_json(path: Path, value: dict) -> None:

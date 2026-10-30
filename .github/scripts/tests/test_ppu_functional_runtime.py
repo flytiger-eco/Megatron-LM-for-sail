@@ -266,6 +266,108 @@ def test_process_runner_cancellation_stops_process_group(tmp_path):
     assert code == 143 and runner.cancelled and not runner.timed_out
 
 
+@pytest.mark.parametrize("mode", ["timeout", "cancel", "success", "failure", "exception"])
+def test_process_runner_reaps_real_detached_worker(tmp_path, monkeypatch, mode):
+    """真实 setsid 子进程忽略 TERM；macOS 仅替换不可用的 /proc 枚举边界。"""
+    runner = runtime.ProcessRunner()
+    ready = tmp_path / "worker.pid"
+    child = (
+        "import os,signal,time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(60)"
+    )
+    parent = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}], start_new_session=True); "
+        f"time.sleep({0.8 if mode in ('success', 'failure') else 60}); "
+        f"raise SystemExit({23 if mode == 'failure' else 0})"
+    )
+    original_family = runtime.process_control.process_family
+    observed = set()
+    raised = False
+
+    def family(pid, known):
+        nonlocal raised
+        if Path("/proc/self/stat").is_file():
+            selected = original_family(pid, known)
+        else:
+            # 不模拟信号发送或进程退出：这两部分始终使用真实系统调用。
+            candidates = {pid, *known}
+            if ready.exists():
+                candidates.add(int(ready.read_text()))
+            selected = {}
+            for candidate in candidates:
+                try:
+                    group = os.getpgid(candidate)
+                except ProcessLookupError:
+                    continue
+                selected[candidate] = {"ppid": pid, "pgid": group, "sid": group, "start": 1}
+            known.update(selected)
+        observed.update(selected)
+        if ready.exists() and int(ready.read_text()) in known:
+            if mode == "cancel":
+                runner.cancel(signal.SIGTERM, None)
+            elif mode == "exception" and not raised:
+                raised = True
+                raise RuntimeError("controller failed after tracking worker")
+        return selected
+
+    monkeypatch.setattr(runtime.process_control, "process_family", family)
+    kwargs = {
+        "cwd": tmp_path,
+        "env": os.environ.copy(),
+        "log": tmp_path / "driver.log",
+        "deadline": time.monotonic() + (1 if mode == "timeout" else 10),
+    }
+    worker = None
+    try:
+        if mode == "exception":
+            with pytest.raises(RuntimeError, match="controller failed"):
+                runner.run([sys.executable, "-c", parent], **kwargs)
+        else:
+            code = runner.run([sys.executable, "-c", parent], **kwargs)
+            assert code == {"timeout": 124, "cancel": 143, "success": 0, "failure": 23}[mode]
+        assert runner.process is None and runner.known_processes == {}
+        assert runner.cancelled is (mode == "cancel")
+        assert runner.timed_out is (mode == "timeout")
+        worker = int(ready.read_text())
+        assert worker in observed
+        for _ in range(30):
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(worker)], capture_output=True, text=True, timeout=2
+            ).stdout.strip()
+            if not state or state.startswith("Z"):
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("跨会话 worker 在 launcher 退出后仍存活")
+    finally:
+        if ready.exists():
+            worker = int(ready.read_text())
+            try:
+                os.killpg(worker, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.parametrize("cancelled", [True, False])
+def test_process_runner_does_not_start_after_cancellation_or_deadline(
+    tmp_path, monkeypatch, cancelled
+):
+    runner = runtime.ProcessRunner()
+    runner.cancelled = cancelled
+    monkeypatch.setattr(runtime.subprocess, "Popen", lambda *_, **__: pytest.fail("不得启动新进程"))
+    code = runner.run(
+        [sys.executable, "-c", "raise SystemExit(0)"],
+        cwd=tmp_path,
+        env=os.environ.copy(),
+        log=tmp_path / "driver.log",
+        deadline=time.monotonic() - 1,
+    )
+    assert code == (143 if cancelled else 124)
+    assert runner.timed_out is not cancelled
+
+
 def test_environment_clears_inherited_shortcuts_and_uses_runtime_copy(
     evidence, tmp_path, monkeypatch
 ):
@@ -479,6 +581,60 @@ chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
         if process.poll() is None:
             process.kill()
             process.wait()
+
+
+def test_configure_archives_complete_standalone_runtime_dependencies(tmp_path):
+    """执行真实 CPU 配置步骤，再从隔离产物冷启动运行器，检查传递依赖。"""
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())
+    step = next(
+        step for step in workflow["jobs"]["configure"]["steps"] if step.get("id") == "config"
+    )
+    (tmp_path / "control").symlink_to(ROOT, target_is_directory=True)
+    plan = tmp_path / ".ppu-ci"
+    (plan / "control").mkdir(parents=True)
+    (plan / "authorization.json").write_text(
+        json.dumps(
+            {
+                "allowed": True,
+                "pr_number": 0,
+                "manual_pr": False,
+                "target_sha": "a" * 40,
+                "control_sha": "a" * 40,
+                "run_id": "123",
+                "run_attempt": 1,
+            }
+        )
+    )
+    run = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", step["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+            "PPU_INPUTS": json.dumps({"test_kind": "functional"}),
+            "PPU_SOURCE_ROOT": str(ROOT),
+            "PPU_CONTROL_ROOT": str(ROOT),
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "GITHUB_REF": functional.BRANCH,
+            "GITHUB_OUTPUT": str(tmp_path / "outputs"),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert run.returncode == 0, run.stderr
+    assert (plan / "control/ppu_compiler_diagnostic.py").read_bytes() == (
+        SCRIPTS / "ppu_compiler_diagnostic.py"
+    ).read_bytes()
+    cold_start = subprocess.run(
+        [sys.executable, "-I", str(plan / "control/ppu_functional_runtime.py"), "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert cold_start.returncode == 0, cold_start.stderr
+    assert "--manifest" in cold_start.stdout
 
 
 def test_workflow_functional_route_is_manual_only_and_preserves_ut():
