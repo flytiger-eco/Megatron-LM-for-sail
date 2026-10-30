@@ -42,6 +42,10 @@ class FakeRunner:
         assert env["DATA_PATH"] == self.manifest["config"]["data_path"]
         assert env["N_REPEAT"] == "1" and env["RECORD_CHECKPOINTS"] == "false"
         assert env["GPUS_PER_NODE"] == "8" and env["NUM_NODES"] == "1"
+        temporary = Path(env["TMPDIR"])
+        assert temporary.is_dir() and temporary.stat().st_mode & 0o777 == 0o700
+        assert len(os.fsencode(str(temporary))) < 60
+        assert env["TMP"] == env["TEMP"] == env["TMPDIR"]
         assert env["GOLDEN_VALUES_PATH"] == str(ROOT / self.case["golden_path"])
         assert env["TRAINING_SCRIPT_PATH"] == str(ROOT / self.case["training_script"])
         config = yaml.safe_load((directory / "model_config.yaml").read_text())
@@ -115,11 +119,14 @@ def test_runtime_runs_every_repeat_and_recomputes_original_comparator(evidence, 
     assert functional.sha256(ROOT / case["config_path"]) == original
     outputs = {env["OUTPUT_PATH"] for _, env, _ in runner.calls}
     assert len(outputs) == 2
+    assert len({env["TMPDIR"] for _, env, _ in runner.calls}) == 2
     assert len({deadline for _, _, deadline in runner.calls}) == 1
     for _, env, _ in runner.calls:
-        for key in ("DATA_CACHE_PATH", "CHECKPOINT_SAVE_PATH", "TENSORBOARD_PATH", "TMPDIR"):
+        for key in ("DATA_CACHE_PATH", "CHECKPOINT_SAVE_PATH", "TENSORBOARD_PATH"):
             assert env[key].startswith(env["OUTPUT_PATH"] + "/")
+        assert not Path(env["TMPDIR"]).exists()
         report = json.loads((Path(env["OUTPUT_PATH"]) / "execution.json").read_text())
+        assert report["temporary_directory"] == env["TMPDIR"]
         assert report["shell_exit_code"] == 0 and report["extraction_exit_code"] is None
 
 
@@ -132,6 +139,8 @@ def test_retry_restarts_all_repeats_with_one_shared_deadline(evidence, tmp_path)
         (env["PPU_FUNCTIONAL_ATTEMPT"], env["PPU_FUNCTIONAL_REPEAT"]) for _, env, _ in runner.calls
     ]
     assert pairs == [("1", "1"), ("1", "2"), ("2", "1"), ("2", "2")]
+    assert len({env["TMPDIR"] for _, env, _ in runner.calls}) == 4
+    assert all(not Path(env["TMPDIR"]).exists() for _, env, _ in runner.calls)
     assert len({deadline for _, _, deadline in runner.calls}) == 1
     envelope(manifest, case, directory)
     assert results.verify_case(manifest, ROOT, case, directory)["retried"]
@@ -145,6 +154,7 @@ def test_retry_restarts_all_repeats_with_one_shared_deadline(evidence, tmp_path)
         (1, "DistNetworkError\nOutOfMemoryError"),
         (1, "Segmentation fault"),
         (1, "MissingTensorboardLogsError"),
+        (1, "OSError: AF_UNIX path too long\nConnectionResetError"),
         (143, "DistNetworkError"),
         (124, "DistNetworkError"),
     ],
@@ -157,6 +167,7 @@ def test_no_retry_on_numeric_integrity_crash_budget_or_cancellation(
     record = runtime.run_case(manifest, ROOT, case["id"], directory, runner=runner)
     assert not record["success"] and record["attempts"] == 1
     assert len(runner.calls) == 1
+    assert not Path(runner.calls[0][1]["TMPDIR"]).exists()
 
 
 def test_maximum_three_complete_attempts(evidence, tmp_path):
@@ -249,12 +260,81 @@ def test_environment_clears_inherited_shortcuts_and_uses_runtime_copy(
     monkeypatch.setenv("PYTEST_ADDOPTS", "--collect-only")
     directory = tmp_path / "repeat"
     directory.mkdir()
-    env = runtime.repeat_environment(manifest, ROOT, case, directory, 1, 1)
-    assert env["RECORD_CHECKPOINTS"] == "false" and env["ENABLE_LIGHTWEIGHT_MODE"] == "false"
-    assert env["PYTEST_ADDOPTS"] == "" and "SLURM_JOB_END_TIME" not in env
-    expected = yaml.safe_load((ROOT / case["config_path"]).read_text())
-    expected.setdefault("ENV_VARS", {})["N_REPEAT"] = 1
-    assert yaml.safe_load((directory / "model_config.yaml").read_text()) == expected
+    with runtime.repeat_environment(manifest, ROOT, case, directory, 1, 1) as env:
+        assert env["RECORD_CHECKPOINTS"] == "false" and env["ENABLE_LIGHTWEIGHT_MODE"] == "false"
+        assert env["PYTEST_ADDOPTS"] == "" and "SLURM_JOB_END_TIME" not in env
+        expected = yaml.safe_load((ROOT / case["config_path"]).read_text())
+        expected.setdefault("ENV_VARS", {})["N_REPEAT"] = 1
+        assert yaml.safe_load((directory / "model_config.yaml").read_text()) == expected
+
+
+@pytest.mark.parametrize("method", ["fork", "forkserver"])
+def test_short_temporary_directory_supports_real_multiprocessing_managers(
+    evidence, tmp_path, method
+):
+    manifest, case, _ = evidence
+    directory = tmp_path / ("long-nas-output-" * 12) / "attempt-1/repeat-1"
+    directory.mkdir(parents=True)
+    legacy_tmp = directory / "tmp"
+    legacy_tmp.mkdir()
+    command = [
+        sys.executable,
+        "-c",
+        f'''
+import multiprocessing
+import os
+import sys
+from contextlib import ExitStack
+from multiprocessing.managers import SyncManager
+from pathlib import Path
+context = multiprocessing.get_context({method!r})
+with ExitStack() as stack:
+    managers = []
+    for rank in range(8):
+        if sys.argv[1] == "explicit-address":
+            manager = SyncManager(address=os.path.join(os.environ["TMPDIR"], f"manager-{{rank}}.sock"), ctx=context)
+        else:
+            manager = context.Manager()
+        managers.append(stack.enter_context(manager))
+    for rank, manager in enumerate(managers):
+        assert Path(manager.address).is_relative_to(os.environ["TMPDIR"])
+        queue = manager.Queue()
+        queue.put(rank)
+        assert queue.get(timeout=5) == rank
+print("eight managers ready")
+''',
+    ]
+    # 新版 Python 会自动回退 /tmp；显式地址保留远端 Python 3.12 的长 socket 路径行为。
+    legacy = subprocess.run(
+        [*command, "explicit-address"],
+        env={**os.environ, "TMPDIR": str(legacy_tmp)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert legacy.returncode != 0 and "AF_UNIX path too long" in legacy.stderr
+    with runtime.repeat_environment(manifest, ROOT, case, directory, 1, 1) as env:
+        process = subprocess.run(
+            [*command, "default-address"], env=env, capture_output=True, text=True, timeout=30
+        )
+        assert process.returncode == 0, process.stderr
+        assert "eight managers ready" in process.stdout
+    assert not Path(env["TMPDIR"]).exists()
+    assert legacy_tmp.is_dir() and (directory / "model_config.yaml").is_file()
+
+
+def test_temporary_directory_is_cleaned_on_unexpected_exception(evidence, tmp_path):
+    manifest, case, _ = evidence
+    directory = tmp_path / "repeat"
+    directory.mkdir()
+    with pytest.raises(RuntimeError, match="unexpected"):
+        with runtime.repeat_environment(manifest, ROOT, case, directory, 1, 1) as env:
+            temporary = Path(env["TMPDIR"])
+            (temporary / "scratch").write_text("transient")
+            (directory / "cache/persistent").write_text("preserve")
+            raise RuntimeError("unexpected")
+    assert not temporary.exists()
+    assert (directory / "cache/persistent").read_text() == "preserve"
 
 
 @pytest.mark.parametrize(

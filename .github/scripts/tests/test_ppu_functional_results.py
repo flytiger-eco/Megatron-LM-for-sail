@@ -320,6 +320,7 @@ def test_retry_requires_entire_new_successful_attempt(evidence):
         "OutOfMemoryError",
         "CUDA error: illegal memory access",
         "MissingTensorboardLogsError",
+        "OSError: AF_UNIX path too long",
     ],
 )
 def test_unauthorized_retry_is_rejected_even_after_success(evidence, message):

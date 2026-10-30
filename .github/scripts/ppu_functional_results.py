@@ -29,6 +29,7 @@ HARD_FAILURES = (
     r"\bAssertionError\b|\b(?:Exact|Approximate) comparison[^\n]*FAILED",
     r"\bMissingTensorboardLogsError\b|\bUndefinedMetricError\b",
     r"\b(?:FileNotFoundError|ModuleNotFoundError|ImportError)\b",
+    r"\bAF_UNIX path too long\b",
 )
 RETRYABLE_FAILURES = (
     r"\bDistNetworkError\b",
