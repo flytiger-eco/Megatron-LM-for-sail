@@ -625,6 +625,95 @@ def test_candidate_cache_mismatch_is_not_accepted(provisioned, monkeypatch, muta
     assert snapshot(data) == before
 
 
+def test_preparation_receipts_export_only_expected_fields(tmp_path, monkeypatch):
+    directory = tmp_path.resolve()
+    expected = {"repositories": sorted(hf.REPOSITORIES), "numerical_validation": False}
+    for command in ("prepare", "verify"):
+        (directory / f"{command}.log").write_bytes(encoded(expected) + b"\n")
+        (directory / f"{command}.exitcode").write_text("0\n")
+    (directory / "verify.stderr").write_bytes(b"private_marker\n\xff\n")
+    (directory / "ppu_functional_hf.py").write_bytes(b"private_script_marker")
+    (directory / "unrelated.txt").write_bytes(b"private_unrelated_marker")
+    before = snapshot(directory)
+    reader = Mock(wraps=hf.read_file)
+    monkeypatch.setattr(hf, "read_file", reader)
+    monkeypatch.setattr(hf, "fetch_official", Mock(side_effect=AssertionError("禁止下载")))
+    report = hf.inspect_receipts(directory)
+    assert report["status"] == "inspected" and not report["reason"]
+    rows = {row["name"]: row for row in report["files"]}
+    for command in ("prepare", "verify"):
+        assert rows[f"{command}.log"]["expected_summary_count"] == 1
+        assert rows[f"{command}.log"]["unrecognized_line_count"] == 0
+        assert rows[f"{command}.exitcode"]["reported_exit_code"] == 0
+    assert rows["verify.stderr"]["unrecognized_line_count"] == 2
+    assert rows["ppu_functional_hf.py"]["sha256"] == hf.digest(b"private_script_marker")
+    assert rows["unrelated.txt"]["status"] == "metadata_only"
+    assert all(call.args[1] != "unrelated.txt" for call in reader.call_args_list)
+    assert "private_" not in json.dumps(report)
+    assert snapshot(directory) == before
+    hf.fetch_official.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "content,code",
+    [(b"1\n", 1), (b"255", 255), (b"256", None), (b"-1", None), (b"true", None), (b"", None)],
+)
+def test_receipt_exit_code_is_not_inferred_from_success_output(tmp_path, content, code):
+    directory = tmp_path.resolve()
+    (directory / "prepare.exit_code.txt").write_bytes(content)
+    row = hf.inspect_receipts(directory)["files"][0]
+    assert row["reported_exit_code"] == code
+    assert row["expected_summary_count"] == 0
+
+
+@pytest.mark.parametrize("mutation", ["numeric_false", "extra", "duplicate", "nested"])
+def test_receipt_summary_must_match_strict_success_schema(tmp_path, mutation):
+    expected = {"repositories": sorted(hf.REPOSITORIES), "numerical_validation": False}
+    if mutation == "numeric_false":
+        expected["numerical_validation"] = 0
+    elif mutation == "extra":
+        expected["secret"] = "private_marker"
+    content = encoded(expected)
+    if mutation == "duplicate":
+        content = content[:-1] + b', "numerical_validation": false}'
+    elif mutation == "nested":
+        content = b'{"a":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}"
+    directory = tmp_path.resolve()
+    (directory / "prepare.log").write_bytes(content)
+    report = hf.inspect_receipts(directory)
+    assert report["files"][0]["expected_summary_count"] == 0
+    assert report["files"][0]["unrecognized_line_count"] == 1
+    assert "private_marker" not in json.dumps(report)
+
+
+@pytest.mark.parametrize("kind", ["missing", "symlink", "large", "directory", "fifo", "many"])
+def test_receipts_reject_unbounded_or_linked_inputs(tmp_path, kind):
+    directory = tmp_path.resolve() / "receipts"
+    directory.mkdir()
+    path = directory / "prepare.log"
+    if kind == "missing":
+        directory = directory / "missing"
+    elif kind == "symlink":
+        alias = directory.with_name("alias")
+        alias.symlink_to(directory, target_is_directory=True)
+        directory = alias
+    elif kind == "large":
+        path.write_bytes(b"x" * (256 * 1024 + 1))
+    elif kind == "directory":
+        path.mkdir()
+    elif kind == "fifo":
+        os.mkfifo(path)
+    else:
+        for index in range(65):
+            (directory / f"prepare-{index}.log").touch()
+    report = hf.inspect_receipts(directory)
+    if kind in ("missing", "symlink", "many"):
+        assert report["status"] == "unreadable" and report["reason"]
+    else:
+        assert report["files"][0]["status"] == "not_bounded_regular_file"
+
+
+@pytest.mark.parametrize("include_receipts", [False, True])
 @pytest.mark.parametrize(
     "mode,location,reachable,fixed",
     [
@@ -637,7 +726,7 @@ def test_candidate_cache_mismatch_is_not_accepted(provisioned, monkeypatch, muta
     ],
 )
 def test_candidate_cli_never_promotes_trust_or_changes_gate(
-    evidence, provisioned, tmp_path, monkeypatch, mode, location, reachable, fixed
+    evidence, provisioned, tmp_path, monkeypatch, mode, location, reachable, fixed, include_receipts
 ):
     manifest, case, _ = evidence
     data, _, lock, _ = provisioned
@@ -667,6 +756,8 @@ def test_candidate_cli_never_promotes_trust_or_changes_gate(
     before = snapshot(data)
     inspect = Mock(wraps=hf.inspect_candidate)
     monkeypatch.setattr(hf, "inspect_candidate", inspect)
+    receipts = Mock(return_value={"status": "inspected", "files": []})
+    monkeypatch.setattr(hf, "inspect_receipts", receipts)
     monkeypatch.setattr(hf, "fetch_official", Mock(side_effect=AssertionError("禁止隐式下载")))
     summary = tmp_path / "step-summary"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
@@ -682,6 +773,7 @@ def test_candidate_cli_never_promotes_trust_or_changes_gate(
             str(data),
             "--location",
             location,
+            *(["--tokenizer-receipts", str(tmp_path)] if include_receipts else []),
         ],
     )
     with pytest.raises(SystemExit) as stopped:
@@ -689,6 +781,13 @@ def test_candidate_cli_never_promotes_trust_or_changes_gate(
     assert stopped.value.code == (0 if baseline["ok"] else 1)
     report = json.loads((output / "assets-report.json").read_text())
     candidate = report.pop("tokenizer_source_candidate", None)
+    receipt_report = report.pop("tokenizer_preparation_receipts", None)
+    if include_receipts and mode == "assets" and location == "cpu" and reachable:
+        receipts.assert_called_once_with(tmp_path)
+        assert receipt_report == receipts.return_value
+    else:
+        receipts.assert_not_called()
+        assert receipt_report is None
     if mode == "assets" and location == "cpu" and reachable:
         inspect.assert_called_once_with(data)
         assert candidate["cache_matches_candidate"] and candidate["trusted"] is False

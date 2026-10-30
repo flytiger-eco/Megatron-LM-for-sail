@@ -234,6 +234,65 @@ def inspect_candidate(data_root: Path) -> dict:
     return report
 
 
+def inspect_receipts(directory: Path) -> dict:
+    """仅回传准备凭据的摘要、已知成功输出及退出码，不公开原始日志或提升信任。"""
+    report = {"checked_path": str(directory), "status": "unreadable", "files": [], "reason": ""}
+    expected = {"repositories": sorted(REPOSITORIES), "numerical_validation": False}
+    try:
+        if directory.is_symlink() or directory.resolve() != directory.absolute():
+            raise ValueError("Preparation receipt directory must not contain symlinks")
+        entries = []
+        for path in directory.iterdir():
+            if len(entries) >= 64:
+                raise ValueError("Too many preparation receipt entries")
+            entries.append(path)
+        for path in sorted(entries):
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", path.name):
+                continue
+            row = {"name": path.name, "status": "metadata_only"}
+            report["files"].append(row)
+            info = path.lstat()
+            row["size"] = info.st_size
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 256 * 1024:
+                row["status"] = "not_bounded_regular_file"
+                continue
+            phase = re.search(r"(?:^|[._-])(prepare|verify)(?:[._-]|$)", path.name)
+            if not phase and path.name != "ppu_functional_hf.py":
+                continue
+            content = read_file(directory, path.name) if info.st_size else b""
+            row.update(status="inspected", sha256=digest(content))
+            if not phase:
+                continue
+            row.update(command=phase[1], reported_exit_code=None, expected_summary_count=0)
+            is_exit = re.search(r"(?:^|[._-])(?:exit(?:_?code)?|rc|status)(?:[._-]|$)", path.name)
+            if is_exit and re.fullmatch(rb"\s*(0|[1-9][0-9]{0,2})\s*", content):
+                code = int(content)
+                if code <= 255:
+                    row["reported_exit_code"] = code
+                continue
+            unexpected = 0
+            for line in content.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    value = unique_json(line)
+                except (ValueError, RecursionError):
+                    value = None
+                if (
+                    value == expected
+                    and value["numerical_validation"] is False
+                    and type(value["numerical_validation"]) is bool
+                ):
+                    row["expected_summary_count"] += 1
+                else:
+                    unexpected += 1
+            row["unrecognized_line_count"] = unexpected
+        report["status"] = "inspected"
+    except (OSError, ValueError, RecursionError) as exc:
+        report["reason"] = f"Preparation receipts unavailable ({type(exc).__name__})"
+    return report
+
+
 def populate(data_root: Path, destination: Path, dependencies: list) -> dict:
     """逐重复复制并复算；不向输入 NAS 写回，也不携带额外缓存文件。"""
     input_root, output_root = data_root.resolve(), destination.resolve()
