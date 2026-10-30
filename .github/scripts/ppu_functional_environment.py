@@ -25,6 +25,7 @@ TRAINING_PACKAGES = {
     "flash-linear-attention": "0.4.1+v0.1.0.ppu2.2.0",
     "fla-core": "0.4.1+v0.1.0.ppu2.2.0",
     "emerging-optimizers": "0.3.0",
+    "apex": "25.9+v0.1.0.ppu2.2.0",
 }
 TRAINING_IMPORTS = {
     "pla": (),
@@ -46,6 +47,10 @@ TRAINING_IMPORTS = {
     "fla.modules.l2norm": ("l2norm",),
     "fla.ops.gated_delta_rule": ("chunk_gated_delta_rule", "fused_recurrent_gated_delta_rule"),
     "emerging_optimizers": (),
+    "apex.normalization.fused_layer_norm": ("FusedLayerNormAffineFunction",),
+    "apex.contrib.layer_norm.layer_norm": ("FastLayerNormFN",),
+    "fused_layer_norm_cuda": ("forward_affine", "backward_affine"),
+    "fast_layer_norm": ("ln_fwd", "ln_bwd"),
 }
 YQ_VERSION = "4.47.2"
 YQ = {
@@ -114,6 +119,40 @@ def check_nvrx(requirements: dict) -> dict:
     return {"version": version, "requirements": requirements, "signatures": signatures}
 
 
+def check_apex_layer_norm() -> dict:
+    """核验原始 LayerNorm 调用接口及后端选择，不执行训练算子。"""
+    fused = importlib.import_module("megatron.core.fusions.fused_layer_norm")
+    if not fused.HAVE_FUSED_LAYER_NORM or not fused.HAVE_PERSIST_LAYER_NORM:
+        raise ValueError("Megatron did not enable Apex fused and persistent LayerNorm")
+    backends = importlib.import_module("megatron.core.models.backends")
+    selected = backends.LocalSpecProvider().layer_norm(rms_norm=False)
+    if selected is not fused.FusedLayerNorm:
+        raise ValueError("Original local LayerNorm backend did not select Apex FusedLayerNorm")
+    signatures = {}
+    for name, module_name, arguments in (
+        (
+            "FusedLayerNormAffineFunction",
+            "apex.normalization.fused_layer_norm",
+            (None, None, None, None, (1024,), 1e-5),
+        ),
+        ("FastLayerNormFN", "apex.contrib.layer_norm.layer_norm", (None, None, None, None, 1e-5)),
+    ):
+        api = getattr(importlib.import_module(module_name), name)
+        if getattr(fused, name, None) is not api or not callable(getattr(api, "apply", None)):
+            raise ValueError(f"Original Apex LayerNorm API mismatch: {name}")
+        forward = inspect.signature(api.forward)
+        if "memory_efficient" in inspect.getfullargspec(api.forward).args:
+            arguments += (False,)
+        forward.bind(*arguments)
+        signatures[name] = str(forward)
+    return {
+        "backend": f"{selected.__module__}.{selected.__qualname__}",
+        "fused_enabled": True,
+        "persistent_enabled": True,
+        "signatures": signatures,
+    }
+
+
 def check_training_dependencies(bundle: Path) -> dict:
     """Build 与 Pod 都检查真实导入，不能仅凭包名或被吞掉的 ImportError 放行。"""
     packages = {}
@@ -139,6 +178,7 @@ def check_training_dependencies(bundle: Path) -> dict:
         raise ValueError(
             "Megatron did not enable emerging-optimizers; required original imports failed"
         )
+    layer_norm = check_apex_layer_norm()
     installation = json.loads((bundle / "functional-package-install.json").read_text())
     if installation.get("version") != "1" or not isinstance(installation.get("install"), list):
         raise ValueError("Invalid functional package installation report")
@@ -154,6 +194,7 @@ def check_training_dependencies(bundle: Path) -> dict:
         "download_sources": sources,
         "satisfied_before_install": sorted(packages.keys() - sources.keys()),
         "emerging_optimizers_enabled": True,
+        "apex_layer_norm": layer_norm,
     }
 
 

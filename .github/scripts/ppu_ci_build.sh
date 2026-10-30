@@ -46,6 +46,7 @@ if json.loads(Path('.ppu-ci/manifest.json').read_text()).get('test_kind') == 'fu
     native_requirements += [
         'flash-linear-attention==0.4.1+v0.1.0.ppu2.2.0',
         'emerging-optimizers==0.3.0',
+        'apex==25.9+v0.1.0.ppu2.2.0',
     ]
 Path('.ppu-ci/ppu-requirements.txt').write_text('\n'.join(native_requirements) + '\n')
 Path('.ppu-ci/constraints.txt').write_text(

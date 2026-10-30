@@ -144,6 +144,51 @@ def tool_environment(tmp_path, monkeypatch):
     training_modules["megatron.core.optimizer.emerging_optimizers"] = SimpleNamespace(
         HAVE_EMERGING_OPTIMIZERS=True
     )
+
+    class AffineFunction:
+        @staticmethod
+        def forward(ctx, x, weight, bias, normalized_shape, eps, memory_efficient=False):
+            pytest.fail("预检不应执行 LayerNorm 算子")
+
+        @staticmethod
+        def apply(*args):
+            pytest.fail("预检不应执行 LayerNorm autograd")
+
+    class FastFunction(AffineFunction):
+        @staticmethod
+        def forward(ctx, x, weight, bias, eps, memory_efficient=False):
+            pytest.fail("预检不应执行 persistent LayerNorm 算子")
+
+    training_modules["apex.normalization.fused_layer_norm"].FusedLayerNormAffineFunction = (
+        AffineFunction
+    )
+    training_modules["apex.contrib.layer_norm.layer_norm"].FastLayerNormFN = FastFunction
+    fused = SimpleNamespace(
+        HAVE_FUSED_LAYER_NORM=True,
+        HAVE_PERSIST_LAYER_NORM=True,
+        FusedLayerNorm=type("FusedLayerNorm", (), {}),
+        FusedLayerNormAffineFunction=AffineFunction,
+        FastLayerNormFN=FastFunction,
+    )
+    fused_name = "megatron.core.fusions.fused_layer_norm"
+    training_modules[fused_name] = fused
+    monkeypatch.setitem(sys.modules, fused_name, fused)
+    path = ROOT / "megatron/core/models/backends.py"
+    provider = next(
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.ClassDef) and node.name == "LocalSpecProvider"
+    )
+    selector = next(
+        node
+        for node in provider.body
+        if isinstance(node, ast.FunctionDef) and node.name == "layer_norm"
+    )
+    namespace = {"LayerNormBuilder": type, "WrappedTorchNorm": object}
+    exec(compile(ast.Module(body=[selector], type_ignores=[]), str(path), "exec"), namespace)
+    training_modules["megatron.core.models.backends"] = SimpleNamespace(
+        LocalSpecProvider=type("LocalSpecProvider", (), {"layer_norm": namespace["layer_norm"]})
+    )
     original_import = environment.importlib.import_module
     monkeypatch.setattr(
         environment.importlib,
@@ -273,6 +318,10 @@ def test_prepare_attests_tools_and_installs_selected_dependencies(
     assert report["training_dependencies"]["packages"] == environment.TRAINING_PACKAGES
     assert environment.TRAINING_PACKAGES.items() <= report["packages"].items()
     assert report["training_dependencies"]["emerging_optimizers_enabled"]
+    layer_norm = report["training_dependencies"]["apex_layer_norm"]
+    assert layer_norm["fused_enabled"] and layer_norm["persistent_enabled"]
+    assert layer_norm["backend"].endswith(".FusedLayerNorm")
+    assert set(layer_norm["signatures"]) == {"FusedLayerNormAffineFunction", "FastLayerNormFN"}
     assert ("nvidia-resiliency-ext" in report["packages"]) == (
         launcher == "ft_launcher" or checkpoint
     )
@@ -359,7 +408,8 @@ def test_incompatible_checkpoint_api_fails_before_training(
     assert not (bundle / "reports/functional-environment.json").exists()
 
 
-def test_training_packages_match_build_constraints(tmp_path, monkeypatch):
+@pytest.mark.parametrize("kind", [None, "unit", "functional"])
+def test_training_packages_match_build_constraints(tmp_path, monkeypatch, kind):
     script = (SCRIPTS / "ppu_ci_build.sh").read_text()
     block = next(
         block
@@ -370,13 +420,16 @@ def test_training_packages_match_build_constraints(tmp_path, monkeypatch):
     monkeypatch.setattr(environment.importlib.metadata, "version", lambda name: "fixed-runtime")
     bundle = tmp_path / ".ppu-ci"
     bundle.mkdir()
-    (bundle / "manifest.json").write_text(json.dumps({"test_kind": "functional"}))
+    (bundle / "manifest.json").write_text(json.dumps({"test_kind": kind} if kind else {}))
     exec(compile(block, "functional-build-requirements", "exec"), {})
     requirements = (bundle / "ppu-requirements.txt").read_text().splitlines()
     constraints = (bundle / "constraints.txt").read_text().splitlines()
+    functional_only = {"apex", "flash-linear-attention", "emerging-optimizers"}
     for name, version in environment.TRAINING_PACKAGES.items():
-        assert requirements.count(f"{name}=={version}") == 1
-        assert constraints.count(f"{name}=={version}") == 1
+        expected = int(kind == "functional" or name not in functional_only)
+        assert requirements.count(f"{name}=={version}") == expected
+        assert constraints.count(f"{name}=={version}") == expected
+    assert len(requirements) == (9 if kind == "functional" else 6)
     assert all(f"{name}==fixed-runtime" in constraints for name in ("torch", "triton"))
     assert 'functional_pip_args=(--report .ppu-ci/functional-package-install.json)' in script
 
@@ -434,6 +487,53 @@ def test_training_dependency_api_is_required(tool_environment, monkeypatch, name
     monkeypatch.setattr(module, symbol, None)
     with pytest.raises(ValueError, match="Missing functional dependency API"):
         environment.check_training_dependencies(bundle)
+
+
+@pytest.mark.parametrize(
+    "damage", ["fused_disabled", "persistent_disabled", "fallback", "identity", "apply", "forward"]
+)
+def test_apex_backend_or_api_failure_prevents_training(tool_environment, monkeypatch, damage):
+    bundle, _, manifest, _, _, _ = tool_environment
+    environment.prepare(bundle, manifest)
+    fused = environment.importlib.import_module("megatron.core.fusions.fused_layer_norm")
+    if damage == "fused_disabled":
+        monkeypatch.setattr(fused, "HAVE_FUSED_LAYER_NORM", False)
+    elif damage == "persistent_disabled":
+        monkeypatch.setattr(fused, "HAVE_PERSIST_LAYER_NORM", False)
+    elif damage == "fallback":
+        backends = environment.importlib.import_module("megatron.core.models.backends")
+        monkeypatch.setattr(backends.LocalSpecProvider, "layer_norm", lambda *a, **k: object)
+    elif damage == "identity":
+        monkeypatch.setattr(fused, "FastLayerNormFN", object)
+    elif damage == "apply":
+        monkeypatch.setattr(fused.FastLayerNormFN, "apply", None)
+    else:
+        monkeypatch.setattr(fused.FusedLayerNormAffineFunction, "forward", lambda ctx, x: None)
+    with pytest.raises((ValueError, TypeError)):
+        environment.check(bundle, manifest, bundle / "reports")
+    assert not (bundle / "reports/functional-environment.json").exists()
+
+
+@pytest.mark.parametrize("memory_efficient", [False, True])
+def test_apex_forward_signature_matches_original_call(
+    tool_environment, monkeypatch, memory_efficient
+):
+    bundle, _, _, _, _, _ = tool_environment
+    fused = environment.importlib.import_module("megatron.core.fusions.fused_layer_norm")
+    if not memory_efficient:
+        monkeypatch.setattr(
+            fused.FusedLayerNormAffineFunction,
+            "forward",
+            lambda ctx, x, weight, bias, normalized_shape, eps: None,
+        )
+        monkeypatch.setattr(
+            fused.FastLayerNormFN, "forward", lambda ctx, x, weight, bias, eps: None
+        )
+    report = environment.check_training_dependencies(bundle)["apex_layer_norm"]
+    assert all(
+        ("memory_efficient" in signature) == memory_efficient
+        for signature in report["signatures"].values()
+    )
 
 
 @pytest.mark.parametrize("damage", ["l2norm", "optimizer", "report_missing", "report_invalid"])
