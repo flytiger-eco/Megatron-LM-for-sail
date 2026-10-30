@@ -261,7 +261,7 @@ def inspect_receipts(directory: Path) -> dict:
                 continue
             content = read_file(directory, path.name) if info.st_size else b""
             row.update(status="inspected", sha256=digest(content))
-            if not phase:
+            if not phase or path.suffix in (".sh", ".py"):
                 continue
             row.update(command=phase[1], reported_exit_code=None, expected_summary_count=0)
             is_exit = re.search(r"(?:^|[._-])(?:exit(?:_?code)?|rc|status)(?:[._-]|$)", path.name)
@@ -271,8 +271,21 @@ def inspect_receipts(directory: Path) -> dict:
                     row["reported_exit_code"] = code
                 continue
             unexpected = 0
-            for line in content.splitlines():
+            exit_records = []
+            for number, line in enumerate(content.splitlines(), 1):
                 if not line.strip():
+                    continue
+                exit_match = re.fullmatch(
+                    rb"(?i)(?:(prepare|verify)[ _-]*)?"
+                    rb"(?:exit(?:[ _-]*(?:code|status))?|return[ _-]*code|rc)"
+                    rb"[ :=]+(0|[1-9][0-9]{0,2})",
+                    line.strip(),
+                )
+                if exit_match and int(exit_match[2]) <= 255:
+                    command = (exit_match[1] or phase[1].encode()).decode().lower()
+                    exit_records.append(
+                        {"line": number, "command": command, "code": int(exit_match[2])}
+                    )
                     continue
                 try:
                     value = unique_json(line)
@@ -287,6 +300,10 @@ def inspect_receipts(directory: Path) -> dict:
                 else:
                     unexpected += 1
             row["unrecognized_line_count"] = unexpected
+            row["exit_code_records"] = exit_records
+            codes = {record["code"] for record in exit_records if record["command"] == phase[1]}
+            if len(codes) == 1:
+                row["reported_exit_code"] = codes.pop()
         report["status"] = "inspected"
     except (OSError, ValueError, RecursionError) as exc:
         report["reason"] = f"Preparation receipts unavailable ({type(exc).__name__})"

@@ -655,6 +655,31 @@ def test_preparation_receipts_export_only_expected_fields(tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize(
+    "line,code",
+    [
+        (b"PREPARE_EXIT_CODE=0", 0),
+        (b"exit_code: 1", 1),
+        (b"prepare_rc=0", 0),
+        (b"prepare exit status = 0", 0),
+        (b"VERIFY_EXIT_CODE=0", None),
+        (b"PREPARE_EXIT_CODE=256", None),
+        (b"echo PREPARE_EXIT_CODE=0", None),
+        (b"PREPARE_EXIT_CODE=0\nPREPARE_EXIT_CODE=1", None),
+    ],
+)
+def test_receipt_labeled_exit_codes_preserve_command_and_conflicts(tmp_path, line, code):
+    directory = tmp_path.resolve()
+    (directory / "prepare.out").write_bytes(line + b"\n")
+    row = hf.inspect_receipts(directory)["files"][0]
+    assert row["reported_exit_code"] == code
+    assert row["expected_summary_count"] == 0
+    (directory / "run_prepare.sh").write_bytes(line + b"\n")
+    script = hf.inspect_receipts(directory)["files"][1]
+    assert script["sha256"] == hf.digest(line + b"\n")
+    assert "reported_exit_code" not in script
+
+
+@pytest.mark.parametrize(
     "content,code",
     [(b"1\n", 1), (b"255", 255), (b"256", None), (b"-1", None), (b"true", None), (b"", None)],
 )
