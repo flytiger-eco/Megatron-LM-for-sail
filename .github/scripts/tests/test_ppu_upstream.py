@@ -688,7 +688,8 @@ def test_merge_snapshot_rechecked_after_parent_lookup(mutation):
         auth.authorize(pr_event(), {}, context("pull_request_target"), api)
 
 
-def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch):
+@pytest.mark.parametrize("test_kind", [None, "unit", "functional"])
+def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch, test_kind):
     script = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
     block = next(
         block
@@ -706,6 +707,7 @@ def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch):
     monkeypatch.setattr(metadata, "version", runtimes.__getitem__)
     artifact = tmp_path / ".ppu-ci"
     artifact.mkdir()
+    (artifact / "manifest.json").write_text(json.dumps({"test_kind": test_kind}))
     exec(compile(block, "ppu-native-requirements", "exec"), {})
     requirements = (artifact / "ppu-requirements.txt").read_text().splitlines()
     constraints = (artifact / "constraints.txt").read_text().splitlines()
@@ -714,7 +716,12 @@ def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch):
     assert set(requirements) <= set(constraints)
     assert {f"{name}=={version}" for name, version in runtimes.items()} <= set(constraints)
     assert {"numpy==1.26.4", "pyarrow==21.0.0"} <= set(constraints)
-    assert not any(line.startswith(("fla==", "flash-linear-attention==")) for line in requirements)
+    assert not any(line.startswith("fla==") for line in requirements)
+    for requirement in (
+        "flash-linear-attention==0.4.1+v0.1.0.ppu2.2.0",
+        "emerging-optimizers==0.3.0",
+    ):
+        assert (requirement in requirements) == (test_kind == "functional")
     assert (
         "export PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"
         in script
@@ -725,6 +732,8 @@ def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch):
     assert (
         install
         < script.index("PLA import check passed:")
+        < script.index("FLA Core l2norm last dimension argument adaptation:")
+        < script.index("ppu_functional_environment.py\" prepare")
         < script.index("tar -czf .ppu-ci/environment.tar.gz")
     )
 
