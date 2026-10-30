@@ -328,6 +328,7 @@ def test_assets_prefixes_and_checkpoint(catalogue):
         asset["relative_path"]
         for row in catalogue["functional"].values()
         for asset in row["assets"]
+        if not asset.get("tokenizer_cache")
     }
     assert len(assets) == 11
     assert "text/common_pile/v01_filtered_data/my-gpt3_00_text_document.bin" in assets
@@ -455,9 +456,9 @@ def test_asset_report_cpu_unreachable_does_not_assert_ppu_unreachable(tmp_path, 
 
 
 @pytest.mark.parametrize("location", ["cpu", "pod"])
-def test_explicit_assets_cannot_hide_unmapped_tokenizer_cache(
-    tmp_path, catalogue, location, monkeypatch
-):
+def test_explicit_assets_cannot_hide_unmapped_tokenizer_cache(tmp_path, location, monkeypatch):
+    monkeypatch.setattr(functional.hf, "load_sources", lambda control: {})
+    catalogue = functional.catalogue(ROOT, ROOT, functional.select_config({}))
     manifest = {**catalogue, "identity": {}, "config": functional.select_config({})}
     monkeypatch.setenv("HF_HOME", str(tmp_path / "unapproved-inherited-cache"))
     for row in catalogue["functional"].values():

@@ -110,6 +110,24 @@ def snapshot(directory):
     }
 
 
+def test_registered_lock_matches_accepted_nas_digest_and_binds_all_dependencies():
+    content = hf.read_file(ROOT, hf.LOCK)
+    assert hf.digest(content) == "f6ed92a6a685939dee223c2735cf60d4e0b73e7aea6347060db65c79bb97511b"
+    sources = hf.load_sources(ROOT)
+    assert set(sources) == set(hf.REPOSITORIES)
+    assert len(hf.cache_files(sources)) == 16
+    catalogue = functional.catalogue(ROOT, ROOT, functional.select_config({}))
+    assert catalogue["tokenizer_lock_sha256"] == hf.digest(content)
+    cases = list(catalogue["functional"].values())
+    assert len(cases) == 85
+    assert sum(bool(case["tokenizer_dependencies"]) for case in cases) == 84
+    for case in cases:
+        assert all(row["status"] == "fixed_source" for row in case["tokenizer_dependencies"])
+        assert functional.validate_tokenizer_assets(case) == hf.asset_requirements(
+            case["tokenizer_dependencies"]
+        )
+
+
 def test_prepare_pins_only_approved_tokenizer_files(provisioned, official, tmp_path):
     _, destination, lock, fetch = provisioned
     assert {call.args[0] for call in fetch.call_args_list} == set(official)
