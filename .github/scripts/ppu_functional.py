@@ -211,6 +211,34 @@ def input_assets(config: dict) -> list:
     ]
 
 
+def nvrx_checkpoint_requirements(config: dict) -> list:
+    """仅描述原配置实际执行阶段的外部 checkpoint 依赖，不改写训练参数。"""
+    sections = ["MODEL_ARGS"]
+    if config["TEST_TYPE"] == "ckpt-resume" and "MODEL_ARGS_2" in config:
+        # 原 shell 将第二阶段参数整组替换，不与第一阶段合并。
+        sections.append("MODEL_ARGS_2")
+    requirements = []
+    for section in sections:
+        arguments = config[section]
+        if not isinstance(arguments, dict):
+            raise ValueError(f"{section} must be a mapping")
+        strategy = arguments.get("--async-strategy", "nvrx")
+        if strategy not in ("nvrx", "mcore"):
+            raise ValueError(f"Unsupported async checkpoint strategy: {section}/{strategy}")
+        # 上游在未启用 async-save 时会选择 mcore，无须安装 NVRx。
+        if enabled(arguments.get("--async-save", False)) and strategy == "nvrx":
+            requirements.append(
+                {
+                    "section": section,
+                    "persistent_worker": enabled(
+                        arguments.get("--use-persistent-ckpt-worker", False)
+                    ),
+                    "cpu_shm": enabled(arguments.get("--async-ckpt-use-cpu-shm", False)),
+                }
+            )
+    return requirements
+
+
 def read_metrics(path: Path) -> dict:
     def unique(pairs):
         result = {}
@@ -402,6 +430,7 @@ def describe_case(root: Path, name: str, specs: list, config: dict) -> dict:
         or enabled(env.get("NON_DETERMINSTIC_RESULTS", 0)),
         "launcher": launcher,
         "launcher_internal_max_restarts": 3 if launcher == "ft_launcher" else 0,
+        "nvrx_checkpoint": nvrx_checkpoint_requirements(model_config),
         "budget_seconds": seconds,
         "action_minutes": math.ceil(seconds / 60) + 30,
         "job_minutes": math.ceil(seconds / 60) + 45,

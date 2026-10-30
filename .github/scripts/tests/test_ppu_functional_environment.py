@@ -1,5 +1,6 @@
 """CPU checks for functional tools, device attestation and shared bundle integrity."""
 
+import ast
 import hashlib
 import io
 import json
@@ -9,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from test_ppu_functional import SCRIPTS, functional
+from test_ppu_functional import ROOT, SCRIPTS, functional
 from test_ppu_upstream import bundle_digest, ci, sealed_bundle
 
 environment = functional.module_from_path(
@@ -133,23 +134,94 @@ def tool_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("NPROC_PER_NODE", "8")
     monkeypatch.setenv("NNODES", "1")
     manifest = {
-        "functional": {"case": {"launcher": "torchrun"}},
+        "functional": {"case": {"launcher": "torchrun", "nvrx_checkpoint": []}},
         "identity": {"run_id": "123"},
         "config": {"image": "fixed"},
     }
     return bundle, site, manifest, calls, versions, cuda
 
 
+@pytest.fixture
+def checkpoint_api(tool_environment, monkeypatch):
+    class Queue:
+        def __init__(self, persistent=True, cpu_shm_mode=False):
+            pytest.fail("预检不应创建 checkpoint 队列")
+
+        @classmethod
+        def warmup_persistent_caller(cls, rank, cpu_priority=10, io_priority=3, cpu_shm_mode=False):
+            pytest.fail("预检不应启动 checkpoint worker")
+
+    class Writer:
+        def __init__(self, path, cpu_shm_mode=False):
+            pytest.fail("预检不应创建 checkpoint writer")
+
+    def request(async_fn, async_fn_args, finalize_fns, async_fn_kwargs=None, preload_fn=None):
+        pytest.fail("预检不应执行 async request")
+
+    def results_queue(mp_mode="spawn"):
+        pytest.fail("预检不应创建多进程资源")
+
+    modules = {
+        "core": SimpleNamespace(AsyncCallsQueue=Queue, AsyncRequest=request),
+        "cached_metadata_filesystem_reader": SimpleNamespace(CachedMetadataFileSystemReader=object),
+        "filesystem_async": SimpleNamespace(
+            FileSystemWriterAsync=Writer, _results_queue=None, get_write_results_queue=results_queue
+        ),
+        "state_dict_saver": SimpleNamespace(
+            CheckpointMetadataCache=object,
+            save_state_dict_async_finalize=object,
+            save_state_dict_async_plan=object,
+        ),
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(
+            sys.modules, f"nvidia_resiliency_ext.checkpointing.async_ckpt.{name}", module
+        )
+    # 执行当前源码中的原始导入函数，避免 mock 自行定义一套不完整的 API 清单。
+    path = ROOT / "megatron/core/dist_checkpointing/strategies/torch.py"
+    getter = next(
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "get_async_strategy"
+    )
+    namespace = {}
+    exec(compile(ast.Module(body=[getter], type_ignores=[]), str(path), "exec"), namespace)
+    requested = []
+
+    def get_strategy(strategy):
+        requested.append(strategy)
+        return namespace["get_async_strategy"](strategy)
+
+    original_import = environment.importlib.import_module
+    monkeypatch.setattr(
+        environment.importlib,
+        "import_module",
+        lambda name: (
+            SimpleNamespace(get_async_strategy=get_strategy)
+            if name == "megatron.core.dist_checkpointing.strategies.torch"
+            else original_import(name)
+        ),
+    )
+    return modules, requested
+
+
 @pytest.mark.parametrize("launcher", ["torchrun", "ft_launcher"])
-def test_prepare_attests_tools_and_installs_only_selected_launcher(tool_environment, launcher):
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_prepare_attests_tools_and_installs_selected_dependencies(
+    tool_environment, checkpoint_api, launcher, checkpoint
+):
     bundle, site, manifest, calls, _, _ = tool_environment
     manifest["functional"]["case"]["launcher"] = launcher
+    if checkpoint:
+        manifest["functional"]["case"]["nvrx_checkpoint"] = [
+            {"section": "MODEL_ARGS", "persistent_worker": True, "cpu_shm": False}
+        ]
     environment.prepare(bundle, manifest)
     assert (site / "ppu_functional_pytest.py").read_bytes() == (
         bundle / "control/ppu_functional_pytest.py"
     ).read_bytes()
     assert any("nvidia-resiliency-ext==0.6.0" in command for command in calls) == (
-        launcher == "ft_launcher"
+        launcher == "ft_launcher" or checkpoint
     )
     assert all(
         command[command.index("--index-url") + 1] == "https://packages.invalid/simple"
@@ -158,7 +230,95 @@ def test_prepare_attests_tools_and_installs_only_selected_launcher(tool_environm
     environment.check(bundle, manifest, bundle / "reports")
     report = json.loads((bundle / "reports/functional-environment.json").read_text())
     assert report["identity"] == manifest["identity"] and report["devices"] == 8
-    assert ("nvidia-resiliency-ext" in report["packages"]) == (launcher == "ft_launcher")
+    assert ("nvidia-resiliency-ext" in report["packages"]) == (
+        launcher == "ft_launcher" or checkpoint
+    )
+    assert checkpoint_api[1] == (["nvrx"] if checkpoint else [])
+    if checkpoint:
+        assert (
+            report["nvrx"]["requirements"]["case"]["checkpoint"]
+            == manifest["functional"]["case"]["nvrx_checkpoint"]
+        )
+        assert "mp_mode" in report["nvrx"]["signatures"]["get_write_results_queue"]
+
+
+@pytest.mark.parametrize(
+    "module,symbol",
+    [
+        ("core", "AsyncCallsQueue"),
+        ("core", "AsyncRequest"),
+        ("cached_metadata_filesystem_reader", "CachedMetadataFileSystemReader"),
+        ("filesystem_async", "FileSystemWriterAsync"),
+        ("filesystem_async", "_results_queue"),
+        ("filesystem_async", "get_write_results_queue"),
+        ("state_dict_saver", "CheckpointMetadataCache"),
+        ("state_dict_saver", "save_state_dict_async_finalize"),
+        ("state_dict_saver", "save_state_dict_async_plan"),
+    ],
+)
+def test_missing_original_checkpoint_import_fails_preflight(
+    tool_environment, checkpoint_api, monkeypatch, module, symbol
+):
+    bundle, _, manifest, _, _, _ = tool_environment
+    manifest["functional"]["case"]["nvrx_checkpoint"] = [
+        {"section": "MODEL_ARGS_2", "persistent_worker": True, "cpu_shm": False}
+    ]
+    environment.prepare(bundle, manifest)
+    monkeypatch.delattr(checkpoint_api[0][module], symbol)
+    with pytest.raises(ModuleNotFoundError, match="compatible.*nvidia-resiliency-ext"):
+        environment.check(bundle, manifest, bundle / "reports")
+    assert not (bundle / "reports/functional-environment.json").exists()
+
+
+@pytest.mark.parametrize(
+    "damage", ["version", "request", "queue", "warmup", "mp_mode", "cpu_shm", "writer", "launcher"]
+)
+def test_incompatible_checkpoint_api_fails_before_training(
+    tool_environment, checkpoint_api, monkeypatch, damage
+):
+    bundle, _, manifest, _, _, _ = tool_environment
+    manifest["functional"]["case"]["nvrx_checkpoint"] = [
+        {
+            "section": "MODEL_ARGS",
+            "persistent_worker": True,
+            "cpu_shm": damage in ("cpu_shm", "writer"),
+        }
+    ]
+    environment.prepare(bundle, manifest)
+    modules, _ = checkpoint_api
+    if damage == "version":
+        monkeypatch.setattr(environment.importlib.metadata, "version", lambda name: "0.5.0")
+    elif damage == "request":
+        modules["core"].AsyncRequest = lambda async_fn, async_fn_args, finalize_fns: None
+    elif damage == "queue":
+        monkeypatch.setattr(modules["core"].AsyncCallsQueue, "__init__", lambda self: None)
+    elif damage == "warmup":
+        monkeypatch.setattr(
+            modules["core"].AsyncCallsQueue, "warmup_persistent_caller", lambda rank: None
+        )
+    elif damage == "mp_mode":
+        modules["filesystem_async"].get_write_results_queue = lambda: None
+    elif damage == "cpu_shm":
+        monkeypatch.setattr(
+            modules["core"].AsyncCallsQueue,
+            "warmup_persistent_caller",
+            lambda rank, cpu_priority=10, io_priority=3: None,
+        )
+    elif damage == "writer":
+        monkeypatch.setattr(
+            modules["filesystem_async"].FileSystemWriterAsync, "__init__", lambda self, path: None
+        )
+    else:
+        manifest["functional"]["case"]["launcher"] = "ft_launcher"
+        monkeypatch.setattr(environment.shutil, "which", lambda name: None)
+    with pytest.raises((ValueError, TypeError)):
+        environment.check(bundle, manifest, bundle / "reports")
+    assert not (bundle / "reports/functional-environment.json").exists()
+
+
+def test_checkpoint_requirement_is_not_optional():
+    with pytest.raises(KeyError, match="nvrx_checkpoint"):
+        environment.nvrx_requirements({"functional": {"case": {"launcher": "torchrun"}}})
 
 
 def test_tool_download_digest_mismatch_prevents_package_installation(tool_environment, monkeypatch):

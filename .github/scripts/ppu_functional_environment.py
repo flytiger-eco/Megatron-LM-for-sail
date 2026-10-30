@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import importlib
 import importlib.metadata
+import inspect
 import json
 import os
 import platform
@@ -13,6 +14,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
+NVRX_VERSION = "0.6.0"
 YQ_VERSION = "4.47.2"
 YQ = {
     "x86_64": ("amd64", "1bb99e1019e23de33c7e6afc23e93dad72aad6cf2cb03c797f068ea79814ddb0"),
@@ -22,6 +24,62 @@ YQ = {
 
 def command_output(command):
     return subprocess.check_output(command, text=True, stderr=subprocess.STDOUT, timeout=30).strip()
+
+
+def nvrx_requirements(manifest: dict) -> dict:
+    """Build 与执行 Pod 共用同一份清单，不能仅按 launcher 判断依赖。"""
+    return {
+        case_id: {"launcher": case["launcher"], "checkpoint": case["nvrx_checkpoint"]}
+        for case_id, case in manifest["functional"].items()
+        if case["nvrx_checkpoint"] or case["launcher"] == "ft_launcher"
+    }
+
+
+def check_nvrx(requirements: dict) -> dict:
+    """只导入并核验原 API，不启动 worker、通信组或 checkpoint 写入。"""
+    if not requirements:
+        return {}
+    version = importlib.metadata.version("nvidia-resiliency-ext")
+    if version != NVRX_VERSION:
+        raise ValueError(f"Functional NVRx version mismatch: {version} != {NVRX_VERSION}")
+    stages = [stage for case in requirements.values() for stage in case["checkpoint"]]
+    signatures = {}
+    if stages:
+        upstream = importlib.import_module("megatron.core.dist_checkpointing.strategies.torch")
+        strategy, modules = upstream.get_async_strategy("nvrx")
+        if strategy != "nvrx":
+            raise ValueError("Original async checkpoint strategy must remain nvrx")
+        queue = modules["AsyncCallsQueue"]
+        request = inspect.signature(modules["AsyncRequest"])
+        request.bind(None, (), [], async_fn_kwargs={}, preload_fn=None)
+        signatures["AsyncRequest"] = str(request)
+        init = inspect.signature(queue.__init__)
+        init.bind(None, persistent=any(stage["persistent_worker"] for stage in stages))
+        signatures["AsyncCallsQueue.__init__"] = str(init)
+        if any(stage["cpu_shm"] for stage in stages):
+            writer = inspect.signature(modules["FileSystemWriterAsync"].__init__)
+            if "cpu_shm_mode" not in writer.parameters:
+                raise ValueError("NVRx FileSystemWriterAsync requires cpu_shm_mode support")
+            signatures["FileSystemWriterAsync.__init__"] = str(writer)
+        if any(stage["persistent_worker"] for stage in stages):
+            warmup = inspect.signature(queue.warmup_persistent_caller)
+            kwargs = {"cpu_priority": 10, "io_priority": 3}
+            if any(stage["cpu_shm"] and stage["persistent_worker"] for stage in stages):
+                if "cpu_shm_mode" not in warmup.parameters:
+                    raise ValueError("NVRx persistent worker requires cpu_shm_mode support")
+                kwargs["cpu_shm_mode"] = True
+            warmup.bind(0, **kwargs)
+            results_queue = inspect.signature(modules["get_write_results_queue"])
+            if "mp_mode" not in results_queue.parameters:
+                raise ValueError("NVRx get_write_results_queue requires mp_mode support")
+            results_queue.bind(mp_mode="fork")
+            signatures["AsyncCallsQueue.warmup_persistent_caller"] = str(warmup)
+            signatures["get_write_results_queue"] = str(results_queue)
+    if any(case["launcher"] == "ft_launcher" for case in requirements.values()):
+        if not shutil.which("ft_launcher"):
+            raise ValueError("Selected case requires the original ft_launcher")
+        command_output(["ft_launcher", "--help"])
+    return {"version": version, "requirements": requirements, "signatures": signatures}
 
 
 def prepare(bundle: Path, manifest: dict):
@@ -53,7 +111,7 @@ def prepare(bundle: Path, manifest: dict):
         ],
         check=True,
     )
-    if any(case["launcher"] == "ft_launcher" for case in manifest["functional"].values()):
+    if nvrx_requirements(manifest):
         subprocess.run(
             [
                 sys.executable,
@@ -62,7 +120,7 @@ def prepare(bundle: Path, manifest: dict):
                 "install",
                 "--index-url",
                 os.environ["PIP_INDEX_URL"],
-                "nvidia-resiliency-ext==0.6.0",
+                f"nvidia-resiliency-ext=={NVRX_VERSION}",
             ],
             check=True,
         )
@@ -104,11 +162,9 @@ def check(bundle: Path, manifest: dict, output: Path):
     }
     for name in ("tensorboard", "yaml", "click", "ppu_functional_pytest"):
         importlib.import_module(name)
-    if any(case["launcher"] == "ft_launcher" for case in manifest["functional"].values()):
-        packages["nvidia-resiliency-ext"] = importlib.metadata.version("nvidia-resiliency-ext")
-        if not shutil.which("ft_launcher"):
-            raise ValueError("Selected case requires the original ft_launcher")
-        command_output(["ft_launcher", "--help"])
+    nvrx = check_nvrx(nvrx_requirements(manifest))
+    if nvrx:
+        packages["nvidia-resiliency-ext"] = nvrx["version"]
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.device_count() != 8:
@@ -127,6 +183,7 @@ def check(bundle: Path, manifest: dict, output: Path):
                 "image": manifest["config"]["image"],
                 "python": sys.version,
                 "packages": packages,
+                "nvrx": nvrx,
                 "bash": bash,
                 "yq": yq,
                 "envsubst": envsubst,
