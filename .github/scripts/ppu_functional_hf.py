@@ -193,6 +193,47 @@ def verify_cache(root: Path, sources: dict) -> dict:
     return {"schema_version": 1, "repositories": sources, "files": files}
 
 
+def inspect_candidate(data_root: Path) -> dict:
+    """只读回传获准路径内的候选清单及缓存一致性，不提升其信任级别。"""
+    relative = CACHE_RELATIVE / "source-lock.json"
+    report = {
+        "checked_path": str(data_root / relative),
+        "trusted": False,
+        "status": "source_lock_invalid",
+        "source_lock": None,
+        "source_lock_sha256": None,
+        "cache_matches_candidate": False,
+        "file_count": 0,
+        "reason": "",
+    }
+    try:
+        content = read_file(data_root, relative)
+        if len(content) > 128 * 1024:
+            raise ValueError("Candidate source lock exceeds its metadata size limit")
+        lock = unique_json(content)
+        sources = validate_lock(lock)
+    except FileNotFoundError:
+        report.update(status="source_lock_missing", reason="Candidate source lock is missing")
+        return report
+    except (OSError, ValueError, RecursionError) as exc:
+        report["reason"] = f"Candidate source lock is unreadable or invalid ({type(exc).__name__})"
+        return report
+    report.update(source_lock=lock, source_lock_sha256=digest(content), status="cache_mismatch")
+    try:
+        verified = verify_cache(data_root / CACHE_RELATIVE, sources)
+        if read_file(data_root, relative) != content:
+            raise ValueError("Candidate source lock changed during verification")
+    except (OSError, ValueError) as exc:
+        report["reason"] = f"Cache does not match a stable candidate ({type(exc).__name__})"
+        return report
+    report.update(
+        status="candidate_matches_cache",
+        cache_matches_candidate=True,
+        file_count=len(verified["files"]),
+    )
+    return report
+
+
 def populate(data_root: Path, destination: Path, dependencies: list) -> dict:
     """逐重复复制并复算；不向输入 NAS 写回，也不携带额外缓存文件。"""
     input_root, output_root = data_root.resolve(), destination.resolve()

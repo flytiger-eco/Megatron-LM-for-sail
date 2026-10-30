@@ -516,6 +516,192 @@ def test_asset_preflight_reads_fixed_digests_without_downloading(
     hf.fetch_official.assert_not_called()
 
 
+def test_candidate_readback_is_read_only_and_does_not_download(provisioned, monkeypatch):
+    data, destination, lock, _ = provisioned
+    (destination / "unapproved-extra").write_bytes(b"private_marker")
+    before = snapshot(data)
+    trusted_before = hf.load_sources(ROOT)
+    monkeypatch.setattr(hf, "fetch_official", Mock(side_effect=AssertionError("禁止隐式下载")))
+    reader = Mock(wraps=hf.read_file)
+    monkeypatch.setattr(hf, "read_file", reader)
+    report = hf.inspect_candidate(data)
+    assert report["status"] == "candidate_matches_cache"
+    assert report["cache_matches_candidate"] and not report["trusted"]
+    assert report["source_lock"] == lock
+    assert report["source_lock_sha256"] == hf.digest(
+        (destination / "source-lock.json").read_bytes()
+    )
+    assert report["file_count"] == len(hf.cache_files(lock["repositories"]))
+    assert "private_marker" not in json.dumps(report)
+    assert all("unapproved-extra" not in str(call.args) for call in reader.call_args_list)
+    assert snapshot(data) == before and hf.load_sources(ROOT) == trusted_before
+    hf.fetch_official.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "empty",
+        "malformed",
+        "duplicate",
+        "oversized",
+        "nested",
+        "weight",
+        "symlink",
+        "directory",
+        "permission",
+    ],
+)
+def test_candidate_invalid_metadata_is_not_exported(provisioned, monkeypatch, mutation):
+    data, destination, lock, _ = provisioned
+    path = destination / "source-lock.json"
+    payloads = {
+        "empty": b"",
+        "malformed": b"private_marker",
+        "duplicate": b'{"private_marker":1,"private_marker":2}',
+        "oversized": b" " * (128 * 1024 + 1),
+        "nested": b'{"a":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}",
+    }
+    if mutation in payloads:
+        path.write_bytes(payloads[mutation])
+    elif mutation == "weight":
+        lock["repositories"]["gpt2"]["files"]["private_marker.bin"] = {}
+        path.write_bytes(encoded(lock))
+    elif mutation == "permission":
+        monkeypatch.setattr(hf, "read_file", Mock(side_effect=PermissionError("private_marker")))
+    else:
+        saved = path.with_name("saved-candidate")
+        path.rename(saved)
+        if mutation == "symlink":
+            path.symlink_to(saved)
+        elif mutation == "directory":
+            path.mkdir()
+    before = snapshot(data)
+    report = hf.inspect_candidate(data)
+    assert report["status"] == (
+        "source_lock_missing" if mutation == "missing" else "source_lock_invalid"
+    )
+    assert report["source_lock"] is None and report["source_lock_sha256"] is None
+    assert not report["cache_matches_candidate"] and not report["trusted"]
+    assert "private_marker" not in json.dumps(report)
+    assert snapshot(data) == before
+
+
+@pytest.mark.parametrize("mutation", ["missing", "digest", "symlink", "ref", "changed_lock"])
+def test_candidate_cache_mismatch_is_not_accepted(provisioned, monkeypatch, mutation):
+    data, destination, lock, _ = provisioned
+    name = f"hub/models--gpt2/snapshots/{REVISION}/config.json"
+    path = destination / name
+    if mutation in ("missing", "symlink"):
+        saved = path.with_name("saved-config")
+        path.rename(saved)
+        if mutation == "symlink":
+            path.symlink_to(saved)
+    elif mutation == "digest":
+        path.write_bytes(b"tampered")
+    elif mutation == "ref":
+        (destination / "hub/models--gpt2/refs/main").write_bytes(b"b" * 40)
+    else:
+        original_read = hf.read_file
+        count = 0
+
+        def changed_read(root, relative):
+            nonlocal count
+            value = original_read(root, relative)
+            if str(relative).endswith("source-lock.json"):
+                count += 1
+                if count == 2:
+                    return value + b"\n"
+            return value
+
+        monkeypatch.setattr(hf, "read_file", changed_read)
+    before = snapshot(data)
+    report = hf.inspect_candidate(data)
+    assert report["status"] == "cache_mismatch"
+    assert report["source_lock"] == lock
+    assert not report["cache_matches_candidate"] and not report["trusted"]
+    assert report["file_count"] == 0 and report["reason"]
+    assert snapshot(data) == before
+
+
+@pytest.mark.parametrize(
+    "mode,location,reachable,fixed",
+    [
+        ("assets", "cpu", True, False),
+        ("assets", "cpu", True, True),
+        ("assets", "cpu", False, False),
+        ("assets", "pod", True, False),
+        ("regression", "cpu", True, False),
+        ("regression", "pod", True, True),
+    ],
+)
+def test_candidate_cli_never_promotes_trust_or_changes_gate(
+    evidence, provisioned, tmp_path, monkeypatch, mode, location, reachable, fixed
+):
+    manifest, case, _ = evidence
+    data, _, lock, _ = provisioned
+    manifest["config"]["functional_mode"] = mode
+    if reachable:
+        for asset in case["assets"]:
+            path = data / asset["relative_path"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"explicit input fixture")
+    else:
+        data = tmp_path / "unreachable-nas"
+    if fixed:
+        bind_case(case, lock)
+    else:
+        case["tokenizer_dependencies"] = [
+            {
+                "repository": "gpt2",
+                "status": "source_mapping_required",
+                "purpose": "MODEL_ARGS.tokenizer",
+            }
+        ]
+    output = tmp_path / "cpu-plan"
+    output.mkdir()
+    manifest_path = output / "manifest.json"
+    manifest_path.write_bytes(encoded(manifest))
+    baseline = functional.asset_report(manifest, data, location=location)
+    before = snapshot(data)
+    inspect = Mock(wraps=hf.inspect_candidate)
+    monkeypatch.setattr(hf, "inspect_candidate", inspect)
+    monkeypatch.setattr(hf, "fetch_official", Mock(side_effect=AssertionError("禁止隐式下载")))
+    summary = tmp_path / "step-summary"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ppu_functional.py",
+            "assets",
+            "--output",
+            str(output),
+            "--assets-root",
+            str(data),
+            "--location",
+            location,
+        ],
+    )
+    with pytest.raises(SystemExit) as stopped:
+        functional.main()
+    assert stopped.value.code == (0 if baseline["ok"] else 1)
+    report = json.loads((output / "assets-report.json").read_text())
+    candidate = report.pop("tokenizer_source_candidate", None)
+    if mode == "assets" and location == "cpu" and reachable:
+        inspect.assert_called_once_with(data)
+        assert candidate["cache_matches_candidate"] and candidate["trusted"] is False
+        assert "not trusted" in summary.read_text()
+    else:
+        inspect.assert_not_called()
+        assert candidate is None
+    assert report == baseline and report["numerical_validation"] is False
+    assert manifest_path.read_bytes() == encoded(manifest)
+    assert snapshot(data) == before
+    hf.fetch_official.assert_not_called()
+
+
 def runtime_case(evidence, provisioned, tmp_path):
     manifest, case, directory = prepare_case(evidence, tmp_path)
     source = provisioned[1]

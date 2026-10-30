@@ -792,6 +792,18 @@ def write_asset_report(report: dict, output: Path) -> None:
             lines.append(
                 f"| {case['name']} | {dependency['purpose']}: {dependency['repository']} | 未确认 | 未检查 | 未知 | 未知 | — | {dependency['reason']} |"
             )
+    candidate = report.get("tokenizer_source_candidate")
+    if candidate:
+        lines.extend(
+            [
+                "",
+                "### HF source candidate (not trusted)",
+                f"Status: `{candidate['status']}`; files matching candidate: {candidate['file_count']}.",
+                f"Candidate path: `{candidate['checked_path']}`.",
+                "Candidate metadata is included in assets-report.json for review only; "
+                "it does not replace the trusted source lock or change the asset gate.",
+            ]
+        )
     lines.append("")
     lines.extend(
         f"- Observation only: `{case['name']}` ({case['observation']}); excluded from the numerical pass rate."
@@ -835,6 +847,12 @@ def main() -> None:
         report = asset_report(
             manifest, args.assets_root, location=args.location, case_id=args.case_id
         )
+        if (
+            args.location == "cpu"
+            and manifest["config"]["functional_mode"] == "assets"
+            and report["root"]["ok"]
+        ):
+            report["tokenizer_source_candidate"] = hf.inspect_candidate(args.assets_root)
         write_asset_report(report, args.output)
         raise SystemExit(0 if report["ok"] else 1)
     inputs = json.loads(os.environ.get("PPU_INPUTS", "{}"))
