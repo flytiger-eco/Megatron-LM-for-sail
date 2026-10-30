@@ -33,11 +33,9 @@ jobs:
         env:
           PPU_TARGET_SHA: ${{ inputs.target_sha }}
           PPU_CONTROL_SHA: ${{ inputs.control_sha }}
-          RESULT_DIR: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic
         run: |
           [[ "$(git -C source rev-parse HEAD)" == "$PPU_CONTROL_SHA" ]]
           python3 -I source/.github/scripts/ppu_compiler_diagnostic.py authorize --authorization .ppu-ci/authorization.json
-          mkdir -p "$RESULT_DIR"
       - name: 单 Pod 八卡有界编译诊断
         id: ppu
         uses: flytiger-eco/ppu-distributed-action@main
@@ -58,6 +56,7 @@ jobs:
           extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_DIAGNOSTIC_RUN_ID=${{ github.run_id }},PPU_DIAGNOSTIC_RUN_ATTEMPT=${{ github.run_attempt }},PPU_DIAGNOSTIC_OUTPUT=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic
           command: |
             set -euo pipefail
+            umask 022
             cd /opt/megatron-lm
             [[ "$(git -c safe.directory="$PWD/source" -C source rev-parse HEAD)" == "$PPU_CONTROL_SHA" ]]
             timeout --signal=TERM --kill-after=5s 540s python3 -I source/.github/scripts/ppu_compiler_diagnostic.py run \
@@ -66,7 +65,7 @@ jobs:
         if: always()
         shell: bash
         env:
-          RESULT_DIR: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic
+          RESULT_DIR: .ppu-diagnostic-action
           ACTION_STATUS: ${{ steps.ppu.outputs.job_status }}
           ACTION_OUTCOME: ${{ steps.ppu.outcome }}
           ACTION_OUTPUTS: ${{ toJSON(steps.ppu.outputs) }}
@@ -75,11 +74,21 @@ jobs:
           printf '{"numerical_validation":false,"action_status":"%s","action_outcome":"%s","outputs":%s}\n' \
             "$ACTION_STATUS" "$ACTION_OUTCOME" "$ACTION_OUTPUTS" > "$RESULT_DIR/action.json"
           printf '%s\n' '独立编译诊断；未执行 Build、UT 或正式模型回归，不计入通过率。' >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - name: 归档 CPU 本地执行状态
+        uses: actions/upload-artifact@v4
         if: always()
         with:
+          name: ppu-compiler-diagnostic-action
+          path: .ppu-diagnostic-action/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+      - name: 只读归档 Pod 诊断证据
+        uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.ppu.outcome != 'skipped' }}
+        with:
           name: ppu-compiler-diagnostic
-          path: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic/
+          path: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic/pod/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7

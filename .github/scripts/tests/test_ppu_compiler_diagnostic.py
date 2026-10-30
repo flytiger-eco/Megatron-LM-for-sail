@@ -486,12 +486,76 @@ def test_cpu_envelope_and_pod_evidence_have_separate_ownership():
     workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-compiler-diagnostic.yml").read_text())
     steps = workflow["jobs"]["diagnose"]["steps"]
     setup = next(step for step in steps if step.get("name") == "核验诊断授权与源码身份")
-    assert 'mkdir -p "$RESULT_DIR"' in setup["run"]
+    assert "mkdir" not in setup["run"] and "RESULT_DIR" not in setup["env"]
     action = next(step for step in steps if step.get("id") == "ppu")
     assert '--output "$PPU_DIAGNOSTIC_OUTPUT/pod"' in action["with"]["command"]
+    assert "umask 022" in action["with"]["command"]
     envelope = next(step for step in steps if step.get("name") == "记录独立诊断执行状态")
-    assert envelope["env"]["RESULT_DIR"] == setup["env"]["RESULT_DIR"]
+    assert envelope["env"]["RESULT_DIR"] == ".ppu-diagnostic-action"
     assert envelope["env"]["ACTION_OUTPUTS"] == "${{ toJSON(steps.ppu.outputs) }}"
+    uploads = {
+        step["with"]["name"]: step
+        for step in steps
+        if step.get("uses") == "actions/upload-artifact@v4"
+    }
+    local = uploads["ppu-compiler-diagnostic-action"]
+    pod = uploads["ppu-compiler-diagnostic"]
+    assert local["if"] == envelope["if"] == "always()"
+    assert local["with"]["path"] == envelope["env"]["RESULT_DIR"] + "/"
+    assert pod["if"] == "${{ always() && steps.ppu.outcome != 'skipped' }}"
+    assert pod["with"]["path"] == (
+        "/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}"
+        "/compiler-diagnostic/pod/"
+    )
+    assert all(step["with"]["if-no-files-found"] == "error" for step in uploads.values())
+    for step in steps:
+        if "run" in step:
+            assert "/wl_nas" not in json.dumps(step)
+
+
+@pytest.mark.parametrize(
+    "outcome,status", [("success", "succeeded"), ("failure", "failed"), ("skipped", "")]
+)
+def test_cpu_envelope_runs_without_nas_write_permission(tmp_path, outcome, status):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-compiler-diagnostic.yml").read_text())
+    steps = workflow["jobs"]["diagnose"]["steps"]
+    envelope = next(step for step in steps if step.get("name") == "记录独立诊断执行状态")
+    nas = tmp_path / "nas"
+    nas.mkdir(mode=0o555)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outputs = {"job_status": status} if status else {}
+    env = {
+        **os.environ,
+        **envelope["env"],
+        "ACTION_OUTCOME": outcome,
+        "ACTION_STATUS": status,
+        "ACTION_OUTPUTS": json.dumps(outputs),
+        "GITHUB_STEP_SUMMARY": str(workspace / "summary"),
+    }
+    try:
+        if os.geteuid() != 0:
+            with pytest.raises(PermissionError):
+                (nas / "run").mkdir()
+        result = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", envelope["run"]],
+            cwd=workspace,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert result.returncode == 0, result.stderr
+        report = json.loads((workspace / env["RESULT_DIR"] / "action.json").read_text())
+        assert report == {
+            "numerical_validation": False,
+            "action_status": status,
+            "action_outcome": outcome,
+            "outputs": outputs,
+        }
+        assert list(nas.iterdir()) == [] and nas.stat().st_mode & 0o777 == 0o555
+    finally:
+        nas.chmod(0o755)
 
 
 def test_kernel_stack_unavailability_is_recorded(tmp_path):
