@@ -1,0 +1,91 @@
+{
+  "repositories": {
+    "bert-large-cased": {
+      "api_url": "https://huggingface.co/api/models/bert-large-cased/revision/06fa25dc1b6e034e91607fd67c247051ccaeff65",
+      "canonical_repository": "google-bert/bert-large-cased",
+      "files": {
+        "config.json": {
+          "sha256": "66a5763bd11fc04661277d8d4d969838a5b499cfdccbd93877e1424e91b3bb55",
+          "size": 762,
+          "url": "https://huggingface.co/google-bert/bert-large-cased/resolve/06fa25dc1b6e034e91607fd67c247051ccaeff65/config.json"
+        },
+        "tokenizer.json": {
+          "sha256": "a17c4dbf7a87e1789a01d3e17ad6cb6dd716c883d0e82fcd11eb525ece122e3e",
+          "size": 435797,
+          "url": "https://huggingface.co/google-bert/bert-large-cased/resolve/06fa25dc1b6e034e91607fd67c247051ccaeff65/tokenizer.json"
+        },
+        "tokenizer_config.json": {
+          "sha256": "0f6d13e6f4da6f9e24f22ada6bc3be571123d858d7c0c05a8a7cd55a9c23c2e8",
+          "size": 49,
+          "url": "https://huggingface.co/google-bert/bert-large-cased/resolve/06fa25dc1b6e034e91607fd67c247051ccaeff65/tokenizer_config.json"
+        },
+        "vocab.txt": {
+          "sha256": "eeaa9875b23b04b4c54ef759d03db9d1ba1554838f8fb26c5d96fa551df93d02",
+          "size": 213450,
+          "url": "https://huggingface.co/google-bert/bert-large-cased/resolve/06fa25dc1b6e034e91607fd67c247051ccaeff65/vocab.txt"
+        }
+      },
+      "revision": "06fa25dc1b6e034e91607fd67c247051ccaeff65"
+    },
+    "bert-large-uncased": {
+      "api_url": "https://huggingface.co/api/models/bert-large-uncased/revision/6da4b6a26a1877e173fca3225479512db81a5e5b",
+      "canonical_repository": "google-bert/bert-large-uncased",
+      "files": {
+        "config.json": {
+          "sha256": "f9a38c9ffa369f288c3206d0bf352dfed11d7bdee93aa5b2de6d7fdc7bff7871",
+          "size": 571,
+          "url": "https://huggingface.co/google-bert/bert-large-uncased/resolve/6da4b6a26a1877e173fca3225479512db81a5e5b/config.json"
+        },
+        "tokenizer.json": {
+          "sha256": "ce64fce797c24f68df90b40a3f74f579b336a493db14bd583fd520ea0d8c9a98",
+          "size": 466062,
+          "url": "https://huggingface.co/google-bert/bert-large-uncased/resolve/6da4b6a26a1877e173fca3225479512db81a5e5b/tokenizer.json"
+        },
+        "tokenizer_config.json": {
+          "sha256": "a025160ef0431f1a392f6f050c1310f4c5d9fb6f275932dbccba73c4d214bf10",
+          "size": 48,
+          "url": "https://huggingface.co/google-bert/bert-large-uncased/resolve/6da4b6a26a1877e173fca3225479512db81a5e5b/tokenizer_config.json"
+        },
+        "vocab.txt": {
+          "sha256": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3",
+          "size": 231508,
+          "url": "https://huggingface.co/google-bert/bert-large-uncased/resolve/6da4b6a26a1877e173fca3225479512db81a5e5b/vocab.txt"
+        }
+      },
+      "revision": "6da4b6a26a1877e173fca3225479512db81a5e5b"
+    },
+    "gpt2": {
+      "api_url": "https://huggingface.co/api/models/gpt2/revision/607a30d783dfa663caf39e06633721c8d4cfcd7e",
+      "canonical_repository": "openai-community/gpt2",
+      "files": {
+        "config.json": {
+          "sha256": "0daed7749b4f02b8f76240d5444551d7b08712dab4d0adb8239c56ba823bb7b4",
+          "size": 665,
+          "url": "https://huggingface.co/openai-community/gpt2/resolve/607a30d783dfa663caf39e06633721c8d4cfcd7e/config.json"
+        },
+        "merges.txt": {
+          "sha256": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5",
+          "size": 456318,
+          "url": "https://huggingface.co/openai-community/gpt2/resolve/607a30d783dfa663caf39e06633721c8d4cfcd7e/merges.txt"
+        },
+        "tokenizer.json": {
+          "sha256": "8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6",
+          "size": 1355256,
+          "url": "https://huggingface.co/openai-community/gpt2/resolve/607a30d783dfa663caf39e06633721c8d4cfcd7e/tokenizer.json"
+        },
+        "tokenizer_config.json": {
+          "sha256": "5e04eb606e3a1583530a42e36c2a6b6615c86f34fe77e44d9ddeb43ff940931f",
+          "size": 26,
+          "url": "https://huggingface.co/openai-community/gpt2/resolve/607a30d783dfa663caf39e06633721c8d4cfcd7e/tokenizer_config.json"
+        },
+        "vocab.json": {
+          "sha256": "196139668be63f3b5d6574427317ae82f612a97c5d1cdaf36ed2256dbf636783",
+          "size": 1042301,
+          "url": "https://huggingface.co/openai-community/gpt2/resolve/607a30d783dfa663caf39e06633721c8d4cfcd7e/vocab.json"
+        }
+      },
+      "revision": "607a30d783dfa663caf39e06633721c8d4cfcd7e"
+    }
+  },
+  "schema_version": 1
+}

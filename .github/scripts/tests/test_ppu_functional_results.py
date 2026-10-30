@@ -89,6 +89,7 @@ def evidence(tmp_path):
     case = next(iter(catalogue["functional"].values()))
     # 此夹具生成合成训练/比较证据，不实例化 tokenizer；真实缓存门禁另有独立测试。
     case["tokenizer_dependencies"] = []
+    case["assets"] = [asset for asset in case["assets"] if not asset.get("tokenizer_cache")]
     manifest = {
         **catalogue,
         "schema_version": 1,
