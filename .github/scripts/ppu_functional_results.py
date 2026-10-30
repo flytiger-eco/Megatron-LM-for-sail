@@ -213,6 +213,7 @@ def verify_repeat(
         text,
         cancelled=execution["cancelled"],
         timed_out=execution["timed_out"],
+        integrity_error=bool(execution.get("error")),
     )
     if classification in ("passed", "infrastructure_retryable") and 139 in statuses.values():
         classification = "hard_failure"
@@ -226,6 +227,11 @@ def verify_repeat(
         }
     verify_source(manifest, root, case)
     verify_runtime_config(root, case, directory)
+    if case["tokenizer_dependencies"]:
+        sources = control.hf.sources_for(case["tokenizer_dependencies"])
+        cache = control.hf.verify_cache(directory / "cache/huggingface", sources)
+        if json.loads((directory / "tokenizer-cache.json").read_text()) != cache:
+            raise ValueError("Missing or mismatched isolated tokenizer cache evidence")
     if statuses != {phase: 0 for phase in range(1, phase_count(case) + 1)}:
         raise ValueError("Training phase or resume phase did not finish successfully")
     if execution["runtime_config_sha256"] != control.sha256(directory / "model_config.yaml"):
@@ -321,8 +327,20 @@ def verify_envelope(manifest: dict, case: dict, directory: Path) -> dict:
     rows = assets.get("cases", [])
     if len(rows) != 1 or rows[0]["id"] != case["id"] or rows[0]["name"] != case["name"]:
         raise ValueError("Asset preflight belongs to a different case")
-    if case["tokenizer_dependencies"] or rows[0].get("unresolved_dependencies"):
+    if rows[0].get("unresolved_dependencies"):
         raise ValueError("Unresolved tokenizer cache dependencies cannot pass asset preflight")
+    control.hf.sources_for(case["tokenizer_dependencies"])
+    expected_tokenizers = control.validate_tokenizer_assets(case)
+    reported_tokenizers = [row for row in rows[0]["assets"] if row.get("tokenizer_cache")]
+    if len(reported_tokenizers) != len(expected_tokenizers):
+        raise ValueError("Missing tokenizer cache preflight evidence")
+    for expected, reported in zip(expected_tokenizers, reported_tokenizers):
+        if (
+            any(reported.get(key) != value for key, value in expected.items())
+            or reported.get("sha256") != expected["expected_sha256"]
+            or reported.get("size") != expected["expected_size"]
+        ):
+            raise ValueError("Tokenizer cache preflight digest evidence mismatch")
     if (
         {row["relative_path"] for row in rows[0]["assets"]}
         != {row["relative_path"] for row in case["assets"]}

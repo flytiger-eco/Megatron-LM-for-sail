@@ -14,6 +14,7 @@ if __name__ == "__main__":
 import pytest
 import yaml
 from test_ppu_functional import ROOT, SCRIPTS, functional
+from test_ppu_functional_hf import bind_case, official, provisioned
 from test_ppu_functional_results import envelope, results
 from test_ppu_functional_runtime import runtime
 
@@ -255,7 +256,7 @@ def test_original_shell_tensorboard_extraction_and_comparison(shell_case, kind):
         assert not results.verify_case(manifest, ROOT, case, directory)["success"]
 
 
-def test_original_shell_preserves_synthetic_reshard_configuration(tmp_path):
+def test_original_shell_preserves_synthetic_reshard_configuration(tmp_path, provisioned):
     config = functional.select_config({"functional_repeat": 1})
     catalogue = functional.catalogue(ROOT, ROOT, config)
     case = next(
@@ -271,10 +272,16 @@ def test_original_shell_preserves_synthetic_reshard_configuration(tmp_path):
     }
     synthetic = tmp_path / "synthetic-reshard.yaml"
     synthetic.write_text(yaml.safe_dump(original))
+    config["data_path"] = str(provisioned[0])
     manifest = {"identity": {}, "config": config}
     repeat = tmp_path / "repeat"
     repeat.mkdir()
     case = {**case, "config_path": str(synthetic)}
+    bind_case(case, provisioned[2])
+    assert {row["section"] for row in case["tokenizer_dependencies"]} == {
+        "MODEL_ARGS",
+        "MODEL_ARGS_2",
+    }
     bootstrap = tmp_path / "mock-boundaries.sh"
     bootstrap.write_text(BOOTSTRAP)
     with runtime.repeat_environment(manifest, ROOT, case, repeat, 1, 1) as env:
@@ -290,6 +297,10 @@ def test_original_shell_preserves_synthetic_reshard_configuration(tmp_path):
     assert second["model_args"] == original["MODEL_ARGS_2"]
     assert second["start"] == case["effective_train_iters"] // 2 + 1
     assert yaml.safe_load(synthetic.read_text()) == original
+    cache = functional.hf.verify_cache(
+        repeat / "cache/huggingface", functional.hf.sources_for(case["tokenizer_dependencies"])
+    )
+    assert json.loads((repeat / "tokenizer-cache.json").read_text()) == cache
     results.verify_pytest(repeat, "resume", manifest, case, 1, 1)
 
 
