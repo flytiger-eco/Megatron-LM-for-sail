@@ -18,6 +18,9 @@ POD_ASSETS = "/mnt/wl_nas/anyunge.ayg/megatron-functional-ci/artifacts-base"
 CPU_ASSETS = "/wl_nas/anyunge.ayg/megatron-functional-ci/artifacts-base"
 IMAGE = "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
 TIERS = ("L0", "L1", "L2", "L3")
+# Python 3.12.3 在编译池休眠后重新 fork 时可能继承已锁定的 shutdown lock。
+# 仅禁止池休眠，保留默认并行编译；对应 pytorch/pytorch#200848。
+COMPILER_ENVIRONMENT = {"TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL": "0"}
 SKIPPED_CASES = {
     "gpt/gpt3_mcore_te_tp2_pp1_modelopt_distill_resume": "teacher_checkpoint_unavailable"
 }
@@ -155,7 +158,22 @@ def select_config(inputs: dict) -> dict:
         "image": IMAGE,
         "data_path": POD_ASSETS,
         "cpu_data_path": CPU_ASSETS,
+        **({"compiler_environment": dict(COMPILER_ENVIRONMENT)} if mode == "regression" else {}),
     }
+
+
+def compiler_environment(manifest: dict) -> dict:
+    """新回归显式绑定适配；历史 manifest 缺字段时不追溯改写运行口径。"""
+    config = manifest["config"]
+    if "compiler_environment" not in config:
+        return {}
+    if (
+        manifest.get("test_kind") != "functional"
+        or config.get("functional_mode") != "regression"
+        or config["compiler_environment"] != COMPILER_ENVIRONMENT
+    ):
+        raise ValueError("Invalid functional compiler environment policy")
+    return dict(COMPILER_ENVIRONMENT)
 
 
 def safe_file(root: Path, relative: str | Path) -> Path:

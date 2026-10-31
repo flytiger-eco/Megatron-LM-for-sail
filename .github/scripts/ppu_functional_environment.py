@@ -320,7 +320,59 @@ def prepare(bundle: Path, manifest: dict):
         stream.write(NAMESPACE_BOOTSTRAP)
 
 
+COMPILER_PROBE = '''
+import json
+import os
+from torch._inductor import config
+print(json.dumps({
+    "environment": {
+        "TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL": os.environ.get("TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"),
+    },
+    "quiesce_async_compile_pool": config.quiesce_async_compile_pool,
+    "compile_threads": config.compile_threads,
+    "compile_threads_override": os.environ.get("TORCHINDUCTOR_COMPILE_THREADS"),
+}))
+'''
+
+
+def check_compiler(manifest: dict) -> dict:
+    """在全新解释器导入配置，验证环境开关确实生效；不执行算子或创建编译池。"""
+    if "compiler_environment" not in manifest["config"]:
+        return {}
+    settings = manifest["config"]["compiler_environment"]
+    if (
+        manifest.get("test_kind") != "functional"
+        or manifest["config"].get("functional_mode") != "regression"
+        or settings != {"TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL": "0"}
+    ):
+        raise ValueError("Invalid functional compiler environment policy")
+    if "TORCHINDUCTOR_COMPILE_THREADS" in os.environ:
+        raise ValueError("Functional compiler policy requires default parallel compilation")
+    report = json.loads(
+        subprocess.check_output(
+            [sys.executable, "-I", "-c", COMPILER_PROBE],
+            env={**os.environ, **settings},
+            text=True,
+            timeout=60,
+        )
+    )
+    if (
+        not isinstance(report, dict)
+        or report.get("environment") != settings
+        or report.get("quiesce_async_compile_pool") is not False
+        or type(report.get("compile_threads")) is not int
+        or report["compile_threads"] <= 1
+        or "compile_threads_override" not in report
+        or report["compile_threads_override"] is not None
+    ):
+        raise ValueError(
+            "Functional compiler environment was not applied with parallel compilation"
+        )
+    return report
+
+
 def check(bundle: Path, manifest: dict, output: Path):
+    compiler = check_compiler(manifest)
     tools = bundle / "functional-tools"
     arch, expected = YQ[platform.machine()]
     if hashlib.sha256((tools / "yq").read_bytes()).hexdigest() != expected:
@@ -378,6 +430,7 @@ def check(bundle: Path, manifest: dict, output: Path):
                 "nvrx": nvrx,
                 "training_dependencies": training_dependencies,
                 "postprocessing": postprocessing,
+                "compiler": compiler,
                 "bash": bash,
                 "yq": yq,
                 "envsubst": envsubst,

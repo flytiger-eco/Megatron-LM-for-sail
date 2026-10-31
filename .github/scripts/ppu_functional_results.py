@@ -220,6 +220,7 @@ def verify_repeat(
 ) -> dict:
     execution = json.loads((directory / "execution.json").read_text())
     verify_identity(execution, manifest, case, attempt, repeat)
+    compiler_env = control.compiler_environment(manifest)
     finite_seconds(execution["duration_seconds"])
     if type(execution.get("exit_code")) is not int:
         raise ValueError("Missing shell exit code")
@@ -234,6 +235,13 @@ def verify_repeat(
     )
     if classification in ("passed", "infrastructure_retryable") and 139 in statuses.values():
         classification = "hard_failure"
+    # 启动前失败可能尚未产生运行环境；不得遮蔽原错误，但缺证据不能通过或重试。
+    if (
+        classification in ("passed", "infrastructure_retryable")
+        and compiler_env
+        and execution.get("compiler_environment") != compiler_env
+    ):
+        raise ValueError("Missing or invalid repeat compiler environment evidence")
     if classification != "passed":
         if classification == "infrastructure_retryable" and not statuses:
             classification = "integrity_error"
@@ -371,6 +379,18 @@ def verify_envelope(manifest: dict, case: dict, directory: Path) -> dict:
         )
     ):
         raise ValueError("Missing or invalid functional environment evidence")
+    compiler_env = control.compiler_environment(manifest)
+    compiler = environment.get("compiler")
+    if compiler_env and (
+        not isinstance(compiler, dict)
+        or compiler.get("environment") != compiler_env
+        or compiler.get("quiesce_async_compile_pool") is not False
+        or type(compiler.get("compile_threads")) is not int
+        or compiler["compile_threads"] <= 1
+        or "compile_threads_override" not in compiler
+        or compiler["compile_threads_override"] is not None
+    ):
+        raise ValueError("Missing or invalid compiler environment attestation")
     action = json.loads((directory / "action-timing.json").read_text())
     pod = json.loads((directory / "pod-timing.json").read_text())
     if (
