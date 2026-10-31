@@ -20,6 +20,11 @@ on:
         description: 独立编译诊断（单 Pod 八卡，最多 10 分钟；不运行 Build、UT 或正式回归）
         type: boolean
         default: false
+      compiler_diagnostic_context:
+        description: bda 隔离计算；bert 仅复用 41070324511 原产物，单次原 50 步上下文取证
+        type: choice
+        options: [bda, bert]
+        default: bda
       functional_mode:
         description: Read-only CPU asset preflight or explicitly requested PPU regression
         type: choice
@@ -187,6 +192,7 @@ jobs:
     with:
       target_sha: ${{ needs.authorize.outputs.target_sha }}
       control_sha: ${{ needs.authorize.outputs.control_sha }}
+      diagnostic_context: ${{ inputs.compiler_diagnostic_context || 'bda' }}
   execute:
     needs: [authorize, pr-pending]
     if: >-

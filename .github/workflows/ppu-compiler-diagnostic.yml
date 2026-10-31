@@ -8,6 +8,9 @@ on:
       control_sha:
         type: string
         required: true
+      diagnostic_context:
+        type: string
+        default: bda
 permissions:
   contents: read
 jobs:
@@ -33,9 +36,10 @@ jobs:
         env:
           PPU_TARGET_SHA: ${{ inputs.target_sha }}
           PPU_CONTROL_SHA: ${{ inputs.control_sha }}
+          PPU_DIAGNOSTIC_CONTEXT: ${{ inputs.diagnostic_context }}
         run: |
           [[ "$(git -C source rev-parse HEAD)" == "$PPU_CONTROL_SHA" ]]
-          python3 -I source/.github/scripts/ppu_compiler_diagnostic.py authorize --authorization .ppu-ci/authorization.json
+          python3 -I source/.github/scripts/ppu_compiler_diagnostic.py authorize --authorization .ppu-ci/authorization.json --output .ppu-diagnostic-action
       - name: 单 Pod 八卡有界编译诊断
         id: ppu
         uses: flytiger-eco/ppu-distributed-action@main
@@ -53,7 +57,7 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_DIAGNOSTIC_RUN_ID=${{ github.run_id }},PPU_DIAGNOSTIC_RUN_ATTEMPT=${{ github.run_attempt }},PPU_DIAGNOSTIC_OUTPUT=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic
+          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_DIAGNOSTIC_CONTEXT=${{ inputs.diagnostic_context }},PPU_DIAGNOSTIC_RUN_ID=${{ github.run_id }},PPU_DIAGNOSTIC_RUN_ATTEMPT=${{ github.run_attempt }},PPU_DIAGNOSTIC_OUTPUT=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic
           command: |
             set -euo pipefail
             umask 022
