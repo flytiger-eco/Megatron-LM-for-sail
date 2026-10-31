@@ -416,7 +416,7 @@ def checkpoint_api(tool_environment, monkeypatch):
             pytest.fail("预检不应启动 checkpoint worker")
 
     class Writer:
-        def __init__(self, path, cpu_shm_mode=False):
+        def __init__(self, path, use_cpu_shm_for_gpu_tensors=False):
             pytest.fail("预检不应创建 checkpoint writer")
 
     def request(async_fn, async_fn_args, finalize_fns, async_fn_kwargs=None, preload_fn=None):
@@ -516,6 +516,23 @@ def test_prepare_attests_tools_and_installs_selected_dependencies(
         assert "mp_mode" in report["nvrx"]["signatures"]["get_write_results_queue"]
 
 
+def test_cpu_shm_checkpoint_uses_writer_parameter_name(tool_environment, checkpoint_api):
+    bundle, _, manifest, _, _, _ = tool_environment
+    manifest["functional"]["case"]["nvrx_checkpoint"] = [
+        {"section": "MODEL_ARGS", "persistent_worker": True, "cpu_shm": True}
+    ]
+    environment.prepare(bundle, manifest)
+    environment.check(bundle, manifest, bundle / "reports")
+    report = json.loads((bundle / "reports/functional-environment.json").read_text())
+    signatures = report["nvrx"]["signatures"]
+    # 与 nvidia-resiliency-ext 0.6.0 的真实签名一致：
+    # writer 用 use_cpu_shm_for_gpu_tensors，队列与 warmup 用 cpu_shm_mode。
+    assert "use_cpu_shm_for_gpu_tensors" in signatures["FileSystemWriterAsync.__init__"]
+    assert "cpu_shm_mode" not in signatures["FileSystemWriterAsync.__init__"]
+    assert "cpu_shm_mode" in signatures["AsyncCallsQueue.__init__"]
+    assert "cpu_shm_mode" in signatures["AsyncCallsQueue.warmup_persistent_caller"]
+
+
 @pytest.mark.parametrize(
     "module,symbol",
     [
@@ -545,7 +562,18 @@ def test_missing_original_checkpoint_import_fails_preflight(
 
 
 @pytest.mark.parametrize(
-    "damage", ["version", "request", "queue", "warmup", "mp_mode", "cpu_shm", "writer", "launcher"]
+    "damage",
+    [
+        "version",
+        "request",
+        "queue",
+        "warmup",
+        "mp_mode",
+        "cpu_shm",
+        "writer",
+        "writer_cpu_shm_mode",
+        "launcher",
+    ],
 )
 def test_incompatible_checkpoint_api_fails_before_training(
     tool_environment, checkpoint_api, monkeypatch, damage
@@ -555,7 +583,7 @@ def test_incompatible_checkpoint_api_fails_before_training(
         {
             "section": "MODEL_ARGS",
             "persistent_worker": True,
-            "cpu_shm": damage in ("cpu_shm", "writer"),
+            "cpu_shm": damage in ("cpu_shm", "writer", "writer_cpu_shm_mode"),
         }
     ]
     environment.prepare(bundle, manifest)
@@ -581,6 +609,14 @@ def test_incompatible_checkpoint_api_fails_before_training(
     elif damage == "writer":
         monkeypatch.setattr(
             modules["filesystem_async"].FileSystemWriterAsync, "__init__", lambda self, path: None
+        )
+    elif damage == "writer_cpu_shm_mode":
+        # 0.6.0 的真实开关在 writer 上叫 use_cpu_shm_for_gpu_tensors；
+        # 只提供 cpu_shm_mode 的 writer 必须被判为不支持。
+        monkeypatch.setattr(
+            modules["filesystem_async"].FileSystemWriterAsync,
+            "__init__",
+            lambda self, path, cpu_shm_mode=False: None,
         )
     else:
         manifest["functional"]["case"]["launcher"] = "ft_launcher"
