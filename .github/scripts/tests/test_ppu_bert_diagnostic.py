@@ -74,6 +74,8 @@ def test_bert_rejects_rerun_or_wrong_control(change):
 def historical_bundle(functional_bundle, evidence, monkeypatch):
     _, bundle = functional_bundle
     manifest, _, _ = evidence
+    # 固定历史 bundle 不包含后续新增的 functional 编译池适配。
+    manifest["config"].pop("compiler_environment")
     manifest["identity"] = {
         "target_sha": bert.HISTORICAL_SHA,
         "control_sha": bert.HISTORICAL_SHA,
@@ -290,6 +292,7 @@ def test_train_uses_original_model_and_shell_exactly_once(
     monkeypatch.setattr(runtime.control, "asset_report", lambda *args, **kwargs: {"ok": True})
     monkeypatch.setattr(runtime.control, "write_asset_report", lambda *args: None)
     monkeypatch.setenv("PPU_DIAGNOSTIC_STACK_DIR", str(tmp_path / "stacks"))
+    monkeypatch.delenv("TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL", raising=False)
     case = manifest["functional"][bert.CASE_ID]
     before = (ROOT / case["config_path"]).read_bytes()
 
@@ -306,6 +309,7 @@ def test_train_uses_original_model_and_shell_exactly_once(
         assert env["N_REPEAT"] == "1" and env["RECORD_CHECKPOINTS"] == "false"
         assert env["GPUS_PER_NODE"] == "8" and env["NUM_NODES"] == "1"
         assert env["PPU_DIAGNOSTIC_STACK_DIR"] == str(tmp_path / "stacks")
+        assert "TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL" not in env
         assert Path(env["TMPDIR"]).is_dir()
         return code
 

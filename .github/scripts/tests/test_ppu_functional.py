@@ -152,6 +152,55 @@ def test_functional_config_does_not_inherit_unit_gate(mode):
     assert config["data_path"] == "/mnt" + config["cpu_data_path"]
 
 
+def test_compiler_policy_only_changes_new_regression_manifest():
+    expected = {"TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL": "0"}
+    config = functional.select_config({"functional_mode": "regression"})
+    manifest = {"test_kind": "functional", "config": config}
+    assert config["compiler_environment"] == expected == functional.compiler_environment(manifest)
+    assert "compiler_environment" not in functional.select_config({})
+    current = functional.catalogue(ROOT, ROOT, config)
+    historical = copy.deepcopy(config)
+    historical.pop("compiler_environment")
+    assert current == functional.catalogue(ROOT, ROOT, historical)
+    assert functional.compiler_environment({"test_kind": "functional", "config": historical}) == {}
+    functional.compiler_environment(manifest).clear()
+    config["compiler_environment"].clear()
+    assert functional.COMPILER_ENVIRONMENT == expected
+
+
+@pytest.mark.parametrize("kind,mode", [("unit", "regression"), ("functional", "assets")])
+def test_compiler_policy_rejects_wrong_route(kind, mode):
+    manifest = {
+        "test_kind": kind,
+        "config": {
+            "functional_mode": mode,
+            "compiler_environment": dict(functional.COMPILER_ENVIRONMENT),
+        },
+    }
+    with pytest.raises(ValueError, match="compiler environment policy"):
+        functional.compiler_environment(manifest)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        None,
+        {},
+        "0",
+        {"TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL": 0},
+        {"TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL": "1"},
+        {**functional.COMPILER_ENVIRONMENT, "TORCHINDUCTOR_COMPILE_THREADS": "1"},
+    ],
+)
+def test_compiler_policy_rejects_arbitrary_settings(settings):
+    manifest = {
+        "test_kind": "functional",
+        "config": {"functional_mode": "regression", "compiler_environment": settings},
+    }
+    with pytest.raises(ValueError, match="compiler environment policy"):
+        functional.compiler_environment(manifest)
+
+
 def test_imported_snapshot_matches_source_bytes():
     files = snapshot.verify(ROOT, ROOT)
     assert len(files) == 224

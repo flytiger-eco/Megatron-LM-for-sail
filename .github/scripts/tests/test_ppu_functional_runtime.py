@@ -129,6 +129,9 @@ def test_runtime_runs_every_repeat_and_recomputes_original_comparator(evidence, 
         report = json.loads((Path(env["OUTPUT_PATH"]) / "execution.json").read_text())
         assert report["temporary_directory"] == env["TMPDIR"]
         assert report["shell_exit_code"] == 0 and report["extraction_exit_code"] is None
+        assert report["compiler_environment"] == manifest["config"]["compiler_environment"]
+        assert env["TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"] == "0"
+        assert "TORCHINDUCTOR_COMPILE_THREADS" not in env
 
 
 def test_retry_restarts_all_repeats_with_one_shared_deadline(evidence, tmp_path):
@@ -402,6 +405,84 @@ def test_environment_clears_inherited_shortcuts_and_uses_runtime_copy(
         expected = yaml.safe_load((ROOT / case["config_path"]).read_text())
         expected.setdefault("ENV_VARS", {})["N_REPEAT"] = 1
         assert yaml.safe_load((directory / "model_config.yaml").read_text()) == expected
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("inherited", [None, "0", "1"])
+def test_compiler_environment_is_scoped_without_rewriting_model(
+    evidence, tmp_path, monkeypatch, legacy, inherited
+):
+    manifest, case, _ = evidence
+    key = "TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"
+    monkeypatch.delenv("TORCHINDUCTOR_COMPILE_THREADS", raising=False)
+    if legacy:
+        manifest["config"].pop("compiler_environment")
+        monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", "1")
+    if inherited is None:
+        monkeypatch.delenv(key, raising=False)
+    else:
+        monkeypatch.setenv(key, inherited)
+    directory = tmp_path / "compiler-repeat"
+    directory.mkdir()
+    original = (ROOT / case["config_path"]).read_bytes()
+    expected = yaml.safe_load(original)
+    expected.setdefault("ENV_VARS", {})["N_REPEAT"] = 1
+    with runtime.repeat_environment(manifest, ROOT, case, directory, 1, 1) as env:
+        assert env.get(key) == (inherited if legacy else "0")
+        assert ("TORCHINDUCTOR_COMPILE_THREADS" in env) is legacy
+        assert yaml.safe_load((directory / "model_config.yaml").read_text()) == expected
+        observed = subprocess.check_output(
+            [
+                "bash",
+                "-c",
+                '"$UV_PYTHON" -I -c \'import os; print(os.environ.get("TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"))\'',
+            ],
+            env=env,
+            text=True,
+            timeout=10,
+        ).strip()
+        assert observed == str(inherited if legacy else "0")
+    assert os.environ.get(key) == inherited
+    assert (ROOT / case["config_path"]).read_bytes() == original
+
+
+@pytest.mark.parametrize("value", ["", "1", "8"])
+def test_thread_override_prevents_any_training_or_retry(evidence, tmp_path, monkeypatch, value):
+    manifest, case, directory = prepare_case(evidence, tmp_path)
+    monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", value)
+    runner = FakeRunner(manifest, case)
+    result = runtime.run_case(manifest, ROOT, case["id"], directory, runner=runner)
+    assert not result["success"] and result["attempts"] == 1
+    assert not runner.calls
+    execution = json.loads((directory / "attempt-1/repeat-1/execution.json").read_text())
+    assert execution["shell_exit_code"] is None
+    assert "default parallel compilation" in execution["error"]
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL", "1"),
+        ("TORCHINDUCTOR_COMPILE_THREADS", "1"),
+        ("TORCHINDUCTOR_COMPILE_THREADS", "8"),
+    ],
+)
+def test_model_environment_cannot_override_compiler_policy(
+    evidence, tmp_path, monkeypatch, key, value
+):
+    manifest, case, _ = evidence
+    monkeypatch.delenv("TORCHINDUCTOR_COMPILE_THREADS", raising=False)
+    config = yaml.safe_load((ROOT / case["config_path"]).read_text())
+    config["ENV_VARS"][key] = value
+    root = tmp_path / "source"
+    path = root / case["config_path"]
+    path.parent.mkdir(parents=True)
+    path.write_text(yaml.safe_dump(config))
+    directory = tmp_path / "repeat"
+    directory.mkdir()
+    with pytest.raises(ValueError, match="compiler.*policy|default parallel compilation"):
+        with runtime.repeat_environment(manifest, root, case, directory, 1, 1):
+            pytest.fail("冲突配置不得启动训练")
 
 
 @pytest.mark.parametrize("method", ["fork", "forkserver"])

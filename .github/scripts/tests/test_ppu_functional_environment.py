@@ -223,6 +223,188 @@ def tool_environment(tmp_path, monkeypatch):
     return bundle, site, manifest, calls, versions, cuda
 
 
+def compiler_manifest():
+    return {
+        "test_kind": "functional",
+        "config": {
+            "functional_mode": "regression",
+            "compiler_environment": dict(functional.COMPILER_ENVIRONMENT),
+        },
+    }
+
+
+def compiler_report():
+    return {
+        "environment": dict(functional.COMPILER_ENVIRONMENT),
+        "quiesce_async_compile_pool": False,
+        "compile_threads": 8,
+        "compile_threads_override": None,
+    }
+
+
+@pytest.mark.parametrize("kind", [None, "unit", "functional"])
+def test_historical_environment_does_not_probe_or_change_compiler(monkeypatch, kind):
+    manifest = {"test_kind": kind, "config": {"functional_mode": "regression"}}
+    monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", "1")
+    monkeypatch.setenv("TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL", "1")
+    monkeypatch.setattr(
+        environment.subprocess,
+        "check_output",
+        lambda *a, **k: pytest.fail("历史环境不得探测编译配置"),
+    )
+    assert environment.check_compiler(manifest) == {}
+    assert os.environ["TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"] == "1"
+
+
+@pytest.mark.parametrize("value", ["", "1", "8"])
+def test_compiler_check_rejects_inherited_thread_override(monkeypatch, value):
+    monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", value)
+    monkeypatch.setattr(
+        environment.subprocess, "check_output", lambda *a, **k: pytest.fail("不应启动探针")
+    )
+    with pytest.raises(ValueError, match="default parallel compilation"):
+        environment.check_compiler(compiler_manifest())
+
+
+@pytest.mark.parametrize(
+    "kind,mode,settings",
+    [
+        ("unit", "regression", functional.COMPILER_ENVIRONMENT),
+        ("functional", "assets", functional.COMPILER_ENVIRONMENT),
+        ("functional", "regression", {}),
+        ("functional", "regression", None),
+        ("functional", "regression", {"TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL": "1"}),
+    ],
+)
+def test_compiler_probe_rejects_invalid_manifest(monkeypatch, kind, mode, settings):
+    manifest = {
+        "test_kind": kind,
+        "config": {"functional_mode": mode, "compiler_environment": settings},
+    }
+    monkeypatch.setattr(
+        environment.subprocess, "check_output", lambda *a, **k: pytest.fail("不应启动探针")
+    )
+    with pytest.raises(ValueError, match="compiler environment policy"):
+        environment.check_compiler(manifest)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "none",
+        "missing",
+        "environment",
+        "quiesce",
+        "quiesce_numeric",
+        "threads",
+        "threads_string",
+        "threads_bool",
+        "override",
+        "override_missing",
+        "json",
+        "import_failure",
+        "timeout",
+    ],
+)
+def test_compiler_probe_is_bounded_and_fails_closed(monkeypatch, damage):
+    monkeypatch.delenv("TORCHINDUCTOR_COMPILE_THREADS", raising=False)
+    monkeypatch.setenv("TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL", "1")
+    report = compiler_report()
+    if damage == "missing":
+        report = None
+    elif damage == "override_missing":
+        report.pop("compile_threads_override")
+    elif damage in (
+        "environment",
+        "quiesce",
+        "quiesce_numeric",
+        "threads",
+        "threads_string",
+        "threads_bool",
+        "override",
+    ):
+        key, value = {
+            "environment": ("environment", {}),
+            "quiesce": ("quiesce_async_compile_pool", True),
+            "quiesce_numeric": ("quiesce_async_compile_pool", 0),
+            "threads": ("compile_threads", 1),
+            "threads_string": ("compile_threads", "8"),
+            "threads_bool": ("compile_threads", True),
+            "override": ("compile_threads_override", "8"),
+        }[damage]
+        report[key] = value
+
+    def probe(command, **kwargs):
+        assert command == [sys.executable, "-I", "-c", environment.COMPILER_PROBE]
+        assert kwargs["env"]["TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"] == "0"
+        assert "TORCHINDUCTOR_COMPILE_THREADS" not in kwargs["env"]
+        assert kwargs["timeout"] == 60 and kwargs["text"] is True
+        if damage == "import_failure":
+            raise subprocess.CalledProcessError(1, command)
+        if damage == "timeout":
+            raise subprocess.TimeoutExpired(command, 60)
+        return "invalid-json" if damage == "json" else json.dumps(report)
+
+    monkeypatch.setattr(environment.subprocess, "check_output", probe)
+    if damage == "none":
+        assert environment.check_compiler(compiler_manifest()) == report
+    else:
+        with pytest.raises((ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+            environment.check_compiler(compiler_manifest())
+    assert os.environ["TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"] == "1"
+
+
+def test_compiler_probe_uses_real_isolated_cpu_interpreter(tmp_path, monkeypatch):
+    """真实 -I 冷启动；用最小配置替身检查导入时机，不冒充厂商 Torch 验收。"""
+    prefix = tmp_path / "compiler-venv"
+    venv.EnvBuilder(with_pip=False).create(prefix)
+    python = prefix / "bin/python"
+    site = Path(
+        subprocess.check_output(
+            [str(python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+            text=True,
+        ).strip()
+    )
+    package = site / "torch/_inductor"
+    package.mkdir(parents=True)
+    (package.parent / "__init__.py").write_text("")
+    (package / "__init__.py").write_text("")
+    (package / "config.py").write_text(
+        "import os, sys\nassert sys.flags.isolated\n"
+        "quiesce_async_compile_pool = os.environ.get('TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL', '1') == '1'\n"
+        "compile_threads = 8\n"
+    )
+    monkeypatch.setattr(environment.sys, "executable", str(python))
+    monkeypatch.delenv("TORCHINDUCTOR_COMPILE_THREADS", raising=False)
+    monkeypatch.setenv("TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL", "1")
+    assert environment.check_compiler(compiler_manifest()) == compiler_report()
+    assert os.environ["TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"] == "1"
+
+
+@pytest.mark.parametrize("passed", [False, True])
+def test_compiler_gate_is_required_before_environment_success(
+    tool_environment, monkeypatch, passed
+):
+    bundle, _, manifest, _, _, _ = tool_environment
+    manifest.update(test_kind="functional")
+    manifest["config"].update(compiler_manifest()["config"])
+    monkeypatch.delenv("TORCHINDUCTOR_COMPILE_THREADS", raising=False)
+    report = compiler_report()
+    report["quiesce_async_compile_pool"] = not passed
+    monkeypatch.setattr(environment.subprocess, "check_output", lambda *a, **k: json.dumps(report))
+    environment.prepare(bundle, manifest)
+    output = bundle / "reports"
+    if passed:
+        environment.check(bundle, manifest, output)
+        assert (
+            json.loads((output / "functional-environment.json").read_text())["compiler"] == report
+        )
+    else:
+        with pytest.raises(ValueError, match="compiler environment was not applied"):
+            environment.check(bundle, manifest, output)
+        assert not (output / "functional-environment.json").exists()
+
+
 @pytest.fixture
 def checkpoint_api(tool_environment, monkeypatch):
     class Queue:

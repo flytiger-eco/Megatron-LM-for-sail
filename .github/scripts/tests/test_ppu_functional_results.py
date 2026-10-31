@@ -141,6 +141,8 @@ def successful_repeat(manifest, case, directory, attempt, repeat):
         "timed_out": False,
         "runtime_config_sha256": functional.sha256(path / "model_config.yaml"),
     }
+    if "compiler_environment" in manifest["config"]:
+        execution["compiler_environment"] = dict(manifest["config"]["compiler_environment"])
     write_json(path / "execution.json", execution)
     phases = ["regular", "resume"] if results.phase_count(case) == 2 else ["regular"]
     for phase in phases:
@@ -192,6 +194,18 @@ def envelope(manifest, case, directory):
             "yq": "Mike Farah v4",
             "envsubst": "GNU gettext",
             "uv": "fixture",
+            **(
+                {
+                    "compiler": {
+                        "environment": dict(manifest["config"]["compiler_environment"]),
+                        "quiesce_async_compile_pool": False,
+                        "compile_threads": 8,
+                        "compile_threads_override": None,
+                    }
+                }
+                if "compiler_environment" in manifest["config"]
+                else {}
+            ),
         },
     )
     write_json(
@@ -227,6 +241,82 @@ def completion(manifest, case, directory, attempts=1, **overrides):
     }
     write_json(directory / "case-run.json", report)
     envelope(manifest, case, directory)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_compiler_policy_preserves_historical_evidence(evidence, legacy):
+    manifest, case, directory = evidence
+    if legacy:
+        manifest["config"].pop("compiler_environment")
+    for repeat in (1, 2):
+        successful_repeat(manifest, case, directory, 1, repeat)
+    completion(manifest, case, directory)
+    assert results.verify_case(manifest, ROOT, case, directory)["success"]
+    execution = json.loads((directory / "attempt-1/repeat-1/execution.json").read_text())
+    environment = json.loads((directory / "functional-environment.json").read_text())
+    assert ("compiler_environment" in execution) is not legacy
+    assert ("compiler" in environment) is not legacy
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing",
+        "empty",
+        "environment",
+        "quiesce",
+        "quiesce_numeric",
+        "single_thread",
+        "threads_string",
+        "threads_bool",
+        "override",
+        "override_missing",
+    ],
+)
+def test_compiler_envelope_must_attest_parallel_configuration(evidence, damage):
+    manifest, case, directory = evidence
+    envelope(manifest, case, directory)
+    path = directory / "functional-environment.json"
+    report = json.loads(path.read_text())
+    compiler = report["compiler"]
+    if damage == "missing":
+        report.pop("compiler")
+    elif damage == "empty":
+        report["compiler"] = None
+    elif damage == "override_missing":
+        compiler.pop("compile_threads_override")
+    else:
+        key, value = {
+            "environment": ("environment", {}),
+            "quiesce": ("quiesce_async_compile_pool", True),
+            "quiesce_numeric": ("quiesce_async_compile_pool", 0),
+            "single_thread": ("compile_threads", 1),
+            "threads_string": ("compile_threads", "8"),
+            "threads_bool": ("compile_threads", True),
+            "override": ("compile_threads_override", "8"),
+        }[damage]
+        compiler[key] = value
+    write_json(path, report)
+    with pytest.raises(ValueError, match="compiler environment attestation"):
+        results.verify_envelope(manifest, case, directory)
+
+
+@pytest.mark.parametrize("value", [None, {}, {"TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL": "1"}])
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_repeat_compiler_policy_cannot_be_missing_or_changed(evidence, value, exit_code):
+    manifest, case, directory = evidence
+    path = successful_repeat(manifest, case, directory, 1, 1)
+    execution = json.loads((path / "execution.json").read_text())
+    execution["exit_code"] = exit_code
+    if exit_code:
+        (path / "driver.log").write_text("DistNetworkError: connection reset")
+    if value is None:
+        execution.pop("compiler_environment")
+    else:
+        execution["compiler_environment"] = value
+    write_json(path / "execution.json", execution)
+    with pytest.raises(ValueError, match="repeat compiler environment"):
+        results.verify_repeat(manifest, ROOT, case, path, 1, 1)
 
 
 @pytest.mark.parametrize("passed", [True, False])

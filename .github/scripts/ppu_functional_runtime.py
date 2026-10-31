@@ -101,6 +101,17 @@ def repeat_environment(
     (directory / "model_config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
     # Upstream consumes these through the environment; no arguments reach its eval parser.
     env = dict(os.environ)
+    compiler_env = control.compiler_environment(manifest)
+    if compiler_env:
+        config_env = config["ENV_VARS"]
+        if any(
+            key in config_env and str(config_env[key]) != value
+            for key, value in compiler_env.items()
+        ):
+            raise ValueError("Model configuration conflicts with compiler environment policy")
+        if "TORCHINDUCTOR_COMPILE_THREADS" in env or "TORCHINDUCTOR_COMPILE_THREADS" in config_env:
+            raise ValueError("Functional compiler policy requires default parallel compilation")
+        env.update(compiler_env)
     for key in (
         "WORLD_SIZE",
         "RANK",
@@ -249,6 +260,11 @@ def run_repeat(manifest, root, case, directory, attempt, repeat, runner, deadlin
                 "launcher": case["launcher"],
                 "launcher_internal_max_restarts": case["launcher_internal_max_restarts"],
                 "temporary_directory": env.get("TMPDIR"),
+                "compiler_environment": (
+                    {key: env.get(key) for key in control.COMPILER_ENVIRONMENT}
+                    if "compiler_environment" in manifest["config"]
+                    else {}
+                ),
                 "error": error,
             },
         )
