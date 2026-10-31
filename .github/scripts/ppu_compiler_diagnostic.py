@@ -3,6 +3,7 @@
 import argparse
 import ast
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -41,6 +42,9 @@ def verify_authorization(authorization: dict, env: dict) -> None:
         and authorization.get("control_sha") == target
         and authorization.get("allowed") is True
         and authorization.get("test_kind") == "compiler_diagnostic"
+        and env.get("PPU_DIAGNOSTIC_CONTEXT", "bda") in ("bda", "bert")
+        and authorization.get("compiler_diagnostic_context")
+        == env.get("PPU_DIAGNOSTIC_CONTEXT", "bda")
         and authorization.get("event_name") == "workflow_dispatch"
         and authorization.get("pr_number") == 0
         and authorization.get("manual_pr") is False
@@ -279,6 +283,13 @@ class DiagnosticRunner:
     def run(self, command: list, env: dict, output: Path, deadline: float) -> dict:
         started = time.monotonic()
         timed_out = False
+        if self.cancelled or started >= deadline:
+            return {
+                "exit_code": 143 if self.cancelled else 124,
+                "timed_out": not self.cancelled,
+                "cancelled": self.cancelled,
+                "duration_seconds": 0,
+            }
         with (output / "launcher.log").open("w") as stream:
             process = subprocess.Popen(
                 command, env=env, stdout=stream, stderr=stream, start_new_session=True
@@ -291,7 +302,7 @@ class DiagnosticRunner:
                     now = time.monotonic()
                     if now >= next_tracking:
                         process_family(process.pid, known)
-                        next_tracking = now + 1
+                        next_tracking = now + 0.2
                     if now >= next_capture:
                         capture_processes(process.pid, output, known)
                         next_capture = now + 30
@@ -302,13 +313,33 @@ class DiagnosticRunner:
                     time.sleep(0.2)
             finally:
                 # torchrun 的 rank 会另建会话；launcher 退出不意味着所有后代已退出。
-                signal_family(process.pid, known, signal.SIGTERM)
                 try:
+                    signal_family(process.pid, known, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        pass
+                finally:
+                    signal_family(process.pid, known, signal.SIGKILL)
                     process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    pass
-                signal_family(process.pid, known, signal.SIGKILL)
-                process.wait(timeout=3)
+                    remaining = {}
+                    for _ in range(20):
+                        remaining = {
+                            pid: row
+                            for pid, row in process_family(process.pid, known).items()
+                            if not re.search(
+                                r"^State:\s+Z", proc_text(Path(f"/proc/{pid}/status")), re.MULTILINE
+                            )
+                        }
+                        if not remaining:
+                            break
+                        time.sleep(0.1)
+                    write_json(
+                        output / "cleanup.json",
+                        {"launcher_pid": process.pid, "tracked": known, "remaining": remaining},
+                    )
+                    if remaining:
+                        raise RuntimeError("Diagnostic descendants survived cleanup")
         return {
             "exit_code": process.returncode,
             "timed_out": timed_out,
@@ -429,12 +460,25 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--variant", choices=VARIANTS)
     args = parser.parse_args()
+    context = os.environ.get("PPU_DIAGNOSTIC_CONTEXT", "bda")
     if args.mode == "probe":
+        if context != "bda":
+            raise ValueError("BDA probe cannot run in BERT context")
         probe(args.root, args.output, args.variant)
         return
     authorization = json.loads(args.authorization.read_text())
     verify_authorization(authorization, os.environ)
-    if args.mode == "run":
+    if context == "bert":
+        spec = importlib.util.spec_from_file_location(
+            "ppu_bert_diagnostic", SCRIPT.with_name("ppu_bert_diagnostic.py")
+        )
+        bert = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bert)
+        if args.mode == "authorize":
+            bert.preflight(args.output)
+        else:
+            raise SystemExit(bert.run_diagnostic(args.root, args.output, authorization))
+    elif args.mode == "run":
         raise SystemExit(run_diagnostic(args.root, args.output, authorization))
 
 

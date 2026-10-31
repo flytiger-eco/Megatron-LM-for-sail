@@ -140,6 +140,8 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
         "event_name": event_name,
         "test_kind": test_kind,
     }
+    if test_kind == "compiler_diagnostic":
+        result["compiler_diagnostic_context"] = inputs.get("compiler_diagnostic_context", "bda")
     if event_name == "workflow_dispatch":
         expected_workflow = f"{repository}/.github/workflows/ppu-build.yml@{BRANCH}"
         if ref != BRANCH or context["workflow_ref"] != expected_workflow:

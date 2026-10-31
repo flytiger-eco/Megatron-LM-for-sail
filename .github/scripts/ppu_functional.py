@@ -87,6 +87,11 @@ def validate_route(event_name: str, ref: str, inputs: dict) -> str:
     diagnostic = str(inputs.get("compiler_diagnostic", False)).lower()
     if diagnostic not in ("true", "false"):
         raise ValueError("compiler_diagnostic must be a boolean")
+    diagnostic_context = inputs.get("compiler_diagnostic_context", "bda")
+    if diagnostic_context not in ("bda", "bert"):
+        raise ValueError("compiler_diagnostic_context must be bda or bert")
+    if diagnostic_context != "bda" and diagnostic != "true":
+        raise ValueError("BERT context requires explicit compiler diagnostics")
     if diagnostic == "true" and kind != "functional":
         raise ValueError("Compiler diagnostics require test_kind=functional")
     if kind == "unit":
@@ -117,7 +122,10 @@ def validate_route(event_name: str, ref: str, inputs: dict) -> str:
 
 
 def select_config(inputs: dict) -> dict:
-    if str(inputs.get("compiler_diagnostic", False)).lower() != "false":
+    if (
+        str(inputs.get("compiler_diagnostic", False)).lower() != "false"
+        or inputs.get("compiler_diagnostic_context", "bda") != "bda"
+    ):
         raise ValueError("Compiler diagnostics must not enter the functional execution chain")
     mode = inputs.get("functional_mode", "assets")
     scope = inputs.get("functional_scope", "all")
