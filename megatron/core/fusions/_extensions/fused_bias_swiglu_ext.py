@@ -2,10 +2,11 @@
 
 """Internal SwiGLU dispatch, CUDA C loading, autograd wrappers, and optional input logging.
 
-Eligible sm89 inputs use the extension by default. Set MEGATRON_ENABLE_PPU_SWIGLU_OPT=0
-before importing the entry point to disable it. Only an explicit "1" enables it;
-an unset variable also enables it. Other devices and inputs use the supplied original
-functions without duplicating formulas or importing the entry module back.
+Eligible sm89 inputs use the extension by default. Only setting
+MEGATRON_DISABLE_PPU_SWIGLU_OPT to the exact string "1" before importing the entry point
+disables it. Unset and all other values leave it enabled; the former enable variable
+is ignored. Other devices and inputs use the supplied original functions without
+duplicating formulas or importing the entry module back.
 MEGATRON_SWIGLU_INPUT_LOG_DIR independently controls input logging, which is off by default.
 The first eligible call compiles the extension using the CUDA/HGGC toolchain and ninja.
 Loading failures warn once and fall back; kernel execution errors propagate.
@@ -26,8 +27,8 @@ from torch.utils._python_dispatch import _get_current_dispatch_mode
 from megatron.core.jit import jit_fuser
 
 _CSRC_DIR = Path(__file__).resolve().parents[1] / "csrc"
-_OPT_ENV = "MEGATRON_ENABLE_PPU_SWIGLU_OPT"
-_OPT_ENABLED = os.environ.get(_OPT_ENV, "1") == "1"
+_OPT_ENV = "MEGATRON_DISABLE_PPU_SWIGLU_OPT"
+_OPT_ENABLED = os.environ.get(_OPT_ENV) != "1"
 _extension = None
 _extension_lock = threading.Lock()
 _extension_error = None
@@ -406,7 +407,7 @@ def install(namespace: dict) -> None:
         namespace: Entry-point globals containing the original functions, avoiding circular imports.
     """
     global _OPT_ENABLED
-    enabled = os.environ.get(_OPT_ENV, "1") == "1"
+    enabled = os.environ.get(_OPT_ENV) != "1"
     log_dir = os.environ.get("MEGATRON_SWIGLU_INPUT_LOG_DIR") or None
     _OPT_ENABLED = enabled
     state = namespace.pop("_swiglu_ext_state", None)

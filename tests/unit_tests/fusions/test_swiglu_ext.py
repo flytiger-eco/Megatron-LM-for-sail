@@ -2,7 +2,7 @@
 
 """Test shared SwiGLU extension contracts and weighted, dense, and bias paths.
 
-Optimization is enabled by default; MEGATRON_ENABLE_PPU_SWIGLU_OPT=0 disables it.
+Only MEGATRON_DISABLE_PPU_SWIGLU_OPT=1 disables optimization; all other values enable it.
 Only sm89 inputs may use the extension. Shared contracts cover imports, reloads,
 device guards, loading failures, error propagation, and independent input logging.
 Both paths exercise real entry-point forward/backward calls, kernel spies, independent
@@ -41,19 +41,18 @@ requires_sm89 = pytest.mark.skipif(not _SM89, reason="CUDA C implementation supp
 
 @pytest.fixture(autouse=True)
 def _enabled_gate(monkeypatch):
-    # Enable gate/kernel unit tests explicitly; subprocesses cover default, off, and invalid values.
+    # Enable gate/kernel unit tests explicitly; subprocesses cover exact disable-only semantics.
     monkeypatch.setattr(cudac, "_OPT_ENABLED", True)
 
 
 @pytest.fixture
 def _entry_cudac():
-    """Reload with env=1 to install both wrappers, restoring the initial state afterward.
+    """Reload with the disable variable unset, restoring the initial state afterward.
 
     Reload defines originals before install captures them, preventing wrappers from
     being mistaken for originals across repeated reloads.
     """
-    saved = os.environ.get("MEGATRON_ENABLE_PPU_SWIGLU_OPT")
-    os.environ["MEGATRON_ENABLE_PPU_SWIGLU_OPT"] = "1"
+    saved = os.environ.pop(cudac._OPT_ENV, None)
     import megatron.core.fusions.fused_bias_swiglu as entry
 
     importlib.reload(entry)
@@ -61,9 +60,9 @@ def _entry_cudac():
         yield entry
     finally:
         if saved is None:
-            os.environ.pop("MEGATRON_ENABLE_PPU_SWIGLU_OPT", None)
+            os.environ.pop(cudac._OPT_ENV, None)
         else:
-            os.environ["MEGATRON_ENABLE_PPU_SWIGLU_OPT"] = saved
+            os.environ[cudac._OPT_ENV] = saved
         importlib.reload(entry)
 
 
@@ -93,10 +92,12 @@ def _run_probe(script, enable):
     env = dict(os.environ)
     env["PYTHONPATH"] = str(_REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     env.pop("MEGATRON_SWIGLU_INPUT_LOG_DIR", None)
+    env.pop("MEGATRON_ENABLE_PPU_SWIGLU_OPT", None)
+    env["SWIGLU_TEST_EXPECT_ENABLED"] = "1" if enable is not False else "0"
     if enable is None:
-        env.pop("MEGATRON_ENABLE_PPU_SWIGLU_OPT", None)
+        env.pop(cudac._OPT_ENV, None)
     else:
-        env["MEGATRON_ENABLE_PPU_SWIGLU_OPT"] = "1" if enable else "0"
+        env[cudac._OPT_ENV] = "0" if enable else "1"
     proc = subprocess.run(
         [sys.executable, "-c", script],
         cwd=str(_REPO_ROOT),
@@ -132,8 +133,12 @@ def forbidden(*args, **kwargs):
 
 
 torch.cuda._lazy_init = forbidden
-import megatron.core.fusions.fused_bias_swiglu as entry
 from megatron.core.fusions._extensions import fused_bias_swiglu_ext as ext
+
+enabled = os.environ["SWIGLU_TEST_EXPECT_ENABLED"] == "1"
+assert ext._OPT_ENV == "MEGATRON_DISABLE_PPU_SWIGLU_OPT"
+assert ext._OPT_ENABLED == enabled
+import megatron.core.fusions.fused_bias_swiglu as entry
 
 assert torch.cuda.is_initialized() == cuda_initialized_before
 assert ext._extension is None
@@ -144,7 +149,6 @@ assert all((ext._CSRC_DIR / name).is_file() for name in ("swiglu.cpp", "swiglu.c
 ext._get_extension = forbidden
 ext._is_sm89 = forbidden
 names = ("weighted_swiglu", "weighted_swiglu_back", "bias_swiglu_impl", "weighted_bias_swiglu_impl")
-enabled = os.environ.get(ext._OPT_ENV, "1") == "1"
 assert ext._OPT_ENABLED == enabled
 assert hasattr(entry, "_orig_weighted_swiglu") == enabled
 assert hasattr(entry, "_orig_bias_swiglu_impl") == enabled
@@ -165,17 +169,25 @@ assert ext.cuda_extension(x, w) is None
 assert ext.cuda_extension_plain(x) is None
 
 # Unwrap repeated installs; preserve new definitions after reload instead of restoring old ones.
-for value in ("0", "1", "0", "1"):
-    os.environ[ext._OPT_ENV] = value
+for value, enabled in (
+    ("1", False), ("0", True), ("1", False), ("", True),
+    ("true", True), (" 1", True), ("1 ", True), (None, True),
+):
+    if value is None:
+        os.environ.pop(ext._OPT_ENV, None)
+    else:
+        os.environ[ext._OPT_ENV] = value
     ext.install(vars(entry))
-    assert hasattr(entry, "_orig_weighted_swiglu") == (value == "1")
-    if value == "0":
+    assert ext._OPT_ENABLED == enabled
+    assert hasattr(entry, "_orig_weighted_swiglu") == enabled
+    if not enabled:
         assert all(getattr(entry, name) is fn for name, fn in originals.items())
     before = entry.bias_swiglu_impl
     importlib.reload(entry)
     assert entry.bias_swiglu_impl is not before
-    assert hasattr(entry, "_orig_bias_swiglu_impl") == (value == "1")
-    if value == "1":
+    assert ext._OPT_ENABLED == enabled
+    assert hasattr(entry, "_orig_bias_swiglu_impl") == enabled
+    if enabled:
         originals = entry._swiglu_ext_state["originals"]
         assert entry.bias_swiglu_impl.__wrapped__ is originals["bias_swiglu_impl"]
     else:
@@ -186,15 +198,19 @@ assert torch.cuda.is_initialized() == cuda_initialized_before
 '''
 
 
-@pytest.mark.parametrize("value", [None, "1", "0", "", "true", "2"])
-def test_configuration_import_and_reload(value):
+def _run_configuration_probe(value, expected_enabled, legacy_value=None):
     env = dict(os.environ)
     env["PYTHONPATH"] = str(_REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     env.pop("MEGATRON_SWIGLU_INPUT_LOG_DIR", None)
-    if value is None:
-        env.pop(cudac._OPT_ENV, None)
-    else:
-        env[cudac._OPT_ENV] = value
+    env["SWIGLU_TEST_EXPECT_ENABLED"] = "1" if expected_enabled else "0"
+    for name, setting in (
+        ("MEGATRON_DISABLE_PPU_SWIGLU_OPT", value),
+        ("MEGATRON_ENABLE_PPU_SWIGLU_OPT", legacy_value),
+    ):
+        if setting is None:
+            env.pop(name, None)
+        else:
+            env[name] = setting
     proc = subprocess.run(
         [sys.executable, "-c", _CONFIG_PROBE],
         cwd=_REPO_ROOT,
@@ -204,6 +220,35 @@ def test_configuration_import_and_reload(value):
         timeout=120,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize(
+    "value,expected_enabled",
+    [
+        (None, True),
+        ("1", False),
+        ("0", True),
+        ("", True),
+        ("true", True),
+        ("false", True),
+        ("True", True),
+        ("2", True),
+        ("-1", True),
+        ("01", True),
+        ("1.0", True),
+        (" 1", True),
+        ("1 ", True),
+        ("\t1\n", True),
+    ],
+)
+def test_configuration_import_and_reload(value, expected_enabled):
+    _run_configuration_probe(value, expected_enabled)
+
+
+@pytest.mark.parametrize("legacy_value", ["0", "1", "false", "", "2"])
+@pytest.mark.parametrize("value,expected_enabled", [(None, True), ("1", False)])
+def test_legacy_enable_variable_is_ignored(value, expected_enabled, legacy_value):
+    _run_configuration_probe(value, expected_enabled, legacy_value)
 
 
 @requires_sm89
@@ -292,7 +337,7 @@ def test_kernel_execution_error_propagates(monkeypatch):
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_logging_is_independent_and_records_each_call_once(monkeypatch, tmp_path, enabled):
-    monkeypatch.setenv(cudac._OPT_ENV, "1" if enabled else "0")
+    monkeypatch.setenv(cudac._OPT_ENV, "0" if enabled else "1")
     monkeypatch.setenv("MEGATRON_SWIGLU_INPUT_LOG_DIR", str(tmp_path))
     monkeypatch.setenv("RANK", "7")
     monkeypatch.setenv("LOCAL_RANK", "0")
@@ -335,7 +380,7 @@ def test_logging_is_independent_and_records_each_call_once(monkeypatch, tmp_path
         assert first["fn"] == "bias_swiglu_impl"
         assert last["fn"] == "weighted_bias_swiglu_impl"
         monkeypatch.delenv("MEGATRON_SWIGLU_INPUT_LOG_DIR")
-        monkeypatch.setenv(cudac._OPT_ENV, "0")
+        monkeypatch.setenv(cudac._OPT_ENV, "1")
         cudac.install(namespace)
         assert all(namespace[name] is fn for name, fn in originals.items())
     finally:
@@ -578,7 +623,7 @@ import torch.nn.functional as F
 import megatron.core.fusions.fused_bias_swiglu as entry
 import megatron.core.fusions._extensions.fused_bias_swiglu_ext as cudac
 
-enabled = os.environ.get("MEGATRON_ENABLE_PPU_SWIGLU_OPT", "1") == "1"
+enabled = os.environ["SWIGLU_TEST_EXPECT_ENABLED"] == "1"
 dev = "cuda"
 
 
@@ -680,7 +725,7 @@ def _run_entry_probe(enable):
 
 
 @requires_sm89
-@pytest.mark.parametrize("enable", [None, True], ids=["default", "explicit_on"])
+@pytest.mark.parametrize("enable", [None, True], ids=["default", "disable_zero"])
 def test_entry_enabled_routes_weighted_through_kernel(enable):
     f = _run_entry_probe(enable=enable)
     # Original-function capture and rebinding.
@@ -1069,7 +1114,7 @@ import torch.nn.functional as F
 import megatron.core.fusions.fused_bias_swiglu as entry
 import megatron.core.fusions._extensions.fused_bias_swiglu_ext as cudac
 
-enabled = os.environ.get("MEGATRON_ENABLE_PPU_SWIGLU_OPT", "1") == "1"
+enabled = os.environ["SWIGLU_TEST_EXPECT_ENABLED"] == "1"
 dev = "cuda"
 
 
@@ -1118,7 +1163,7 @@ def _run_dense_probe(enable):
 
 
 @requires_sm89
-@pytest.mark.parametrize("enable", [None, True], ids=["default", "explicit_on"])
+@pytest.mark.parametrize("enable", [None, True], ids=["default", "disable_zero"])
 def test_dense_entry_enabled_routes_through_kernel(enable):
     f = _run_dense_probe(enable=enable)
     assert f["DENSE_CAPTURED_ORIG"]
