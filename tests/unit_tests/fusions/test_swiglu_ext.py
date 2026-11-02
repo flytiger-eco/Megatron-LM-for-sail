@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -342,6 +343,7 @@ def test_loading_failure_warns_once_and_falls_back(monkeypatch):
     loader = Mock(side_effect=RuntimeError("simulated build failure"))
     monkeypatch.setattr(cudac, "_extension", None)
     monkeypatch.setattr(cudac, "_extension_error", None)
+    monkeypatch.setattr(cudac, "_extension_warned", False)
     monkeypatch.setattr(cudac, "_get_extension", loader)
     with pytest.warns(RuntimeWarning, match="simulated build failure") as captured:
         assert cudac.cuda_extension_plain(y) is None
@@ -349,6 +351,161 @@ def test_loading_failure_warns_once_and_falls_back(monkeypatch):
         assert cudac.cuda_extension(y, w) is None
     assert len(captured) == 1
     assert loader.call_count == 1
+
+
+@pytest.fixture
+def _mock_extension_loader(monkeypatch):
+    import torch.utils.cpp_extension as cpp_extension
+
+    backend = SimpleNamespace(swiglu_cuda=Mock())
+    loader = Mock(return_value=backend)
+    warning = Mock()
+    monkeypatch.setattr(cudac, "_extension", None)
+    monkeypatch.setattr(cudac, "_extension_error", None)
+    monkeypatch.setattr(cudac, "_extension_warned", False)
+    monkeypatch.setattr(cudac, "_extension_lock", threading.Lock())
+    monkeypatch.setattr(cpp_extension, "load", loader)
+    monkeypatch.setattr(cudac.warnings, "warn", warning)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda, "_lazy_init", Mock(side_effect=AssertionError("测试不得初始化 CUDA"))
+    )
+    return loader, backend, warning
+
+
+@pytest.mark.parametrize("error_type", [None, ImportError, OSError, RuntimeError])
+@pytest.mark.parametrize("first_entry", ["_get_extension", "_load_extension"])
+def test_concurrent_extension_loading(monkeypatch, _mock_extension_loader, error_type, first_entry):
+    """保留真实互斥锁，确保第二线程已排队才让第一次加载完成。"""
+    loader, backend, warning = _mock_extension_loader
+    failure = error_type("simulated build failure") if error_type else None
+    entered = threading.Event()
+    waiting = threading.Event()
+    release = threading.Event()
+    mutex = threading.Lock()
+    counter_lock = threading.Lock()
+    attempts = 0
+    published = []
+
+    class ObservedLock:
+        def __enter__(self):
+            nonlocal attempts
+            with counter_lock:
+                attempts += 1
+                if attempts == 2:
+                    waiting.set()
+            assert mutex.acquire(timeout=10), "加载锁未释放"
+            return self
+
+        def __exit__(self, *args):
+            published.append((cudac._extension, cudac._extension_error))
+            mutex.release()
+
+    def build(*args, **kwargs):
+        entered.set()
+        assert release.wait(10), "未收到加载完成信号"
+        if failure is not None:
+            raise failure
+        return backend
+
+    results, errors = {}, {}
+
+    def invoke(index, callback):
+        try:
+            results[index] = callback()
+        except BaseException as error:
+            errors[index] = error
+
+    monkeypatch.setattr(cudac, "_extension_lock", ObservedLock())
+    loader.side_effect = build
+    first = threading.Thread(target=invoke, args=(0, getattr(cudac, first_entry)), daemon=True)
+    second = threading.Thread(target=invoke, args=(1, cudac._load_extension), daemon=True)
+    first.start()
+    try:
+        assert entered.wait(10), "首次加载未开始"
+        second.start()
+        assert waiting.wait(10), "第二线程未在加载锁上排队"
+    finally:
+        release.set()
+        first.join(timeout=10)
+        if second.ident is not None:
+            second.join(timeout=10)
+    assert not first.is_alive() and not second.is_alive()
+    loader.assert_called_once()
+    assert published[0] == ((None, failure) if failure is not None else (backend, None))
+    if failure is not None and first_entry == "_get_extension":
+        assert errors == {0: failure}
+        assert results == {1: None}
+    else:
+        assert not errors
+        expected = None if failure is not None else backend
+        assert results == {0: expected, 1: expected}
+    assert warning.call_count == int(failure is not None)
+    for _ in range(3):
+        assert cudac._load_extension() is (None if failure is not None else backend)
+    loader.assert_called_once()
+    assert warning.call_count == int(failure is not None)
+    if failure is not None:
+        with pytest.raises(error_type, match="simulated build failure"):
+            cudac._get_extension()
+        loader.assert_called_once()
+
+
+def test_cached_extension_bypasses_loading_lock(monkeypatch, _mock_extension_loader):
+    loader, backend, warning = _mock_extension_loader
+    monkeypatch.setattr(cudac, "_extension", backend)
+    forbidden = Mock(side_effect=AssertionError("已加载路径不得获取锁或查询 CUDA"))
+    monkeypatch.setattr(cudac, "_extension_lock", SimpleNamespace(__enter__=forbidden))
+    monkeypatch.setattr(torch.cuda, "is_available", forbidden)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", forbidden)
+    assert cudac._get_extension() is backend
+    assert cudac._load_extension() is backend
+    loader.assert_not_called()
+    warning.assert_not_called()
+    forbidden.assert_not_called()
+
+
+def test_capture_fallback_does_not_poison_loader(monkeypatch, _mock_extension_loader):
+    loader, backend, warning = _mock_extension_loader
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert cudac._load_extension() is None
+    with pytest.raises(RuntimeError, match="Warm up"):
+        cudac._get_extension()
+    assert cudac._extension is None
+    assert cudac._extension_error is None
+    assert not cudac._extension_warned
+    loader.assert_not_called()
+    warning.assert_not_called()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert cudac._load_extension() is backend
+    loader.assert_called_once()
+    warning.assert_not_called()
+
+
+def test_loading_warning_is_outside_lock_and_reentrant(_mock_extension_loader):
+    loader, _, warning = _mock_extension_loader
+    failure = RuntimeError("simulated build failure")
+    loader.side_effect = failure
+
+    def emit(*args, **kwargs):
+        assert not cudac._extension_lock.locked(), "告警回调不能在加载锁内执行"
+        assert cudac._extension_error is failure
+        assert cudac._load_extension() is None
+
+    warning.side_effect = emit
+    assert cudac._load_extension() is None
+    loader.assert_called_once()
+    warning.assert_called_once()
+
+
+def test_unhandled_loading_error_propagates(_mock_extension_loader):
+    loader, _, warning = _mock_extension_loader
+    loader.side_effect = ValueError("unexpected loader error")
+    with pytest.raises(ValueError, match="unexpected loader error"):
+        cudac._load_extension()
+    assert cudac._extension_error is None
+    warning.assert_not_called()
 
 
 def test_kernel_execution_error_propagates(monkeypatch):

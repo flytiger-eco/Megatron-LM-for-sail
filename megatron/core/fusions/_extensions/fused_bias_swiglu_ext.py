@@ -30,6 +30,7 @@ _OPT_ENABLED = os.environ.get(_OPT_ENV) != "1"
 _extension = None
 _extension_lock = threading.Lock()
 _extension_error = None
+_extension_warned = False
 
 # Preserve the validated dtype, row-count, and layout limits despite default enablement.
 _REAL_PATTERN_MIN_ROWS = {torch.bfloat16: 256, torch.float16: 256}
@@ -37,10 +38,12 @@ _REAL_PATTERN_MIN_ROWS = {torch.bfloat16: 256, torch.float16: 256}
 
 def _get_extension():
     """Compile lazily after the caller checks enablement, input device, and shape."""
-    global _extension
+    global _extension, _extension_error
     if _extension is not None:
         return _extension
     with _extension_lock:
+        if _extension_error is not None:
+            raise _extension_error
         if _extension is None:
             if not torch.cuda.is_available():
                 raise RuntimeError("SwiGLU CUDA C requires an available CUDA/HGGC device")
@@ -48,37 +51,48 @@ def _get_extension():
                 raise RuntimeError(
                     "Warm up SwiGLU CUDA C with nonempty inputs before CUDA Graph capture"
                 )
-            from torch.utils.cpp_extension import load
+            try:
+                from torch.utils.cpp_extension import load
 
-            sources = [_CSRC_DIR / "swiglu.cpp", _CSRC_DIR / "swiglu.cu"]
-            cuda_flags = ["-O3", "-lineinfo", "-gencode=arch=compute_89,code=sm_89"]
-            source_hash = hashlib.sha256((torch.__version__ + repr(cuda_flags)).encode())
-            for source in sources:
-                source_hash.update(source.read_bytes())
-            digest = source_hash.hexdigest()[:12]
-            _extension = load(
-                name=f"megatron_swiglu_cudac_{digest}",
-                sources=[str(source) for source in sources],
-                extra_cflags=["-O3"],
-                extra_cuda_cflags=cuda_flags,
-                with_cuda=True,
-            )
+                sources = [_CSRC_DIR / "swiglu.cpp", _CSRC_DIR / "swiglu.cu"]
+                cuda_flags = ["-O3", "-lineinfo", "-gencode=arch=compute_89,code=sm_89"]
+                source_hash = hashlib.sha256((torch.__version__ + repr(cuda_flags)).encode())
+                for source in sources:
+                    source_hash.update(source.read_bytes())
+                digest = source_hash.hexdigest()[:12]
+                _extension = load(
+                    name=f"megatron_swiglu_cudac_{digest}",
+                    sources=[str(source) for source in sources],
+                    extra_cflags=["-O3"],
+                    extra_cuda_cflags=cuda_flags,
+                    with_cuda=True,
+                )
+            except (ImportError, OSError, RuntimeError) as error:
+                # 在释放加载锁前发布失败，排队线程不得再次尝试加载。
+                _extension_error = error
+                raise
     return _extension
 
 
 def _load_extension():
     """Handle loading failures without catching kernel execution errors."""
-    global _extension_error
+    global _extension_error, _extension_warned
     if _extension is None and torch.cuda.is_current_stream_capturing():
         return None
     try:
         return _get_extension()
     except (ImportError, OSError, RuntimeError) as error:
-        _extension_error = error
-        warnings.warn(
-            f"SwiGLU CUDA C extension unavailable; using the original implementation: {error}",
-            RuntimeWarning,
-        )
+        with _extension_lock:
+            if _extension_error is None:
+                _extension_error = error
+            warn = not _extension_warned
+            _extension_warned = True
+        # 告警可能调用用户回调；先认领告警，再在锁外执行，避免重入死锁。
+        if warn:
+            warnings.warn(
+                f"SwiGLU CUDA C extension unavailable; using the original implementation: {error}",
+                RuntimeWarning,
+            )
         return None
 
 
