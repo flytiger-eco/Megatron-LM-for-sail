@@ -93,30 +93,28 @@ jobs:
           RESULT_DIR: ppu://redacted/history-root-007${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
         run: |
           # Upload only evidence: checkpoints can reach tens of GB, so record what is omitted.
+          # The audit stays advisory: unreadable payloads must not fail an otherwise valid case.
           [[ -d "$RESULT_DIR" ]] || exit 0
-          python3 - "$RESULT_DIR" <<'PY'
-          import json
-          import pathlib
-          import sys
-
-          root = pathlib.Path(sys.argv[1])
-          omitted = []
-          for name in ("checkpoints", "initial-checkpoints"):
-              for path in sorted(root.rglob(name)):
-                  if not path.is_dir():
-                      continue
-                  files = [item for item in path.rglob("*") if item.is_file()]
-                  omitted.append(
-                      {
-                          "path": path.relative_to(root).as_posix(),
-                          "files": len(files),
-                          "bytes": sum(item.stat().st_size for item in files),
-                      }
-                  )
-          (root / "checkpoint-omissions.json").write_text(
-              json.dumps({"omitted": omitted}, sort_keys=True) + "\n"
-          )
-          PY
+          report="$RESULT_DIR/checkpoint-omissions.json"
+          recorded=0
+          if stat -c%s . >/dev/null 2>&1; then size_format='-c%s'; else size_format='-f%z'; fi
+          {
+            printf '{"omitted":['
+            separator=''
+            for name in checkpoints initial-checkpoints; do
+              while IFS= read -r directory; do
+                stats=$(find "$directory" -type f -exec stat "$size_format" {} + 2>/dev/null |
+                  awk '{count += 1; total += $1} END {printf "%d %d", count, total}')
+                stats=${stats:-0 0}
+                printf '%s{"bytes":%s,"files":%s,"path":"%s"}' \
+                  "$separator" "${stats##* }" "${stats%% *}" "${directory#"$RESULT_DIR"/}"
+                separator=','
+                recorded=$((recorded + 1))
+              done < <(find "$RESULT_DIR" -type d -name "$name" 2>/dev/null | sort)
+            done
+            printf ']}\n'
+          } > "$report" 2>/dev/null || echo "::warning::Unable to record omitted checkpoint payloads"
+          printf 'Recorded %s omitted checkpoint payload groups\n' "$recorded"
       - name: Upload every attempt, rank log, actual value and comparison report
         if: always()
         uses: actions/upload-artifact@v4
