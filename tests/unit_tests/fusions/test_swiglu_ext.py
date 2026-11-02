@@ -332,7 +332,7 @@ def test_native_host_checks_sm89_before_launch():
     assert guard in source
     assert "std::strstr(properties->name" not in source
     assert source.index("CUDAGuard guard(input.device())") < source.index(guard)
-    assert source.index(guard) < source.index("auto y = input.contiguous()")
+    assert source.index(guard) < source.index("auto y = input.resolve_neg().contiguous()")
 
 
 @requires_sm89
@@ -366,7 +366,7 @@ def test_kernel_execution_error_propagates(monkeypatch):
     with pytest.raises(RuntimeError, match="simulated kernel error"):
         backward(g, y, w)
     with pytest.raises(RuntimeError, match="simulated kernel error"):
-        cudac._dense_wrapper(original)(y, None)
+        cudac._dense_wrapper(original, original, original)(y, None)
     original.assert_not_called()
 
 
@@ -388,7 +388,7 @@ def test_logging_is_independent_and_records_each_call_once(monkeypatch, tmp_path
         bias_swiglu_impl=dense,
         weighted_bias_swiglu_impl=weighted,
     )
-    namespace = dict(originals)
+    namespace = dict(originals, swiglu_back=Mock(), bias_swiglu_back=Mock())
     cudac.install(namespace)
     installed = namespace["bias_swiglu_impl"]
     cudac.install(namespace)
@@ -559,6 +559,60 @@ def test_native_exact_tokenwise_preserves_shape_and_strides(dtype, shape, same_w
     materialized += raw(y, grad.contiguous(), None, weights.contiguous())
     for actual, ref in zip((out, dx, dw), materialized):
         torch.testing.assert_close(actual, ref, rtol=0, atol=0)
+
+
+@requires_sm89
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    "kind,negative",
+    [
+        (kind, negative)
+        for kind, peers in (
+            ("dense", ("input", "grad")),
+            ("bias_vector", ("input", "grad", "bias")),
+            ("bias_broadcast", ("bias",)),
+            ("weighted_token", ("input", "grad", "weights")),
+            ("weighted_feature", ("input", "grad", "weights")),
+            ("weighted_broadcast", ("input", "grad", "weights")),
+            ("weighted_grad_broadcast", ("input", "grad", "weights")),
+        )
+        for negative in peers
+    ],
+)
+def test_native_resolves_negative_views(dtype, kind, negative):
+    torch.manual_seed(321)
+    peers = dict(
+        input=torch.randn(256, 64, device="cuda", dtype=dtype),
+        grad=torch.randn(256, 32, device="cuda", dtype=dtype),
+        bias=None,
+        weights=None,
+    )
+    if kind.startswith("bias"):
+        shape = (64,) if kind == "bias_vector" else (256, 64)
+        peers["bias"] = torch.randn(shape, device="cuda", dtype=dtype)
+    if kind.startswith("weighted"):
+        shape = {"weighted_feature": (32,), "weighted_broadcast": (2, 256, 32)}.get(kind, (256, 1))
+        peers["weights"] = torch.rand(shape, device="cuda", dtype=torch.float32)
+    if kind == "weighted_grad_broadcast":
+        peers["grad"] = torch.randn(1, 32, device="cuda", dtype=dtype)
+    peers[negative] = torch._neg_view(peers[negative])
+    assert peers[negative].is_neg() and peers[negative].contiguous().is_neg()
+    resolved = {name: None if t is None else t.resolve_neg() for name, t in peers.items()}
+    raw = cudac._get_extension().swiglu_cuda
+    for backward in (False, True):
+        actual = raw(
+            peers["input"], peers["grad"] if backward else None, peers["bias"], peers["weights"]
+        )
+        expected = raw(
+            resolved["input"],
+            resolved["grad"] if backward else None,
+            resolved["bias"],
+            resolved["weights"],
+        )
+        assert len(actual) == len(expected)
+        for value, ref in zip(actual, expected):
+            assert torch.isfinite(value).all() and torch.count_nonzero(ref) > 0
+            torch.testing.assert_close(value, ref, rtol=0, atol=0)
 
 
 @requires_sm89
@@ -1454,7 +1508,7 @@ def test_native_specialization_kernel_names(_entry_cudac, family, h, record_prop
 
 @requires_sm89
 @pytest.mark.parametrize("family", ["dense", "bias", "weighted_bf16", "weighted_fp16"])
-@pytest.mark.parametrize("layout", ["sum", "transpose", "stride2", "offset"])
+@pytest.mark.parametrize("layout", ["sum", "transpose", "stride2", "offset", "negative"])
 def test_backward_gradient_layouts(_entry_cudac, monkeypatch, family, layout):
     """Dense native handles zero-stride and other unusual gradients; weighted backward falls back."""
     torch.manual_seed(106)
@@ -1472,6 +1526,9 @@ def test_backward_gradient_layouts(_entry_cudac, monkeypatch, family, layout):
     elif layout == "stride2":
         g = torch.randn(rows, 2 * h, device="cuda", dtype=dtype)[:, ::2]
         assert g.stride(-1) == 2
+    elif layout == "negative":
+        g = torch._neg_view(torch.randn(rows, h, device="cuda", dtype=dtype))
+        assert g.is_neg() and g.contiguous().is_neg()
     else:
         g = torch.randn(rows * h + 1, device="cuda", dtype=dtype)[1:].view(rows, h)
         assert g.is_contiguous() and g.data_ptr() % 16 != 0
@@ -1482,7 +1539,7 @@ def test_backward_gradient_layouts(_entry_cudac, monkeypatch, family, layout):
 
         def observe(y, weights, grad=None):
             if grad is not None:
-                seen.append((grad.stride(), grad.data_ptr() % 16))
+                seen.append((grad.stride(), grad.data_ptr() % 16, grad.is_neg()))
             return gate(y, weights, grad)
 
         monkeypatch.setattr(cudac, "cuda_extension", observe)
@@ -1490,7 +1547,7 @@ def test_backward_gradient_layouts(_entry_cudac, monkeypatch, family, layout):
 
         def observe(y, grad, bias, weights):
             if grad is not None:
-                seen.append((grad.stride(), grad.data_ptr() % 16))
+                seen.append((grad.stride(), grad.data_ptr() % 16, grad.is_neg()))
                 calls["bwd"] += 1
             else:
                 calls["fwd"] += 1
@@ -1498,7 +1555,7 @@ def test_backward_gradient_layouts(_entry_cudac, monkeypatch, family, layout):
 
         monkeypatch.setattr(cudac._get_extension(), "swiglu_cuda", observe)
     actual = _run_impl(_entry_cudac, y, g, bias, weights, sum_loss=layout == "sum")
-    assert seen == [(g.stride(), g.data_ptr() % 16)]
+    assert seen == [(g.stride(), g.data_ptr() % 16, g.is_neg())]
     assert calls == {"fwd": 1, "bwd": int(weights is None)}
     with monkeypatch.context() as patch:
         patch.setattr(cudac, "_OPT_ENABLED", False)
@@ -1511,6 +1568,131 @@ def test_backward_gradient_layouts(_entry_cudac, monkeypatch, family, layout):
             torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
     if bias is not None:
         torch.testing.assert_close(actual["dbias"], actual["dx"].sum(0), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("backend", ["mock_cpu", pytest.param("native", marks=requires_sm89)])
+@pytest.mark.parametrize("shape", [(256, 64), (128, 2, 64)])
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("grad_requires_grad", [False, True])
+@pytest.mark.parametrize("negative_grad", [False, True])
+@pytest.mark.parametrize("create_graph", [False, True])
+def test_dense_backward_graph_contract(
+    _entry_cudac,
+    monkeypatch,
+    backend,
+    shape,
+    with_bias,
+    grad_requires_grad,
+    negative_grad,
+    create_graph,
+):
+    entry = _entry_cudac
+    torch.manual_seed(322)
+    if backend == "mock_cpu":
+        device, dtype = "cpu", torch.float64
+        for name in ("swiglu", "bias_swiglu", "swiglu_back", "bias_swiglu_back"):
+            monkeypatch.setattr(entry, name, inspect.unwrap(getattr(entry, name)))
+        calls = {"fwd": 0, "bwd": 0}
+
+        def raw(y, g, bias, weights):
+            assert weights is None
+            calls["fwd" if g is None else "bwd"] += 1
+            with torch.no_grad():
+                if g is None:
+                    return [entry.swiglu(y) if bias is None else entry.bias_swiglu(y, bias)]
+                return [
+                    entry.swiglu_back(g, y) if bias is None else entry.bias_swiglu_back(g, y, bias)
+                ]
+
+        extension = SimpleNamespace(swiglu_cuda=raw)
+        monkeypatch.setattr(cudac, "cuda_extension_plain", lambda *args, **kwargs: extension)
+        helpers = [Mock(wraps=entry.swiglu_back), Mock(wraps=entry.bias_swiglu_back)]
+        namespace = dict(
+            entry._swiglu_ext_state["originals"],
+            swiglu_back=helpers[0],
+            bias_swiglu_back=helpers[1],
+        )
+        cudac.install(namespace)
+        impl = namespace["bias_swiglu_impl"]
+    else:
+        device, dtype = "cuda", torch.bfloat16
+        calls, _ = _install_spy(monkeypatch)
+        impl = entry.bias_swiglu_impl
+    x = torch.randn(shape, device=device, dtype=dtype, requires_grad=True)
+    bias = (
+        torch.randn(shape[-1], device=device, dtype=dtype, requires_grad=True)
+        if with_bias
+        else None
+    )
+    g = torch.randn(
+        shape[:-1] + (shape[-1] // 2,), device=device, dtype=dtype, requires_grad=grad_requires_grad
+    )
+    if negative_grad:
+        g = torch._neg_view(g)
+        assert g.is_neg() and g.contiguous().is_neg()
+    leaves = (x, bias) if with_bias else (x,)
+    ref_leaves = tuple(t.detach().clone().requires_grad_() for t in leaves)
+    ref_g = g.detach().clone().requires_grad_(grad_requires_grad)
+    out = impl(x, bias)
+    first = torch.autograd.grad(out, leaves, g, create_graph=create_graph)
+    assert calls == {"fwd": 1, "bwd": int(not create_graph)}
+    if backend == "mock_cpu":
+        assert helpers[int(with_bias)].call_count == int(create_graph)
+        helpers[int(not with_bias)].assert_not_called()
+        if create_graph:
+            assert all(not t.is_neg() for t in helpers[int(with_bias)].call_args.args)
+    ref_out = entry._orig_bias_swiglu_impl(ref_leaves[0], ref_leaves[1] if with_bias else None)
+    expected_first = torch.autograd.grad(ref_out, ref_leaves, ref_g, create_graph=create_graph)
+    for value, ref in zip(first, expected_first):
+        assert value.requires_grad == create_graph
+        assert (value.grad_fn is not None) == create_graph
+        torch.testing.assert_close(value, ref, rtol=0, atol=0)
+    if create_graph:
+        directions = tuple(torch.randn_like(t) for t in first)
+        targets = leaves + ((g,) if grad_requires_grad else ())
+        ref_targets = ref_leaves + ((ref_g,) if grad_requires_grad else ())
+        second = torch.autograd.grad(first, targets, directions)
+        expected_second = torch.autograd.grad(expected_first, ref_targets, directions)
+        for value, ref in zip(second, expected_second):
+            assert torch.isfinite(value).all() and torch.count_nonzero(ref) > 0
+            torch.testing.assert_close(value, ref, rtol=0, atol=0)
+    assert calls == {"fwd": 1, "bwd": int(not create_graph)}
+
+
+@requires_sm89
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_dense_saved_negative_views(_entry_cudac, monkeypatch, with_bias):
+    torch.manual_seed(323)
+    y = torch.randn(256, 64, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(64, device="cuda", dtype=y.dtype) if with_bias else None
+    g = torch.randn(256, 32, device="cuda", dtype=y.dtype)
+    calls, raw = _install_spy(monkeypatch)
+    restored, seen = [], []
+
+    def unpack(tensor):
+        view = torch._neg_view(tensor)
+        assert view.is_neg() and view.contiguous().is_neg()
+        restored.append(view)
+        return view
+
+    def observe(x, grad, b, weights):
+        calls["fwd" if grad is None else "bwd"] += 1
+        if grad is not None:
+            seen.extend(t.is_neg() for t in (x, b) if t is not None)
+        return raw(x, grad, b, weights)
+
+    monkeypatch.setattr(cudac._get_extension(), "swiglu_cuda", observe)
+    with torch.autograd.graph.saved_tensors_hooks(lambda t: -t.detach(), unpack):
+        actual = _run_impl(_entry_cudac, y, g, bias)
+    assert len(restored) == 1 + int(with_bias)
+    assert seen == [True] * (1 + int(with_bias))
+    assert calls == {"fwd": 1, "bwd": 1}
+    expected = _run_impl(_entry_cudac, y, g, bias)
+    oracle = _oracle_results(y, g, bias)
+    for name, value in actual.items():
+        torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
+        torch.testing.assert_close(value, oracle[name], **_result_tol(name, y))
+    assert calls == {"fwd": 2, "bwd": 2}
 
 
 def _rounding_ulp(ref, dtype):

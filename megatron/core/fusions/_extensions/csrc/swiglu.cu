@@ -782,7 +782,7 @@ std::vector<torch::Tensor> swiglu_cuda(
     const auto* properties = at::cuda::getDeviceProperties(input.get_device());
     TORCH_CHECK(properties->major == 8 && properties->minor == 9,
                 "SwiGLU CUDA C requires sm89, got sm", properties->major, properties->minor);
-    auto y = input.contiguous();
+    auto y = input.resolve_neg().contiguous();
     const int64_t h = y.size(-1) / 2;
     const int64_t rows = y.numel() / (2 * h);
     auto output_shape = y.sizes().vec();
@@ -795,10 +795,12 @@ std::vector<torch::Tensor> swiglu_cuda(
         TORCH_CHECK(weights_arg->scalar_type() == y.scalar_type() ||
                     weights_arg->scalar_type() == torch::kFloat,
                     "weights dtype must match input or be float32");
+        weights_arg = weights_arg->resolve_neg();
     }
     if (grad.has_value()) {
         check_peer(*grad, y, "g");
         TORCH_CHECK(grad->scalar_type() == y.scalar_type(), "g dtype must match input");
+        grad = grad->resolve_neg();
     }
     if (weights_arg.has_value()) {
         weight_shape = output_shape;
@@ -835,6 +837,7 @@ std::vector<torch::Tensor> swiglu_cuda(
     if (bias_arg.has_value()) {
         check_peer(*bias_arg, y, "bias");
         TORCH_CHECK(bias_arg->scalar_type() == y.scalar_type(), "bias dtype must match input");
+        bias_arg = bias_arg->resolve_neg();
         if (bias_arg->dim() == 1 && bias_arg->size(0) == 2 * h) {
             bias = bias_arg->contiguous();
         } else {

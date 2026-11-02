@@ -216,16 +216,21 @@ class _DenseSwiGLUCudacFunction(torch.autograd.Function):
     """Internal CUDA C autograd wrapper for dense inputs with optional bias."""
 
     @staticmethod
-    def forward(ctx, input2d, bias, extension):
+    def forward(ctx, input2d, bias, extension, backward):
         ctx.save_for_backward(input2d, bias)
         ctx.ext = extension
+        ctx.original_backward = backward
         return extension.swiglu_cuda(input2d, None, bias, None)[0]
 
     @staticmethod
     def backward(ctx, grad_output):
         y, bias = ctx.saved_tensors
-        dx = ctx.ext.swiglu_cuda(y, grad_output, bias, None)[0]
-        return dx, (dx if bias is not None else None), None
+        if torch.is_grad_enabled():
+            args = (grad_output, y) if bias is None else (grad_output, y, bias)
+            dx = ctx.original_backward(*(t.resolve_neg() for t in args))
+        else:
+            dx = ctx.ext.swiglu_cuda(y, grad_output, bias, None)[0]
+        return dx, (dx if bias is not None else None), None, None
 
 
 def _weighted_wrappers(forward, backward):
@@ -244,14 +249,14 @@ def _weighted_wrappers(forward, backward):
             return backward(g, y, weights)
         extension = cuda_extension(y, weights, grad=g)
         if extension is None:
-            return backward(g, y, weights)
+            return backward(g.resolve_neg(), y, weights)
         dx, dw = extension.swiglu_cuda(y, g, None, weights)
         return dx, dw
 
     return weighted_swiglu, weighted_swiglu_back
 
 
-def _dense_wrapper(original):
+def _dense_wrapper(original, backward, bias_backward):
     @wraps(original)
     def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False):
         if torch.jit.is_scripting():
@@ -263,7 +268,8 @@ def _dense_wrapper(original):
         extension = cuda_extension_plain(input2d, bias)
         if extension is None:
             return original(input, bias, fp8_input_store, cpu_offload_input)
-        output = _DenseSwiGLUCudacFunction.apply(input2d, bias, extension)
+        helper = backward if bias is None else bias_backward
+        output = _DenseSwiGLUCudacFunction.apply(input2d, bias, extension, helper)
         return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
     return bias_swiglu_impl
@@ -443,7 +449,9 @@ def install(namespace: dict) -> None:
         namespace["weighted_swiglu"], namespace["weighted_swiglu_back"] = _weighted_wrappers(
             originals["weighted_swiglu"], originals["weighted_swiglu_back"]
         )
-        namespace["bias_swiglu_impl"] = _dense_wrapper(originals["bias_swiglu_impl"])
+        namespace["bias_swiglu_impl"] = _dense_wrapper(
+            originals["bias_swiglu_impl"], namespace["swiglu_back"], namespace["bias_swiglu_back"]
+        )
     if log_dir:
         logger = _InputLogger(log_dir, enabled)
         namespace["bias_swiglu_impl"], namespace["weighted_bias_swiglu_impl"] = _logging_wrappers(
