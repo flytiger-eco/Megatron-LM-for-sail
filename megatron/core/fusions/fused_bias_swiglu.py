@@ -253,3 +253,8 @@ def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
 
 # bias_swiglu_impl = BiasSwiGLUFunction.apply
 # swiglu_impl = SwiGLUFunction.apply
+
+# Keep original definitions intact; the extension owns dispatch, controls, and logging.
+from megatron.core.fusions._extensions import fused_bias_swiglu_ext as _swiglu_ext
+
+_swiglu_ext.install(globals())
