@@ -746,3 +746,72 @@ def test_workflow_functional_route_is_manual_only_and_preserves_ut():
     assert action["with"]["image"] == functional.IMAGE
     assert "verify-bundle" in action["with"]["command"]
     assert "ppu_functional_run.sh" in action["with"]["command"]
+
+
+def test_workflow_uploads_evidence_without_checkpoint_payloads():
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-functional.yml").read_text())
+    steps = workflow["jobs"]["test"]["steps"]
+    upload = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
+    root = (
+        "ppu://redacted/history-root-007${{ github.run_id }}-${{ github.run_attempt }}"
+        "/functional/${{ matrix.id }}"
+    )
+    assert upload["with"]["path"].strip().splitlines() == [
+        root,
+        f"!{root}/**/checkpoints/**",
+        f"!{root}/**/initial-checkpoints/**",
+    ]
+    assert upload["with"]["include-hidden-files"] is True
+    assert upload["with"]["if-no-files-found"] == "error"
+    assert upload["with"]["retention-days"] == 7
+    names = [step.get("name") for step in steps]
+    assert names.index("Record omitted checkpoint payloads") == names.index(upload["name"]) - 1
+
+
+def test_checkpoint_omission_report_records_excluded_payloads(tmp_path):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-functional.yml").read_text())
+    step = next(
+        step
+        for step in workflow["jobs"]["test"]["steps"]
+        if step.get("name") == "Record omitted checkpoint payloads"
+    )
+    result = tmp_path / "functional-000"
+    repeat = result / "attempt-1/repeat-1"
+    (repeat / "checkpoints").mkdir(parents=True)
+    (repeat / "checkpoints/model.bin").write_bytes(b"x" * 10)
+    (repeat / "initial-checkpoints").mkdir()
+    (repeat / "initial-checkpoints/base.bin").write_bytes(b"y" * 3)
+    (repeat / "logs").mkdir()
+    (repeat / "logs/rank.log").write_text("ok")
+    subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", step["run"]],
+        env={**os.environ, "RESULT_DIR": str(result)},
+        check=True,
+    )
+    report = json.loads((result / "checkpoint-omissions.json").read_text())
+    assert report == {
+        "omitted": [
+            {"path": "attempt-1/repeat-1/checkpoints", "files": 1, "bytes": 10},
+            {"path": "attempt-1/repeat-1/initial-checkpoints", "files": 1, "bytes": 3},
+        ]
+    }
+    # The exclusion only narrows the upload scope; NAS originals and evidence stay untouched.
+    assert (repeat / "checkpoints/model.bin").stat().st_size == 10
+    assert (repeat / "logs/rank.log").read_text() == "ok"
+
+
+def test_checkpoint_omission_report_does_not_create_missing_results(tmp_path):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-functional.yml").read_text())
+    step = next(
+        step
+        for step in workflow["jobs"]["test"]["steps"]
+        if step.get("name") == "Record omitted checkpoint payloads"
+    )
+    result = tmp_path / "functional-999"
+    subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", step["run"]],
+        env={**os.environ, "RESULT_DIR": str(result)},
+        check=True,
+    )
+    # A case without evidence must still fail if-no-files-found: error, so no empty dir is created.
+    assert not result.exists()
