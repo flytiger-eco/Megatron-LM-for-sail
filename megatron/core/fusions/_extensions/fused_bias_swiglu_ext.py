@@ -1,5 +1,3 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-
 """Internal SwiGLU dispatch, CUDA C loading, autograd wrappers, and optional input logging.
 
 Eligible sm89 inputs use the extension by default. Only setting
@@ -17,7 +15,7 @@ import hashlib
 import os
 import threading
 import warnings
-from functools import wraps
+from functools import lru_cache, wraps
 from pathlib import Path
 from types import ModuleType
 
@@ -26,7 +24,7 @@ from torch.utils._python_dispatch import _get_current_dispatch_mode
 
 from megatron.core.jit import jit_fuser
 
-_CSRC_DIR = Path(__file__).resolve().parents[1] / "csrc"
+_CSRC_DIR = Path(__file__).resolve().parent / "csrc"
 _OPT_ENV = "MEGATRON_DISABLE_PPU_SWIGLU_OPT"
 _OPT_ENABLED = os.environ.get(_OPT_ENV) != "1"
 _extension = None
@@ -34,7 +32,7 @@ _extension_lock = threading.Lock()
 _extension_error = None
 
 # Preserve the validated dtype, row-count, and layout limits despite default enablement.
-_REAL_PATTERN_MIN_ROWS = {torch.bfloat16: 256, torch.float16: 512}
+_REAL_PATTERN_MIN_ROWS = {torch.bfloat16: 256, torch.float16: 256}
 
 
 def _get_extension():
@@ -84,9 +82,18 @@ def _load_extension():
         return None
 
 
+@lru_cache(maxsize=None)
+def _is_sm89_index(index):
+    # Capabilities are immutable within a process; cache each logical device separately.
+    return torch.cuda.get_device_capability(index) == (8, 9)
+
+
 def _is_sm89(device):
-    # Query the actual input device; neither match names nor cache the first device globally.
-    return torch.cuda.get_device_capability(device) == (8, 9)
+    # Tensor devices have explicit indices. Resolve an unindexed alias before caching it.
+    if device.type != "cuda":
+        return False
+    index = device.index
+    return _is_sm89_index(torch.cuda.current_device() if index is None else index)
 
 
 def cuda_extension(

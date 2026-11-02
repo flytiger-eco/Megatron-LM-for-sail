@@ -788,19 +788,30 @@ std::vector<torch::Tensor> swiglu_cuda(
     auto output_shape = y.sizes().vec();
     output_shape.back() = h;
     torch::Tensor g, bias, weights, dw;
+    std::vector<int64_t> weight_shape;
+    bool exact_token_weights = false;
     if (weights_arg.has_value()) {
         check_peer(*weights_arg, y, "weights");
         TORCH_CHECK(weights_arg->scalar_type() == y.scalar_type() ||
                     weights_arg->scalar_type() == torch::kFloat,
                     "weights dtype must match input or be float32");
-        if (grad.has_value()) {
-            check_peer(*grad, y, "g");
-            TORCH_CHECK(grad->scalar_type() == y.scalar_type(), "g dtype must match input");
+    }
+    if (grad.has_value()) {
+        check_peer(*grad, y, "g");
+        TORCH_CHECK(grad->scalar_type() == y.scalar_type(), "g dtype must match input");
+    }
+    if (weights_arg.has_value()) {
+        weight_shape = output_shape;
+        weight_shape.back() = 1;
+        exact_token_weights = weights_arg->sizes() == at::IntArrayRef(weight_shape);
+        // Exact tokenwise shapes need neither broadcast inference nor an expanded view.
+        bool token_weights = exact_token_weights;
+        if (!token_weights) {
+            const auto broadcast_shape = at::infer_size(output_shape, weights_arg->sizes());
+            token_weights = (weights_arg->dim() == 0 || weights_arg->size(-1) == 1) &&
+                            broadcast_shape == output_shape;
         }
-        const auto broadcast_shape = at::infer_size(output_shape, weights_arg->sizes());
-        const bool token_weights = (weights_arg->dim() == 0 || weights_arg->size(-1) == 1) &&
-                                   broadcast_shape == output_shape;
-        if (!token_weights || (grad.has_value() && grad->sizes().vec() != output_shape)) {
+        if (!token_weights || (grad.has_value() && grad->sizes() != at::IntArrayRef(output_shape))) {
             TORCH_CHECK(!bias_arg.has_value(), "Bias is not supported for weighted swiglu fusion");
             std::vector<torch::Tensor> result;
             const auto stream = at::cuda::getCurrentCUDAStream(y.get_device());
@@ -818,33 +829,30 @@ std::vector<torch::Tensor> swiglu_cuda(
     }
     int64_t bias_stride = 0;
     if (grad.has_value()) {
-        check_peer(*grad, y, "g");
-        TORCH_CHECK(grad->scalar_type() == y.scalar_type(), "g dtype must match input");
-        TORCH_CHECK(grad->sizes().vec() == output_shape, "g shape must match SwiGLU output");
+        TORCH_CHECK(grad->sizes() == at::IntArrayRef(output_shape), "g shape must match SwiGLU output");
         g = grad->contiguous();
     }
     if (bias_arg.has_value()) {
         check_peer(*bias_arg, y, "bias");
         TORCH_CHECK(bias_arg->scalar_type() == y.scalar_type(), "bias dtype must match input");
-        auto expanded = bias_arg->expand(y.sizes());
-        if (bias_arg->numel() == 2 * h && bias_arg->size(-1) == 2 * h) {
+        if (bias_arg->dim() == 1 && bias_arg->size(0) == 2 * h) {
             bias = bias_arg->contiguous();
         } else {
-            bias = expanded.contiguous();
-            bias_stride = 2 * h;
+            auto expanded = bias_arg->expand(y.sizes());
+            if (bias_arg->numel() == 2 * h && bias_arg->size(-1) == 2 * h) {
+                bias = bias_arg->contiguous();
+            } else {
+                bias = expanded.contiguous();
+                bias_stride = 2 * h;
+            }
         }
     }
     if (weights_arg.has_value()) {
-        check_peer(*weights_arg, y, "weights");
-        TORCH_CHECK(weights_arg->scalar_type() == y.scalar_type() ||
-                    weights_arg->scalar_type() == torch::kFloat,
-                    "weights dtype must match input or be float32");
-        auto weight_shape = output_shape;
-        weight_shape.back() = 1;
-        weights = weights_arg->expand(weight_shape).contiguous();
+        weights = exact_token_weights ? weights_arg->contiguous()
+                                      : weights_arg->expand(weight_shape).contiguous();
         if (g.defined()) dw = torch::empty(weight_shape, weights.options());
     }
-    auto out = torch::empty(g.defined() ? y.sizes().vec() : output_shape, y.options());
+    auto out = torch::empty(g.defined() ? y.sizes() : at::IntArrayRef(output_shape), y.options());
     if (rows != 0) {
         const auto stream = at::cuda::getCurrentCUDAStream(y.get_device());
         AT_DISPATCH_SWITCH(y.scalar_type(), "swiglu_cuda",

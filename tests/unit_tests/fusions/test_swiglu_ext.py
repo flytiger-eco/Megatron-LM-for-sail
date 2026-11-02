@@ -1,5 +1,3 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-
 """Test shared SwiGLU extension contracts and weighted, dense, and bias paths.
 
 Only MEGATRON_DISABLE_PPU_SWIGLU_OPT=1 disables optimization; all other values enable it.
@@ -43,6 +41,9 @@ requires_sm89 = pytest.mark.skipif(not _SM89, reason="CUDA C implementation supp
 def _enabled_gate(monkeypatch):
     # Enable gate/kernel unit tests explicitly; subprocesses cover exact disable-only semantics.
     monkeypatch.setattr(cudac, "_OPT_ENABLED", True)
+    cudac._is_sm89_index.cache_clear()
+    yield
+    cudac._is_sm89_index.cache_clear()
 
 
 @pytest.fixture
@@ -142,9 +143,11 @@ import megatron.core.fusions.fused_bias_swiglu as entry
 
 assert torch.cuda.is_initialized() == cuda_initialized_before
 assert ext._extension is None
+assert ext._is_sm89_index.cache_info().currsize == 0
 assert entry._swiglu_ext is ext
 assert ext.__package__ == "megatron.core.fusions._extensions"
-assert ext._CSRC_DIR == ext.Path(entry.__file__).resolve().parent / "csrc"
+assert ext._CSRC_DIR == ext.Path(entry.__file__).resolve().parent / "_extensions" / "csrc"
+assert ext._CSRC_DIR == ext.Path(ext.__file__).resolve().parent / "csrc"
 assert all((ext._CSRC_DIR / name).is_file() for name in ("swiglu.cpp", "swiglu.cu"))
 ext._get_extension = forbidden
 ext._is_sm89 = forbidden
@@ -276,19 +279,51 @@ def test_both_gates_enforce_sm89_and_switch(monkeypatch, capability, enabled):
     assert cudac.cuda_extension_plain(y) is expected
     assert cudac.cuda_extension_plain(y, grad=g) is expected
     assert loader.call_count == (4 if expected is backend else 0)
-    assert device_query.call_count == (4 if enabled else 0)
+    assert device_query.call_count == (1 if enabled else 0)
     for call in device_query.call_args_list:
-        assert call.args == (y.device,)
+        assert call.args == (y.device.index,)
 
 
 def test_sm89_is_queried_per_input_device(monkeypatch):
-    devices = {torch.device("cuda:0"): (8, 0), torch.device("cuda:1"): (8, 9)}
+    devices = {0: (8, 0), 1: (8, 9)}
     query = Mock(side_effect=devices.__getitem__)
     monkeypatch.setattr(torch.cuda, "get_device_capability", query)
-    assert not cudac._is_sm89(torch.device("cuda:0"))
-    assert cudac._is_sm89(torch.device("cuda:1"))
-    assert not cudac._is_sm89(torch.device("cuda:0"))
-    assert query.call_count == 3
+    monkeypatch.setattr(
+        torch.cuda, "current_device", Mock(side_effect=AssertionError("Use the input device"))
+    )
+    for _ in range(3):
+        assert not cudac._is_sm89(torch.device("cuda:0"))
+        assert cudac._is_sm89(torch.device("cuda:1"))
+    assert [call.args for call in query.call_args_list] == [(0,), (1,)]
+
+
+def test_sm89_unindexed_alias_tracks_current_device(monkeypatch):
+    query = Mock(side_effect={0: (8, 0), 1: (8, 9)}.__getitem__)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", query)
+    current = Mock(side_effect=[0, 1, 0, 1])
+    monkeypatch.setattr(torch.cuda, "current_device", current)
+    assert [cudac._is_sm89(torch.device("cuda")) for _ in range(4)] == [False, True, False, True]
+    assert query.call_count == 2
+    assert current.call_count == 4
+
+
+def test_sm89_query_failures_are_not_cached(monkeypatch):
+    query = Mock(side_effect=[RuntimeError("device query failed"), (8, 9)])
+    monkeypatch.setattr(torch.cuda, "get_device_capability", query)
+    with pytest.raises(RuntimeError, match="device query failed"):
+        cudac._is_sm89(torch.device("cuda:0"))
+    assert cudac._is_sm89_index.cache_info().currsize == 0
+    assert cudac._is_sm89(torch.device("cuda:0"))
+    assert cudac._is_sm89(torch.device("cuda:0"))
+    assert query.call_count == 2
+
+
+def test_sm89_non_cuda_device_never_queries_cuda(monkeypatch):
+    query = Mock(side_effect=AssertionError("CPU devices must not query CUDA"))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", query)
+    monkeypatch.setattr(torch.cuda, "current_device", query)
+    assert not cudac._is_sm89(torch.device("cpu"))
+    query.assert_not_called()
 
 
 def test_native_host_checks_sm89_before_launch():
@@ -499,6 +534,138 @@ def test_weighted_real_pattern_hits_kernel(dtype, rows, h, wdtype):
     torch.testing.assert_close(dw, exp_dw, **_dw_tol(dtype, wdtype))
 
 
+@requires_sm89
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("shape", [(64,), (8, 64), (4, 2, 64), (0, 64)])
+@pytest.mark.parametrize("same_weight_dtype", [False, True])
+def test_native_exact_tokenwise_preserves_shape_and_strides(dtype, shape, same_weight_dtype):
+    """Exact shapes bypass expand while retaining materialization for noncontiguous peers."""
+    torch.manual_seed(318)
+    y = torch.randn(shape, device="cuda", dtype=dtype)
+    output_shape = shape[:-1] + (shape[-1] // 2,)
+    wdtype = dtype if same_weight_dtype else torch.float32
+    storage = torch.rand(shape[:-1] + (2,), device="cuda", dtype=wdtype)
+    weights = storage[..., :1]
+    grad = torch.randn(output_shape + (2,), device="cuda", dtype=dtype)[..., 0]
+    raw = cudac._get_extension().swiglu_cuda
+    out = raw(y, None, None, weights)[0]
+    dx, dw = raw(y, grad, None, weights)
+    expected = _weighted_reference(y, grad, weights)
+    for actual, ref, tol in zip(
+        (out, dx, dw), expected, (_tol(dtype), _tol(dtype), _dw_tol(dtype, wdtype))
+    ):
+        torch.testing.assert_close(actual, ref, **tol)
+    materialized = [raw(y, None, None, weights.contiguous())[0]]
+    materialized += raw(y, grad.contiguous(), None, weights.contiguous())
+    for actual, ref in zip((out, dx, dw), materialized):
+        torch.testing.assert_close(actual, ref, rtol=0, atol=0)
+
+
+@requires_sm89
+@pytest.mark.parametrize("kind", ["weighted", "bias"])
+@pytest.mark.parametrize("backward", [False, True])
+def test_native_exact_shapes_do_not_expand(kind, backward):
+    y = torch.randn(256, 1024, device="cuda", dtype=torch.bfloat16)
+    g = torch.randn(256, 512, device="cuda", dtype=y.dtype) if backward else None
+    bias = torch.randn(1024, device="cuda", dtype=y.dtype) if kind == "bias" else None
+    weights = torch.rand(256, 1, device="cuda") if kind == "weighted" else None
+    raw = cudac._get_extension().swiglu_cuda
+    raw(y, g, bias, weights)
+    torch.cuda.synchronize()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+        result = raw(y, g, bias, weights)
+    assert result
+    assert not any(event.key == "aten::expand" for event in profile.key_averages())
+
+
+@requires_sm89
+@pytest.mark.parametrize(
+    "weight_shape", [(), (1,), (2, 1), (1, 2, 1), (32,), (4, 2, 32), (1, 4, 2, 1)]
+)
+@pytest.mark.parametrize("broadcast_grad", [False, True])
+def test_native_weighted_generic_broadcast_is_preserved(weight_shape, broadcast_grad):
+    torch.manual_seed(319)
+    y = torch.randn(4, 2, 64, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(weight_shape, device="cuda", dtype=torch.float32)
+    grad = torch.randn((1, 32) if broadcast_grad else (4, 2, 32), device="cuda", dtype=y.dtype)
+    raw = cudac._get_extension().swiglu_cuda
+    out = raw(y, None, None, weights)[0]
+    dx, dw = raw(y, grad, None, weights)
+    expected = _weighted_reference(y, grad, weights)
+    # Native returns last-axis dW reduction; the public autograd layer reduces broadcast axes.
+    for actual, ref, tol in zip(
+        (out, dx, dw), expected, (_tol(y.dtype), _tol(y.dtype), _dw_tol(y.dtype, weights.dtype))
+    ):
+        torch.testing.assert_close(actual, ref, **tol)
+
+
+@requires_sm89
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "weights_device",
+        "weights_dtype",
+        "weights_layout",
+        "weights_shape",
+        "grad_device",
+        "grad_dtype",
+        "grad_layout",
+        "grad_shape",
+        "bias_device",
+        "bias_dtype",
+        "bias_shape",
+        "bias_extra_rank",
+    ],
+)
+def test_native_fastpath_retains_peer_validation(invalid):
+    y = torch.randn(256, 64, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(256, 1, device="cuda")
+    grad = torch.randn(256, 32, device="cuda", dtype=y.dtype)
+    bias = torch.randn(64, device="cuda", dtype=y.dtype) if invalid.startswith("bias") else None
+    if invalid == "weights_device":
+        weights = weights.cpu()
+    elif invalid == "weights_dtype":
+        weights = weights.double()
+    elif invalid == "weights_layout":
+        weights = weights.to_sparse()
+    elif invalid == "weights_shape":
+        weights = torch.ones(255, 1, device="cuda")
+    elif invalid == "grad_device":
+        grad = grad.cpu()
+    elif invalid == "grad_dtype":
+        grad = grad.float()
+    elif invalid == "grad_layout":
+        grad = grad.to_sparse()
+    elif invalid == "grad_shape":
+        grad = torch.ones(255, 32, device="cuda", dtype=y.dtype)
+    elif invalid == "bias_device":
+        bias = bias.cpu()
+    elif invalid == "bias_dtype":
+        bias = bias.float()
+    elif invalid == "bias_shape":
+        bias = bias[:32]
+    elif invalid == "bias_extra_rank":
+        bias = bias.view(1, 1, 64)
+    raw = cudac._get_extension().swiglu_cuda
+    with pytest.raises(RuntimeError):
+        raw(y, grad, bias, None if invalid.startswith("bias") else weights)
+
+
+@requires_sm89
+@pytest.mark.parametrize("shape", [(), (1, 64), (4, 1), (4, 64)])
+def test_native_generic_bias_is_preserved(shape):
+    torch.manual_seed(320)
+    y = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
+    g = torch.randn(4, 32, device="cuda", dtype=y.dtype)
+    bias = torch.randn(shape, device="cuda", dtype=y.dtype)
+    raw = cudac._get_extension().swiglu_cuda
+    out = raw(y, None, bias, None)[0]
+    dx = raw(y, g, bias, None)[0]
+    expected_out, expected_dx, _ = _dense_reference(y, g, bias)
+    torch.testing.assert_close(out, expected_out, **_tol(y.dtype))
+    torch.testing.assert_close(dx, expected_dx, **_tol(y.dtype))
+
+
 # Ineligible weighted patterns must transparently fall back. Factories return (y, w, g).
 def _fb_tiny_rows():
     y = torch.randn(8, 2048, device="cuda", dtype=torch.bfloat16)
@@ -510,11 +677,11 @@ def _fb_tiny_rows():
 
 
 def _fb_fp16_below_min():
-    y = torch.randn(256, 2048, device="cuda", dtype=torch.float16)
+    y = torch.randn(255, 2048, device="cuda", dtype=torch.float16)
     return (
         y,
-        torch.rand(256, 1, device="cuda"),
-        torch.randn(256, 1024, device="cuda", dtype=torch.float16),
+        torch.rand(255, 1, device="cuda"),
+        torch.randn(255, 1024, device="cuda", dtype=torch.float16),
     )
 
 
@@ -562,6 +729,40 @@ def test_weighted_nonreal_gate_rejects(name, make):
     # Reject both forward and backward eligibility without calling native.
     assert cudac.cuda_extension(y, w) is None
     assert cudac.cuda_extension(y, w, grad=g) is None
+
+
+@requires_sm89
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("same_weight_dtype", [False, True])
+@pytest.mark.parametrize(
+    "rows,accepted",
+    [
+        (0, False),
+        (1, False),
+        (128, False),
+        (255, False),
+        (256, True),
+        (257, True),
+        (384, True),
+        (511, True),
+        (512, True),
+    ],
+)
+def test_weighted_row_threshold_is_shared(monkeypatch, dtype, same_weight_dtype, rows, accepted):
+    """Both activation dtypes require at least 256 rows before loading the extension."""
+    y = torch.empty(rows, 1024, device="cuda", dtype=dtype)
+    weights = torch.empty(
+        rows, 1, device="cuda", dtype=dtype if same_weight_dtype else torch.float32
+    )
+    grad = torch.empty(rows, 512, device="cuda", dtype=dtype)
+    backend = object()
+    loader = Mock(return_value=backend)
+    monkeypatch.setattr(cudac, "_extension_error", None)
+    monkeypatch.setattr(cudac, "_load_extension", loader)
+    expected = backend if accepted else None
+    assert cudac.cuda_extension(y, weights) is expected
+    assert cudac.cuda_extension(y, weights, grad=grad) is expected
+    assert loader.call_count == (2 if accepted else 0)
 
 
 @requires_sm89
@@ -1533,6 +1734,30 @@ def _precision_inputs(dtype, h, family, wdtype, sample):
         assert torch.equal(g[2::2], -g[3::2])
         assert torch.equal(g[:, 3::2], -g[:, 2::2])
     return y, g, bias, weights
+
+
+@requires_sm89
+@pytest.mark.parametrize("rows", [256, 257, 384, 511, 512])
+@pytest.mark.parametrize("h", [64, 512, 768, 1024, 1408, 2048, 12288, 14336])
+@pytest.mark.parametrize("wdtype", [torch.float16, torch.float32])
+def test_fp16_row_boundaries_entry_fwd_bwd(_entry_cudac, monkeypatch, rows, h, wdtype):
+    """Check native hits and FP64 accuracy across the newly admitted FP16 row range."""
+    calls, raw = _install_spy(monkeypatch)
+    for sample in ("random", "near_zero", "cancellation"):
+        # Slice an aligned prefix; keep existing paired-row cancellation construction unchanged.
+        y, g, _, weights = _precision_inputs(torch.float16, h, "weighted", wdtype, sample)
+        y, g, weights = y[:rows], g[:rows], weights[:rows]
+        calls.update(fwd=0, bwd=0)
+        actual = _run_impl(_entry_cudac, y, g, weights=weights)
+        assert calls == {"fwd": 1, "bwd": 1}, sample
+        oracle = _oracle_results(y, g, weights=weights)
+        for name, value in actual.items():
+            torch.testing.assert_close(value, oracle[name], **_result_tol(name, y, weights))
+        with torch.no_grad():
+            out = raw(y, None, None, weights)[0]
+            dx, dw = raw(y, g, None, weights)
+        for name, value in dict(out=out, dx=dx, dw=dw).items():
+            torch.testing.assert_close(actual[name], value, rtol=0, atol=0)
 
 
 _PRECISION_CASES = [
