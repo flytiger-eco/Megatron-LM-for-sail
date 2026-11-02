@@ -525,8 +525,8 @@ def test_cpu_shm_checkpoint_uses_writer_parameter_name(tool_environment, checkpo
     environment.check(bundle, manifest, bundle / "reports")
     report = json.loads((bundle / "reports/functional-environment.json").read_text())
     signatures = report["nvrx"]["signatures"]
-    # 与 nvidia-resiliency-ext 0.6.0 的真实签名一致：
-    # writer 用 use_cpu_shm_for_gpu_tensors，队列与 warmup 用 cpu_shm_mode。
+    # Matches the real nvidia-resiliency-ext 0.6.0 signatures:
+    # the writer uses use_cpu_shm_for_gpu_tensors while the queue and warmup use cpu_shm_mode.
     assert "use_cpu_shm_for_gpu_tensors" in signatures["FileSystemWriterAsync.__init__"]
     assert "cpu_shm_mode" not in signatures["FileSystemWriterAsync.__init__"]
     assert "cpu_shm_mode" in signatures["AsyncCallsQueue.__init__"]
@@ -611,8 +611,8 @@ def test_incompatible_checkpoint_api_fails_before_training(
             modules["filesystem_async"].FileSystemWriterAsync, "__init__", lambda self, path: None
         )
     elif damage == "writer_cpu_shm_mode":
-        # 0.6.0 的真实开关在 writer 上叫 use_cpu_shm_for_gpu_tensors；
-        # 只提供 cpu_shm_mode 的 writer 必须被判为不支持。
+        # nvidia-resiliency-ext 0.6.0 names the writer flag use_cpu_shm_for_gpu_tensors;
+        # a writer exposing only cpu_shm_mode must be rejected.
         monkeypatch.setattr(
             modules["filesystem_async"].FileSystemWriterAsync,
             "__init__",

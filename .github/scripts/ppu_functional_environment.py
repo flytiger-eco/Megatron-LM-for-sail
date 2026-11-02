@@ -94,7 +94,7 @@ def check_nvrx(requirements: dict) -> dict:
         init.bind(None, persistent=any(stage["persistent_worker"] for stage in stages))
         signatures["AsyncCallsQueue.__init__"] = str(init)
         if any(stage["cpu_shm"] for stage in stages):
-            # writer 侧开关名为 use_cpu_shm_for_gpu_tensors，cpu_shm_mode 只属于队列与 warmup。
+            # The writer flag is use_cpu_shm_for_gpu_tensors; cpu_shm_mode belongs to the queue and warmup.
             writer = inspect.signature(modules["FileSystemWriterAsync"].__init__)
             if "use_cpu_shm_for_gpu_tensors" not in writer.parameters:
                 raise ValueError(
