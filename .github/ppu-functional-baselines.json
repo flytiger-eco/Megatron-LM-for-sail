@@ -557,8 +557,8 @@
       "size": 1848
     },
     "hybrid/hybrid_flextron_nightly_tp2_pp1_ep2_dgx_h100_1N8G/golden_values_dev_ppu.json": {
-      "sha256": "ee1be0a3ff8fa142dfe4734dd340089b05b9ae414bb1df9c2e1547260b3663ed",
-      "size": 3601
+      "sha256": "8a126e990b1b6869ade3f8cc8f61b43f93835527dffeec098a13681df6013efe",
+      "size": 4185
     },
     "hybrid/hybrid_flextron_nightly_tp2_pp1_ep2_dgx_h100_1N8G/model_config.yaml": {
       "sha256": "9cf360ff9f8106b08cb8a3562261c4d5f0bf54acef6ee6e806f005365144a98e",
@@ -665,24 +665,24 @@
       "size": 2100
     },
     "moe/gpt3_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective/golden_values_dev_ppu.json": {
-      "sha256": "30020050fff958785a1e80482520eb0bdb6d7b885fab649edb5c50f9a25d3416",
-      "size": 7877
+      "sha256": "33b883bca884ce41775b75dc2e414aff4b02efb3c020b635ca7d5cee776c4c6b",
+      "size": 8957
     },
     "moe/gpt3_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective/model_config.yaml": {
       "sha256": "98c269556d50641ee5d203c2523607fcd8310572a21454153b3d3782cc9804ed",
       "size": 2069
     },
     "moe/gpt3_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM/golden_values_dev_ppu.json": {
-      "sha256": "b6bc0cd74f22a5bb7375e8b3141f206866d1f4ad51dc15fee8e37e5b0cdb3122",
-      "size": 7882
+      "sha256": "415f5d28733877443d3196662cba5f0b8b5f11c187d803d31c318e370a86ebb9",
+      "size": 8961
     },
     "moe/gpt3_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM/model_config.yaml": {
       "sha256": "98c269556d50641ee5d203c2523607fcd8310572a21454153b3d3782cc9804ed",
       "size": 2069
     },
     "moe/gpt3_mcore_te_tp2_pp1_te_a2a_ovlp_8experts_etp1_ep4/golden_values_dev_ppu.json": {
-      "sha256": "a09e7aed23699f84c52c53b464c37a1c38ec9c8ea38e96a5b5dd4ce900085dc3",
-      "size": 7934
+      "sha256": "877692beb3f3f9bd5790462d1207fe4ce11dfc4d92321a55de1e0def32054948",
+      "size": 9504
     },
     "moe/gpt3_mcore_te_tp2_pp1_te_a2a_ovlp_8experts_etp1_ep4/model_config.yaml": {
       "sha256": "4b95acf7664c804f873539216ecacf7fd35236227ba51c8ef099c2e062cfdd8a",
@@ -765,8 +765,8 @@
       "size": 2181
     },
     "moe/gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer/golden_values_dev_ppu.json": {
-      "sha256": "924344371aeecfd0a3d3f25577a8a1f4bbaea5854bf95ab5f022ef7d4981566c",
-      "size": 15067
+      "sha256": "8fd5d2feb66a47bff2a87a26210812e540de14f8d75477735f8e8605251749f4",
+      "size": 17170
     },
     "moe/gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer/golden_values_dev_ppu_2nd.json": {
       "sha256": "410abd4cf6dcc51f27dda3e7008abec57283c0119bdea07c9cfbe3dde4cb87ca",
@@ -793,8 +793,8 @@
       "size": 1582
     },
     "t5/t5_11b_mcore_tp4_pp1/golden_values_dev_ppu.json": {
-      "sha256": "9d7307b68c12c36bf82121ebcab9858e50e54b9a7af7f055fd00fd2b245d55b4",
-      "size": 4348
+      "sha256": "98d6af1c66573e433b6e2cc2837167f1cb7e30a11be908bc0d72cb9a36933641",
+      "size": 4854
     },
     "t5/t5_11b_mcore_tp4_pp1/model_config.yaml": {
       "sha256": "f1cdc1402e8cd12a89b760ad2eebf6a21818f3a602d2dcec0c1cb7b570811e9e",
