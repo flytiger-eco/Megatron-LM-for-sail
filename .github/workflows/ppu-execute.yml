@@ -202,7 +202,7 @@ jobs:
           path: .ppu-ci
       - name: Build shared DEV/LTS artifacts in an eight-card 890P Pod
         id: ppu-build
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
           image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
           nnodes: 0
