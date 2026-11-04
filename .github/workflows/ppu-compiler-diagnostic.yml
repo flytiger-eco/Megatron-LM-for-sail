@@ -42,7 +42,7 @@ jobs:
           python3 -I source/.github/scripts/ppu_compiler_diagnostic.py authorize --authorization .ppu-ci/authorization.json --output .ppu-diagnostic-action
       - name: 单 Pod 八卡有界编译诊断
         id: ppu
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
           image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
           nnodes: 0
