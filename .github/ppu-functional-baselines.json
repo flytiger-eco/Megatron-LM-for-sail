@@ -57,8 +57,8 @@
       "size": 1471
     },
     "bert/bert_mcore_tp4_pp1/golden_values_dev_ppu.json": {
-      "sha256": "7d2ee7ae901582fbf83a291c77b5e88b1de07b13bd691c83523f1e759c3525e0",
-      "size": 7874
+      "sha256": "a1f87d24f29577016f8d6cb7c69066566c87fe736975e95bace6f56a7664478d",
+      "size": 8900
     },
     "bert/bert_mcore_tp4_pp1/model_config.yaml": {
       "sha256": "abcf173424a334e77f9918f3f899a29513301c3e9935bfe305d894ac15955392",
@@ -109,8 +109,8 @@
       "size": 1788
     },
     "gpt/gpt3_mcore_te_tp1_pp1_resume_torch_dist_uniform_full_recompute/golden_values_dev_ppu.json": {
-      "sha256": "9e41f0985952978e92cbf369e5fa81ea5958f8b15258ff21d46e544b4ecf9142",
-      "size": 15086
+      "sha256": "5ccec0c3c91b29a6e6246a5c9dd93ff98bc279455e7fdaf8abb278b537e11304",
+      "size": 17261
     },
     "gpt/gpt3_mcore_te_tp1_pp1_resume_torch_dist_uniform_full_recompute/golden_values_dev_ppu_2nd.json": {
       "sha256": "39394e2873a31e9a179ae0f4a7fd0a27eb9768ea6f407e61ca949c63682a1b80",
@@ -477,16 +477,16 @@
       "size": 1847
     },
     "gpt/gpt3_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather/golden_values_dev_ppu.json": {
-      "sha256": "ae3eed396594e0fcdd7194db9ca945738d1f62a22b898e5e9fdd8e3ded4a82ce",
-      "size": 7826
+      "sha256": "614018718c57902d5bd08429b67726cb2313e03b8c839264452c8799098c7f93",
+      "size": 8899
     },
     "gpt/gpt3_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather/model_config.yaml": {
       "sha256": "12bd95a1dbc3420f9f8f25d89806f80fbd673305bb0694d2ba600a0a7c6068a0",
       "size": 1795
     },
     "gpt/gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce/golden_values_dev_ppu.json": {
-      "sha256": "b97ddd89f715a67f9ccb2b1fc4800d400de37a755c3124cd8d32460ed0cd1f87",
-      "size": 14994
+      "sha256": "828eefe5ecd197b0c806a94dce8c6ef64f56072788965ec0b975c3eacd090f38",
+      "size": 17129
     },
     "gpt/gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce/golden_values_dev_ppu_2nd.json": {
       "sha256": "0b52975bc5e5ddabe997ae87381f6da035f78cd00bffa40e556ff21cb056705d",
@@ -497,8 +497,8 @@
       "size": 1780
     },
     "gpt/gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather/golden_values_dev_ppu.json": {
-      "sha256": "409f54d3a0d3c3ff0c34e6a88e3b30b94ffc2cbf36c7113b00aa06ed59313340",
-      "size": 14988
+      "sha256": "161b0f815a4c82fbf89b9cf0c8e208d1066a67ec07e9f8b009e3a3003aa8cec3",
+      "size": 17156
     },
     "gpt/gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather/golden_values_dev_ppu_2nd.json": {
       "sha256": "b6b11316e5d1047f5b2a83a54a1686d41b4bbaec6177a352656fa8dfacf10518",
@@ -509,8 +509,8 @@
       "size": 1977
     },
     "gpt/gpt3_mcore_te_tp4_pp1_resume_torch_dist_qk_layernorm_test_mode/golden_values_dev_ppu.json": {
-      "sha256": "34db37969157812f827fd2c87ef3b185a4899154f99d25369ff882da58c46a8a",
-      "size": 15002
+      "sha256": "365b0e6ee9081f966b6dc8a0f5634c704cf769932ff0b130ecb5fb467c029e13",
+      "size": 17112
     },
     "gpt/gpt3_mcore_te_tp4_pp1_resume_torch_dist_qk_layernorm_test_mode/golden_values_dev_ppu_2nd.json": {
       "sha256": "b7d1cd4bf58cd9b5bb34bb220745ab9a7aa941ef2a97fd85848614be79d28c51",
@@ -621,8 +621,8 @@
       "size": 1961
     },
     "moe/gpt3_mcore_te_tp1_pp1_te_4experts_groupedGEMM_op_fuser/golden_values_dev_ppu.json": {
-      "sha256": "0836e1ef399f6373b5a49bb0e9db03f5175824a49aea140a3e4d04b3c74b056d",
-      "size": 7880
+      "sha256": "01d084e1ba6a0875cfb6211b61510a0031b0067e66ef5a4a55d48e3fc79e3d7f",
+      "size": 8978
     },
     "moe/gpt3_mcore_te_tp1_pp1_te_4experts_groupedGEMM_op_fuser/model_config.yaml": {
       "sha256": "69422c0200621becfaec0847d176b07e4deba40625f21adc006b0772784e5c01",
@@ -801,8 +801,8 @@
       "size": 1697
     },
     "t5/t5_mcore_te_tp1_pp1_vp1_resume_torch/golden_values_dev_ppu.json": {
-      "sha256": "aea79c8de285448a0fe86e49ed4b7d2b60a188e45f1802d8154e1fd56a77ecad",
-      "size": 15133
+      "sha256": "a685d3c2380286d25384c9632212b87519efe2aaba98c65821ba7caa5ef9479f",
+      "size": 17288
     },
     "t5/t5_mcore_te_tp1_pp1_vp1_resume_torch/golden_values_dev_ppu_2nd.json": {
       "sha256": "85bef7695abbca2d208f7b11880771b6d91f43121c5af247498a5d24da08e2d9",
@@ -813,32 +813,32 @@
       "size": 2073
     },
     "t5/t5_mcore_te_tp2_pp1_vp1/golden_values_dev_ppu.json": {
-      "sha256": "696118921c77c1daaa37f44a06f3e62ae49def533ec28fcd1e17e274615d2ed0",
-      "size": 15134
+      "sha256": "082ebe9789bb047705766665e67fa7e98c9e09cd7013f1190576f20e1c5c7646",
+      "size": 17273
     },
     "t5/t5_mcore_te_tp2_pp1_vp1/model_config.yaml": {
       "sha256": "5fc0edb4d0a753594715537c4ea66b80c39b2ecd87d0a077886d8f522b7e338d",
       "size": 1664
     },
     "t5/t5_mcore_te_tp2_pp1_vp1_sequence_parallel/golden_values_dev_ppu.json": {
-      "sha256": "0e3169b6ea804aa6e1ad0c764de0bc3dcac767e4501b48cd7ae16e731e0e6fc2",
-      "size": 15133
+      "sha256": "283cf3abec7fdb535873c30cc8a1c0afa4b6bbb0fde92c06cb6b3ba5635d2b19",
+      "size": 17282
     },
     "t5/t5_mcore_te_tp2_pp1_vp1_sequence_parallel/model_config.yaml": {
       "sha256": "0decb4503d0bfa7a5654c48b10c784c872996ec7359f060a20d861a1be4374f9",
       "size": 1692
     },
     "t5/t5_mcore_te_tp4_pp1/golden_values_dev_ppu.json": {
-      "sha256": "e21df6461b81e8f2aa7ea40484797452975a693852128a5f929d1908357f3d3d",
-      "size": 15140
+      "sha256": "06b6d9c368ed3a1d38fcb47b0be46ebde601e1feb22546d37226d7fa45ae6f69",
+      "size": 17270
     },
     "t5/t5_mcore_te_tp4_pp1/model_config.yaml": {
       "sha256": "6a25290eb928993f1a04b6fd22d52ba09b24763b86b734493dbfed0429d0a160",
       "size": 1707
     },
     "t5/t5_mcore_te_tp4_pp1_resume_torch_dist/golden_values_dev_ppu.json": {
-      "sha256": "d2b339760375c863054e7b31f1f58c3df2785cfafea58f119b375ee38267a4e1",
-      "size": 15139
+      "sha256": "93a5e5de2c7b066794673c20912b4d656cdce0ffd2e4b9905240a18b9b7dfb5c",
+      "size": 17265
     },
     "t5/t5_mcore_te_tp4_pp1_resume_torch_dist/golden_values_dev_ppu_2nd.json": {
       "sha256": "df28979e6f285b2effb3bc18adcc5aa5f1349ad3b0886c78d3eca61d0a1b62a4",
@@ -849,16 +849,16 @@
       "size": 1708
     },
     "t5/t5_mcore_tp1_pp1_vp1/golden_values_dev_ppu.json": {
-      "sha256": "d04d52be5a9ebfcd2c4d5ca73cab26ed267c7889849fcf14800c2b7ecfc70c03",
-      "size": 15138
+      "sha256": "4b79fea549b56b4faba9a7c1fc50c2202596c7e26108e5e45eb987423661ab9a",
+      "size": 17319
     },
     "t5/t5_mcore_tp1_pp1_vp1/model_config.yaml": {
       "sha256": "c3da445458e25f63e3e5b322abd3a70c3fddc8cf2e3b94b13688fc412039c81e",
       "size": 1992
     },
     "t5/t5_mcore_tp1_pp1_vp1_resume_torch/golden_values_dev_ppu.json": {
-      "sha256": "01383fb2422588f4b9e914f92579fdca70334edf2c256d60b93342bd4a2a91c5",
-      "size": 15135
+      "sha256": "3ee51ea486db185087823682ea0bf0a4cfdae2a5b6ea3e4961c73ba1b7fa2848",
+      "size": 17300
     },
     "t5/t5_mcore_tp1_pp1_vp1_resume_torch/golden_values_dev_ppu_2nd.json": {
       "sha256": "ee04a58c1038e03343602b19f3b0c954f05d30496d19de96cabeba190e701d18",
@@ -869,24 +869,24 @@
       "size": 1993
     },
     "t5/t5_mcore_tp2_pp1_vp1/golden_values_dev_ppu.json": {
-      "sha256": "c8d330e6f3c42d3f1c48a83d2eab7f31c6e29861158cba4585daf01e5f71c0c5",
-      "size": 15132
+      "sha256": "57a120fe6c21b24a176713c90659324f4fea6244f69b6e5a3572cef35c04dbc2",
+      "size": 17301
     },
     "t5/t5_mcore_tp2_pp1_vp1/model_config.yaml": {
       "sha256": "056e1194afe62bc8d991d54f702eaf4be01d98a1f85e5aeef47ab066ee71bbd2",
       "size": 1584
     },
     "t5/t5_mcore_tp4_pp1/golden_values_dev_ppu.json": {
-      "sha256": "cad702b53028408a33a5123208ce51dc8c1f11da5b3f741f9bcb80b7056f6f74",
-      "size": 15131
+      "sha256": "25d3f4cdc7471ea1ef06cfd4fde4eedc0b9ffe8087bbc245694e51732952e1be",
+      "size": 17289
     },
     "t5/t5_mcore_tp4_pp1/model_config.yaml": {
       "sha256": "df6c2e478ca3a07bf985a5e9e02e00c4e94b8c12dd45f182b798d54f57b362f0",
       "size": 1663
     },
     "t5/t5_mcore_tp4_pp1_resume_torch_dist/golden_values_dev_ppu.json": {
-      "sha256": "e6efe4276ac6140e6c6e1b82cd5305796c4fc5835364f1f1fe5af279174bbee7",
-      "size": 15125
+      "sha256": "c6784c3e324c992478fd8ea300ba461a252167481c36fc03d4a60f77e1af19e9",
+      "size": 17274
     },
     "t5/t5_mcore_tp4_pp1_resume_torch_dist/golden_values_dev_ppu_2nd.json": {
       "sha256": "71248f2dd7c0dc34209ab83397e26390093d4f195e0259178a50c5ded5c77cef",
