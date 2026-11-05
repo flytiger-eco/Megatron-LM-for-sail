@@ -60,6 +60,11 @@ jobs:
       control_sha: ${{ inputs.control_sha }}
       manual_pr: ${{ inputs.manual_pr }}
     steps:
+      - name: Prepare isolated configuration environment
+        run: |
+          # 在检出源码和下载产物前安装固定依赖；不修改 job 的 PATH。
+          python3 -m venv "$RUNNER_TEMP/ppu-configure-venv"
+          "$RUNNER_TEMP/ppu-configure-venv/bin/python" -m pip install --index-url "$PIP_INDEX_URL" click pyyaml
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.control_sha }}
@@ -78,11 +83,6 @@ jobs:
           ref: ${{ inputs.target_sha }}
           path: source
           persist-credentials: false
-      - name: Prepare isolated configuration environment
-        run: |
-          python3 -m venv "$RUNNER_TEMP/ppu-configure-venv"
-          "$RUNNER_TEMP/ppu-configure-venv/bin/python" -m pip install --index-url "$PIP_INDEX_URL" click pyyaml
-          printf '%s\n' "$RUNNER_TEMP/ppu-configure-venv/bin" >> "$GITHUB_PATH"
       - id: config
         env:
           PPU_INPUTS: ${{ inputs.request_inputs }}
@@ -93,12 +93,12 @@ jobs:
             "repeat":"${{ vars.PPU_UNIT_TEST_REPEAT || '1' }}","timeout":"${{ vars.PPU_UNIT_TEST_TIMEOUT || '30' }}"}
         run: |
           if [[ "$(python3 -c 'import json,os; print(json.loads(os.environ["PPU_INPUTS"]).get("test_kind", "unit"))')" == functional ]]; then
-            python3 -I control/.github/scripts/ppu_functional.py configure
+            "$RUNNER_TEMP/ppu-configure-venv/bin/python" -I control/.github/scripts/ppu_functional.py configure
             cp control/.github/scripts/ppu_functional*.py .ppu-ci/control/
             cp control/.github/scripts/ppu_compiler_diagnostic.py .ppu-ci/control/
             cp control/.github/scripts/ppu_functional_run.sh .ppu-ci/control/
           else
-            python3 -I control/.github/scripts/ppu_ci.py configure
+            "$RUNNER_TEMP/ppu-configure-venv/bin/python" -I control/.github/scripts/ppu_ci.py configure
             echo 'test_kind=unit' >> "$GITHUB_OUTPUT"
           fi
           cp control/.github/scripts/{ppu_ci.py,ppu_ci_build.sh,ppu_ci_run.sh,ppu_pytest_policy.py} .ppu-ci/control/

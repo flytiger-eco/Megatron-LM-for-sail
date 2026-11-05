@@ -671,6 +671,9 @@ def test_configure_archives_complete_standalone_runtime_dependencies(tmp_path):
         step for step in workflow["jobs"]["configure"]["steps"] if step.get("id") == "config"
     )
     (tmp_path / "control").symlink_to(ROOT, target_is_directory=True)
+    (tmp_path / "ppu-configure-venv").symlink_to(
+        Path(sys.executable).parent.parent, target_is_directory=True
+    )
     plan = tmp_path / ".ppu-ci"
     (plan / "control").mkdir(parents=True)
     (plan / "authorization.json").write_text(
@@ -692,6 +695,7 @@ def test_configure_archives_complete_standalone_runtime_dependencies(tmp_path):
         env={
             **os.environ,
             "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+            "RUNNER_TEMP": str(tmp_path),
             "PPU_INPUTS": json.dumps({"test_kind": "functional"}),
             "PPU_SOURCE_ROOT": str(ROOT),
             "PPU_CONTROL_ROOT": str(ROOT),
@@ -749,6 +753,53 @@ def test_workflow_functional_route_is_manual_only_and_preserves_ut():
     assert action["with"]["image"] == functional.IMAGE
     assert "verify-bundle" in action["with"]["command"]
     assert "ppu_functional_run.sh" in action["with"]["command"]
+
+
+@pytest.mark.parametrize(
+    "workflow_name,job_name,prepare_name,venv,script_names",
+    [
+        (
+            "ppu-execute",
+            "configure",
+            "Prepare isolated configuration environment",
+            "ppu-configure-venv",
+            ("ppu_functional.py", "ppu_ci.py"),
+        ),
+        (
+            "ppu-functional",
+            "result",
+            "Prepare isolated upstream comparison environment",
+            "ppu-functional-summary",
+            ("ppu_functional_results.py",),
+        ),
+    ],
+)
+def test_fixed_dependencies_are_prepared_before_untrusted_downloads(
+    workflow_name, job_name, prepare_name, venv, script_names
+):
+    """固定依赖先于输入内容准备，后续用显式解释器且不修改 job 的 PATH。"""
+    workflow = yaml.safe_load((ROOT / f".github/workflows/{workflow_name}.yml").read_text())
+    steps = workflow["jobs"][job_name]["steps"]
+    prepare_index = next(
+        index for index, step in enumerate(steps) if step.get("name") == prepare_name
+    )
+    downloads = [
+        index
+        for index, step in enumerate(steps)
+        if step.get("uses") in ("actions/checkout@v4", "actions/download-artifact@v4")
+    ]
+    assert downloads and prepare_index < min(downloads)
+    prepare = steps[prepare_index]["run"]
+    assert f'"$RUNNER_TEMP/{venv}/bin/python" -m pip install' in prepare
+    assert "$PIP_INDEX_URL" in prepare
+    assert "--root" not in prepare and "requirements" not in prepare
+    for step in steps:
+        assert "$GITHUB_PATH" not in step.get("run", "")
+        for script in script_names:
+            if script in step.get("run", ""):
+                assert f'"$RUNNER_TEMP/{venv}/bin/python" -I' in step["run"]
+    for script in script_names:
+        assert any(script in step.get("run", "") for step in steps)
 
 
 def test_workflow_uploads_evidence_without_checkpoint_payloads():
