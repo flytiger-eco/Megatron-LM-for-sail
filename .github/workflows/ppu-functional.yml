@@ -1,0 +1,181 @@
+name: PPU Functional
+on:
+  workflow_call:
+    inputs:
+      matrix:
+        type: string
+        required: true
+      bundle_digest:
+        type: string
+        required: true
+      target_sha:
+        type: string
+        required: true
+      control_sha:
+        type: string
+        required: true
+permissions:
+  contents: read
+env:
+  PIP_INDEX_URL: https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
+  PIP_CONFIG_FILE: /dev/null
+  PIP_EXTRA_INDEX_URL: ''
+  PIP_FIND_LINKS: ''
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    environment: ppu-ci
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: ${{ matrix.job_minutes }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-plan
+          path: .ppu-ci
+      - name: Record action request time
+        id: timing
+        shell: bash
+        run: printf 'requested_at=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
+      - name: Run unchanged upstream functional case on eight PPU cards
+        id: ppu
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+          nnodes: 0
+          nproc_per_node: 8
+          namespace: ${{ vars.PPU_NAMESPACE || 'ppu-sched' }}
+          node_selector: "board-type=ZW-M890P"
+          host_volumes: "ppu://redacted/history-root-003:ppu://redacted/history-root-003,ppu://redacted/history-root-004:ppu://redacted/history-root-000"
+          source_dir: /opt/megatron-lm
+          artifact_paths: .ppu-ci
+          timeout_minutes: ${{ matrix.action_minutes }}
+          cleanup_policy: always
+          dmesg_policy: on_failure
+          container_options: |
+            shm_size: "64Gi"
+          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=ppu://redacted/history-root-002${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_RESULTS_DIR=ppu://redacted/history-root-002${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
+          command: |
+            set -euo pipefail
+            cd /opt/megatron-lm
+            [[ -d "$PPU_BUNDLE_DIR" ]]
+            mkdir .ppu-bundle
+            cp -a "$PPU_BUNDLE_DIR/." .ppu-bundle/
+            python3 -I "$PPU_CONTROL_DIR/ppu_ci.py" verify-bundle \
+              --output "$PPU_ARTIFACT_DIR" --plan .ppu-ci --bundle-digest "$PPU_BUNDLE_DIGEST"
+            [[ "$(< "$PPU_ARTIFACT_DIR/commit.txt")" == "$PPU_TARGET_SHA" ]]
+            [[ "$(< "$PPU_ARTIFACT_DIR/control.txt")" == "$PPU_CONTROL_SHA" ]]
+            mkdir source
+            tar -xzf "$PPU_ARTIFACT_DIR/source.tar.gz" -C source
+            bash "$PPU_CONTROL_DIR/ppu_functional_run.sh" '${{ matrix.id }}'
+      - name: Record execution and scheduling envelope
+        if: always()
+        shell: bash
+        env:
+          REQUESTED_AT: ${{ steps.timing.outputs.requested_at }}
+          ACTION_OUTCOME: ${{ steps.ppu.outcome }}
+          ACTION_STATUS: ${{ steps.ppu.outputs.job_status }}
+          ACTION_OUTPUTS: ${{ toJSON(steps.ppu.outputs) }}
+          RESULT_DIR: ppu://redacted/history-root-007${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
+        run: |
+          mkdir -p "$RESULT_DIR"
+          printf '{"requested_at":%s,"completed_at":%s,"action_outcome":"%s","action_status":"%s","outputs":%s}\n' \
+            "${REQUESTED_AT:-0}" "$(date +%s)" "$ACTION_OUTCOME" "$ACTION_STATUS" "$ACTION_OUTPUTS" > "$RESULT_DIR/action-timing.json"
+      - name: Record omitted checkpoint payloads
+        if: always()
+        shell: bash
+        env:
+          RESULT_DIR: ppu://redacted/history-root-007${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
+        run: |
+          # Upload only evidence: checkpoints can reach tens of GB, so record what is omitted.
+          # The audit stays advisory: unreadable payloads must not fail an otherwise valid case.
+          [[ -d "$RESULT_DIR" ]] || exit 0
+          report="$RESULT_DIR/checkpoint-omissions.json"
+          recorded=0
+          if stat -c%s . >/dev/null 2>&1; then size_format='-c%s'; else size_format='-f%z'; fi
+          {
+            printf '{"omitted":['
+            separator=''
+            for name in checkpoints initial-checkpoints; do
+              while IFS= read -r directory; do
+                stats=$(find "$directory" -type f -exec stat "$size_format" {} + 2>/dev/null |
+                  awk '{count += 1; total += $1} END {printf "%d %d", count, total}')
+                stats=${stats:-0 0}
+                printf '%s{"bytes":%s,"files":%s,"path":"%s"}' \
+                  "$separator" "${stats##* }" "${stats%% *}" "${directory#"$RESULT_DIR"/}"
+                separator=','
+                recorded=$((recorded + 1))
+              done < <(find "$RESULT_DIR" -type d -name "$name" 2>/dev/null | sort)
+            done
+            printf ']}\n'
+          } > "$report" 2>/dev/null || echo "::warning::Unable to record omitted checkpoint payloads"
+          printf 'Recorded %s omitted checkpoint payload groups\n' "$recorded"
+      - name: Upload every attempt, rank log, actual value and comparison report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.id }}
+          path: |
+            ppu://redacted/history-root-007${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
+            !ppu://redacted/history-root-007${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}/**/checkpoints/**
+            !ppu://redacted/history-root-007${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}/**/initial-checkpoints/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+      - name: Check action execution completeness
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        env:
+          PPU_STATUS: ${{ steps.ppu.outputs.job_status }}
+          PPU_OUTCOME: ${{ steps.ppu.outcome }}
+        run: '[[ "$PPU_OUTCOME" == success && "$PPU_STATUS" == succeeded ]]'
+  result:
+    name: Functional integrity and 100% numeric gate
+    needs: test
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha }}
+          path: source
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-plan
+          path: .ppu-ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: functional-*
+          path: results
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare isolated upstream comparison environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ppu-functional-summary"
+          "$RUNNER_TEMP/ppu-functional-summary/bin/python" -m pip install --index-url "$PIP_INDEX_URL" \
+            'numpy==1.26.4' 'pydantic>=2,<2.14' tensorboard pyyaml pytest click
+          printf '%s\n' "$RUNNER_TEMP/ppu-functional-summary/bin" >> "$GITHUB_PATH"
+      - name: Independently verify all required repetitions using original comparators
+        run: |
+          python3 -I .ppu-ci/control/ppu_functional_results.py \
+            --manifest .ppu-ci/manifest.json --root source --results results
+      - name: Require successful execution and artifact upload for every matrix job
+        if: ${{ always() && !cancelled() }}
+        env:
+          MATRIX_RESULT: ${{ needs.test.result }}
+        run: '[[ "$MATRIX_RESULT" == success ]]'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ppu-functional-summary
+          path: results/summary.json
+          if-no-files-found: error
+          retention-days: 7

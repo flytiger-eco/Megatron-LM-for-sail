@@ -134,6 +134,8 @@ def test_docs_only_pr_skips_without_merge_or_source(fork):
     def api(path):
         if "/files?" in path:
             return [{"filename": "README.md"}]
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": BASE_SHA}}
         assert path == "pulls/7"
         return pull
 
@@ -148,6 +150,8 @@ def test_snapshot_drift_during_docs_check():
         nonlocal calls
         if "/files?" in path:
             return [{"filename": "README.md"}]
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": BASE_SHA}}
         calls += 1
         pull = pr()
         if calls > 1:
@@ -479,7 +483,18 @@ def test_final_status_cannot_overwrite_new_snapshot(monkeypatch, mutation):
                 "status": "completed" if mutation == "cancelled" else "in_progress",
                 "run_attempt": 2 if mutation == "rerun" else 1,
             }
-        return [{"context": auth.STATUS_CONTEXT, "target_url": url}]
+        if path == f"git/commits/{MERGE_SHA}":
+            return {"parents": [{"sha": BASE_SHA}, {"sha": SHA}]}
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": pull["base"]["sha"]}}
+        return [
+            {
+                "context": auth.STATUS_CONTEXT,
+                "target_url": url,
+                "state": "pending",
+                "description": f"attempt=1 base={BASE_SHA}",
+            }
+        ]
 
     auth.publish_status(
         {
@@ -622,7 +637,18 @@ def test_status_snapshot_is_rechecked_before_write(monkeypatch, decision):
             return pull
         if path == "actions/runs/123":
             return {"status": "in_progress", "run_attempt": 1}
-        return [{"context": auth.STATUS_CONTEXT, "target_url": auth.run_url("123")}]
+        if path == f"git/commits/{MERGE_SHA}":
+            return {"parents": [{"sha": BASE_SHA}, {"sha": SHA}]}
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": BASE_SHA}}
+        return [
+            {
+                "context": auth.STATUS_CONTEXT,
+                "target_url": auth.run_url("123"),
+                "state": "pending",
+                "description": f"attempt=1 base={BASE_SHA}",
+            }
+        ]
 
     auth.publish_status(
         {
@@ -631,6 +657,7 @@ def test_status_snapshot_is_rechecked_before_write(monkeypatch, decision):
             "base_sha": BASE_SHA,
             "run_id": "123",
             "decision": decision,
+            "target_sha": MERGE_SHA,
         },
         "success",
         "completed",
@@ -661,7 +688,8 @@ def test_merge_snapshot_rechecked_after_parent_lookup(mutation):
         auth.authorize(pr_event(), {}, context("pull_request_target"), api)
 
 
-def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch):
+@pytest.mark.parametrize("test_kind", [None, "unit", "functional"])
+def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch, test_kind):
     script = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
     block = next(
         block
@@ -679,6 +707,7 @@ def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch):
     monkeypatch.setattr(metadata, "version", runtimes.__getitem__)
     artifact = tmp_path / ".ppu-ci"
     artifact.mkdir()
+    (artifact / "manifest.json").write_text(json.dumps({"test_kind": test_kind}))
     exec(compile(block, "ppu-native-requirements", "exec"), {})
     requirements = (artifact / "ppu-requirements.txt").read_text().splitlines()
     constraints = (artifact / "constraints.txt").read_text().splitlines()
@@ -687,7 +716,12 @@ def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch):
     assert set(requirements) <= set(constraints)
     assert {f"{name}=={version}" for name, version in runtimes.items()} <= set(constraints)
     assert {"numpy==1.26.4", "pyarrow==21.0.0"} <= set(constraints)
-    assert not any(line.startswith(("fla==", "flash-linear-attention==")) for line in requirements)
+    assert not any(line.startswith("fla==") for line in requirements)
+    for requirement in (
+        "flash-linear-attention==0.4.1+v0.1.0.ppu2.2.0",
+        "emerging-optimizers==0.3.0",
+    ):
+        assert (requirement in requirements) == (test_kind == "functional")
     assert (
         "export PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"
         in script
@@ -698,6 +732,8 @@ def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch):
     assert (
         install
         < script.index("PLA import check passed:")
+        < script.index("FLA Core l2norm last dimension argument adaptation:")
+        < script.index("ppu_functional_environment.py\" prepare")
         < script.index("tar -czf .ppu-ci/environment.tar.gz")
     )
 
@@ -994,7 +1030,7 @@ def test_diagnostic_generates_one_unchanged_upstream_bucket(tmp_path, capsys):
     workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
     events = workflow.get("on", workflow.get(True))
     assert events["workflow_dispatch"]["inputs"]["unit_bucket"]["default"] == ""
-    assert len(events["workflow_dispatch"]["inputs"]) <= 10
+    assert len(events["workflow_dispatch"]["inputs"]) <= 25
 
 
 @pytest.mark.parametrize(
@@ -1253,7 +1289,7 @@ def test_ut_workflow_restores_same_run_bundle_before_execution(sealed_bundle, tm
 
 
 def test_bundle_workflow_digest_and_run_scoping():
-    build = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
+    build = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())
     ut = yaml.safe_load((ROOT / ".github/workflows/ppu-ut.yml").read_text())
     assert (
         build["jobs"]["build"]["outputs"]["bundle_digest"]
