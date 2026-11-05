@@ -141,6 +141,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare isolated upstream comparison environment
+        run: |
+          # 在检出源码和下载产物前安装固定依赖；不修改 job 的 PATH。
+          python3 -m venv "$RUNNER_TEMP/ppu-functional-summary"
+          "$RUNNER_TEMP/ppu-functional-summary/bin/python" -m pip install --index-url "$PIP_INDEX_URL" \
+            'numpy==1.26.4' 'pydantic>=2,<2.14' tensorboard pyyaml pytest click
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.target_sha }}
@@ -154,18 +163,9 @@ jobs:
         with:
           pattern: functional-*
           path: results
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Prepare isolated upstream comparison environment
-        run: |
-          python3 -m venv "$RUNNER_TEMP/ppu-functional-summary"
-          "$RUNNER_TEMP/ppu-functional-summary/bin/python" -m pip install --index-url "$PIP_INDEX_URL" \
-            'numpy==1.26.4' 'pydantic>=2,<2.14' tensorboard pyyaml pytest click
-          printf '%s\n' "$RUNNER_TEMP/ppu-functional-summary/bin" >> "$GITHUB_PATH"
       - name: Independently verify all required repetitions using original comparators
         run: |
-          python3 -I .ppu-ci/control/ppu_functional_results.py \
+          "$RUNNER_TEMP/ppu-functional-summary/bin/python" -I .ppu-ci/control/ppu_functional_results.py \
             --manifest .ppu-ci/manifest.json --root source --results results
       - name: Require successful execution and artifact upload for every matrix job
         if: ${{ always() && !cancelled() }}
