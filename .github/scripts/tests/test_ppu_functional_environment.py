@@ -75,6 +75,30 @@ def test_functional_bundle_rejects_incomplete_or_changed_payload(functional_bund
 
 
 @pytest.fixture
+def combined_bundle(functional_bundle):
+    plan, bundle = functional_bundle
+    for root in (plan, bundle):
+        manifest = json.loads((root / "manifest.json").read_text())
+        manifest["test_kind"] = "combined"
+        (root / "manifest.json").write_text(json.dumps(manifest))
+        (root / "functional-manifest.json").write_text('{"test_kind": "functional"}\n')
+    ci.seal_bundle(bundle)
+    return plan, bundle
+
+
+def test_combined_bundle_carries_the_trusted_functional_plan(combined_bundle):
+    plan, bundle = combined_bundle
+    digest = bundle_digest(bundle)
+    ci.verify_bundle(bundle, plan, digest)
+    (plan / "functional-manifest.json").write_text('{"test_kind": "functional", "x": 1}\n')
+    with pytest.raises(ValueError, match="trusted functional plan"):
+        ci.verify_bundle(bundle, plan, digest)
+    (bundle / "functional-manifest.json").unlink()
+    with pytest.raises(ValueError, match="Missing or empty functional"):
+        ci.seal_bundle(bundle)
+
+
+@pytest.fixture
 def tool_environment(tmp_path, monkeypatch):
     bundle = tmp_path / "bundle"
     bundle.mkdir()

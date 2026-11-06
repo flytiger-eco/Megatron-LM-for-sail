@@ -556,7 +556,7 @@ def main() -> None:
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--results", required=True, type=Path)
     args = parser.parse_args()
-    manifest = json.loads(args.manifest.read_text())
+    manifest = control.load_manifest(args.manifest)
     result = summarize(manifest, args.root, args.results)
     args.results.mkdir(parents=True, exist_ok=True)
     (args.results / "summary.json").write_text(json.dumps(result, indent=2) + "\n")

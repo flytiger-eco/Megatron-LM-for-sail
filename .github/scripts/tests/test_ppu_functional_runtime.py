@@ -407,6 +407,16 @@ def test_environment_clears_inherited_shortcuts_and_uses_runtime_copy(
         assert yaml.safe_load((directory / "model_config.yaml").read_text()) == expected
 
 
+def test_lightweight_policy_reaches_the_upstream_runner(evidence, tmp_path, monkeypatch):
+    manifest, case, _ = evidence
+    manifest = {**manifest, "config": {**manifest["config"], "lightweight": True}}
+    monkeypatch.setenv("ENABLE_LIGHTWEIGHT_MODE", "false")
+    directory = tmp_path / "repeat"
+    directory.mkdir()
+    with runtime.repeat_environment(manifest, ROOT, case, directory, 1, 1) as env:
+        assert env["ENABLE_LIGHTWEIGHT_MODE"] == "true"
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.parametrize("inherited", [None, "0", "1"])
 def test_compiler_environment_is_scoped_without_rewriting_model(
@@ -686,6 +696,7 @@ def test_configure_archives_complete_standalone_runtime_dependencies(tmp_path):
                 "control_sha": "a" * 40,
                 "run_id": "123",
                 "run_attempt": 1,
+                "test_kind": "functional",
             }
         )
     )

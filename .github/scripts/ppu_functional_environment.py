@@ -453,7 +453,12 @@ def main():
     parser.add_argument("--bundle", required=True, type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    manifest = json.loads((args.bundle / "manifest.json").read_text())
+    spec = importlib.util.spec_from_file_location(
+        "ppu_functional_control", Path(__file__).with_name("ppu_functional.py")
+    )
+    control = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(control)
+    manifest = control.load_manifest(args.bundle / "manifest.json")
     if manifest.get("test_kind") != "functional" or not manifest["config"]["build"]:
         raise ValueError("Functional environment setup requires a regression build")
     if args.command == "prepare":

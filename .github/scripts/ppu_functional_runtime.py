@@ -151,7 +151,7 @@ def repeat_environment(
             "HF_HUB_DISABLE_TELEMETRY": "1",
             "RECORD_CHECKPOINTS": "false",
             "N_REPEAT": "1",
-            "ENABLE_LIGHTWEIGHT_MODE": "false",
+            "ENABLE_LIGHTWEIGHT_MODE": "true" if manifest["config"].get("lightweight") else "false",
             "SKIP_PYTEST": "0",
             "ALLOW_NONDETERMINISTIC_ALGO_ARG": "",
             "NUM_NODES": "1",
@@ -356,7 +356,7 @@ def main():
     parser.add_argument("--case-id", required=True)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
-    manifest = json.loads(args.manifest.read_text())
+    manifest = control.load_manifest(args.manifest)
     for key in ("target_sha", "control_sha"):
         if manifest["identity"][key] != os.environ[f"PPU_{key.upper()}"]:
             raise ValueError(f"Runtime identity mismatch: {key}")
