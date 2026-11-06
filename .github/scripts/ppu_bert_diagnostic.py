@@ -1,4 +1,6 @@
-"""复用固定历史产物的单次 BERT 上下文取证；永不进入正式数值汇总。"""
+"""Single BERT context capture reusing fixed historical artifacts; never
+enters the formal numeric summary.
+"""
 
 import argparse
 import hashlib
@@ -39,7 +41,9 @@ bundle_control = load_module("ppu_bert_bundle_control", SCRIPT.with_name("ppu_ci
 
 
 def verify_manifest(raw: bytes) -> dict:
-    """固定原始字节摘要，区分历史被测身份与本次控制代码身份。"""
+    """Pin raw byte digests to separate the historical tested identity
+    from this run's control identity.
+    """
     if hashlib.sha256(raw).hexdigest() != MANIFEST_DIGEST:
         raise ValueError("Historical manifest digest mismatch")
     manifest = json.loads(raw)
@@ -67,10 +71,15 @@ def verify_manifest(raw: bytes) -> dict:
 
 
 def verify_historical_bundle(directory: Path) -> dict:
-    """CPU 只读检查与 Pod 副本复验共用完整摘要门禁，不信任目录名称。"""
-    # 信任锚是原 BERT action 的 PPU_BUNDLE_DIGEST，不是 NAS 自报摘要。
-    # 固定 inventory 认证了全部 manifest/control 字节，因此可作为自身 plan。
-    # verify_bundle 仍独立检查完整清单、文件内容、.complete 与 SHA 标记。
+    """CPU read-only checks and Pod replica re-verification share the full digest gate;
+    directory names are not trusted.
+    """
+    # The trust anchor is the original BERT action's
+    # PPU_BUNDLE_DIGEST, not a digest reported by NAS.
+    # The fixed inventory authenticates every manifest/control byte,
+    # so it can serve as its own plan.
+    # verify_bundle still independently checks the full inventory, file
+    # contents, .complete and SHA markers.
     bundle_control.verify_bundle(directory, directory, BUNDLE_DIGEST)
     manifest = verify_manifest((directory / "manifest.json").read_bytes())
     if (directory / "image.txt").read_text().strip() != manifest["config"]["image"]:
@@ -79,7 +88,7 @@ def verify_historical_bundle(directory: Path) -> dict:
 
 
 def preflight(output: Path) -> None:
-    """失败也归档本地 CPU envelope；绝不创建或修改 NAS run 目录。"""
+    """Always archive the local CPU envelope; never create or modify the NAS run directory."""
     output.mkdir(parents=True, exist_ok=True)
     report = {
         "numerical_validation": False,
@@ -99,14 +108,16 @@ def preflight(output: Path) -> None:
 
 
 def stage(output: Path, name: str, **details) -> None:
-    """记录环境复原和原训练入口是否实际到达。"""
+    """Record whether the environment restore and the original training
+    entry point were actually reached.
+    """
     row = {"stage": name, "time": time.time(), "numerical_validation": False, **details}
     with (output / "stages.jsonl").open("a") as stream:
         stream.write(json.dumps(row) + "\n")
 
 
 def install_hook(python: Path, venv: Path, hook: Path) -> dict:
-    """仅给本次恢复的 venv 增加观测钩子，覆盖 Python -I 与 fork。"""
+    """Add observation hooks only to this restored venv, covering Python -I and fork."""
     site = Path(
         subprocess.check_output(
             [str(python), "-I", "-c", 'import sysconfig; print(sysconfig.get_path("purelib"))'],
@@ -124,7 +135,8 @@ def install_hook(python: Path, venv: Path, hook: Path) -> dict:
     return {"module": str(destination), "sha256": hashlib.sha256(hook.read_bytes()).hexdigest()}
 
 
-# 复用原 functional 启动所需的镜像内环境清理与 check；无安装、Build 或重试。
+# Reuse the in-image environment cleanup and check needed by the original functional
+# launch; no install, Build or retry.
 SETUP_SCRIPT = r'''
 set -euo pipefail
 root="$1"; bundle="$2"; output="$3"; script="$4"
@@ -144,7 +156,9 @@ exec python -I "$script" train --work "$root" --bundle "$bundle" --output "$outp
 
 
 def execute(work: Path, output: Path) -> None:
-    """整个复原阶段也在外层进程树预算内；输入 bundle 始终只读。"""
+    """The whole restore phase also runs within the outer process-tree budget;
+    the input bundle stays read-only.
+    """
     stage(output, "historical_bundle_verifying")
     verify_historical_bundle(POD_BUNDLE)
     bundle = work / "bundle"
@@ -181,7 +195,9 @@ def execute(work: Path, output: Path) -> None:
 
 
 def train(root: Path, bundle: Path, output: Path) -> int:
-    """只调用一次历史原 shell；不调用带重复/重试循环的 run_case。"""
+    """Call the historical original shell exactly once; never call
+    run_case with its repeat/retry loop.
+    """
     manifest = verify_manifest((bundle / "manifest.json").read_bytes())
     runtime = load_module("ppu_bert_original_runtime", bundle / "control/ppu_functional_runtime.py")
     case = manifest["functional"][CASE_ID]
@@ -217,7 +233,9 @@ def train(root: Path, bundle: Path, output: Path) -> int:
 
 
 def run_diagnostic(root: Path, output: Path, authorization: dict) -> int:
-    """单个被监控进程树覆盖校验、复原、训练与清理，无自动重启。"""
+    """One monitored process tree covers verification, restore, training and
+    cleanup, with no automatic restart.
+    """
     diagnostic.verify_authorization(authorization, os.environ)
     if authorization["compiler_diagnostic_context"] != "bert":
         raise ValueError("BERT diagnostic requires BERT authorization")
@@ -291,7 +309,8 @@ def run_diagnostic(root: Path, output: Path, authorization: dict) -> int:
         diagnostic.write_json(output / "diagnostic.json", report)
         for sig, handler in handlers.items():
             signal.signal(sig, handler)
-        # 仅开放本次证据读取，不归档恢复出来的整个 venv/source，也不修改历史 NAS。
+        # Expose only this run's evidence for reading; do not archive the restored venv/source
+        # or modify historical NAS data.
         for path in output.rglob("*"):
             if not path.is_symlink():
                 path.chmod(path.stat().st_mode | 0o444 | (0o111 if path.is_dir() else 0))

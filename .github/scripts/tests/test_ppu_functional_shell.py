@@ -163,7 +163,8 @@ def shell_case(tmp_path):
         )
         catalogue = functional.catalogue(ROOT, ROOT, config)
         case = next(iter(catalogue["functional"].values()))
-        # training 边界已替换为合成 TensorBoard 生成器，不会实例化原 tokenizer。
+        # training boundary is replaced by a synthetic TensorBoard generator and never
+        # instantiates the original tokenizer.
         case["tokenizer_dependencies"] = []
         case["assets"] = [asset for asset in case["assets"] if not asset.get("tokenizer_cache")]
         assets = tmp_path / "assets"
@@ -208,7 +209,8 @@ def shell_case(tmp_path):
 )
 def test_original_shell_tensorboard_extraction_and_comparison(shell_case, kind, monkeypatch):
     if kind in ("skip", "long_run"):
-        # 仅 CPU 模拟器复验原始 shell 的长训练和观测行为，不改变正式选集策略。
+        # Only the CPU simulator re-verifies the original shell long-training and observation
+        # behaviour; selection policy is unchanged.
         monkeypatch.setattr(functional, "SKIPPED_CASES", {})
     catalogue = functional.catalogue(ROOT, ROOT, functional.select_config({}))
     cases = list(catalogue["functional"].values())

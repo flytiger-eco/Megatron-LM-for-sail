@@ -158,7 +158,9 @@ def tool_environment(tmp_path, monkeypatch):
         name: SimpleNamespace(
             __file__=str(site / name.replace(".", "/") / "__init__.py"),
             **{
-                symbol: lambda *a, **k: pytest.fail("依赖预检不应执行训练算子")
+                symbol: lambda *a, **k: pytest.fail(
+                    "Dependency preflight must not run training kernels"
+                )
                 for symbol in symbols
             },
         )
@@ -172,16 +174,16 @@ def tool_environment(tmp_path, monkeypatch):
     class AffineFunction:
         @staticmethod
         def forward(ctx, x, weight, bias, normalized_shape, eps, memory_efficient=False):
-            pytest.fail("预检不应执行 LayerNorm 算子")
+            pytest.fail("Preflight must not run LayerNorm kernels")
 
         @staticmethod
         def apply(*args):
-            pytest.fail("预检不应执行 LayerNorm autograd")
+            pytest.fail("Preflight must not run LayerNorm autograd")
 
     class FastFunction(AffineFunction):
         @staticmethod
         def forward(ctx, x, weight, bias, eps, memory_efficient=False):
-            pytest.fail("预检不应执行 persistent LayerNorm 算子")
+            pytest.fail("Preflight must not run persistent LayerNorm kernels")
 
     training_modules["apex.normalization.fused_layer_norm"].FusedLayerNormAffineFunction = (
         AffineFunction
@@ -274,7 +276,7 @@ def test_historical_environment_does_not_probe_or_change_compiler(monkeypatch, k
     monkeypatch.setattr(
         environment.subprocess,
         "check_output",
-        lambda *a, **k: pytest.fail("历史环境不得探测编译配置"),
+        lambda *a, **k: pytest.fail("Historical environments must not probe the compiler config"),
     )
     assert environment.check_compiler(manifest) == {}
     assert os.environ["TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"] == "1"
@@ -284,7 +286,9 @@ def test_historical_environment_does_not_probe_or_change_compiler(monkeypatch, k
 def test_compiler_check_rejects_inherited_thread_override(monkeypatch, value):
     monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", value)
     monkeypatch.setattr(
-        environment.subprocess, "check_output", lambda *a, **k: pytest.fail("不应启动探针")
+        environment.subprocess,
+        "check_output",
+        lambda *a, **k: pytest.fail("Must not start a probe"),
     )
     with pytest.raises(ValueError, match="default parallel compilation"):
         environment.check_compiler(compiler_manifest())
@@ -306,7 +310,9 @@ def test_compiler_probe_rejects_invalid_manifest(monkeypatch, kind, mode, settin
         "config": {"functional_mode": mode, "compiler_environment": settings},
     }
     monkeypatch.setattr(
-        environment.subprocess, "check_output", lambda *a, **k: pytest.fail("不应启动探针")
+        environment.subprocess,
+        "check_output",
+        lambda *a, **k: pytest.fail("Must not start a probe"),
     )
     with pytest.raises(ValueError, match="compiler environment policy"):
         environment.check_compiler(manifest)
@@ -379,7 +385,9 @@ def test_compiler_probe_is_bounded_and_fails_closed(monkeypatch, damage):
 
 
 def test_compiler_probe_uses_real_isolated_cpu_interpreter(tmp_path, monkeypatch):
-    """真实 -I 冷启动；用最小配置替身检查导入时机，不冒充厂商 Torch 验收。"""
+    """Real -I cold start; a minimal config stand-in checks import timing without
+    posing as vendor Torch acceptance.
+    """
     prefix = tmp_path / "compiler-venv"
     venv.EnvBuilder(with_pip=False).create(prefix)
     python = prefix / "bin/python"
@@ -433,21 +441,21 @@ def test_compiler_gate_is_required_before_environment_success(
 def checkpoint_api(tool_environment, monkeypatch):
     class Queue:
         def __init__(self, persistent=True, cpu_shm_mode=False):
-            pytest.fail("预检不应创建 checkpoint 队列")
+            pytest.fail("Preflight must not create checkpoint queues")
 
         @classmethod
         def warmup_persistent_caller(cls, rank, cpu_priority=10, io_priority=3, cpu_shm_mode=False):
-            pytest.fail("预检不应启动 checkpoint worker")
+            pytest.fail("Preflight must not start checkpoint worker")
 
     class Writer:
         def __init__(self, path, use_cpu_shm_for_gpu_tensors=False):
-            pytest.fail("预检不应创建 checkpoint writer")
+            pytest.fail("Preflight must not create checkpoint writer")
 
     def request(async_fn, async_fn_args, finalize_fns, async_fn_kwargs=None, preload_fn=None):
-        pytest.fail("预检不应执行 async request")
+        pytest.fail("Preflight must not run async request")
 
     def results_queue(mp_mode="spawn"):
-        pytest.fail("预检不应创建多进程资源")
+        pytest.fail("Preflight must not create multiprocessing resources")
 
     modules = {
         "core": SimpleNamespace(AsyncCallsQueue=Queue, AsyncRequest=request),
@@ -465,7 +473,8 @@ def checkpoint_api(tool_environment, monkeypatch):
         monkeypatch.setitem(
             sys.modules, f"nvidia_resiliency_ext.checkpointing.async_ckpt.{name}", module
         )
-    # 执行当前源码中的原始导入函数，避免 mock 自行定义一套不完整的 API 清单。
+    # Run the original import function from current sources so the mock cannot
+    # define an incomplete API list.
     path = ROOT / "megatron/core/dist_checkpointing/strategies/torch.py"
     getter = next(
         node
@@ -820,7 +829,9 @@ def test_dependency_report_preserves_actual_sources(tool_environment):
 
 @pytest.fixture
 def cold_postprocessing(tmp_path, monkeypatch):
-    """真实独立解释器模拟系统 legacy namespace 钩子，不借用父进程预热。"""
+    """A real standalone interpreter emulates the system legacy
+    namespace hook without parent warm-up.
+    """
     prefix = tmp_path / "venv"
     venv.EnvBuilder(with_pip=False).create(prefix)
     python = prefix / "bin/python"
@@ -830,7 +841,8 @@ def cold_postprocessing(tmp_path, monkeypatch):
         ).strip()
     )
     parent_site = Path(sysconfig.get_path("purelib"))
-    # 只复制 CPU protobuf；其余已安装的 CPU 测试依赖由路径提供，不执行父环境启动钩子。
+    # Copy only the CPU protobuf; other installed CPU test dependencies come from the path
+    # and no parent startup hook runs.
     shutil.copytree(parent_site / "google/protobuf", site / "google/protobuf")
     system = tmp_path / "system-site"
     (system / "google/shared_sibling").mkdir(parents=True)
@@ -847,9 +859,10 @@ def cold_postprocessing(tmp_path, monkeypatch):
     )
     startup = site / environment.NAMESPACE_PTH
     startup.write_text(environment.NAMESPACE_BOOTSTRAP)
-    # uv 是真实工具；没有工具时测试失败，不用 mock 或跳过来冒充启动验证。
+    # uv is a real tool; the test fails without it instead of mocking or
+    # skipping to fake startup validation.
     uv = shutil.which("uv") or str(Path(sys.executable).parent / "uv")
-    assert Path(uv).is_file(), "CPU 冷启动回归需要安装 uv"
+    assert Path(uv).is_file(), "CPU cold-start regression requires installing uv"
     monkeypatch.setenv("PATH", str(Path(uv).parent) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
     monkeypatch.setenv("UV_OFFLINE", "1")
@@ -939,7 +952,8 @@ writer.close()
 def test_legacy_namespace_reproduces_missing_protobuf_without_bootstrap(cold_postprocessing):
     _, _, startup, _ = cold_postprocessing
     startup.rename(startup.with_suffix(".absent"))
-    # 必须保留 CI 的 safe-path；否则 Python 插入 cwd 会触发 namespace 重算并掩盖缺陷。
+    # Keep the CI safe-path; otherwise Python inserts cwd, which recomputes the
+    # namespace and masks the defect.
     probe = subprocess.run(
         [sys.executable, "-c", "from tests.functional_tests.python_test_utils import common"],
         cwd=ROOT,

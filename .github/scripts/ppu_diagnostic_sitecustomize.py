@@ -1,4 +1,6 @@
-"""仅独立诊断子进程使用的 Python 栈采样，不载入正式训练环境。"""
+"""Python stack sampling used only by standalone diagnostic subprocesses; never loaded into
+the formal training environment.
+"""
 
 import faulthandler
 import json
@@ -11,7 +13,7 @@ _stack_stream = None
 
 
 def install() -> None:
-    """为当前解释器或 fork worker 打开独立栈文件。"""
+    """Open a dedicated stack file for the current interpreter or fork worker."""
     global _stack_stream
     destination = os.environ.get("PPU_DIAGNOSTIC_STACK_DIR")
     if not destination:
@@ -26,7 +28,8 @@ def install() -> None:
     )
     faulthandler.enable(file=_stack_stream, all_threads=True)
     faulthandler.register(signal.SIGUSR1, file=_stack_stream, all_threads=True)
-    # 由控制进程发送采样信号，不在被测解释器启动额外 watchdog 线程。
+    # The control process sends the sampling signal; no extra watchdog thread starts
+    # in the interpreter under test.
     (directory / f"python-{os.getpid()}.ready").touch()
 
 

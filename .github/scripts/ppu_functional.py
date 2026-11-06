@@ -28,12 +28,14 @@ EVENT_POLICIES = {
     "Run functional tests": ("L1", "bypass", 5, 30, False),
     "pr": ("L0", "pr", 2, 30, False),
 }
-# Python 3.12.3 在编译池休眠后重新 fork 时可能继承已锁定的 shutdown lock。
-# 仅禁止池休眠，保留默认并行编译；对应 pytorch/pytorch#200848。
+# Python 3.12.3 may inherit a locked shutdown lock when it forks again
+# after the compile pool quiesces.
+# Only disable pool quiescing and keep default parallel compilation; see pytorch/pytorch#200848.
 COMPILER_ENVIRONMENT = {"TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL": "0"}
 SKIPPED_CASES = {
     "gpt/gpt3_mcore_te_tp2_pp1_modelopt_distill_resume": "teacher_checkpoint_unavailable",
-    # 暂时隔离数值不稳定的 weekly FP8；保留 recipe 和 golden，待独立采样验收后恢复。
+    # Temporarily isolate the numerically unstable weekly FP8 case; keep its recipe and golden until
+    # independent sampling accepts it.
     "gpt/gpt3_weekly_mcore_tp4_cp2_current_scaling_native_fp8_tp_sp_cp_tp_overlap": (
         "weekly_fp8_numerical_instability_temporarily_skipped"
     ),
@@ -227,7 +229,9 @@ def select_config(inputs: dict, policy: dict | None = None) -> dict:
 
 
 def compiler_environment(manifest: dict) -> dict:
-    """新回归显式绑定适配；历史 manifest 缺字段时不追溯改写运行口径。"""
+    """New regressions bind adaptations explicitly; historical manifests with
+    missing fields are not reinterpreted.
+    """
     config = manifest["config"]
     if "compiler_environment" not in config:
         return {}
@@ -319,7 +323,9 @@ def input_assets(config: dict) -> list:
 
 
 def tokenizer_dependencies(root: Path, config: dict, entrypoint: str) -> list:
-    """静态读取原入口默认值及 HF 仓库名；不导入训练栈、不探测或下载缓存。"""
+    """Statically read the original entry-point defaults and HF repository names; never import the
+    training stack or probe/download caches.
+    """
     defaults = []
     for node in ast.walk(ast.parse(safe_file(root, entrypoint).read_text())):
         if isinstance(node, ast.keyword) and node.arg == "args_defaults":
@@ -349,8 +355,10 @@ def tokenizer_dependencies(root: Path, config: dict, entrypoint: str) -> list:
             continue
         if kind not in maps[0]:
             raise ValueError(f"Tokenizer assets require explicit adaptation: {section}/{kind}")
-        # 提供 vocab/merges 后原实现仍调用 AutoTokenizer.from_pretrained(repository)。
-        # 固定来源由可信 control 的独立锁文件补充；显式 vocab 就绪不代表缓存就绪。
+        # With vocab/merges provided, the original implementation still calls
+        # AutoTokenizer.from_pretrained(repository).
+        # Fixed sources come from a separate lock file in trusted control; an explicit vocab
+        # does not mean the cache is ready.
         requirements.append(
             {
                 "section": section,
@@ -364,10 +372,13 @@ def tokenizer_dependencies(root: Path, config: dict, entrypoint: str) -> list:
 
 
 def nvrx_checkpoint_requirements(config: dict) -> list:
-    """仅描述原配置实际执行阶段的外部 checkpoint 依赖，不改写训练参数。"""
+    """Describe only external checkpoint dependencies of the phases the original config actually
+    runs; never rewrite training arguments.
+    """
     sections = ["MODEL_ARGS"]
     if config["TEST_TYPE"] == "ckpt-resume" and "MODEL_ARGS_2" in config:
-        # 原 shell 将第二阶段参数整组替换，不与第一阶段合并。
+        # The original shell replaces the second-phase arguments wholesale instead of
+        # merging them with the first phase.
         sections.append("MODEL_ARGS_2")
     requirements = []
     for section in sections:
@@ -377,7 +388,7 @@ def nvrx_checkpoint_requirements(config: dict) -> list:
         strategy = arguments.get("--async-strategy", "nvrx")
         if strategy not in ("nvrx", "mcore"):
             raise ValueError(f"Unsupported async checkpoint strategy: {section}/{strategy}")
-        # 上游在未启用 async-save 时会选择 mcore，无须安装 NVRx。
+        # Upstream selects mcore when async-save is disabled, so NVRx is not required.
         if enabled(arguments.get("--async-save", False)) and strategy == "nvrx":
             requirements.append(
                 {
@@ -999,7 +1010,7 @@ def write_asset_report(report: dict, output: Path) -> None:
             )
         for dependency in case["unresolved_dependencies"]:
             lines.append(
-                f"| {case['name']} | {dependency['purpose']}: {dependency['repository']} | 未确认 | 未检查 | 未知 | 未知 | — | {dependency['reason']} |"
+                f"| {case['name']} | {dependency['purpose']}: {dependency['repository']} | unconfirmed | not checked | unknown | unknown | — | {dependency['reason']} |"
             )
     candidate = report.get("tokenizer_source_candidate")
     if candidate:

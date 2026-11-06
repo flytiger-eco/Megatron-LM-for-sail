@@ -18,7 +18,8 @@ finish() {
     printf '{"started_at":%s,"completed_at":%s,"elapsed_seconds":%s,"exit_code":%s}\n' \
         "$started_at" "$completed_at" "$((completed_at - started_at))" "$code" > "$PPU_RESULTS_DIR/pod-timing.json" || code=1
     chmod -R a+rX "$PPU_RESULTS_DIR" || code=1
-    # 仅开放本次运行的时间交接文件，供不同 UID 的 CPU Runner 写入。
+    # Open only this run's timing handoff files so the CPU Runner with
+    # a different UID can write them.
     if (set -o noclobber; : > "$PPU_RESULTS_DIR/action-timing.json"); then
         chmod a+rw "$PPU_RESULTS_DIR/action-timing.json" || code=1
     else
