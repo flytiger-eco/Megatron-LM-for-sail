@@ -749,6 +749,33 @@ def bundle_inventory(directory: Path) -> dict:
     ):
         if name not in inventory or inventory[name]["size"] == 0:
             raise ValueError(f"Missing or empty build artifact: {name}")
+    manifest = json.loads((directory / "manifest.json").read_text())
+    if manifest.get("test_kind") in ("functional", "combined"):
+        required = [
+            "functional-tools/yq",
+            "functional-tools/envsubst",
+            "functional-environment.json",
+            "functional-package-install.json",
+            "installed-packages.json",
+            "control/ppu_functional_run.sh",
+        ]
+        required += [
+            f"control/ppu_functional{suffix}.py"
+            for suffix in (
+                "",
+                "_results",
+                "_runtime",
+                "_environment",
+                "_pytest",
+                "_snapshot",
+                "_hf",
+            )
+        ]
+        if manifest["test_kind"] == "combined":
+            required.append("functional-manifest.json")
+        for name in required:
+            if name not in inventory or inventory[name]["size"] == 0:
+                raise ValueError(f"Missing or empty functional build artifact: {name}")
     return inventory
 
 
@@ -770,6 +797,12 @@ def verify_bundle(directory: Path, plan: Path, digest: str) -> None:
         raise ValueError("Build artifacts are missing, truncated, or failed content verification")
     if (directory / "manifest.json").read_bytes() != (plan / "manifest.json").read_bytes():
         raise ValueError("Build artifacts do not match the trusted test plan")
+    combined = json.loads((plan / "manifest.json").read_text()).get("test_kind") == "combined"
+    if combined and (
+        (directory / "functional-manifest.json").read_bytes()
+        != (plan / "functional-manifest.json").read_bytes()
+    ):
+        raise ValueError("Build artifacts do not match the trusted functional plan")
     identity = json.loads((plan / "manifest.json").read_text())["identity"]
     for filename, key in (
         (".complete", "target_sha"),

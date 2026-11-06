@@ -23,6 +23,7 @@ export VIRTUAL_ENV=/opt/ppu-ci-venv
 
 python - <<'PY'
 import importlib.metadata as md
+import json
 from pathlib import Path
 packages = ('torch', 'torchvision', 'triton', 'scipy', 'scikit-learn')
 lines = []
@@ -40,6 +41,14 @@ native_requirements = [
     'pla==1.0.0+v0.1.0.ppu2.2.0',
     'fla-core==0.4.1+v0.1.0.ppu2.2.0',
 ]
+if json.loads(Path('.ppu-ci/manifest.json').read_text()).get('test_kind') in ('functional', 'combined'):
+    # All six dependencies are currently available from Flytiger; do not mix in extra
+    # indexes or override the PPU runtime.
+    native_requirements += [
+        'flash-linear-attention==0.4.1+v0.1.0.ppu2.2.0',
+        'emerging-optimizers==0.3.0',
+        'apex==24.4.1+v0.1.0.ppu2.2.0',
+    ]
 Path('.ppu-ci/ppu-requirements.txt').write_text('\n'.join(native_requirements) + '\n')
 Path('.ppu-ci/constraints.txt').write_text(
     '\n'.join(lines + native_requirements + ['numpy==1.26.4', 'pyarrow==21.0.0']) + '\n'
@@ -59,7 +68,11 @@ requirements = (
 )
 Path('.ppu-ci/test-requirements.txt').write_text('\n'.join(requirements) + '\n')
 PY
-python -m pip install --index-url "$PIP_INDEX_URL" --no-build-isolation \
+functional_pip_args=()
+if python -c 'import json; raise SystemExit(json.load(open(".ppu-ci/manifest.json")).get("test_kind") not in ("functional", "combined"))'; then
+    functional_pip_args=(--report .ppu-ci/functional-package-install.json)
+fi
+python -m pip install --index-url "$PIP_INDEX_URL" --no-build-isolation "${functional_pip_args[@]}" \
     -r .ppu-ci/test-requirements.txt -r .ppu-ci/ppu-requirements.txt \
     pytest-timeout click wrapt requests tensorstore scipy scikit-learn \
     'pydantic<2.14' boto3 'multi-storage-client~=0.50' 'einops~=0.8' 'uv==0.13.0' \
@@ -315,6 +328,11 @@ python setup.py build_ext --inplace
 make -C megatron/core/datasets
 make -q -C megatron/core/datasets
 python -m pip install --no-index --no-deps --ignore-installed dist/*.whl
+if python -c 'import json; raise SystemExit(json.load(open(".ppu-ci/manifest.json")).get("test_kind") not in ("functional", "combined"))'; then
+    apt-get update
+    apt-get install -y --no-install-recommends gettext-base
+    python -I "$PPU_CONTROL_DIR/ppu_functional_environment.py" prepare --bundle "$PPU_ARTIFACT_DIR"
+fi
 python -m pip check
 python -m pip list --format=json > .ppu-ci/installed-packages.json
 python -I - <<'PY'
