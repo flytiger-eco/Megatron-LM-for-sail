@@ -18,6 +18,16 @@ POD_ASSETS = "/mnt/wl_nas/anyunge.ayg/megatron-functional-ci/artifacts-base"
 CPU_ASSETS = "/wl_nas/anyunge.ayg/megatron-functional-ci/artifacts-base"
 IMAGE = "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
 TIERS = ("L0", "L1", "L2", "L3")
+FUNCTIONAL_MANIFEST = "functional-manifest.json"
+SCOPE_LABELS = ("Run tests", "Run functional tests")
+# Mirrors the upstream GitHub/GitLab functional triggers (scope, cadence, repeat, budget).
+EVENT_POLICIES = {
+    "push": ("mr", "bypass", 5, 60, False),
+    "merge_group": ("L1", "mergegroup", 1, 30, False),
+    "Run tests": ("L1", "bypass", 1, 30, True),
+    "Run functional tests": ("L1", "bypass", 5, 30, False),
+    "pr": ("L0", "pr", 2, 30, False),
+}
 # Python 3.12.3 在编译池休眠后重新 fork 时可能继承已锁定的 shutdown lock。
 # 仅禁止池休眠，保留默认并行编译；对应 pytorch/pytorch#200848。
 COMPILER_ENVIRONMENT = {"TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL": "0"}
@@ -128,7 +138,51 @@ def validate_route(event_name: str, ref: str, inputs: dict) -> str:
     return kind
 
 
-def select_config(inputs: dict) -> dict:
+def event_policy(trigger: str, labels=()) -> dict | None:
+    """Functional policy of an automatic trigger; release tags and other events run UT only."""
+    if trigger == "pr":
+        # `Run tests` wins over `Run functional tests`, as in the upstream workflow.
+        trigger = next((label for label in SCOPE_LABELS if label in labels), "pr")
+    elif trigger not in ("push", "merge_group"):
+        return None
+    scope, cadence, repeat, timeout, lightweight = EVENT_POLICIES[trigger]
+    return {
+        "trigger": trigger,
+        "functional_scope": scope,
+        "cadence": cadence,
+        "repeat": repeat,
+        "timeout": timeout,
+        "lightweight": lightweight,
+    }
+
+
+def authorization_trigger(authorization: dict) -> str:
+    event = authorization.get("event_name")
+    if event in ("push", "merge_group"):
+        return event
+    if authorization.get("pr_number") and event in ("pull_request_target", "workflow_dispatch"):
+        return "pr"
+    raise ValueError("Combined functional runs require a main push, merge queue, or PR trigger")
+
+
+def functional_label(config: dict) -> str:
+    kind = "lightweight" if config["lightweight"] else "numeric"
+    return f"functional {config['scope']} {kind} x{config['repeat']}"
+
+
+def select_config(inputs: dict, policy: dict | None = None) -> dict:
+    if policy is not None:
+        if inputs:
+            raise ValueError("Automatic functional policies do not accept manual inputs")
+        return {
+            **select_config({"functional_mode": "regression"}),
+            "scope": policy["functional_scope"],
+            "cadence": policy["cadence"],
+            "lightweight": policy["lightweight"],
+            "repeat": positive(policy["repeat"], "functional_repeat", 10),
+            "timeout": positive(policy["timeout"], "functional_timeout", 1380),
+            "trigger_kind": policy["trigger"],
+        }
     if (
         str(inputs.get("compiler_diagnostic", False)).lower() != "false"
         or inputs.get("compiler_diagnostic_context", "bda") != "bda"
@@ -136,8 +190,12 @@ def select_config(inputs: dict) -> dict:
         raise ValueError("Compiler diagnostics must not enter the functional execution chain")
     mode = inputs.get("functional_mode", "assets")
     scope = inputs.get("functional_scope", "all")
-    if mode not in ("assets", "regression") or scope not in ("all", *TIERS):
+    if mode not in ("assets", "regression") or scope not in ("all", "auto", "mr", *TIERS):
         raise ValueError("Invalid functional mode or scope")
+    cadence = "bypass"
+    if scope == "auto":
+        # Manual regression mirrors the upstream nightly L1 run; asset checks cover everything.
+        scope, cadence = ("L1", "nightly") if mode == "regression" else ("all", "bypass")
     requested = inputs.get("functional_cases", "all")
     if not isinstance(requested, str) or not requested:
         raise ValueError("functional_cases must be all or full model/case names")
@@ -151,6 +209,8 @@ def select_config(inputs: dict) -> dict:
         "test_kind": "functional",
         "functional_mode": mode,
         "scope": scope,
+        "cadence": cadence,
+        "lightweight": False,
         "requested_cases": names,
         "repeat": positive(inputs.get("functional_repeat", 5), "functional_repeat", 10),
         "timeout": positive(inputs.get("functional_timeout", 30), "functional_timeout", 1380),
@@ -458,7 +518,9 @@ def describe_case(root: Path, name: str, specs: list, config: dict) -> dict:
     if model_config.get("TEST_EVALUATION", "pass") != "pass":
         raise ValueError(f"Expected failures cannot count as PPU regression: {name}")
     env = model_config.get("ENV_VARS", {})
-    lightweight = enabled(env.get("ENABLE_LIGHTWEIGHT_MODE", False))
+    lightweight = config.get("lightweight", False) or enabled(
+        env.get("ENABLE_LIGHTWEIGHT_MODE", False)
+    )
     skip = enabled(env.get("SKIP_PYTEST", False))
     observation = "lightweight" if lightweight else "SKIP_PYTEST" if skip else ""
     repeat = 1 if observation else config["repeat"]
@@ -554,13 +616,18 @@ def catalogue(root: Path, control: Path, config: dict) -> dict:
     requested = config["requested_cases"]
     if requested != ["all"] and set(requested) - by_name.keys():
         raise ValueError(f"Unknown requested cases: {sorted(set(requested) - by_name.keys())}")
+    # GitLab's `mr` scope is not an L-tier alias; it is selected only when explicitly requested.
+    tiers = ("mr",) if config["scope"] == "mr" else TIERS
+    cadence = config.get("cadence", "bypass")
     for name, specs in sorted(by_name.items()):
-        active = [row for row in specs if row.get("scope") in TIERS]
+        active = [row for row in specs if row.get("scope") in tiers]
         eligible = (
             active
             if config["scope"] == "all"
             else [row for row in active if row["scope"] == config["scope"]]
         )
+        if cadence != "bypass":
+            eligible = [row for row in eligible if cadence in row["cadence"]]
         if not active:
             scopes = sorted({row.get("scope", "") for row in specs})
             if any("broken" in scope or "disabled" in scope for scope in scopes):
@@ -650,7 +717,7 @@ def emit(key: str, value) -> None:
             stream.write(f"{key}={value}\n")
 
 
-def generate(root: Path, control: Path, config: dict, identity: dict, output: Path) -> dict:
+def build_manifest(root: Path, control: Path, config: dict, identity: dict) -> dict:
     for key in ("target_sha", "control_sha"):
         if not re.fullmatch(r"[0-9a-f]{40}", str(identity.get(key, ""))):
             raise ValueError(f"Invalid functional identity: {key}")
@@ -685,6 +752,23 @@ def generate(root: Path, control: Path, config: dict, identity: dict, output: Pa
     ]
     manifest["source_files"] = {name: sha256(safe_file(root, name)) for name in protected}
     manifest["control_files"] = {name: sha256(safe_file(control, name)) for name in protected}
+    return manifest
+
+
+def emit_matrix(manifest: dict) -> None:
+    emit(
+        "functional_matrix",
+        {
+            "include": [
+                {key: row[key] for key in ("id", "name", "cards", "action_minutes", "job_minutes")}
+                for row in manifest["functional"].values()
+            ]
+        },
+    )
+
+
+def generate(root: Path, control: Path, config: dict, identity: dict, output: Path) -> dict:
+    manifest = build_manifest(root, control, config, identity)
     output.mkdir(parents=True, exist_ok=True)
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     for key in (
@@ -699,16 +783,82 @@ def generate(root: Path, control: Path, config: dict, identity: dict, output: Pa
         emit(key, config[key])
     emit("config", config)
     emit("unit_matrix", {"include": [{"id": "unused"}]})
-    emit(
-        "functional_matrix",
-        {
-            "include": [
-                {key: row[key] for key in ("id", "name", "cards", "action_minutes", "job_minutes")}
-                for row in manifest["functional"].values()
-            ]
+    emit_matrix(manifest)
+    return manifest
+
+
+def combine(root: Path, control: Path, output: Path) -> dict:
+    """Attach an automatic functional plan to the UT manifest; both share one Build."""
+    authorization = json.loads((output / "authorization.json").read_text())
+    if authorization.get("allowed") is not True or authorization.get("test_kind") != "combined":
+        raise ValueError("Combined functional configuration requires an authorized combined run")
+    trigger, labels = authorization_trigger(authorization), authorization.get("labels", [])
+    policy = event_policy(trigger, labels)
+    if (
+        policy is None
+        or authorization.get("functional_policy") != policy
+        or (trigger != "pr" and labels)
+    ):
+        raise ValueError("Authorized functional policy does not match the trusted trigger policy")
+    top = json.loads((output / "manifest.json").read_text())
+    if (
+        top.get("schema_version") != 3
+        or "test_kind" in top
+        or top["config"].get("build") is not True
+    ):
+        raise ValueError("Combined runs require a UT manifest with a shared Build")
+    identity = {
+        key: authorization[key] for key in ("target_sha", "control_sha", "run_id", "run_attempt")
+    }
+    if any(top["identity"].get(key) != identity[key] for key in ("target_sha", "control_sha")):
+        raise ValueError("UT and functional plans have different commit identities")
+    config = select_config({}, policy)
+    content = json.dumps(build_manifest(root, control, config, identity), indent=2) + "\n"
+    (output / FUNCTIONAL_MANIFEST).write_text(content)
+    top.update(
+        schema_version=4,
+        test_kind="combined",
+        functional_plan={
+            "path": FUNCTIONAL_MANIFEST,
+            "sha256": hashlib.sha256(content.encode()).hexdigest(),
         },
     )
+    (output / "manifest.json").write_text(json.dumps(top, indent=2), encoding="utf-8")
+    manifest = load_manifest(output / "manifest.json")
+    emit("test_kind", "combined")
+    emit("functional_mode", "regression")
+    emit("functional_label", functional_label(config))
+    emit_matrix(manifest)
     return manifest
+
+
+def load_manifest(path: Path) -> dict:
+    """Return the functional plan of a functional or combined manifest after verification."""
+    manifest = json.loads(path.read_text())
+    if manifest.get("test_kind") == "functional":
+        return manifest
+    plan = manifest.get("functional_plan")
+    if (
+        manifest.get("schema_version") != 4
+        or manifest.get("test_kind") != "combined"
+        or not isinstance(plan, dict)
+        or set(plan) != {"path", "sha256"}
+        or plan["path"] != FUNCTIONAL_MANIFEST
+    ):
+        raise ValueError("Manifest does not contain a trusted functional plan")
+    sidecar = path.with_name(FUNCTIONAL_MANIFEST)
+    if sidecar.is_symlink() or not sidecar.is_file():
+        raise ValueError("Functional plan is missing or not a regular file")
+    content = sidecar.read_bytes()
+    if hashlib.sha256(content).hexdigest() != plan["sha256"]:
+        raise ValueError("Functional plan does not match the combined manifest digest")
+    functional = json.loads(content)
+    if functional.get("schema_version") != 1 or functional.get("test_kind") != "functional":
+        raise ValueError("Invalid functional plan structure")
+    for key in ("target_sha", "control_sha"):
+        if functional["identity"][key] != manifest["identity"].get(key):
+            raise ValueError(f"Functional plan identity mismatch: {key}")
+    return functional
 
 
 def check_asset(root: Path, requirement: dict) -> dict:
@@ -890,7 +1040,7 @@ def write_asset_report(report: dict, output: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("configure", "catalogue", "assets"))
+    parser.add_argument("command", choices=("configure", "catalogue", "assets", "combine"))
     parser.add_argument(
         "--root",
         type=Path,
@@ -907,8 +1057,11 @@ def main() -> None:
     parser.add_argument("--location", choices=("cpu", "pod"), default="cpu")
     parser.add_argument("--case-id")
     args = parser.parse_args()
+    if args.command == "combine":
+        combine(args.root, args.control, args.output)
+        return
     if args.command == "assets":
-        manifest = json.loads((args.output / "manifest.json").read_text())
+        manifest = load_manifest(args.output / "manifest.json")
         report = asset_report(
             manifest, args.assets_root, location=args.location, case_id=args.case_id
         )

@@ -22,6 +22,8 @@ on:
         value: ${{ jobs.configure.outputs.scope }}
       threshold_percent:
         value: ${{ jobs.configure.outputs.threshold_percent }}
+      functional_label:
+        value: ${{ jobs.configure.outputs.functional_label }}
       execution_success:
         value: ${{ jobs.result.outputs.execution_success }}
 permissions:
@@ -56,6 +58,7 @@ jobs:
       test_kind: ${{ steps.config.outputs.test_kind }}
       functional_mode: ${{ steps.config.outputs.functional_mode }}
       functional_matrix: ${{ steps.config.outputs.functional_matrix }}
+      functional_label: ${{ steps.config.outputs.functional_label }}
       target_sha: ${{ inputs.target_sha }}
       control_sha: ${{ inputs.control_sha }}
       manual_pr: ${{ inputs.manual_pr }}
@@ -92,14 +95,24 @@ jobs:
             {"build":"${{ vars.PPU_BUILD || 'yes' }}","unit_test":"${{ vars.PPU_UNIT_TEST || 'yes' }}",
             "repeat":"${{ vars.PPU_UNIT_TEST_REPEAT || '1' }}","timeout":"${{ vars.PPU_UNIT_TEST_TIMEOUT || '30' }}"}
         run: |
-          if [[ "$(python3 -c 'import json,os; print(json.loads(os.environ["PPU_INPUTS"]).get("test_kind", "unit"))')" == functional ]]; then
+          test_kind=$(python3 -c 'import json; print(json.load(open(".ppu-ci/authorization.json")).get("test_kind", "unit"))')
+          if [[ "$test_kind" == functional ]]; then
             "$RUNNER_TEMP/ppu-configure-venv/bin/python" -I control/.github/scripts/ppu_functional.py configure
             cp control/.github/scripts/ppu_functional*.py .ppu-ci/control/
             cp control/.github/scripts/ppu_compiler_diagnostic.py .ppu-ci/control/
             cp control/.github/scripts/ppu_functional_run.sh .ppu-ci/control/
           else
             "$RUNNER_TEMP/ppu-configure-venv/bin/python" -I control/.github/scripts/ppu_ci.py configure
-            echo 'test_kind=unit' >> "$GITHUB_OUTPUT"
+            if [[ "$test_kind" == combined ]] &&
+              python3 -c 'import json; raise SystemExit(json.load(open(".ppu-ci/manifest.json"))["config"]["build"] is not True)'; then
+              # Automatic triggers append the functional plan to the UT manifest; both share one Build.
+              "$RUNNER_TEMP/ppu-configure-venv/bin/python" -I control/.github/scripts/ppu_functional.py combine
+              cp control/.github/scripts/ppu_functional*.py .ppu-ci/control/
+              cp control/.github/scripts/ppu_compiler_diagnostic.py .ppu-ci/control/
+              cp control/.github/scripts/ppu_functional_run.sh .ppu-ci/control/
+            else
+              echo 'test_kind=unit' >> "$GITHUB_OUTPUT"
+            fi
           fi
           cp control/.github/scripts/{ppu_ci.py,ppu_ci_build.sh,ppu_ci_run.sh,ppu_pytest_policy.py} .ppu-ci/control/
       - uses: actions/upload-artifact@v4
@@ -111,7 +124,7 @@ jobs:
           retention-days: 7
   functional-assets:
     needs: configure
-    if: needs.configure.outputs.test_kind == 'functional'
+    if: contains(fromJSON('["functional","combined"]'), needs.configure.outputs.test_kind)
     runs-on: k8s-runner-group-cpu-flytiger
     environment: ppu-ci
     timeout-minutes: 15
@@ -253,6 +266,8 @@ jobs:
           [[ "$(< "$PPU_BUNDLE_DIR/image.txt")" == "$PPU_IMAGE" ]] || exit 1
           [[ -s "$PPU_BUNDLE_DIR/source.tar.gz" && -s "$PPU_BUNDLE_DIR/environment.tar.gz" ]] || exit 1
           cmp .ppu-ci/manifest.json "$PPU_BUNDLE_DIR/manifest.json"
+          [[ ! -e .ppu-ci/functional-manifest.json ]] ||
+            cmp .ppu-ci/functional-manifest.json "$PPU_BUNDLE_DIR/functional-manifest.json"
           digest=$(sha256sum "$PPU_BUNDLE_DIR/bundle-integrity.json")
           digest=${digest%% *}
           [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
@@ -281,11 +296,16 @@ jobs:
       threshold_percent: ${{ needs.configure.outputs.threshold_percent }}
       scope: ${{ needs.configure.outputs.scope }}
   functional-tests:
-    needs: [configure, functional-assets, build]
+    needs: [configure, functional-assets, build, unit-tests]
     if: >-
       always() && !cancelled() && needs.configure.result == 'success' &&
       needs.functional-assets.result == 'success' && needs.build.result == 'success' &&
-      needs.configure.outputs.test_kind == 'functional' && needs.configure.outputs.functional_mode == 'regression'
+      (needs.configure.outputs.test_kind == 'combined' ||
+       (needs.configure.outputs.test_kind == 'functional' && needs.configure.outputs.functional_mode == 'regression'))
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
     uses: ./.github/workflows/ppu-functional.yml
     with:
       matrix: ${{ needs.configure.outputs.functional_matrix }}
@@ -310,7 +330,18 @@ jobs:
           FUNCTIONAL_MODE: ${{ needs.configure.outputs.functional_mode }}
           ASSETS_RESULT: ${{ needs.functional-assets.result }}
           FUNCTIONAL_SUCCESS: ${{ needs.configure.result == 'success' && needs.functional-assets.result == 'success' && needs.admit-build.result == 'success' && needs.build.result == 'success' && needs.functional-tests.result == 'success' }}
+          UT_RESULT: ${{ needs.unit-tests.result }}
         run: |
+          if [[ "$TEST_KIND" == combined ]]; then
+            # Automatic triggers pass only when UT (or its explicit disablement) and functional tests both pass.
+            ut_ok=false
+            [[ "$UT_RESULT" == success || ("$UT_ENABLED" == false && "$BUILD_RESULT" == success) ]] && ut_ok=true
+            combined=false
+            [[ "$ut_ok" == true && "$FUNCTIONAL_SUCCESS" == true ]] && combined=true
+            printf 'execution_success=%s\n' "$combined" >> "$GITHUB_OUTPUT"
+            [[ "$combined" == true ]]
+            exit $?
+          fi
           if [[ "$TEST_KIND" == functional ]]; then
             if [[ "$FUNCTIONAL_MODE" == assets ]]; then
               echo 'execution_success=false' >> "$GITHUB_OUTPUT"

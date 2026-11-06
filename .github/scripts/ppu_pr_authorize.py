@@ -12,6 +12,8 @@ from pathlib import Path
 
 BRANCH = "refs/heads/main"
 STATUS_CONTEXT = "PPU PR Quick"
+# Keep in sync with ppu_functional.SCOPE_LABELS; status jobs only ship this script.
+SCOPE_LABELS = ("Run tests", "Run functional tests")
 
 
 def github_api(path: str, payload: dict | None = None) -> dict:
@@ -66,6 +68,10 @@ class StaleSnapshot(ValueError):
     """The event no longer describes the current PR."""
 
 
+def scope_labels(pr: dict) -> list:
+    return sorted({label["name"] for label in pr.get("labels") or []} & set(SCOPE_LABELS))
+
+
 def pr_identity(pr: dict) -> tuple:
     return (
         *snapshot(pr),
@@ -74,6 +80,7 @@ def pr_identity(pr: dict) -> tuple:
         (pr["head"].get("repo") or {}).get("full_name"),
         pr["state"],
         bool(pr.get("draft")),
+        tuple(scope_labels(pr)),
     )
 
 
@@ -85,6 +92,7 @@ def current_pr(pr: dict, authorization: dict, repository: str) -> bool:
         and bool(pr["head"].get("repo"))
         and pr["head"]["repo"]["full_name"]
         == authorization.get("head_repository", pr["head"]["repo"]["full_name"])
+        and scope_labels(pr) == authorization.get("labels", [])
     )
 
 
@@ -183,6 +191,11 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
             raise ValueError("Unsupported push event")
     else:
         raise ValueError("Unsupported authorization event")
+    if event_name in ("push", "merge_group") and ref.startswith("refs/heads/"):
+        # Main pushes and merge queues pair UT with functional tests; release tags run UT only.
+        result.update(
+            test_kind="combined", labels=[], functional_policy=functional.event_policy(event_name)
+        )
 
     if not (manual_pr or event_name == "pull_request_target"):
         return result
@@ -202,11 +215,15 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
         if pr_identity(pr) != pr_identity(event["pull_request"]):
             raise StaleSnapshot("PR identity or lifecycle state changed since the event")
         requested_base = current_base_sha(api)
+    labels = scope_labels(pr)
     result.update(
         pr_number=int(number),
         pr_head_sha=requested_sha,
         base_sha=requested_base,
         head_repository=pr["head"]["repo"]["full_name"],
+        test_kind="combined",
+        labels=labels,
+        functional_policy=functional.event_policy("pr", labels),
     )
     if pr["state"] != "open":
         if manual_pr:
@@ -220,6 +237,12 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
         and "base" not in event.get("changes", {})
     ):
         return blocked(result, "ignore", "Title or body edits do not rerun tests")
+    if (
+        event_name == "pull_request_target"
+        and event.get("action") in ("labeled", "unlabeled")
+        and event.get("label", {}).get("name") not in SCOPE_LABELS
+    ):
+        return blocked(result, "ignore", "Labels outside the test scope do not rerun tests")
     try:
         return resolve_pr(result, pr, inputs, repository, api, sleep)
     except StaleSnapshot:
@@ -237,7 +260,7 @@ def resolve_pr(result: dict, pr: dict, inputs: dict, repository: str, api, sleep
     checked = api(f"pulls/{number}")
     if pr_identity(checked) != pr_identity(pr) or not base_is_current(requested_base, api):
         raise StaleSnapshot("PR snapshot changed during preflight")
-    if only_docs and inputs.get("scope", "auto") == "auto":
+    if only_docs and inputs.get("scope", "auto") == "auto" and not result["labels"]:
         return blocked(result, "docs_only", "Docs-only changes; UT exempt under policy")
     if pr["head"]["repo"]["full_name"] != repository and not result["manual_pr"]:
         return blocked(
@@ -350,7 +373,7 @@ def publish_status(
     authorization: dict, state: str, description: str, api=github_api, *, cancelled: bool = False
 ) -> str:
     number, decision = authorization["pr_number"], authorization.get("decision")
-    if authorization.get("test_kind", "unit") != "unit":
+    if authorization.get("test_kind", "unit") not in ("unit", "combined"):
         return "rejected"
     if not number or decision not in (
         "run",
