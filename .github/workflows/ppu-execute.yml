@@ -65,7 +65,8 @@ jobs:
     steps:
       - name: Prepare isolated configuration environment
         run: |
-          # 在检出源码和下载产物前安装固定依赖；不修改 job 的 PATH。
+          # Install pinned dependencies before checking out sources or downloading
+          # artifacts; never modify the job PATH.
           python3 -m venv "$RUNNER_TEMP/ppu-configure-venv"
           "$RUNNER_TEMP/ppu-configure-venv/bin/python" -m pip install --index-url "$PIP_INDEX_URL" click pyyaml
       - uses: actions/checkout@v4

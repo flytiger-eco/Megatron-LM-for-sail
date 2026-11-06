@@ -142,7 +142,9 @@ def log_text(directory: Path) -> str:
 
 
 def verify_rank_logs(case: dict, directory: Path) -> None:
-    """按独立 launcher 会话核验阶段，内部重启不能补足另一阶段的日志。"""
+    """Verify phases per independent launcher session; an internal restart cannot
+    supply logs for another phase.
+    """
     attempts = sorted((directory / "logs").glob("**/attempt_*"))
     sessions = {path.parent for path in attempts}
     if len(sessions) != phase_count(case):
@@ -235,7 +237,8 @@ def verify_repeat(
     )
     if classification in ("passed", "infrastructure_retryable") and 139 in statuses.values():
         classification = "hard_failure"
-    # 启动前失败可能尚未产生运行环境；不得遮蔽原错误，但缺证据不能通过或重试。
+    # Failures before launch may leave no runtime environment; do not mask the original error, but
+    # missing evidence never passes or retries.
     if (
         classification in ("passed", "infrastructure_retryable")
         and compiler_env

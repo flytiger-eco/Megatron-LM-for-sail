@@ -1,4 +1,6 @@
-"""单 Pod 八卡有界编译诊断；不运行模型回归，不产生数值验收结论。"""
+"""Bounded compiler diagnostic on a single 8-card Pod; runs no model regression and
+yields no numeric acceptance result.
+"""
 
 import argparse
 import ast
@@ -24,14 +26,16 @@ SCRIPT = Path(__file__).resolve()
 
 
 def write_json(path: Path, value: dict) -> None:
-    """原子保存证据。"""
+    """Save evidence atomically."""
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value, indent=2), encoding="utf-8")
     temporary.replace(path)
 
 
 def verify_authorization(authorization: dict, env: dict) -> None:
-    """要求同一次运行的维护者授权；禁止 PR、重跑和不同源码快照。"""
+    """Require maintainer authorization from the same run; reject PRs, reruns
+    and different source snapshots.
+    """
     target = env.get("PPU_TARGET_SHA", "")
     run_id = env.get("PPU_DIAGNOSTIC_RUN_ID", env.get("GITHUB_RUN_ID", ""))
     attempt = env.get("PPU_DIAGNOSTIC_RUN_ATTEMPT", env.get("GITHUB_RUN_ATTEMPT", ""))
@@ -56,7 +60,9 @@ def verify_authorization(authorization: dict, env: dict) -> None:
 
 
 def load_bda(root: Path, torch_module):
-    """保留原函数 AST，仅注入 torch.compile 以隔离非编译依赖导入。"""
+    """Keep the original function AST and inject only torch.compile to isolate
+    non-compiler dependency imports.
+    """
     path = root / BDA
     tree = ast.parse(path.read_text(), filename=str(path))
     imports = [
@@ -78,7 +84,9 @@ def load_bda(root: Path, torch_module):
 
 
 def verify_runtime(report: dict) -> None:
-    """分别核验安装包与模块版本，厂商后缀不一定出现在 torch.__version__。"""
+    """Verify the installed package and module versions separately; vendor suffixes may
+    not appear in torch.__version__.
+    """
     if not (
         report["device_count"] == 8
         and report["torch_distribution"] == "2.13.0+v0.1.0.ppu2.2.0"
@@ -89,7 +97,7 @@ def verify_runtime(report: dict) -> None:
 
 
 def probe(root: Path, output: Path, variant: str) -> None:
-    """使用原 BDA 的 BF16 形状、dropout、梯度和确定性设置。"""
+    """Use the original BDA BF16 shapes, dropout, gradients and determinism settings."""
     import importlib.metadata
 
     import torch
@@ -146,7 +154,9 @@ def probe(root: Path, output: Path, variant: str) -> None:
 def variant_environment(
     base: dict, output: Path, bootstrap: Path, temporary: str, variant: str
 ) -> dict:
-    """两个冷缓存变体仅改变编译线程设置，清除继承的分布式上下文。"""
+    """The two cold-cache variants change only compiler thread settings and clear
+    inherited distributed context.
+    """
     if variant not in VARIANTS:
         raise ValueError("Unknown compiler diagnostic variant")
     env = {
@@ -183,7 +193,7 @@ def variant_environment(
 
 
 def proc_text(path: Path) -> str:
-    """只读有界 /proc 字段；权限或退出竞态原样记录。"""
+    """Read bounded /proc fields only; record permission or exit races as they are."""
     try:
         with path.open(errors="replace") as stream:
             return stream.read(16384)
@@ -192,7 +202,7 @@ def proc_text(path: Path) -> str:
 
 
 def process_family(root_pid: int, known: dict) -> dict:
-    """跟踪跨 setsid 的后代；保留会话归属以回收已成为孤儿的编译 worker。"""
+    """Track descendants across setsid; keep session ownership to reap orphaned compiler workers."""
     table = {}
     for path in Path("/proc").glob("[0-9]*"):
         fields = proc_text(path / "stat").rsplit(")", 1)[-1].split()
@@ -225,7 +235,9 @@ def process_family(root_pid: int, known: dict) -> dict:
 
 
 def signal_family(root_pid: int, known: dict, sig: int) -> None:
-    """只向本次 launcher 及其后代会话的进程组转发终止信号。"""
+    """Forward termination signals only to process groups of this
+    launcher and its descendant sessions.
+    """
     groups = {root_pid, *(row["pgid"] for row in process_family(root_pid, known).values())}
     for group in groups:
         if group <= 1 or group == os.getpgrp():
@@ -237,7 +249,9 @@ def signal_family(root_pid: int, known: dict, sig: int) -> None:
 
 
 def capture_processes(session: int, output: Path, known: dict | None = None) -> None:
-    """记录所有后代会话的线程内核栈、等待点和 Python 采样覆盖。"""
+    """Record kernel stacks, wait points and Python sampling coverage for
+    threads of all descendant sessions.
+    """
     processes = []
     family = process_family(session, {} if known is None else known)
     for pid in family:
@@ -272,7 +286,9 @@ def capture_processes(session: int, output: Path, known: dict | None = None) -> 
 
 
 class DiagnosticRunner:
-    """取消或预算结束时清理整个变体进程组，包括编译 worker。"""
+    """On cancellation or budget expiry, clean up the whole variant process
+    group, including compiler workers.
+    """
 
     def __init__(self):
         self.cancelled = False
@@ -312,7 +328,8 @@ class DiagnosticRunner:
                         break
                     time.sleep(0.2)
             finally:
-                # torchrun 的 rank 会另建会话；launcher 退出不意味着所有后代已退出。
+                # torchrun ranks start their own sessions; a launcher exit does not
+                # mean all descendants have exited.
                 try:
                     signal_family(process.pid, known, signal.SIGTERM)
                     try:
@@ -349,7 +366,7 @@ class DiagnosticRunner:
 
 
 def run_diagnostic(root: Path, output: Path, authorization: dict) -> int:
-    """单次执行两个变体；总预算固定，禁止重试或提交额外 Pod。"""
+    """Run both variants once within a fixed total budget; no retries or extra Pods."""
     started = time.monotonic()
     root, output = root.resolve(), output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -366,7 +383,7 @@ def run_diagnostic(root: Path, output: Path, authorization: dict) -> int:
             "dropout": 0.1,
             "deterministic": True,
         },
-        "scope": "原 BDA 计算隔离诊断；仅替换 jit_fuser 导入，不载入完整模型或分布式通信",
+        "scope": "Isolated BDA compute; only the jit_fuser import is replaced; no model or comms",
     }
     runner = DiagnosticRunner()
     handlers = {sig: signal.signal(sig, runner.cancel) for sig in (signal.SIGTERM, signal.SIGINT)}
@@ -443,7 +460,8 @@ def run_diagnostic(root: Path, output: Path, authorization: dict) -> int:
             row["completed"] for row in report["variants"]
         )
         write_json(output / "diagnostic.json", report)
-        # 只开放本次输出的读取权限，CPU 归档不需要输入资产或缓存的写权限。
+        # Grant read access to this run's output only; the CPU archive needs no write
+        # access to input assets or caches.
         for path in output.rglob("*"):
             if not path.is_symlink():
                 path.chmod(path.stat().st_mode | 0o444 | (0o111 if path.is_dir() else 0))
