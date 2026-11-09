@@ -27,7 +27,9 @@ process_control = control.module_from_path(
 
 
 class ProcessRunner:
-    """转发取消并回收所有后代会话，防止 rank 或编译 worker 污染后续重复。"""
+    """Forward cancellation and reap all descendant sessions so ranks or compiler
+    workers cannot pollute later repeats.
+    """
 
     def __init__(self):
         self.cancelled = False
@@ -36,7 +38,8 @@ class ProcessRunner:
         self.known_processes = {}
 
     def cancel(self, signum, frame):
-        # 信号处理器只记状态，避免重入 /proc 枚举或进程启动临界区。
+        # The signal handler only records state to avoid re-entering /proc enumeration or
+        # process-spawn critical sections.
         self.cancelled = True
 
     def terminate(self):
@@ -70,7 +73,8 @@ class ProcessRunner:
                 return 143 if self.cancelled else self.process.returncode
             finally:
                 try:
-                    # launcher 提前退出或控制器异常时，也必须清理跨 setsid 的后代。
+                    # launcher early exits or controller errors must still
+                    # reap descendants across setsid.
                     self.terminate()
                     try:
                         self.process.wait(timeout=10)
@@ -131,7 +135,7 @@ def repeat_environment(
             "TENSORBOARD_PATH": str(directory / "tensorboard"),
             "CHECKPOINT_SAVE_PATH": str(directory / "checkpoints"),
             "CHECKPOINT_LOAD_PATH": str(directory / "initial-checkpoints"),
-            "DATA_PATH": manifest["config"]["data_path"],
+            "DATA_PATH": str(control.paths.asset_root(manifest, "pod")),
             "DATA_CACHE_PATH": str(directory / "cache"),
             "HF_HOME": str(directory / "cache/huggingface"),
             "HF_HUB_CACHE": str(directory / "cache/huggingface/hub"),
@@ -183,13 +187,15 @@ def repeat_environment(
         (directory / name).mkdir()
     if case["tokenizer_dependencies"]:
         cache_report = control.hf.populate(
-            Path(manifest["config"]["data_path"]),
+            control.paths.asset_root(manifest, "pod"),
             Path(env["HF_HOME"]),
             case["tokenizer_dependencies"],
         )
         write_json(directory / "tokenizer-cache.json", cache_report)
-    # multiprocessing 在 TMPDIR 下创建 AF_UNIX socket；NAS 输出路径会超过地址长度限制。
-    # 仅瞬态临时文件使用每次重复专属的短路径，持久缓存、checkpoint 和证据仍留在输出目录。
+    # multiprocessing creates AF_UNIX sockets under TMPDIR; NAS output paths
+    # exceed the address length limit.
+    # Only transient temporary files use a short per-repeat path; persistent caches, checkpoints and
+    # evidence stay in the output directory.
     with tempfile.TemporaryDirectory(prefix="ppu-fn-", dir="/tmp") as temporary_directory:
         env.update({name: temporary_directory for name in ("TMPDIR", "TMP", "TEMP")})
         yield env
@@ -290,7 +296,7 @@ def run_case(
     results.verify_source(manifest, root, case)
     directory.mkdir(parents=True, exist_ok=False)
     report = control.asset_report(
-        manifest, Path(manifest["config"]["data_path"]), location="pod", case_id=case_id
+        manifest, control.paths.asset_root(manifest, "pod"), location="pod", case_id=case_id
     )
     control.write_asset_report(report, directory)
     if not report["ok"]:
@@ -360,6 +366,8 @@ def main():
     for key in ("target_sha", "control_sha"):
         if manifest["identity"][key] != os.environ[f"PPU_{key.upper()}"]:
             raise ValueError(f"Runtime identity mismatch: {key}")
+    control.paths.require_current(manifest)
+    control.paths.root("PPU_POD_ASSETS_ROOT")
     runner = ProcessRunner()
     signal.signal(signal.SIGTERM, runner.cancel)
     signal.signal(signal.SIGINT, runner.cancel)

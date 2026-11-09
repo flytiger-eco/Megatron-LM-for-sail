@@ -1,6 +1,19 @@
 name: PPU Compiler Diagnostic
 on:
   workflow_call:
+    secrets:
+      PPU_HOST_VOLUMES:
+        required: false
+      PPU_CPU_RUN_ROOT:
+        required: false
+      PPU_POD_RUN_ROOT:
+        required: false
+      PPU_CPU_ASSETS_ROOT:
+        required: false
+      PPU_POD_ASSETS_ROOT:
+        required: false
+      PPU_TOKENIZER_RECEIPTS_ROOT:
+        required: false
     inputs:
       target_sha:
         type: string
@@ -13,6 +26,11 @@ on:
         default: bda
 permissions:
   contents: read
+env:
+  PIP_INDEX_URL: https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
+  PIP_CONFIG_FILE: /dev/null
+  PIP_EXTRA_INDEX_URL: ''
+  PIP_FIND_LINKS: ''
 jobs:
   diagnose:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/ci/ppu-validation' && github.run_attempt == 1
@@ -22,6 +40,14 @@ jobs:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 20
     steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare isolated public evidence exporter
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ppu-public-export"
+          "$RUNNER_TEMP/ppu-public-export/bin/python" -m pip install --index-url "$PIP_INDEX_URL" \
+            'tensorboard==2.20.0' 'google-crc32c==1.7.1' 'pyyaml==6.0.3'
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.control_sha }}
@@ -31,16 +57,26 @@ jobs:
         with:
           name: ppu-authorization
           path: .ppu-ci
-      - name: 核验诊断授权与源码身份
+      - name: Verify diagnostic authorization and source identity
         shell: bash
         env:
           PPU_TARGET_SHA: ${{ inputs.target_sha }}
           PPU_CONTROL_SHA: ${{ inputs.control_sha }}
           PPU_DIAGNOSTIC_CONTEXT: ${{ inputs.diagnostic_context }}
+          PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+          PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+          PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
         run: |
+          python3 -I source/.github/scripts/ppu_ci_paths.py run
           [[ "$(git -C source rev-parse HEAD)" == "$PPU_CONTROL_SHA" ]]
           python3 -I source/.github/scripts/ppu_compiler_diagnostic.py authorize --authorization .ppu-ci/authorization.json --output .ppu-diagnostic-action
-      - name: 单 Pod 八卡有界编译诊断
+      - name: Validate trusted runtime directories
+        env:
+          PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+          PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+          PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+        run: python3 -I source/.github/scripts/ppu_ci_paths.py run
+      - name: Bounded compiler diagnostic on a single 8-card Pod
         id: ppu
         uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
@@ -49,7 +85,7 @@ jobs:
           nproc_per_node: 8
           namespace: ${{ vars.PPU_NAMESPACE || 'ppu-sched' }}
           node_selector: "board-type=ZW-M890P"
-          host_volumes: "ppu://redacted/history-root-003:ppu://redacted/history-root-003,ppu://redacted/history-root-004:ppu://redacted/history-root-000"
+          host_volumes: ${{ secrets.PPU_HOST_VOLUMES }}
           source_dir: /opt/megatron-lm
           artifact_paths: .ppu-ci
           timeout_minutes: 10
@@ -57,7 +93,7 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_DIAGNOSTIC_CONTEXT=${{ inputs.diagnostic_context }},PPU_DIAGNOSTIC_RUN_ID=${{ github.run_id }},PPU_DIAGNOSTIC_RUN_ATTEMPT=${{ github.run_attempt }},PPU_DIAGNOSTIC_OUTPUT=ppu://redacted/history-root-002${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic
+          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_DIAGNOSTIC_CONTEXT=${{ inputs.diagnostic_context }},PPU_DIAGNOSTIC_RUN_ID=${{ github.run_id }},PPU_DIAGNOSTIC_RUN_ATTEMPT=${{ github.run_attempt }},PPU_DIAGNOSTIC_OUTPUT=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic,PPU_POD_RUN_ROOT=${{ secrets.PPU_POD_RUN_ROOT }}
           command: |
             set -euo pipefail
             umask 022
@@ -65,7 +101,7 @@ jobs:
             [[ "$(git -c safe.directory="$PWD/source" -C source rev-parse HEAD)" == "$PPU_CONTROL_SHA" ]]
             timeout --signal=TERM --kill-after=5s 540s python3 -I source/.github/scripts/ppu_compiler_diagnostic.py run \
               --authorization .ppu-ci/authorization.json --root source --output "$PPU_DIAGNOSTIC_OUTPUT/pod"
-      - name: 记录独立诊断执行状态
+      - name: Record standalone diagnostic execution status
         if: always()
         shell: bash
         env:
@@ -75,28 +111,47 @@ jobs:
           ACTION_OUTPUTS: ${{ toJSON(steps.ppu.outputs) }}
         run: |
           mkdir -p "$RESULT_DIR"
+          ACTION_OUTPUTS=$(python3 -I source/.github/scripts/ppu_ci_export.py --action-outputs)
           printf '{"numerical_validation":false,"action_status":"%s","action_outcome":"%s","outputs":%s}\n' \
             "$ACTION_STATUS" "$ACTION_OUTCOME" "$ACTION_OUTPUTS" > "$RESULT_DIR/action.json"
-          printf '%s\n' '独立编译诊断；未执行 Build、UT 或正式模型回归，不计入通过率。' >> "$GITHUB_STEP_SUMMARY"
-      - name: 归档 CPU 本地执行状态
+          printf '%s\n' 'Standalone compiler diagnostic; Build, UT and formal model regression were not run and it does not count toward the pass rate.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Export checked public evidence
+        id: public-diagnose-110
+        if: ${{ always() && !cancelled() }}
+        env:
+          PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+          PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+          PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+          EXPORT_SOURCE: .ppu-diagnostic-action/
+        run: '"$RUNNER_TEMP/ppu-public-export/bin/python" -I source/.github/scripts/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/diagnose-110 --kind evidence'
+      - name: Archive CPU-local execution status
         uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ always() && steps.public-diagnose-110.outcome == 'success' }}
         with:
           name: ppu-compiler-diagnostic-action
-          path: .ppu-diagnostic-action/
+          path: .ppu-public/diagnose-110/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
-      - name: 只读归档 Pod 诊断证据
-        uses: actions/upload-artifact@v4
+      - name: Export checked public evidence
+        id: public-diagnose-119
         if: ${{ always() && steps.ppu.outcome != 'skipped' }}
+        env:
+          PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+          PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+          PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+          EXPORT_SOURCE: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic/pod/
+        run: '"$RUNNER_TEMP/ppu-public-export/bin/python" -I source/.github/scripts/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/diagnose-119 --kind evidence'
+      - name: Archive Pod diagnostic evidence read-only
+        uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.public-diagnose-119.outcome == 'success' }}
         with:
           name: ppu-compiler-diagnostic
-          path: ppu://redacted/history-root-007${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic/pod/
+          path: .ppu-public/diagnose-119/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
-      - name: 核验单 Pod 执行状态
+      - name: Verify single-Pod execution status
         if: ${{ always() && !cancelled() }}
         shell: bash
         env:

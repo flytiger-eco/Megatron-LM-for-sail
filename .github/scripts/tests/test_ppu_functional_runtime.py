@@ -271,7 +271,9 @@ def test_process_runner_cancellation_stops_process_group(tmp_path):
 
 @pytest.mark.parametrize("mode", ["timeout", "cancel", "success", "failure", "exception"])
 def test_process_runner_reaps_real_detached_worker(tmp_path, monkeypatch, mode):
-    """真实 setsid 子进程忽略 TERM；macOS 仅替换不可用的 /proc 枚举边界。"""
+    """A real setsid child ignores TERM; macOS only replaces the
+    unavailable /proc enumeration boundary.
+    """
     runner = runtime.ProcessRunner()
     ready = tmp_path / "worker.pid"
     child = (
@@ -294,7 +296,7 @@ def test_process_runner_reaps_real_detached_worker(tmp_path, monkeypatch, mode):
         if Path("/proc/self/stat").is_file():
             selected = original_family(pid, known)
         else:
-            # 不模拟信号发送或进程退出：这两部分始终使用真实系统调用。
+            # Signal delivery and process exit are never mocked; both always use real system calls.
             candidates = {pid, *known}
             if ready.exists():
                 candidates.add(int(ready.read_text()))
@@ -343,7 +345,7 @@ def test_process_runner_reaps_real_detached_worker(tmp_path, monkeypatch, mode):
                 break
             time.sleep(0.1)
         else:
-            pytest.fail("跨会话 worker 在 launcher 退出后仍存活")
+            pytest.fail("Cross-session worker survived the launcher exit")
     finally:
         if ready.exists():
             worker = int(ready.read_text())
@@ -359,7 +361,9 @@ def test_process_runner_does_not_start_after_cancellation_or_deadline(
 ):
     runner = runtime.ProcessRunner()
     runner.cancelled = cancelled
-    monkeypatch.setattr(runtime.subprocess, "Popen", lambda *_, **__: pytest.fail("不得启动新进程"))
+    monkeypatch.setattr(
+        runtime.subprocess, "Popen", lambda *_, **__: pytest.fail("Must not start new processes")
+    )
     code = runner.run(
         [sys.executable, "-c", "raise SystemExit(0)"],
         cwd=tmp_path,
@@ -482,7 +486,7 @@ def test_model_environment_cannot_override_compiler_policy(
     directory.mkdir()
     with pytest.raises(ValueError, match="compiler.*policy|default parallel compilation"):
         with runtime.repeat_environment(manifest, root, case, directory, 1, 1):
-            pytest.fail("冲突配置不得启动训练")
+            pytest.fail("Conflicting config must not start training")
 
 
 @pytest.mark.parametrize("method", ["fork", "forkserver"])
@@ -521,7 +525,8 @@ with ExitStack() as stack:
 print("eight managers ready")
 ''',
     ]
-    # 新版 Python 会自动回退 /tmp；显式地址保留远端 Python 3.12 的长 socket 路径行为。
+    # Newer Python falls back to /tmp; the explicit address keeps the long socket path
+    # behaviour of remote Python 3.12.
     legacy = subprocess.run(
         [*command, "explicit-address"],
         env={**os.environ, "TMPDIR": str(legacy_tmp)},
@@ -642,11 +647,17 @@ chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
             )
             outcome = "success" if process.returncode == 0 else "failure"
             action_status = "succeeded" if process.returncode == 0 else "failed"
+            local_control = tmp_path / ".ppu-ci/control"
+            local_control.mkdir(parents=True, exist_ok=True)
+            for name in ("ppu_ci_export.py", "ppu_ci_paths.py"):
+                (local_control / name).write_bytes((SCRIPTS / name).read_bytes())
+            local_result = tmp_path / ".ppu-action"
             subprocess.run(
                 ["bash", "-euo", "pipefail", "-c", step["run"]],
+                cwd=tmp_path,
                 env={
                     **os.environ,
-                    "RESULT_DIR": str(output),
+                    "RESULT_DIR": str(local_result),
                     "REQUESTED_AT": "1",
                     "ACTION_OUTCOME": outcome,
                     "ACTION_STATUS": action_status,
@@ -654,7 +665,10 @@ chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
                 },
                 check=True,
             )
-            envelope = json.loads(handoff.read_text())
+            assert (
+                handoff.read_text() == ""
+            ), "CPU envelope must not modify the private Pod placeholder"
+            envelope = json.loads((local_result / "action-timing.json").read_text())
             assert envelope["action_outcome"] == outcome
             assert envelope["action_status"] == action_status
             assert envelope["requested_at"] == 1
@@ -665,7 +679,9 @@ chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
 
 
 def test_configure_archives_complete_standalone_runtime_dependencies(tmp_path):
-    """执行真实 CPU 配置步骤，再从隔离产物冷启动运行器，检查传递依赖。"""
+    """Run the real CPU configure step, then cold-start the runner from isolated artifacts to
+    check transitive dependencies.
+    """
     workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())
     step = next(
         step for step in workflow["jobs"]["configure"]["steps"] if step.get("id") == "config"
@@ -734,13 +750,13 @@ def test_workflow_functional_route_is_manual_only_and_preserves_ut():
     assert "needs.functional-assets.result == 'success'" in execute["admit-build"]["if"]
     assert not any(
         "ppu-distributed-action" in step.get("uses", "")
+        or "shared-workflows/cluster-task" in step.get("uses", "")
         for step in execute["functional-assets"]["steps"]
     )
     test = workflow["jobs"]["test"]
     assert test["strategy"]["max-parallel"] == 1 and test["strategy"]["fail-fast"] is False
-    action = next(
-        step for step in test["steps"] if "ppu-distributed-action" in step.get("uses", "")
-    )
+    action = next(step for step in test["steps"] if step.get("id") == "ppu")
+    assert action["uses"] == "flytiger-eco/shared-workflows/cluster-task@main"
     assert action["with"]["nproc_per_node"] == 8
     assert action["with"]["node_selector"] == "board-type=ZW-M890P"
     assert action["with"]["image"] == functional.IMAGE
@@ -752,20 +768,16 @@ def test_workflow_uploads_evidence_without_checkpoint_payloads():
     workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-functional.yml").read_text())
     steps = workflow["jobs"]["test"]["steps"]
     upload = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
-    root = (
-        "ppu://redacted/history-root-007${{ github.run_id }}-${{ github.run_attempt }}"
-        "/functional/${{ matrix.id }}"
-    )
-    assert upload["with"]["path"].strip().splitlines() == [
-        root,
-        f"!{root}/**/checkpoints/**",
-        f"!{root}/**/initial-checkpoints/**",
-    ]
+    assert upload["with"]["path"].startswith(".ppu-public/")
+    assert "outcome == 'success'" in upload["if"]
+    exporter = next(step for step in steps if step.get("id") == "public-test-152")
+    assert exporter["env"]["EXPORT_SOURCE"].startswith("${{ secrets.PPU_CPU_RUN_ROOT }}/")
+    assert "--overlay .ppu-action" in exporter["run"]
     assert upload["with"]["include-hidden-files"] is True
     assert upload["with"]["if-no-files-found"] == "error"
     assert upload["with"]["retention-days"] == 7
     names = [step.get("name") for step in steps]
-    assert names.index("Record omitted checkpoint payloads") == names.index(upload["name"]) - 1
+    assert names.index("Record omitted checkpoint payloads") == names.index(upload["name"]) - 2
 
 
 def test_checkpoint_omission_report_records_excluded_payloads(tmp_path):
@@ -783,12 +795,18 @@ def test_checkpoint_omission_report_records_excluded_payloads(tmp_path):
     (repeat / "initial-checkpoints/base.bin").write_bytes(b"y" * 3)
     (repeat / "logs").mkdir()
     (repeat / "logs/rank.log").write_text("ok")
+    control = tmp_path / ".ppu-ci/control"
+    control.mkdir(parents=True)
+    for name in ("ppu_ci_export.py", "ppu_ci_paths.py"):
+        (control / name).write_bytes((SCRIPTS / name).read_bytes())
     subprocess.run(
         ["bash", "-euo", "pipefail", "-c", step["run"]],
+        cwd=tmp_path,
         env={**os.environ, "RESULT_DIR": str(result)},
         check=True,
     )
-    report = json.loads((result / "checkpoint-omissions.json").read_text())
+    assert not (result / "checkpoint-omissions.json").exists()
+    report = json.loads((tmp_path / ".ppu-action/checkpoint-omissions.json").read_text())
     assert report == {
         "omitted": [
             {"path": "attempt-1/repeat-1/checkpoints", "files": 1, "bytes": 10},
@@ -808,8 +826,13 @@ def test_checkpoint_omission_report_does_not_create_missing_results(tmp_path):
         if step.get("name") == "Record omitted checkpoint payloads"
     )
     result = tmp_path / "functional-999"
+    control = tmp_path / ".ppu-ci/control"
+    control.mkdir(parents=True)
+    for name in ("ppu_ci_export.py", "ppu_ci_paths.py"):
+        (control / name).write_bytes((SCRIPTS / name).read_bytes())
     subprocess.run(
         ["bash", "-euo", "pipefail", "-c", step["run"]],
+        cwd=tmp_path,
         env={**os.environ, "RESULT_DIR": str(result)},
         check=True,
     )

@@ -1,4 +1,6 @@
-"""完整 BERT 诊断的历史身份、单次预算、冷启动采样与原入口隔离测试。"""
+"""Tests for the full BERT diagnostic: historical identity, single budget, cold-start
+sampling and original entry isolation.
+"""
 
 import hashlib
 import json
@@ -74,7 +76,7 @@ def test_bert_rejects_rerun_or_wrong_control(change):
 def historical_bundle(functional_bundle, evidence, monkeypatch):
     _, bundle = functional_bundle
     manifest, _, _ = evidence
-    # 固定历史 bundle 不包含后续新增的 functional 编译池适配。
+    # The fixed historical bundle does not include the later functional compile-pool adaptation.
     manifest["config"].pop("compiler_environment")
     manifest["identity"] = {
         "target_sha": bert.HISTORICAL_SHA,
@@ -132,7 +134,9 @@ def test_corrupt_or_resealed_history_never_reaches_pod(
     (bundle / name).write_text("corrupt")
     if reseal and name not in ("manifest.json", "bundle-integrity.json"):
         bert.bundle_control.seal_bundle(bundle)
-    monkeypatch.setattr(bert.subprocess, "Popen", lambda *_, **__: pytest.fail("预检禁止启动进程"))
+    monkeypatch.setattr(
+        bert.subprocess, "Popen", lambda *_, **__: pytest.fail("Preflight must not start processes")
+    )
     with pytest.raises((ValueError, OSError, KeyError)):
         bert.preflight(tmp_path / "cpu-envelope")
     report = json.loads((tmp_path / "cpu-envelope/historical-preflight.json").read_text())
@@ -224,7 +228,9 @@ def test_corruption_during_copy_prevents_extraction(historical_bundle, tmp_path,
             (Path(target) / "environment.tar.gz").write_text("partial")
 
     monkeypatch.setattr(bert.shutil, "copytree", corrupt)
-    monkeypatch.setattr(bert.subprocess, "run", lambda *_, **__: pytest.fail("不得展开损坏副本"))
+    monkeypatch.setattr(
+        bert.subprocess, "run", lambda *_, **__: pytest.fail("A damaged copy must not be extracted")
+    )
     with pytest.raises(ValueError):
         bert.execute(work, output)
 
@@ -365,7 +371,7 @@ def test_no_launch_after_budget_or_cancellation(tmp_path, monkeypatch, cancelled
     runner = diagnostic.DiagnosticRunner()
     runner.cancelled = cancelled
     monkeypatch.setattr(
-        diagnostic.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("不得启动")
+        diagnostic.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("Must not start")
     )
     report = runner.run(["unused"], {}, tmp_path, time.monotonic() - 1)
     assert report["exit_code"] == (143 if cancelled else 124)
@@ -373,7 +379,7 @@ def test_no_launch_after_budget_or_cancellation(tmp_path, monkeypatch, cancelled
 
 @pytest.mark.parametrize("mode", ["timeout", "cancel", "success", "failure", "exception"])
 def test_real_detached_workers_are_reaped_and_cleanup_recorded(tmp_path, monkeypatch, mode):
-    """真实跨 session 信号测试；macOS 只替换不可用的 /proc 读取。"""
+    """Real cross-session signal test; macOS only replaces the unavailable /proc reads."""
     runner = diagnostic.DiagnosticRunner()
     ready = tmp_path / "worker.pid"
     child = (
@@ -462,7 +468,11 @@ def test_dispatch_wires_bound_context_before_only_ppu_action():
     )
     workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-compiler-diagnostic.yml").read_text())
     steps = workflow["jobs"]["diagnose"]["steps"]
-    preflight = next(step for step in steps if step.get("name") == "核验诊断授权与源码身份")
+    preflight = next(
+        step
+        for step in steps
+        if step.get("name") == "Verify diagnostic authorization and source identity"
+    )
     action = next(step for step in steps if step.get("id") == "ppu")
     assert steps.index(preflight) < steps.index(action) and "if" not in action
     assert preflight["env"]["PPU_DIAGNOSTIC_CONTEXT"] == "${{ inputs.diagnostic_context }}"

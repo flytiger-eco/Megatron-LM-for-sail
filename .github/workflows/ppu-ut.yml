@@ -1,6 +1,19 @@
 name: PPU UT
 on:
   workflow_call:
+    secrets:
+      PPU_HOST_VOLUMES:
+        required: false
+      PPU_CPU_RUN_ROOT:
+        required: false
+      PPU_POD_RUN_ROOT:
+        required: false
+      PPU_CPU_ASSETS_ROOT:
+        required: false
+      PPU_POD_ASSETS_ROOT:
+        required: false
+      PPU_TOKENIZER_RECEIPTS_ROOT:
+        required: false
     inputs:
       matrix:
         type: string
@@ -43,6 +56,12 @@ jobs:
         with:
           name: ppu-plan
           path: .ppu-ci
+      - name: Validate trusted runtime directories
+        env:
+          PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+          PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+          PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+        run: python3 -I .ppu-ci/control/ppu_ci_paths.py run
       - name: Run PPU UT bucket
         id: ppu
         uses: flytiger-eco/shared-workflows/cluster-task@main
@@ -52,7 +71,7 @@ jobs:
           nproc_per_node: ${{ matrix.cards }}
           namespace: ${{ vars.PPU_NAMESPACE || 'ppu-sched' }}
           node_selector: "board-type=ZW-M890P"
-          host_volumes: "ppu://redacted/history-root-003:ppu://redacted/history-root-003,ppu://redacted/history-root-004:ppu://redacted/history-root-000"
+          host_volumes: ${{ secrets.PPU_HOST_VOLUMES }}
           source_dir: /opt/megatron-lm
           artifact_paths: .ppu-ci
           timeout_minutes: ${{ matrix.action_minutes }}
@@ -60,7 +79,7 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=ppu://redacted/history-root-002${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_RESULTS_DIR=ppu://redacted/history-root-002${{ github.run_id }}-${{ github.run_attempt }}/unit/${{ matrix.id }}
+          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_RESULTS_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/unit/${{ matrix.id }}
           command: |
             set -euo pipefail
             cd /opt/megatron-lm
@@ -74,12 +93,21 @@ jobs:
             mkdir source
             tar -xzf "$PPU_ARTIFACT_DIR/source.tar.gz" -C source
             bash "$PPU_CONTROL_DIR/ppu_ci_run.sh" '${{ matrix.id }}'
+      - name: Export checked public evidence
+        id: public-test-100
+        if: ${{ always() && !cancelled() }}
+        env:
+          PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+          PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+          PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+          EXPORT_SOURCE: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/unit/${{ matrix.id }}/
+        run: python3 -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/test-100 --kind evidence
       - name: Upload actual results, logs, and coverage for each rank
-        if: always()
         uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.public-test-100.outcome == 'success' }}
         with:
           name: ppu-ut-${{ matrix.id }}
-          path: ppu://redacted/history-root-007${{ github.run_id }}-${{ github.run_attempt }}/unit/${{ matrix.id }}/
+          path: .ppu-public/test-100/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
@@ -108,10 +136,16 @@ jobs:
         env:
           PPU_MATRIX_RESULT: ${{ needs.test.result }}
         run: python3 -I .ppu-ci/control/ppu_ci.py summarize --results results
+      - name: Export checked public evidence
+        id: public-result-132
+        if: ${{ always() && !cancelled() }}
+        env:
+          EXPORT_SOURCE: results/summary.json
+        run: python3 -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/result-132 --kind evidence
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ always() && steps.public-result-132.outcome == 'success' }}
         with:
           name: ppu-ut-summary
-          path: results/summary.json
+          path: .ppu-public/result-132/
           if-no-files-found: error
           retention-days: 7

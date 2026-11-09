@@ -16,7 +16,8 @@ from pathlib import Path
 
 NVRX_VERSION = "0.6.0"
 NAMESPACE_PTH = "00-ppu-functional-google-namespace.pth"
-# 先建立完整的 PEP 420 namespace，避免继承的 nspkg 启动钩子将 google 固定到系统目录。
+# Build a complete PEP 420 namespace first so inherited nspkg startup hooks cannot pin
+# google to the system directory.
 NAMESPACE_BOOTSTRAP = "import importlib; importlib.invalidate_caches(); import google\n"
 TRAINING_PACKAGES = {
     "pla": "1.0.0+v0.1.0.ppu2.2.0",
@@ -64,7 +65,9 @@ def command_output(command):
 
 
 def nvrx_requirements(manifest: dict) -> dict:
-    """Build 与执行 Pod 共用同一份清单，不能仅按 launcher 判断依赖。"""
+    """Build and the execution Pod share one inventory; dependencies cannot be
+    judged from the launcher alone.
+    """
     return {
         case_id: {"launcher": case["launcher"], "checkpoint": case["nvrx_checkpoint"]}
         for case_id, case in manifest["functional"].items()
@@ -73,7 +76,9 @@ def nvrx_requirements(manifest: dict) -> dict:
 
 
 def check_nvrx(requirements: dict) -> dict:
-    """只导入并核验原 API，不启动 worker、通信组或 checkpoint 写入。"""
+    """Only import and verify the original APIs; never start workers,
+    process groups or checkpoint writes.
+    """
     if not requirements:
         return {}
     version = importlib.metadata.version("nvidia-resiliency-ext")
@@ -123,7 +128,9 @@ def check_nvrx(requirements: dict) -> dict:
 
 
 def check_apex_layer_norm() -> dict:
-    """核验原始 LayerNorm 调用接口及后端选择，不执行训练算子。"""
+    """Verify the original LayerNorm call interface and backend selection
+    without running training kernels.
+    """
     fused = importlib.import_module("megatron.core.fusions.fused_layer_norm")
     if not fused.HAVE_FUSED_LAYER_NORM or not fused.HAVE_PERSIST_LAYER_NORM:
         raise ValueError("Megatron did not enable Apex fused and persistent LayerNorm")
@@ -157,7 +164,9 @@ def check_apex_layer_norm() -> dict:
 
 
 def check_training_dependencies(bundle: Path) -> dict:
-    """Build 与 Pod 都检查真实导入，不能仅凭包名或被吞掉的 ImportError 放行。"""
+    """Build and the Pod both check real imports; a package name or a swallowed
+    ImportError is not enough to pass.
+    """
     packages = {}
     for name, expected in TRAINING_PACKAGES.items():
         installed = importlib.metadata.version(name)
@@ -173,7 +182,8 @@ def check_training_dependencies(bundle: Path) -> dict:
             if not callable(getattr(module, symbol, None)):
                 raise ValueError(f"Missing functional dependency API: {name}.{symbol}")
         if name == "fla.modules.l2norm":
-            # 安装完整 FLA 后仍须保留已有的最后一维参数适配。
+            # The existing last-dimension argument adaptation must stay after
+            # installing the full FLA package.
             inspect.signature(module.l2norm).bind(object(), dim=-1, eps=1e-6)
         imports[name] = str(Path(module.__file__).resolve())
     optimizer = importlib.import_module("megatron.core.optimizer.emerging_optimizers")
@@ -185,7 +195,8 @@ def check_training_dependencies(bundle: Path) -> dict:
     installation = json.loads((bundle / "functional-package-install.json").read_text())
     if installation.get("version") != "1" or not isinstance(installation.get("install"), list):
         raise ValueError("Invalid functional package installation report")
-    # 原始 pip 报告随 bundle 一并封存；没有条目只表示本次解析前已满足，不能伪造下载来源。
+    # The raw pip report is sealed with the bundle; no entry only means it was already satisfied,
+    # never a fabricated download source.
     sources = {
         item["metadata"]["name"].lower().replace("_", "-"): item["download_info"]
         for item in installation["install"]
@@ -202,7 +213,9 @@ def check_training_dependencies(bundle: Path) -> dict:
 
 
 def check_postprocessing(root: Path) -> dict:
-    """在全新 uv 子进程中先导入原比较器，避免训练依赖的导入顺序掩盖 namespace 缺陷。"""
+    """Import the original comparators first in a fresh uv subprocess so training import order
+    cannot mask namespace defects.
+    """
     probe = f'''
 import hashlib
 import json
@@ -254,7 +267,8 @@ print(json.dumps({{
         or Path(report["prefix"]).resolve() != Path(sys.prefix).resolve()
     ):
         raise ValueError("Functional postprocessing source or interpreter mismatch")
-    # 原提取器也须独立启动成功；不以父进程预热后的导入结果代替。
+    # The original extractor must also start on its own; imports warmed up by
+    # the parent process do not count.
     extractor = (
         root / "tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py"
     )
@@ -318,7 +332,8 @@ def prepare(bundle: Path, manifest: dict):
         bundle / "control/ppu_functional_pytest.py", Path(site) / "ppu_functional_pytest.py"
     )
     startup = Path(site) / NAMESPACE_PTH
-    # 只新增到本次 functional venv，不删除系统 google 目录或其他分发包的启动钩子。
+    # Only add to this functional venv; never remove the system google directory or
+    # startup hooks of other distributions.
     with startup.open("x") as stream:
         stream.write(NAMESPACE_BOOTSTRAP)
 
@@ -339,7 +354,9 @@ print(json.dumps({
 
 
 def check_compiler(manifest: dict) -> dict:
-    """在全新解释器导入配置，验证环境开关确实生效；不执行算子或创建编译池。"""
+    """Import the config in a fresh interpreter to verify the environment switch takes
+    effect; no kernels or compile pools.
+    """
     if "compiler_environment" not in manifest["config"]:
         return {}
     settings = manifest["config"]["compiler_environment"]

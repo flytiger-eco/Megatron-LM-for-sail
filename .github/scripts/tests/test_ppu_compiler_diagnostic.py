@@ -1,4 +1,4 @@
-"""编译诊断的入口互斥、授权、预算和栈采集 CPU 测试。"""
+"""CPU tests for compiler diagnostic entry exclusivity, authorization, budget and stack capture."""
 
 import hashlib
 import importlib.util
@@ -176,7 +176,7 @@ def test_workflow_dispatch_defaults_and_job_exclusion():
     workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
     inputs = workflow.get("on", workflow.get(True))["workflow_dispatch"]["inputs"]
     assert inputs["compiler_diagnostic"] == {
-        "description": "独立编译诊断（单 Pod 八卡，最多 10 分钟；不运行 Build、UT 或正式回归）",
+        "description": "Standalone compiler diagnostic (single 8-card Pod, at most 10 minutes; no Build, UT or formal regression)",
         "type": "boolean",
         "default": False,
     }
@@ -218,10 +218,21 @@ def test_fixed_single_pod_budget_and_no_build_or_test_entrypoints():
         "ppu_ci_build.sh",
         "ppu_ci_run.sh",
         "ppu_functional_run.sh",
-        "pip install",
         "run_ci_test.sh",
     ):
         assert forbidden not in text
+    assert "pip install" not in config["command"]
+    steps = job["steps"]
+    prepare = next(
+        i
+        for i, step in enumerate(steps)
+        if step.get("name") == "Prepare isolated public evidence exporter"
+    )
+    assert all(
+        prepare < i
+        for i, step in enumerate(steps)
+        if step.get("uses") in ("actions/checkout@v4", "actions/download-artifact@v4")
+    )
 
 
 def test_cold_cache_variant_environments(tmp_path):
@@ -398,7 +409,7 @@ def test_cleanup_kills_worker_after_launcher_exits(tmp_path, monkeypatch):
         time.sleep(0.1)
     else:
         os.kill(worker, signal.SIGKILL)
-        pytest.fail("编译 worker 未随诊断进程组回收")
+        pytest.fail("Compiler worker was not reaped with the diagnostic process group")
 
 
 @pytest.mark.parametrize(
@@ -485,12 +496,20 @@ def test_cross_session_discovery_orphans_and_pid_reuse(tmp_path, monkeypatch):
 def test_cpu_envelope_and_pod_evidence_have_separate_ownership():
     workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-compiler-diagnostic.yml").read_text())
     steps = workflow["jobs"]["diagnose"]["steps"]
-    setup = next(step for step in steps if step.get("name") == "核验诊断授权与源码身份")
+    setup = next(
+        step
+        for step in steps
+        if step.get("name") == "Verify diagnostic authorization and source identity"
+    )
     assert "mkdir" not in setup["run"] and "RESULT_DIR" not in setup["env"]
     action = next(step for step in steps if step.get("id") == "ppu")
     assert '--output "$PPU_DIAGNOSTIC_OUTPUT/pod"' in action["with"]["command"]
     assert "umask 022" in action["with"]["command"]
-    envelope = next(step for step in steps if step.get("name") == "记录独立诊断执行状态")
+    envelope = next(
+        step
+        for step in steps
+        if step.get("name") == "Record standalone diagnostic execution status"
+    )
     assert envelope["env"]["RESULT_DIR"] == ".ppu-diagnostic-action"
     assert envelope["env"]["ACTION_OUTPUTS"] == "${{ toJSON(steps.ppu.outputs) }}"
     uploads = {
@@ -500,17 +519,14 @@ def test_cpu_envelope_and_pod_evidence_have_separate_ownership():
     }
     local = uploads["ppu-compiler-diagnostic-action"]
     pod = uploads["ppu-compiler-diagnostic"]
-    assert local["if"] == envelope["if"] == "always()"
-    assert local["with"]["path"] == envelope["env"]["RESULT_DIR"] + "/"
-    assert pod["if"] == "${{ always() && steps.ppu.outcome != 'skipped' }}"
-    assert pod["with"]["path"] == (
-        "ppu://redacted/history-root-007${{ github.run_id }}-${{ github.run_attempt }}"
-        "/compiler-diagnostic/pod/"
-    )
+    assert envelope["if"] == "always()"
+    assert "outcome == 'success'" in local["if"] and "outcome == 'success'" in pod["if"]
+    assert local["with"]["path"].startswith(".ppu-public/")
+    assert pod["with"]["path"].startswith(".ppu-public/")
+    exports = [step for step in steps if step.get("name") == "Export checked public evidence"]
+    assert exports[0]["env"]["EXPORT_SOURCE"] == envelope["env"]["RESULT_DIR"] + "/"
+    assert exports[1]["env"]["EXPORT_SOURCE"].startswith("${{ secrets.PPU_CPU_RUN_ROOT }}/")
     assert all(step["with"]["if-no-files-found"] == "error" for step in uploads.values())
-    for step in steps:
-        if "run" in step:
-            assert "ppu://redacted/history-root-004" not in json.dumps(step)
 
 
 @pytest.mark.parametrize(
@@ -519,11 +535,19 @@ def test_cpu_envelope_and_pod_evidence_have_separate_ownership():
 def test_cpu_envelope_runs_without_nas_write_permission(tmp_path, outcome, status):
     workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-compiler-diagnostic.yml").read_text())
     steps = workflow["jobs"]["diagnose"]["steps"]
-    envelope = next(step for step in steps if step.get("name") == "记录独立诊断执行状态")
+    envelope = next(
+        step
+        for step in steps
+        if step.get("name") == "Record standalone diagnostic execution status"
+    )
     nas = tmp_path / "nas"
     nas.mkdir(mode=0o555)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    scripts = workspace / "source/.github/scripts"
+    scripts.mkdir(parents=True)
+    for name in ("ppu_ci_export.py", "ppu_ci_paths.py"):
+        (scripts / name).write_bytes((SCRIPTS / name).read_bytes())
     outputs = {"job_status": status} if status else {}
     env = {
         **os.environ,

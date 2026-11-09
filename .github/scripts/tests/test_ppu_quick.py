@@ -316,7 +316,13 @@ def test_configure_cli_separates_control_and_source(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     manifest = json.loads((output / "manifest.json").read_text())
-    assert manifest["identity"] == {**IDENTITY, "pr_head_sha": "", "base_sha": ""}
+    assert manifest["identity"] == {
+        **IDENTITY,
+        "pr_head_sha": "",
+        "base_sha": "",
+        "run_id": "",
+        "run_attempt": "",
+    }
     expected_scope = ci.load_policy()["daily_scope"]
     assert manifest["config"]["scope"] == expected_scope
     assert len(manifest["unit"]) == (6 if expected_scope == "quick" else 37)

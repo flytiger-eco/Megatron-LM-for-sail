@@ -1,7 +1,10 @@
-"""获批 tokenizer 的独立准备、固定来源校验与离线缓存复制；不包含模型权重。"""
+"""Standalone preparation, fixed-source verification and offline cache copy for
+approved tokenizers; no model weights.
+"""
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -12,9 +15,18 @@ from pathlib import Path
 
 LOCK = Path(".github/ppu-functional-tokenizers.json")
 CACHE_RELATIVE = Path("tokenizers/huggingface")
-APPROVED_DESTINATION = Path(
-    "ppu://redacted/history-root-006"
-)
+
+
+def approved_destination() -> Path:
+    """Only trusted runtime configuration can authorize the preparation root."""
+    spec = importlib.util.spec_from_file_location(
+        "ppu_hf_paths", Path(__file__).with_name("ppu_ci_paths.py")
+    )
+    paths = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(paths)
+    return paths.root("PPU_CPU_ASSETS_ROOT") / CACHE_RELATIVE
+
+
 MAX_FILE_BYTES = 20 * 1024 * 1024
 REPOSITORIES = {
     "gpt2": "openai-community/gpt2",
@@ -87,7 +99,7 @@ def validate_source(repository: str, source: dict) -> None:
 
 
 def read_file(root: Path, relative: str | Path) -> bytes:
-    """仅读取预期的小型普通文件，拒绝缓存内的符号链接和路径越界。"""
+    """Read only expected small regular files; reject symlinks and path escapes inside the cache."""
     relative = Path(relative)
     if (
         relative.is_absolute()
@@ -148,7 +160,9 @@ def sources_for(dependencies: list) -> dict:
 
 
 def cache_files(sources: dict) -> dict:
-    """HF 的原仓库别名和 refs/main 均保留，原训练参数无须添加 revision。"""
+    """HF keeps the original repository alias and refs/main, so the original
+    training arguments need no revision.
+    """
     files = {}
     for repository, source in sorted(sources.items()):
         validate_source(repository, source)
@@ -194,7 +208,9 @@ def verify_cache(root: Path, sources: dict) -> dict:
 
 
 def inspect_candidate(data_root: Path) -> dict:
-    """只读回传获准路径内的候选清单及缓存一致性，不提升其信任级别。"""
+    """Return the candidate inventory and cache consistency under approved paths read-only,
+    without raising their trust level.
+    """
     relative = CACHE_RELATIVE / "source-lock.json"
     report = {
         "checked_path": str(data_root / relative),
@@ -235,7 +251,9 @@ def inspect_candidate(data_root: Path) -> dict:
 
 
 def inspect_receipts(directory: Path) -> dict:
-    """仅回传准备凭据的摘要、已知成功输出及退出码，不公开原始日志或提升信任。"""
+    """Return only digests of the preparation credentials, known success output and exit codes;
+    never expose raw logs or raise trust.
+    """
     report = {"checked_path": str(directory), "status": "unreadable", "files": [], "reason": ""}
     expected = {"repositories": sorted(REPOSITORIES), "numerical_validation": False}
     try:
@@ -311,7 +329,7 @@ def inspect_receipts(directory: Path) -> dict:
 
 
 def populate(data_root: Path, destination: Path, dependencies: list) -> dict:
-    """逐重复复制并复算；不向输入 NAS 写回，也不携带额外缓存文件。"""
+    """Copy and re-verify per repeat; never write back to input NAS or carry extra cache files."""
     input_root, output_root = data_root.resolve(), destination.resolve()
     if output_root.is_relative_to(input_root) or input_root.is_relative_to(output_root):
         raise ValueError("Tokenizer output must not overlap the input asset root")
@@ -332,7 +350,9 @@ def populate(data_root: Path, destination: Path, dependencies: list) -> dict:
 
 
 class OfficialRedirect(urllib.request.HTTPRedirectHandler):
-    """仅接受官方 HTTPS 重定向；不把授权范围扩展到任意镜像或下载站。"""
+    """Accept only official HTTPS redirects; never extend authorization to
+    arbitrary mirrors or download sites.
+    """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         validate_redirect(req.full_url, newurl)
@@ -352,7 +372,9 @@ def validate_url(url: str) -> None:
 
 
 def validate_redirect(origin: str, target: str) -> None:
-    """重定向只能规范化批准仓库名或进入同一 commit 的官方小文件缓存。"""
+    """Redirects may only normalize the approved repository name or enter the official
+    small-file cache of the same commit.
+    """
     validate_url(origin)
     validate_url(target)
     old, new = urllib.parse.urlsplit(origin).path, urllib.parse.urlsplit(target).path
@@ -395,7 +417,9 @@ def validate_content(name: str, content: bytes) -> None:
 
 
 def prepare(destination: Path, *, fetch=None) -> dict:
-    """仅显式命令调用：先解析官方 commit，再按该 commit 下载 allowlist。"""
+    """Explicit command only: resolve the official commit first, then
+    download the allowlist at that commit.
+    """
     if destination.exists() or destination.is_symlink():
         raise FileExistsError("Refusing to overwrite an existing tokenizer cache")
     fetch = fetch or fetch_official
@@ -436,7 +460,8 @@ def prepare(destination: Path, *, fetch=None) -> dict:
             "files": files,
         }
         validate_source(repository, sources[repository])
-    # 所有网络及内容校验成功后才创建新缓存；已有 vocab/merges 或缓存一律不覆盖。
+    # Create a new cache only after all network and content checks pass; never overwrite
+    # existing vocab/merges or caches.
     destination.mkdir(parents=True, exist_ok=False)
     for name, content in contents.items():
         path = destination / name
@@ -454,16 +479,15 @@ def prepare(destination: Path, *, fetch=None) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("prepare", "verify"))
-    parser.add_argument("--destination", type=Path, default=APPROVED_DESTINATION)
+    parser.add_argument("--destination", type=Path)
     parser.add_argument("--lock", type=Path)
     args = parser.parse_args()
     if args.command == "prepare":
         if os.environ.get("GITHUB_ACTIONS") == "true":
             raise ValueError("Tokenizer preparation is separate from CI asset preflight")
-        if (
-            args.destination != APPROVED_DESTINATION
-            or args.destination.resolve() != APPROVED_DESTINATION
-        ):
+        authorized = approved_destination()
+        args.destination = args.destination or authorized
+        if args.destination != authorized or args.destination.resolve() != authorized:
             raise ValueError(
                 "Tokenizer preparation requires the explicitly approved NAS destination"
             )
@@ -473,6 +497,7 @@ def main() -> None:
             )
         lock = prepare(args.destination)
     else:
+        args.destination = args.destination or approved_destination()
         if not args.lock:
             raise ValueError("Read-only verification requires an explicitly supplied trusted lock")
         lock = unique_json(read_file(args.lock.parent, args.lock.name))

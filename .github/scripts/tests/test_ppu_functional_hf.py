@@ -1,4 +1,6 @@
-"""HF 来源、只读资产门禁、逐重复隔离及原 tokenizer 离线行为的 CPU 回归。"""
+"""HF source pinning, read-only asset gates, per-repeat isolation and original tokenizer
+offline behaviour (CPU regression).
+"""
 
 import copy
 import io
@@ -27,7 +29,9 @@ def encoded(value):
 
 @pytest.fixture
 def official():
-    """合成官方响应结构，不代表已下载真实资产或获得真实官方 SHA。"""
+    """Synthetic official response structure; does not mean real assets were downloaded
+    or real official SHAs obtained.
+    """
     payloads = {}
     for repository, canonical in hf.REPOSITORIES.items():
         if repository == "gpt2":
@@ -282,7 +286,7 @@ def test_prepare_never_overwrites_existing_or_linked_directory(tmp_path):
     (original / "vocab.json").write_bytes(b"original")
     linked = tmp_path / "linked"
     linked.symlink_to(original, target_is_directory=True)
-    fetch = Mock(side_effect=AssertionError("下载不应发生"))
+    fetch = Mock(side_effect=AssertionError("Downloads must not occur"))
     for path in (original, linked):
         with pytest.raises(FileExistsError):
             hf.prepare(path, fetch=fetch)
@@ -518,7 +522,9 @@ def test_asset_preflight_reads_fixed_digests_without_downloading(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"explicit input fixture")
     bind_case(case, lock)
-    monkeypatch.setattr(hf, "fetch_official", Mock(side_effect=AssertionError("资产预检禁止下载")))
+    monkeypatch.setattr(
+        hf, "fetch_official", Mock(side_effect=AssertionError("Asset preflight must not download"))
+    )
     before = snapshot(data)
     report = functional.asset_report(manifest, data, location=location)
     assert report["ok"] and report["result"] == "assets_ready"
@@ -539,7 +545,9 @@ def test_candidate_readback_is_read_only_and_does_not_download(provisioned, monk
     (destination / "unapproved-extra").write_bytes(b"private_marker")
     before = snapshot(data)
     trusted_before = hf.load_sources(ROOT)
-    monkeypatch.setattr(hf, "fetch_official", Mock(side_effect=AssertionError("禁止隐式下载")))
+    monkeypatch.setattr(
+        hf, "fetch_official", Mock(side_effect=AssertionError("Implicit downloads are not allowed"))
+    )
     reader = Mock(wraps=hf.read_file)
     monkeypatch.setattr(hf, "read_file", reader)
     report = hf.inspect_candidate(data)
@@ -655,7 +663,9 @@ def test_preparation_receipts_export_only_expected_fields(tmp_path, monkeypatch)
     before = snapshot(directory)
     reader = Mock(wraps=hf.read_file)
     monkeypatch.setattr(hf, "read_file", reader)
-    monkeypatch.setattr(hf, "fetch_official", Mock(side_effect=AssertionError("禁止下载")))
+    monkeypatch.setattr(
+        hf, "fetch_official", Mock(side_effect=AssertionError("Downloads are not allowed"))
+    )
     report = hf.inspect_receipts(directory)
     assert report["status"] == "inspected" and not report["reason"]
     rows = {row["name"]: row for row in report["files"]}
@@ -791,17 +801,25 @@ def test_candidate_cli_never_promotes_trust_or_changes_gate(
                 "purpose": "MODEL_ARGS.tokenizer",
             }
         ]
+    manifest["schema_version"] = 2
+    manifest["config"].update(data_path="ppu://assets/pod", cpu_data_path="ppu://assets/cpu")
+    monkeypatch.setenv(f"PPU_{location.upper()}_ASSETS_ROOT", str(data))
+    monkeypatch.setenv("PPU_TOKENIZER_RECEIPTS_ROOT", str(tmp_path))
     output = tmp_path / "cpu-plan"
     output.mkdir()
     manifest_path = output / "manifest.json"
     manifest_path.write_bytes(encoded(manifest))
-    baseline = functional.asset_report(manifest, data, location=location)
+    baseline = functional.public_asset_report(
+        functional.asset_report(manifest, data, location=location)
+    )
     before = snapshot(data)
     inspect = Mock(wraps=hf.inspect_candidate)
     monkeypatch.setattr(hf, "inspect_candidate", inspect)
     receipts = Mock(return_value={"status": "inspected", "files": []})
     monkeypatch.setattr(hf, "inspect_receipts", receipts)
-    monkeypatch.setattr(hf, "fetch_official", Mock(side_effect=AssertionError("禁止隐式下载")))
+    monkeypatch.setattr(
+        hf, "fetch_official", Mock(side_effect=AssertionError("Implicit downloads are not allowed"))
+    )
     summary = tmp_path / "step-summary"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
     monkeypatch.setattr(
@@ -953,7 +971,8 @@ def test_original_auto_tokenizer_call_in_fresh_offline_process(
     deps = dependencies(lock, [repository])
     hf.populate(data, cache, deps)
     source = ROOT / "megatron/core/tokenizers/text/libraries/huggingface_tokenizer.py"
-    # 只执行原构造函数的 AutoTokenizer 调用段；不是完整 Megatron/PPU 训练验收。
+    # Run only the AutoTokenizer call section of the original constructor; not a full
+    # Megatron/PPU training acceptance.
     program = '''
 import ast, json, socket, sys
 from pathlib import Path
@@ -1015,7 +1034,9 @@ print(json.dumps(dict(repository=repository, tokens=len(ids), offline=True)))
 def test_complete_original_tokenizer_classes_offline(
     provisioned, tmp_path, repository, include_special_tokens
 ):
-    """执行完整原类与映射，隔离训练栈导入；不替代真实官方资产或 PPU 验收。"""
+    """Run the full original class and mapping with training-stack imports isolated; no substitute
+    for real assets or PPU acceptance.
+    """
     data, _, lock, _ = provisioned
     cache = tmp_path / "repeat/cache/huggingface"
     deps = dependencies(lock, [repository])
@@ -1159,7 +1180,7 @@ print(json.dumps(dict(repository=repository, offline=True, full_classes=True)))
 def test_cli_cannot_download_from_ci_or_without_approved_destination(in_ci, arguments, monkeypatch):
     monkeypatch.setenv("GITHUB_ACTIONS", str(in_ci).lower())
     monkeypatch.setattr(sys, "argv", ["ppu_functional_hf.py", *arguments])
-    fetch = Mock(side_effect=AssertionError("下载不应发生"))
+    fetch = Mock(side_effect=AssertionError("Downloads must not occur"))
     monkeypatch.setattr(hf, "fetch_official", fetch)
     with pytest.raises(ValueError):
         hf.main()
@@ -1181,7 +1202,11 @@ def test_cli_verify_only_reports_asset_readiness(provisioned, monkeypatch, capsy
             str(destination / "source-lock.json"),
         ],
     )
-    monkeypatch.setattr(hf, "fetch_official", Mock(side_effect=AssertionError("只读校验禁止下载")))
+    monkeypatch.setattr(
+        hf,
+        "fetch_official",
+        Mock(side_effect=AssertionError("Read-only verification must not download")),
+    )
     hf.main()
     report = json.loads(capsys.readouterr().out)
     assert report == {"repositories": sorted(hf.REPOSITORIES), "numerical_validation": False}

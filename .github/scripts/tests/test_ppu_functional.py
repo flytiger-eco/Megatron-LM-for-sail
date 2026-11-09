@@ -147,9 +147,8 @@ def test_functional_config_does_not_inherit_unit_gate(mode):
     assert config["repeat"] == 5
     assert config["timeout"] == 30
     assert config["threshold_percent"] == 100
-    assert config["data_path"] == ("ppu://redacted/history-root-001")
-    assert config["cpu_data_path"] == ("ppu://redacted/history-root-005")
-    assert config["data_path"] == "/mnt" + config["cpu_data_path"]
+    assert config["data_path"] == "ppu://assets/pod"
+    assert config["cpu_data_path"] == "ppu://assets/cpu"
 
 
 def test_compiler_policy_only_changes_new_regression_manifest():

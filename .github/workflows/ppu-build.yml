@@ -17,11 +17,11 @@ on:
         options: [unit, functional]
         default: unit
       compiler_diagnostic:
-        description: 独立编译诊断（单 Pod 八卡，最多 10 分钟；不运行 Build、UT 或正式回归）
+        description: Standalone compiler diagnostic (single 8-card Pod, at most 10 minutes; no Build, UT or formal regression)
         type: boolean
         default: false
       compiler_diagnostic_context:
-        description: bda 隔离计算；bert 仅复用 41070324511 原产物，单次原 50 步上下文取证
+        description: bda isolates compute; bert only reuses the original 41070324511 artifacts for one original 50-step context capture
         type: choice
         options: [bda, bert]
         default: bda
@@ -134,11 +134,17 @@ jobs:
         run: |
           python3 -I control/.github/scripts/ppu_pr_authorize.py authorize
           mkdir -p .ppu-ci/control
-          cp control/.github/scripts/{ppu_pr_authorize.py,ppu_functional.py} .ppu-ci/control/
+          cp control/.github/scripts/{ppu_pr_authorize.py,ppu_functional.py,ppu_ci_paths.py,ppu_ci_export.py} .ppu-ci/control/
+      - name: Export checked public evidence
+        id: public-authorize-140
+        env:
+          EXPORT_SOURCE: .ppu-ci/
+        run: python3 -I control/.github/scripts/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/authorize-140 --kind evidence
       - uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.public-authorize-140.outcome == 'success' }}
         with:
           name: ppu-authorization
-          path: .ppu-ci/
+          path: .ppu-public/authorize-140/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
@@ -189,6 +195,13 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/ppu-compiler-diagnostic.yml
+    secrets:
+      PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+      PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+      PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+      PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+      PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
+      PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
     with:
       target_sha: ${{ needs.authorize.outputs.target_sha }}
       control_sha: ${{ needs.authorize.outputs.control_sha }}
@@ -208,6 +221,13 @@ jobs:
       pull-requests: read
       actions: read
     uses: ./.github/workflows/ppu-execute.yml
+    secrets:
+      PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+      PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+      PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+      PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+      PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
+      PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
     with:
       allowed: ${{ needs.authorize.outputs.allowed == 'true' }}
       target_sha: ${{ needs.authorize.outputs.target_sha }}
