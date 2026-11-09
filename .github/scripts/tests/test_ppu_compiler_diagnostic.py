@@ -218,10 +218,21 @@ def test_fixed_single_pod_budget_and_no_build_or_test_entrypoints():
         "ppu_ci_build.sh",
         "ppu_ci_run.sh",
         "ppu_functional_run.sh",
-        "pip install",
         "run_ci_test.sh",
     ):
         assert forbidden not in text
+    assert "pip install" not in config["command"]
+    steps = job["steps"]
+    prepare = next(
+        i
+        for i, step in enumerate(steps)
+        if step.get("name") == "Prepare isolated public evidence exporter"
+    )
+    assert all(
+        prepare < i
+        for i, step in enumerate(steps)
+        if step.get("uses") in ("actions/checkout@v4", "actions/download-artifact@v4")
+    )
 
 
 def test_cold_cache_variant_environments(tmp_path):
@@ -508,17 +519,14 @@ def test_cpu_envelope_and_pod_evidence_have_separate_ownership():
     }
     local = uploads["ppu-compiler-diagnostic-action"]
     pod = uploads["ppu-compiler-diagnostic"]
-    assert local["if"] == envelope["if"] == "always()"
-    assert local["with"]["path"] == envelope["env"]["RESULT_DIR"] + "/"
-    assert pod["if"] == "${{ always() && steps.ppu.outcome != 'skipped' }}"
-    assert pod["with"]["path"] == (
-        "/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}"
-        "/compiler-diagnostic/pod/"
-    )
+    assert envelope["if"] == "always()"
+    assert "outcome == 'success'" in local["if"] and "outcome == 'success'" in pod["if"]
+    assert local["with"]["path"].startswith(".ppu-public/")
+    assert pod["with"]["path"].startswith(".ppu-public/")
+    exports = [step for step in steps if step.get("name") == "Export checked public evidence"]
+    assert exports[0]["env"]["EXPORT_SOURCE"] == envelope["env"]["RESULT_DIR"] + "/"
+    assert exports[1]["env"]["EXPORT_SOURCE"].startswith("${{ secrets.PPU_CPU_RUN_ROOT }}/")
     assert all(step["with"]["if-no-files-found"] == "error" for step in uploads.values())
-    for step in steps:
-        if "run" in step:
-            assert "/wl_nas" not in json.dumps(step)
 
 
 @pytest.mark.parametrize(
@@ -536,6 +544,10 @@ def test_cpu_envelope_runs_without_nas_write_permission(tmp_path, outcome, statu
     nas.mkdir(mode=0o555)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    scripts = workspace / "source/.github/scripts"
+    scripts.mkdir(parents=True)
+    for name in ("ppu_ci_export.py", "ppu_ci_paths.py"):
+        (scripts / name).write_bytes((SCRIPTS / name).read_bytes())
     outputs = {"job_status": status} if status else {}
     env = {
         **os.environ,

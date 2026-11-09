@@ -135,7 +135,7 @@ def repeat_environment(
             "TENSORBOARD_PATH": str(directory / "tensorboard"),
             "CHECKPOINT_SAVE_PATH": str(directory / "checkpoints"),
             "CHECKPOINT_LOAD_PATH": str(directory / "initial-checkpoints"),
-            "DATA_PATH": manifest["config"]["data_path"],
+            "DATA_PATH": str(control.paths.asset_root(manifest, "pod")),
             "DATA_CACHE_PATH": str(directory / "cache"),
             "HF_HOME": str(directory / "cache/huggingface"),
             "HF_HUB_CACHE": str(directory / "cache/huggingface/hub"),
@@ -187,7 +187,7 @@ def repeat_environment(
         (directory / name).mkdir()
     if case["tokenizer_dependencies"]:
         cache_report = control.hf.populate(
-            Path(manifest["config"]["data_path"]),
+            control.paths.asset_root(manifest, "pod"),
             Path(env["HF_HOME"]),
             case["tokenizer_dependencies"],
         )
@@ -296,7 +296,7 @@ def run_case(
     results.verify_source(manifest, root, case)
     directory.mkdir(parents=True, exist_ok=False)
     report = control.asset_report(
-        manifest, Path(manifest["config"]["data_path"]), location="pod", case_id=case_id
+        manifest, control.paths.asset_root(manifest, "pod"), location="pod", case_id=case_id
     )
     control.write_asset_report(report, directory)
     if not report["ok"]:
@@ -366,6 +366,8 @@ def main():
     for key in ("target_sha", "control_sha"):
         if manifest["identity"][key] != os.environ[f"PPU_{key.upper()}"]:
             raise ValueError(f"Runtime identity mismatch: {key}")
+    control.paths.require_current(manifest)
+    control.paths.root("PPU_POD_ASSETS_ROOT")
     runner = ProcessRunner()
     signal.signal(signal.SIGTERM, runner.cancel)
     signal.signal(signal.SIGINT, runner.cancel)

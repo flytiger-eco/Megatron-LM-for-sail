@@ -4,6 +4,7 @@ approved tokenizers; no model weights.
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -14,9 +15,18 @@ from pathlib import Path
 
 LOCK = Path(".github/ppu-functional-tokenizers.json")
 CACHE_RELATIVE = Path("tokenizers/huggingface")
-APPROVED_DESTINATION = Path(
-    "/wl_nas/anyunge.ayg/megatron-functional-ci/artifacts-base/tokenizers/huggingface"
-)
+
+
+def approved_destination() -> Path:
+    """Only trusted runtime configuration can authorize the preparation root."""
+    spec = importlib.util.spec_from_file_location(
+        "ppu_hf_paths", Path(__file__).with_name("ppu_ci_paths.py")
+    )
+    paths = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(paths)
+    return paths.root("PPU_CPU_ASSETS_ROOT") / CACHE_RELATIVE
+
+
 MAX_FILE_BYTES = 20 * 1024 * 1024
 REPOSITORIES = {
     "gpt2": "openai-community/gpt2",
@@ -469,16 +479,15 @@ def prepare(destination: Path, *, fetch=None) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("prepare", "verify"))
-    parser.add_argument("--destination", type=Path, default=APPROVED_DESTINATION)
+    parser.add_argument("--destination", type=Path)
     parser.add_argument("--lock", type=Path)
     args = parser.parse_args()
     if args.command == "prepare":
         if os.environ.get("GITHUB_ACTIONS") == "true":
             raise ValueError("Tokenizer preparation is separate from CI asset preflight")
-        if (
-            args.destination != APPROVED_DESTINATION
-            or args.destination.resolve() != APPROVED_DESTINATION
-        ):
+        authorized = approved_destination()
+        args.destination = args.destination or authorized
+        if args.destination != authorized or args.destination.resolve() != authorized:
             raise ValueError(
                 "Tokenizer preparation requires the explicitly approved NAS destination"
             )
@@ -488,6 +497,7 @@ def main() -> None:
             )
         lock = prepare(args.destination)
     else:
+        args.destination = args.destination or approved_destination()
         if not args.lock:
             raise ValueError("Read-only verification requires an explicitly supplied trusted lock")
         lock = unique_json(read_file(args.lock.parent, args.lock.name))
