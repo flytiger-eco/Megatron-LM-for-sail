@@ -1,6 +1,19 @@
 name: PPU Execute
 on:
   workflow_call:
+    secrets:
+      PPU_HOST_VOLUMES:
+        required: false
+      PPU_CPU_RUN_ROOT:
+        required: false
+      PPU_POD_RUN_ROOT:
+        required: false
+      PPU_CPU_ASSETS_ROOT:
+        required: false
+      PPU_POD_ASSETS_ROOT:
+        required: false
+      PPU_TOKENIZER_RECEIPTS_ROOT:
+        required: false
     inputs:
       allowed:
         type: boolean
@@ -101,11 +114,17 @@ jobs:
             python3 -I control/.github/scripts/ppu_ci.py configure
             echo 'test_kind=unit' >> "$GITHUB_OUTPUT"
           fi
-          cp control/.github/scripts/{ppu_ci.py,ppu_ci_build.sh,ppu_ci_run.sh,ppu_pytest_policy.py} .ppu-ci/control/
+          cp control/.github/scripts/{ppu_ci.py,ppu_ci_build.sh,ppu_ci_run.sh,ppu_pytest_policy.py,ppu_ci_paths.py,ppu_ci_export.py} .ppu-ci/control/
+      - name: Export checked public evidence
+        id: public-configure-131
+        env:
+          EXPORT_SOURCE: .ppu-ci/
+        run: python3 -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/configure-131 --kind evidence
       - uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.public-configure-131.outcome == 'success' }}
         with:
           name: ppu-plan
-          path: .ppu-ci/
+          path: .ppu-public/configure-131/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
@@ -126,14 +145,30 @@ jobs:
         with:
           python-version: '3.12'
       - name: Read-only NAS asset preflight (no PPU requested)
-        run: >-
-          python3 -I .ppu-ci/control/ppu_functional.py assets --output .ppu-ci
-          --tokenizer-receipts /wl_nas/anyunge.ayg/hf-prep
+        env:
+          PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+          PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+          PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
+          PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
+        run: |
+          python3 -I .ppu-ci/control/ppu_ci_paths.py assets
+          python3 -I .ppu-ci/control/ppu_functional.py assets --output .ppu-ci \
+            --tokenizer-receipts "$PPU_TOKENIZER_RECEIPTS_ROOT"
+      - name: Export checked public evidence
+        id: public-functional-assets-166
+        if: ${{ always() && !cancelled() }}
+        env:
+          PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+          PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+          PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
+          PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
+          EXPORT_SOURCE: .ppu-ci/assets-report.json
+        run: python3 -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/functional-assets-166 --kind evidence
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ always() && steps.public-functional-assets-166.outcome == 'success' }}
         with:
           name: ppu-functional-assets
-          path: .ppu-ci/assets-report.json
+          path: .ppu-public/functional-assets-166/
           if-no-files-found: error
           retention-days: 7
   admit-build:
@@ -200,6 +235,12 @@ jobs:
         with:
           name: ppu-plan
           path: .ppu-ci
+      - name: Validate trusted runtime directories
+        env:
+          PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+          PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+          PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+        run: python3 -I .ppu-ci/control/ppu_ci_paths.py run
       - name: Build shared DEV/LTS artifacts in an eight-card 890P Pod
         id: ppu-build
         uses: flytiger-eco/shared-workflows/cluster-task@main
@@ -209,7 +250,7 @@ jobs:
           nproc_per_node: 8
           namespace: ${{ vars.PPU_NAMESPACE || 'ppu-sched' }}
           node_selector: "board-type=ZW-M890P"
-          host_volumes: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
+          host_volumes: ${{ secrets.PPU_HOST_VOLUMES }}
           source_dir: /opt/megatron-lm
           artifact_paths: .ppu-ci
           timeout_minutes: 180
@@ -217,7 +258,7 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ needs.configure.outputs.target_sha }},PPU_CONTROL_SHA=${{ needs.configure.outputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_BUNDLE_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build
+          extra_env: PPU_TARGET_SHA=${{ needs.configure.outputs.target_sha }},PPU_CONTROL_SHA=${{ needs.configure.outputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build
           command: |
             set -euo pipefail
             umask 022
@@ -240,7 +281,7 @@ jobs:
         env:
           PPU_STATUS: ${{ steps.ppu-build.outputs.job_status }}
           PPU_OUTCOME: ${{ steps.ppu-build.outcome }}
-          PPU_BUNDLE_DIR: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build
+          PPU_BUNDLE_DIR: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build
           PPU_TARGET_SHA: ${{ needs.configure.outputs.target_sha }}
           PPU_CONTROL_SHA: ${{ needs.configure.outputs.control_sha }}
         run: |
@@ -257,10 +298,19 @@ jobs:
           digest=${digest%% *}
           [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
           printf 'bundle_digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - name: Export checked public evidence
+        id: public-build-305
+        env:
+          PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+          PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+          PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+          EXPORT_SOURCE: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build/
+        run: python3 -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/build-305 --kind bundle
       - uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.public-build-305.outcome == 'success' }}
         with:
           name: ppu-bundle
-          path: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build/
+          path: .ppu-public/build-305/
           include-hidden-files: true
           compression-level: 0
           if-no-files-found: error
@@ -272,6 +322,13 @@ jobs:
       needs.build.result == 'success' && needs.configure.outputs.unit_test == 'true' &&
       (needs.configure.outputs.manual_pr != 'true' || github.run_attempt == 1)
     uses: ./.github/workflows/ppu-ut.yml
+    secrets:
+      PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+      PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+      PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+      PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+      PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
+      PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
     with:
       matrix: ${{ needs.configure.outputs.unit_matrix }}
       bundle_digest: ${{ needs.build.outputs.bundle_digest }}
@@ -287,6 +344,13 @@ jobs:
       needs.functional-assets.result == 'success' && needs.build.result == 'success' &&
       needs.configure.outputs.test_kind == 'functional' && needs.configure.outputs.functional_mode == 'regression'
     uses: ./.github/workflows/ppu-functional.yml
+    secrets:
+      PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+      PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+      PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+      PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+      PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
+      PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
     with:
       matrix: ${{ needs.configure.outputs.functional_matrix }}
       bundle_digest: ${{ needs.build.outputs.bundle_digest }}

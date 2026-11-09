@@ -1,6 +1,19 @@
 name: PPU Functional
 on:
   workflow_call:
+    secrets:
+      PPU_HOST_VOLUMES:
+        required: false
+      PPU_CPU_RUN_ROOT:
+        required: false
+      PPU_POD_RUN_ROOT:
+        required: false
+      PPU_CPU_ASSETS_ROOT:
+        required: false
+      PPU_POD_ASSETS_ROOT:
+        required: false
+      PPU_TOKENIZER_RECEIPTS_ROOT:
+        required: false
     inputs:
       matrix:
         type: string
@@ -34,6 +47,14 @@ jobs:
       max-parallel: 1
       matrix: ${{ fromJSON(inputs.matrix) }}
     steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare isolated public evidence exporter
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ppu-public-export"
+          "$RUNNER_TEMP/ppu-public-export/bin/python" -m pip install --index-url "$PIP_INDEX_URL" \
+            'tensorboard==2.20.0' 'google-crc32c==1.7.1' 'pyyaml==6.0.3'
       - uses: actions/download-artifact@v4
         with:
           name: ppu-plan
@@ -42,6 +63,14 @@ jobs:
         id: timing
         shell: bash
         run: printf 'requested_at=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
+      - name: Validate trusted runtime directories
+        env:
+          PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+          PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+          PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+          PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+          PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
+        run: python3 -I .ppu-ci/control/ppu_ci_paths.py functional
       - name: Run unchanged upstream functional case on eight PPU cards
         id: ppu
         uses: flytiger-eco/shared-workflows/cluster-task@main
@@ -51,7 +80,7 @@ jobs:
           nproc_per_node: 8
           namespace: ${{ vars.PPU_NAMESPACE || 'ppu-sched' }}
           node_selector: "board-type=ZW-M890P"
-          host_volumes: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
+          host_volumes: ${{ secrets.PPU_HOST_VOLUMES }}
           source_dir: /opt/megatron-lm
           artifact_paths: .ppu-ci
           timeout_minutes: ${{ matrix.action_minutes }}
@@ -59,7 +88,7 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_RESULTS_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
+          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_RESULTS_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }},PPU_POD_ASSETS_ROOT=${{ secrets.PPU_POD_ASSETS_ROOT }}
           command: |
             set -euo pipefail
             cd /opt/megatron-lm
@@ -81,49 +110,40 @@ jobs:
           ACTION_OUTCOME: ${{ steps.ppu.outcome }}
           ACTION_STATUS: ${{ steps.ppu.outputs.job_status }}
           ACTION_OUTPUTS: ${{ toJSON(steps.ppu.outputs) }}
-          RESULT_DIR: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
+          RESULT_DIR: .ppu-action
         run: |
           mkdir -p "$RESULT_DIR"
+          ACTION_OUTPUTS=$(python3 -I .ppu-ci/control/ppu_ci_export.py --action-outputs)
           printf '{"requested_at":%s,"completed_at":%s,"action_outcome":"%s","action_status":"%s","outputs":%s}\n' \
             "${REQUESTED_AT:-0}" "$(date +%s)" "$ACTION_OUTCOME" "$ACTION_STATUS" "$ACTION_OUTPUTS" > "$RESULT_DIR/action-timing.json"
       - name: Record omitted checkpoint payloads
         if: always()
         shell: bash
         env:
-          RESULT_DIR: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
+          RESULT_DIR: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
         run: |
-          # Upload only evidence: checkpoints can reach tens of GB, so record what is omitted.
-          # The audit stays advisory: unreadable payloads must not fail an otherwise valid case.
-          [[ -d "$RESULT_DIR" ]] || exit 0
-          report="$RESULT_DIR/checkpoint-omissions.json"
-          recorded=0
-          if stat -c%s . >/dev/null 2>&1; then size_format='-c%s'; else size_format='-f%z'; fi
-          {
-            printf '{"omitted":['
-            separator=''
-            for name in checkpoints initial-checkpoints; do
-              while IFS= read -r directory; do
-                stats=$(find "$directory" -type f -exec stat "$size_format" {} + 2>/dev/null |
-                  awk '{count += 1; total += $1} END {printf "%d %d", count, total}')
-                stats=${stats:-0 0}
-                printf '%s{"bytes":%s,"files":%s,"path":"%s"}' \
-                  "$separator" "${stats##* }" "${stats%% *}" "${directory#"$RESULT_DIR"/}"
-                separator=','
-                recorded=$((recorded + 1))
-              done < <(find "$RESULT_DIR" -type d -name "$name" 2>/dev/null | sort)
-            done
-            printf ']}\n'
-          } > "$report" 2>/dev/null || echo "::warning::Unable to record omitted checkpoint payloads"
-          printf 'Recorded %s omitted checkpoint payload groups\n' "$recorded"
+          # Advisory and read-only; unreadable checkpoint payloads do not change the case gate.
+          python3 -I .ppu-ci/control/ppu_ci_export.py --checkpoint-audit \
+            --source "$RESULT_DIR" --destination .ppu-action/checkpoint-omissions.json
+      - name: Export checked public evidence
+        id: public-test-152
+        if: ${{ always() && !cancelled() }}
+        env:
+          PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+          PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+          PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+          PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+          PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
+          EXPORT_SOURCE: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
+        run: >-
+          "$RUNNER_TEMP/ppu-public-export/bin/python" -I .ppu-ci/control/ppu_ci_export.py
+          --source "$EXPORT_SOURCE" --destination .ppu-public/test-152 --kind evidence --overlay .ppu-action
       - name: Upload every attempt, rank log, actual value and comparison report
-        if: always()
         uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.public-test-152.outcome == 'success' }}
         with:
           name: ${{ matrix.id }}
-          path: |
-            /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
-            !/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}/**/checkpoints/**
-            !/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}/**/initial-checkpoints/**
+          path: .ppu-public/test-152/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
@@ -172,10 +192,16 @@ jobs:
         env:
           MATRIX_RESULT: ${{ needs.test.result }}
         run: '[[ "$MATRIX_RESULT" == success ]]'
+      - name: Export checked public evidence
+        id: public-result-208
+        if: ${{ always() && !cancelled() }}
+        env:
+          EXPORT_SOURCE: results/summary.json
+        run: python3 -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/result-208 --kind evidence
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ always() && steps.public-result-208.outcome == 'success' }}
         with:
           name: ppu-functional-summary
-          path: results/summary.json
+          path: .ppu-public/result-208/
           if-no-files-found: error
           retention-days: 7

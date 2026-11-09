@@ -42,7 +42,8 @@ native_requirements = [
     'fla-core==0.4.1+v0.1.0.ppu2.2.0',
 ]
 if json.loads(Path('.ppu-ci/manifest.json').read_text()).get('test_kind') == 'functional':
-    # 六项依赖当前均可从 Flytiger 获取；不混用额外索引或覆盖 PPU runtime。
+    # All six dependencies are currently available from Flytiger; do not mix in extra
+    # indexes or override the PPU runtime.
     native_requirements += [
         'flash-linear-attention==0.4.1+v0.1.0.ppu2.2.0',
         'emerging-optimizers==0.3.0',

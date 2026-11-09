@@ -12,14 +12,16 @@ import shlex
 from pathlib import Path
 
 BRANCH = "refs/heads/ci/ppu-validation"
+FUNCTIONAL_MANIFEST = "functional-manifest.json"
 BASELINES = Path("tests/functional_tests/zhenwu_test_cases")
 LOCK = Path(".github/ppu-functional-baselines.json")
-POD_ASSETS = "/mnt/wl_nas/anyunge.ayg/megatron-functional-ci/artifacts-base"
-CPU_ASSETS = "/wl_nas/anyunge.ayg/megatron-functional-ci/artifacts-base"
+POD_ASSETS = "ppu://assets/pod"
+CPU_ASSETS = "ppu://assets/cpu"
 IMAGE = "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
 TIERS = ("L0", "L1", "L2", "L3")
-# Python 3.12.3 在编译池休眠后重新 fork 时可能继承已锁定的 shutdown lock。
-# 仅禁止池休眠，保留默认并行编译；对应 pytorch/pytorch#200848。
+# Python 3.12.3 may inherit a locked shutdown lock when it forks again
+# after the compile pool quiesces.
+# Only disable pool quiescing and keep default parallel compilation; see pytorch/pytorch#200848.
 COMPILER_ENVIRONMENT = {"TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL": "0"}
 SKIPPED_CASES = {
     "gpt/gpt3_mcore_te_tp2_pp1_modelopt_distill_resume": "teacher_checkpoint_unavailable"
@@ -71,6 +73,7 @@ def module_from_path(name: str, path: Path):
 
 
 hf = module_from_path("ppu_functional_hf", Path(__file__).with_name("ppu_functional_hf.py"))
+paths = module_from_path("ppu_functional_paths", Path(__file__).with_name("ppu_ci_paths.py"))
 
 
 def positive(value, name: str, maximum: int) -> int:
@@ -163,7 +166,9 @@ def select_config(inputs: dict) -> dict:
 
 
 def compiler_environment(manifest: dict) -> dict:
-    """新回归显式绑定适配；历史 manifest 缺字段时不追溯改写运行口径。"""
+    """New regressions bind adaptations explicitly; historical manifests with
+    missing fields are not reinterpreted.
+    """
     config = manifest["config"]
     if "compiler_environment" not in config:
         return {}
@@ -255,7 +260,9 @@ def input_assets(config: dict) -> list:
 
 
 def tokenizer_dependencies(root: Path, config: dict, entrypoint: str) -> list:
-    """静态读取原入口默认值及 HF 仓库名；不导入训练栈、不探测或下载缓存。"""
+    """Statically read the original entry-point defaults and HF repository names; never import the
+    training stack or probe/download caches.
+    """
     defaults = []
     for node in ast.walk(ast.parse(safe_file(root, entrypoint).read_text())):
         if isinstance(node, ast.keyword) and node.arg == "args_defaults":
@@ -285,8 +292,10 @@ def tokenizer_dependencies(root: Path, config: dict, entrypoint: str) -> list:
             continue
         if kind not in maps[0]:
             raise ValueError(f"Tokenizer assets require explicit adaptation: {section}/{kind}")
-        # 提供 vocab/merges 后原实现仍调用 AutoTokenizer.from_pretrained(repository)。
-        # 固定来源由可信 control 的独立锁文件补充；显式 vocab 就绪不代表缓存就绪。
+        # With vocab/merges provided, the original implementation still calls
+        # AutoTokenizer.from_pretrained(repository).
+        # Fixed sources come from a separate lock file in trusted control; an explicit vocab
+        # does not mean the cache is ready.
         requirements.append(
             {
                 "section": section,
@@ -300,10 +309,13 @@ def tokenizer_dependencies(root: Path, config: dict, entrypoint: str) -> list:
 
 
 def nvrx_checkpoint_requirements(config: dict) -> list:
-    """仅描述原配置实际执行阶段的外部 checkpoint 依赖，不改写训练参数。"""
+    """Describe only external checkpoint dependencies of the phases the original config actually
+    runs; never rewrite training arguments.
+    """
     sections = ["MODEL_ARGS"]
     if config["TEST_TYPE"] == "ckpt-resume" and "MODEL_ARGS_2" in config:
-        # 原 shell 将第二阶段参数整组替换，不与第一阶段合并。
+        # The original shell replaces the second-phase arguments wholesale instead of
+        # merging them with the first phase.
         sections.append("MODEL_ARGS_2")
     requirements = []
     for section in sections:
@@ -313,7 +325,7 @@ def nvrx_checkpoint_requirements(config: dict) -> list:
         strategy = arguments.get("--async-strategy", "nvrx")
         if strategy not in ("nvrx", "mcore"):
             raise ValueError(f"Unsupported async checkpoint strategy: {section}/{strategy}")
-        # 上游在未启用 async-save 时会选择 mcore，无须安装 NVRx。
+        # Upstream selects mcore when async-save is disabled, so NVRx is not required.
         if enabled(arguments.get("--async-save", False)) and strategy == "nvrx":
             requirements.append(
                 {
@@ -653,7 +665,8 @@ def generate(root: Path, control: Path, config: dict, identity: dict, output: Pa
     positive(identity.get("run_id"), "run_id", 10**18)
     positive(identity.get("run_attempt"), "run_attempt", 10**9)
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "runtime_path_schema": 1,
         "test_kind": "functional",
         "config": config,
         "identity": identity,
@@ -705,6 +718,47 @@ def generate(root: Path, control: Path, config: dict, identity: dict, output: Pa
         },
     )
     return manifest
+
+
+def load_manifest(path: Path) -> dict:
+    """Return the functional plan of a functional or combined manifest after verification."""
+    manifest = json.loads(path.read_text())
+    if manifest.get("test_kind") == "functional":
+        if manifest.get("schema_version") not in (1, 2):
+            raise ValueError("Unsupported functional manifest schema")
+        if manifest["schema_version"] == 2:
+            paths.require_current(manifest)
+        return manifest
+    plan = manifest.get("functional_plan")
+    if (
+        manifest.get("schema_version") != 4
+        or manifest.get("test_kind") != "combined"
+        or not isinstance(plan, dict)
+        or set(plan) != {"path", "sha256"}
+        or plan["path"] != FUNCTIONAL_MANIFEST
+    ):
+        raise ValueError("Manifest does not contain a trusted functional plan")
+    sidecar = path.with_name(FUNCTIONAL_MANIFEST)
+    if sidecar.is_symlink() or not sidecar.is_file():
+        raise ValueError("Functional plan is missing or not a regular file")
+    content = sidecar.read_bytes()
+    if hashlib.sha256(content).hexdigest() != plan["sha256"]:
+        raise ValueError("Functional plan does not match the combined manifest digest")
+    functional = json.loads(content)
+    if (
+        functional.get("schema_version") not in (1, 2)
+        or functional.get("test_kind") != "functional"
+    ):
+        raise ValueError("Invalid functional plan structure")
+    if functional["schema_version"] == 2:
+        paths.require_current(functional)
+    keys = ("target_sha", "control_sha")
+    if functional["schema_version"] == 2:
+        keys += ("run_id", "run_attempt")
+    for key in keys:
+        if functional["identity"][key] != manifest["identity"].get(key):
+            raise ValueError(f"Functional plan identity mismatch: {key}")
+    return functional
 
 
 def check_asset(root: Path, requirement: dict) -> dict:
@@ -796,7 +850,7 @@ def asset_report(
         for case in cases
     )
     return {
-        "schema_version": 1,
+        "schema_version": manifest.get("schema_version", 1),
         "identity": manifest["identity"],
         "location": location,
         "root": root_check,
@@ -821,7 +875,28 @@ def asset_report(
     }
 
 
+def public_asset_report(report: dict) -> dict:
+    """Publish checked facts without disclosing the physical asset root."""
+    if report.get("schema_version") != 2:
+        return report
+    report = json.loads(json.dumps(report))
+    root = report["root"]["checked_path"]
+    reference = paths.LOGICAL[report["location"]]
+
+    def convert(value):
+        if isinstance(value, str):
+            return paths.redact(value.replace(root, reference))
+        if isinstance(value, list):
+            return [convert(item) for item in value]
+        if isinstance(value, dict):
+            return {key: convert(item) for key, item in value.items()}
+        return value
+
+    return convert(report)
+
+
 def write_asset_report(report: dict, output: Path) -> None:
+    report = public_asset_report(report)
     output.mkdir(parents=True, exist_ok=True)
     (output / "assets-report.json").write_text(json.dumps(report, indent=2) + "\n")
     lines = [
@@ -845,7 +920,7 @@ def write_asset_report(report: dict, output: Path) -> None:
             )
         for dependency in case["unresolved_dependencies"]:
             lines.append(
-                f"| {case['name']} | {dependency['purpose']}: {dependency['repository']} | 未确认 | 未检查 | 未知 | 未知 | — | {dependency['reason']} |"
+                f"| {case['name']} | {dependency['purpose']}: {dependency['repository']} | unconfirmed | not checked | unknown | unknown | — | {dependency['reason']} |"
             )
     candidate = report.get("tokenizer_source_candidate")
     if candidate:
@@ -898,26 +973,29 @@ def main() -> None:
         default=Path(os.environ.get("PPU_CONTROL_ROOT", Path(__file__).resolve().parents[2])),
     )
     parser.add_argument("--output", type=Path, default=Path(".ppu-ci"))
-    parser.add_argument("--assets-root", type=Path, default=Path(CPU_ASSETS))
+    parser.add_argument("--assets-root", type=Path)
     parser.add_argument("--tokenizer-receipts", type=Path)
     parser.add_argument("--location", choices=("cpu", "pod"), default="cpu")
     parser.add_argument("--case-id")
     args = parser.parse_args()
     if args.command == "assets":
-        manifest = json.loads((args.output / "manifest.json").read_text())
-        report = asset_report(
-            manifest, args.assets_root, location=args.location, case_id=args.case_id
-        )
+        manifest = load_manifest(args.output / "manifest.json")
+        paths.require_current(manifest)
+        trusted_root = paths.asset_root(manifest, args.location)
+        if args.assets_root is not None and args.assets_root != trusted_root:
+            raise ValueError("Asset CLI root differs from trusted configuration")
+        report = asset_report(manifest, trusted_root, location=args.location, case_id=args.case_id)
         if (
             args.location == "cpu"
             and manifest["config"]["functional_mode"] == "assets"
             and report["root"]["ok"]
         ):
-            report["tokenizer_source_candidate"] = hf.inspect_candidate(args.assets_root)
+            report["tokenizer_source_candidate"] = hf.inspect_candidate(trusted_root)
             if args.tokenizer_receipts:
-                report["tokenizer_preparation_receipts"] = hf.inspect_receipts(
-                    args.tokenizer_receipts
-                )
+                receipts = paths.root("PPU_TOKENIZER_RECEIPTS_ROOT")
+                if args.tokenizer_receipts != receipts:
+                    raise ValueError("Receipt CLI root differs from trusted configuration")
+                report["tokenizer_preparation_receipts"] = hf.inspect_receipts(receipts)
         write_asset_report(report, args.output)
         raise SystemExit(0 if report["ok"] else 1)
     inputs = json.loads(os.environ.get("PPU_INPUTS", "{}"))

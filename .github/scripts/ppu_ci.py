@@ -385,6 +385,7 @@ def generate(config: dict, output: Path, identity: dict | None = None) -> dict:
     }
     manifest = {
         "schema_version": 3,
+        "runtime_path_schema": 1,
         "config": config,
         "identity": identity or {},
         "provenance": provenance,
@@ -598,6 +599,16 @@ def summarize(manifest: dict, directory: Path) -> dict:
             require_timing=manifest.get("schema_version", 2) >= 3,
         )
         group_errors = result["errors"]
+        if manifest.get("runtime_path_schema") == 1:
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    "ppu_ci_public_export", Path(__file__).with_name("ppu_ci_export.py")
+                )
+                exporter = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(exporter)
+                exporter.verify_public(result_dir)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                group_errors.append(f"Public evidence inventory: {exc}")
         timing_path = result_dir / "timing.json"
         timing = (
             read_timing(timing_path, group_errors)
@@ -750,6 +761,13 @@ def bundle_inventory(directory: Path) -> dict:
         if name not in inventory or inventory[name]["size"] == 0:
             raise ValueError(f"Missing or empty build artifact: {name}")
     manifest = json.loads((directory / "manifest.json").read_text())
+    current_paths = manifest.get("runtime_path_schema") == 1 or (
+        manifest.get("test_kind") == "functional" and manifest.get("schema_version") == 2
+    )
+    if current_paths:
+        for name in ("control/ppu_ci_paths.py", "control/ppu_ci_export.py"):
+            if name not in inventory or inventory[name]["size"] == 0:
+                raise ValueError("Missing or empty trusted path control helper")
     if manifest.get("test_kind") == "functional":
         required = [
             "functional-tools/yq",
@@ -855,7 +873,14 @@ def main() -> None:
             config.update(build=False, unit_test=False)
         identity = {
             key: authorization.get(key, "")
-            for key in ("target_sha", "control_sha", "pr_head_sha", "base_sha")
+            for key in (
+                "target_sha",
+                "control_sha",
+                "pr_head_sha",
+                "base_sha",
+                "run_id",
+                "run_attempt",
+            )
         }
         emit("config", json.dumps(config))
         emit("build", config["build"])

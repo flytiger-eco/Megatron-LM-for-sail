@@ -1101,7 +1101,14 @@ def test_diagnostic_results_never_count_as_full_baseline(tmp_path, capsys, state
         (directory / "prod-1-rank-7.json").rename(directory / "missing-rank")
     if state == "missing_timing":
         (directory / "suite-timing.json").rename(directory / "missing-timing")
-    result = ci.summarize(manifest, tmp_path)
+    spec = importlib.util.spec_from_file_location(
+        "diagnostic_export_fixture", ROOT / ".github/scripts/ppu_ci_export.py"
+    )
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    public = tmp_path / "public-results" / directory.name
+    exporter.export(directory, public, env={})
+    result = ci.summarize(manifest, public.parent)
     assert result["success"] is (state == "passed")
     assert not result["baseline_complete"]
     assert result["scope"] == "diagnostic"
@@ -1307,7 +1314,7 @@ def test_bundle_workflow_digest_and_run_scoping():
     assert downloads == ["ppu-plan"]
     action = next(step for step in ut["jobs"]["test"]["steps"] if step.get("id") == "ppu")
     assert (
-        "PPU_BUNDLE_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build"
+        "PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build"
         in action["with"]["extra_env"]
     )
     assert "PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }}" in action["with"]["extra_env"]
