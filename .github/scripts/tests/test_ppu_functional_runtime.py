@@ -657,11 +657,17 @@ chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
             )
             outcome = "success" if process.returncode == 0 else "failure"
             action_status = "succeeded" if process.returncode == 0 else "failed"
+            local_control = tmp_path / ".ppu-ci/control"
+            local_control.mkdir(parents=True, exist_ok=True)
+            for name in ("ppu_ci_export.py", "ppu_ci_paths.py"):
+                (local_control / name).write_bytes((SCRIPTS / name).read_bytes())
+            local_result = tmp_path / ".ppu-action"
             subprocess.run(
                 ["bash", "-euo", "pipefail", "-c", step["run"]],
+                cwd=tmp_path,
                 env={
                     **os.environ,
-                    "RESULT_DIR": str(output),
+                    "RESULT_DIR": str(local_result),
                     "REQUESTED_AT": "1",
                     "ACTION_OUTCOME": outcome,
                     "ACTION_STATUS": action_status,
@@ -669,7 +675,10 @@ chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
                 },
                 check=True,
             )
-            envelope = json.loads(handoff.read_text())
+            assert (
+                handoff.read_text() == ""
+            ), "CPU envelope must not modify the private Pod placeholder"
+            envelope = json.loads((local_result / "action-timing.json").read_text())
             assert envelope["action_outcome"] == outcome
             assert envelope["action_status"] == action_status
             assert envelope["requested_at"] == 1
@@ -826,20 +835,16 @@ def test_workflow_uploads_evidence_without_checkpoint_payloads():
     workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-functional.yml").read_text())
     steps = workflow["jobs"]["test"]["steps"]
     upload = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
-    root = (
-        "ppu://redacted/history-root-007${{ github.run_id }}-${{ github.run_attempt }}"
-        "/functional/${{ matrix.id }}"
-    )
-    assert upload["with"]["path"].strip().splitlines() == [
-        root,
-        f"!{root}/**/checkpoints/**",
-        f"!{root}/**/initial-checkpoints/**",
-    ]
+    assert upload["with"]["path"].startswith(".ppu-public/")
+    assert "outcome == 'success'" in upload["if"]
+    exporter = next(step for step in steps if step.get("id") == "public-test-152")
+    assert exporter["env"]["EXPORT_SOURCE"].startswith("${{ secrets.PPU_CPU_RUN_ROOT }}/")
+    assert "--overlay .ppu-action" in exporter["run"]
     assert upload["with"]["include-hidden-files"] is True
     assert upload["with"]["if-no-files-found"] == "error"
     assert upload["with"]["retention-days"] == 7
     names = [step.get("name") for step in steps]
-    assert names.index("Record omitted checkpoint payloads") == names.index(upload["name"]) - 1
+    assert names.index("Record omitted checkpoint payloads") == names.index(upload["name"]) - 2
 
 
 def test_checkpoint_omission_report_records_excluded_payloads(tmp_path):
@@ -857,12 +862,18 @@ def test_checkpoint_omission_report_records_excluded_payloads(tmp_path):
     (repeat / "initial-checkpoints/base.bin").write_bytes(b"y" * 3)
     (repeat / "logs").mkdir()
     (repeat / "logs/rank.log").write_text("ok")
+    control = tmp_path / ".ppu-ci/control"
+    control.mkdir(parents=True)
+    for name in ("ppu_ci_export.py", "ppu_ci_paths.py"):
+        (control / name).write_bytes((SCRIPTS / name).read_bytes())
     subprocess.run(
         ["bash", "-euo", "pipefail", "-c", step["run"]],
+        cwd=tmp_path,
         env={**os.environ, "RESULT_DIR": str(result)},
         check=True,
     )
-    report = json.loads((result / "checkpoint-omissions.json").read_text())
+    assert not (result / "checkpoint-omissions.json").exists()
+    report = json.loads((tmp_path / ".ppu-action/checkpoint-omissions.json").read_text())
     assert report == {
         "omitted": [
             {"path": "attempt-1/repeat-1/checkpoints", "files": 1, "bytes": 10},
@@ -882,8 +893,13 @@ def test_checkpoint_omission_report_does_not_create_missing_results(tmp_path):
         if step.get("name") == "Record omitted checkpoint payloads"
     )
     result = tmp_path / "functional-999"
+    control = tmp_path / ".ppu-ci/control"
+    control.mkdir(parents=True)
+    for name in ("ppu_ci_export.py", "ppu_ci_paths.py"):
+        (control / name).write_bytes((SCRIPTS / name).read_bytes())
     subprocess.run(
         ["bash", "-euo", "pipefail", "-c", step["run"]],
+        cwd=tmp_path,
         env={**os.environ, "RESULT_DIR": str(result)},
         check=True,
     )

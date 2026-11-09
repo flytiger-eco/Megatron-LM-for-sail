@@ -338,6 +338,13 @@ def action_timings(action: dict) -> dict:
 
 
 def verify_envelope(manifest: dict, case: dict, directory: Path) -> dict:
+    current = manifest.get("schema_version") == 2
+    if current:
+        control.paths.require_current(manifest)
+        exporter = control.module_from_path(
+            "ppu_results_export", Path(__file__).with_name("ppu_ci_export.py")
+        )
+        exporter.verify_public(directory)
     assets = json.loads((directory / "assets-report.json").read_text())
     if (
         assets.get("identity") != manifest["identity"]
@@ -350,6 +357,27 @@ def verify_envelope(manifest: dict, case: dict, directory: Path) -> dict:
     rows = assets.get("cases", [])
     if len(rows) != 1 or rows[0]["id"] != case["id"] or rows[0]["name"] != case["name"]:
         raise ValueError("Asset preflight belongs to a different case")
+    if current:
+        reference = control.paths.LOGICAL["pod"]
+        if assets.get("schema_version") != 2 or assets["root"].get("checked_path") != reference:
+            raise ValueError("Invalid logical asset preflight root")
+        reported = rows[0].get("assets", [])
+        if len(reported) != len(case["assets"]):
+            raise ValueError("Incomplete logical asset evidence")
+        by_path = {row.get("relative_path"): row for row in reported}
+        if len(by_path) != len(reported):
+            raise ValueError("Duplicate logical asset evidence")
+        for expected in case["assets"]:
+            row = by_path.get(expected["relative_path"], {})
+            if (
+                any(row.get(key) != val for key, val in expected.items())
+                or row.get("checked_path") != reference + "/" + expected["relative_path"]
+                or row.get("exists") is not True
+                or row.get("readable") is not True
+                or type(row.get("size")) is not int
+                or row["size"] <= 0
+            ):
+                raise ValueError("Invalid logical asset check facts")
     if rows[0].get("unresolved_dependencies"):
         raise ValueError("Unresolved tokenizer cache dependencies cannot pass asset preflight")
     control.hf.sources_for(case["tokenizer_dependencies"])

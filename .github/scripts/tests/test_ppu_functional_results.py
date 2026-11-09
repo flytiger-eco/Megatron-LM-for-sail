@@ -86,6 +86,8 @@ def evidence(tmp_path):
             "functional_cases": "bert/bert_mcore_tp1_pp2",
         }
     )
+    # Historical offline fixtures retain fictional physical roots; new public-view tests use schema 2.
+    config.update(data_path="/fictional-pod/assets", cpu_data_path="/fictional-host/assets")
     catalogue = functional.catalogue(ROOT, ROOT, config)
     case = next(iter(catalogue["functional"].values()))
     # This fixture produces synthetic training/comparison evidence without a tokenizer; real

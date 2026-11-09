@@ -801,11 +801,17 @@ def test_candidate_cli_never_promotes_trust_or_changes_gate(
                 "purpose": "MODEL_ARGS.tokenizer",
             }
         ]
+    manifest["schema_version"] = 2
+    manifest["config"].update(data_path="ppu://assets/pod", cpu_data_path="ppu://assets/cpu")
+    monkeypatch.setenv(f"PPU_{location.upper()}_ASSETS_ROOT", str(data))
+    monkeypatch.setenv("PPU_TOKENIZER_RECEIPTS_ROOT", str(tmp_path))
     output = tmp_path / "cpu-plan"
     output.mkdir()
     manifest_path = output / "manifest.json"
     manifest_path.write_bytes(encoded(manifest))
-    baseline = functional.asset_report(manifest, data, location=location)
+    baseline = functional.public_asset_report(
+        functional.asset_report(manifest, data, location=location)
+    )
     before = snapshot(data)
     inspect = Mock(wraps=hf.inspect_candidate)
     monkeypatch.setattr(hf, "inspect_candidate", inspect)

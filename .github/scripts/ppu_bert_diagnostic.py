@@ -20,8 +20,8 @@ HISTORICAL_RUN = "41070324511"
 HISTORICAL_SHA = "3eee00c953c0699e1a28bc7f53d3f0fbc017d4f5"
 BUNDLE_DIGEST = "a4bff0e73d62bda207775f57986e77c8e561d5b7ceda19cdb24767b19985c7df"
 MANIFEST_DIGEST = "42052aabd1591f06467232ba5b73f7ee08c1aa306851b9e63f75e29f49ca76b6"
-CPU_BUNDLE = Path(f"ppu://redacted/history-root-007{HISTORICAL_RUN}-1/build")
-POD_BUNDLE = Path(f"ppu://redacted/history-root-002{HISTORICAL_RUN}-1/build")
+CPU_BUNDLE = None
+POD_BUNDLE = None
 CASE_ID = "functional-000"
 CASE_NAME = "bert/bert_mcore_tp1_pp2"
 VENV = Path("/opt/ppu-ci-venv")
@@ -38,6 +38,12 @@ def load_module(name: str, path: Path):
 
 diagnostic = load_module("ppu_bert_process_control", SCRIPT.with_name("ppu_compiler_diagnostic.py"))
 bundle_control = load_module("ppu_bert_bundle_control", SCRIPT.with_name("ppu_ci.py"))
+paths = load_module("ppu_bert_paths", SCRIPT.with_name("ppu_ci_paths.py"))
+
+
+def historical_bundle(location: str) -> Path:
+    override = CPU_BUNDLE if location == "cpu" else POD_BUNDLE
+    return override or paths.root(f"PPU_{location.upper()}_RUN_ROOT") / f"{HISTORICAL_RUN}-1/build"
 
 
 def verify_manifest(raw: bytes) -> dict:
@@ -94,11 +100,11 @@ def preflight(output: Path) -> None:
         "numerical_validation": False,
         "historical_run_id": HISTORICAL_RUN,
         "bundle_digest": BUNDLE_DIGEST,
-        "bundle_path": str(CPU_BUNDLE),
+        "bundle_path": f"ppu://runs/cpu/{HISTORICAL_RUN}-1/build",
         "ok": False,
     }
     try:
-        manifest = verify_historical_bundle(CPU_BUNDLE)
+        manifest = verify_historical_bundle(historical_bundle("cpu"))
         report.update(ok=True, historical_identity=manifest["identity"])
     except Exception as error:
         report["error"] = f"{type(error).__name__}: {error}"
@@ -160,9 +166,10 @@ def execute(work: Path, output: Path) -> None:
     the input bundle stays read-only.
     """
     stage(output, "historical_bundle_verifying")
-    verify_historical_bundle(POD_BUNDLE)
+    source_bundle = historical_bundle("pod")
+    verify_historical_bundle(source_bundle)
     bundle = work / "bundle"
-    shutil.copytree(POD_BUNDLE, bundle, symlinks=True)
+    shutil.copytree(source_bundle, bundle, symlinks=True)
     manifest = verify_historical_bundle(bundle)
     for name in ("manifest.json", "bundle-integrity.json"):
         shutil.copy2(bundle / name, output / name)
@@ -265,6 +272,7 @@ def run_diagnostic(root: Path, output: Path, authorization: dict) -> int:
             SCRIPT.name,
             "ppu_compiler_diagnostic.py",
             "ppu_ci.py",
+            "ppu_ci_paths.py",
             "ppu_diagnostic_sitecustomize.py",
         ):
             relative = f".github/scripts/{name}"
