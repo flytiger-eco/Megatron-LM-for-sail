@@ -91,11 +91,6 @@ on:
         default: 30
 permissions:
   contents: read
-env:
-  PIP_INDEX_URL: https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
-  PIP_CONFIG_FILE: /dev/null
-  PIP_EXTRA_INDEX_URL: ''
-  PIP_FIND_LINKS: ''
 concurrency:
   group: ppu-validation-${{ (github.event_name == 'pull_request_target' && format('preflight-{0}', github.run_id)) || (github.event_name == 'workflow_dispatch' && (inputs.pr_number != '' || inputs.pr_sha != '' || inputs.pr_base_sha != '') && format('preflight-{0}', github.run_id)) || (startsWith(github.ref, 'refs/tags/v') && format('release-{0}', github.ref)) || (github.event_name == 'workflow_dispatch' && format('full-{0}', github.run_id)) || format('daily-{0}', github.ref) }}
   cancel-in-progress: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v') || github.event_name == 'merge_group' }}
@@ -186,8 +181,63 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I .ppu-ci/control/ppu_pr_authorize.py invalidate-base
+  control-environment:
+    needs: [authorize, pr-pending]
+    if: >-
+      always() && !cancelled() && needs.authorize.result == 'success' &&
+      needs.authorize.outputs.allowed == 'true' &&
+      (needs.authorize.outputs.pr_number == '0' ||
+       (needs.pr-pending.result == 'success' && needs.pr-pending.outputs.status_result == 'published'))
+    runs-on: k8s-runner-group-cpu-flytiger
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      control_digest: ${{ steps.control.outputs.environment_digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.control_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-authorization
+          path: .ppu-ci
+      - name: Revalidate authorization before accessing build cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I control/.github/scripts/ppu_pr_authorize.py guard
+      - name: Check CPU builder and resolve immutable control image
+        id: identity
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh fingerprint --kind control
+          --control-root control --control-sha '${{ needs.authorize.outputs.control_sha }}'
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ppu-control-cache
+          key: ppu-control-linux-amd64-${{ steps.identity.outputs.cache_key }}
+      - name: Build control environment from trusted Dockerfile
+        id: control
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh build --kind control
+          --control-root control --control-sha '${{ needs.authorize.outputs.control_sha }}'
+          --image-digest '${{ steps.identity.outputs.image_digest }}'
+          --output .ppu-control-export --cache-root "$RUNNER_TEMP/ppu-control-cache"
+      - uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ppu-control-cache
+          key: ppu-control-linux-amd64-${{ steps.identity.outputs.cache_key }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppu-control-environment
+          path: .ppu-control-export/
+          if-no-files-found: error
+          retention-days: 7
   compiler-diagnostic:
-    needs: authorize
+    needs: [authorize, control-environment]
     if: >-
       github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/ci/ppu-validation' &&
       github.run_attempt == 1 && needs.authorize.outputs.allowed == 'true' &&
@@ -206,11 +256,13 @@ jobs:
       target_sha: ${{ needs.authorize.outputs.target_sha }}
       control_sha: ${{ needs.authorize.outputs.control_sha }}
       diagnostic_context: ${{ inputs.compiler_diagnostic_context || 'bda' }}
+      control_digest: ${{ needs.control-environment.outputs.control_digest }}
   execute:
-    needs: [authorize, pr-pending]
+    needs: [authorize, pr-pending, control-environment]
     if: >-
       always() && !cancelled() && needs.authorize.result == 'success' &&
       needs.authorize.outputs.test_kind != 'compiler_diagnostic' &&
+      (needs.authorize.outputs.allowed != 'true' || needs.control-environment.result == 'success') &&
       (needs.authorize.outputs.pr_number == '0' ||
        (needs.pr-pending.result == 'success' && needs.pr-pending.outputs.status_result == 'published'))
     concurrency:
@@ -234,6 +286,7 @@ jobs:
       control_sha: ${{ needs.authorize.outputs.control_sha }}
       manual_pr: ${{ needs.authorize.outputs.manual_pr == 'true' }}
       request_inputs: ${{ toJSON(inputs) }}
+      control_digest: ${{ needs.control-environment.outputs.control_digest }}
   pr-result:
     needs: [authorize, pr-pending, execute]
     if: >-

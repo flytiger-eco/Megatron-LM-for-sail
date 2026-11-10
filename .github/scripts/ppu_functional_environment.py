@@ -11,7 +11,6 @@ import platform
 import shutil
 import subprocess
 import sys
-import urllib.request
 from pathlib import Path
 
 NVRX_VERSION = "0.6.0"
@@ -284,58 +283,32 @@ print(json.dumps({{
 
 
 def prepare(bundle: Path, manifest: dict):
-    tools = bundle / "functional-tools"
-    tools.mkdir(exist_ok=False)
-    arch, digest = YQ[platform.machine()]
-    url = f"https://github.com/mikefarah/yq/releases/download/v{YQ_VERSION}/yq_linux_{arch}"
-    with urllib.request.urlopen(url, timeout=60) as response:
-        content = response.read()
-    if hashlib.sha256(content).hexdigest() != digest:
-        raise ValueError("Official Mike Farah yq binary digest mismatch")
-    (tools / "yq").write_bytes(content)
-    (tools / "yq").chmod(0o755)
-    envsubst = shutil.which("envsubst")
-    if not envsubst:
-        raise ValueError("GNU envsubst must be installed by the Build preparation step")
-    shutil.copy2(envsubst, tools / "envsubst")
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--index-url",
-            os.environ["PIP_INDEX_URL"],
-            "tensorboard",
-            "click",
-            "pyyaml",
-        ],
-        check=True,
-    )
-    if nvrx_requirements(manifest):
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--index-url",
-                os.environ["PIP_INDEX_URL"],
-                f"nvidia-resiliency-ext=={NVRX_VERSION}",
-            ],
-            check=True,
+    """Attest the already restored Dockerfile output; never acquire software here."""
+    if manifest.get("environment_build_schema") != 1:
+        raise ValueError("Functional preparation requires a Dockerfile environment export")
+    metadata = json.loads((bundle / "docker-build.json").read_text())
+    for name in ("yq", "envsubst"):
+        path = bundle / "functional-tools" / name
+        expected = metadata["files"][f"functional-tools/{name}"]
+        installed = Path(sys.prefix) / "bin" / name
+        if (
+            path.is_symlink()
+            or path.stat().st_size != expected["size"]
+            or hashlib.sha256(path.read_bytes()).hexdigest() != expected["sha256"]
+            or installed.read_bytes() != path.read_bytes()
+        ):
+            raise ValueError("Restored functional tool does not match the Dockerfile export")
+    site = Path(
+        command_output(
+            [sys.executable, "-c", 'import sysconfig; print(sysconfig.get_path("purelib"))']
         )
-    site = command_output(
-        [sys.executable, "-c", 'import sysconfig; print(sysconfig.get_path("purelib"))']
     )
-    shutil.copy2(
-        bundle / "control/ppu_functional_pytest.py", Path(site) / "ppu_functional_pytest.py"
-    )
-    startup = Path(site) / NAMESPACE_PTH
-    # Only add to this functional venv; never remove the system google directory or
-    # startup hooks of other distributions.
-    with startup.open("x") as stream:
-        stream.write(NAMESPACE_BOOTSTRAP)
+    if (site / NAMESPACE_PTH).read_text() != NAMESPACE_BOOTSTRAP:
+        raise ValueError("Missing Dockerfile namespace startup hook")
+    if (site / "ppu_functional_pytest.py").read_bytes() != (
+        bundle / "control/ppu_functional_pytest.py"
+    ).read_bytes():
+        raise ValueError("Restored pytest policy does not match trusted control")
 
 
 COMPILER_PROBE = '''
@@ -397,12 +370,19 @@ def check(bundle: Path, manifest: dict, output: Path):
     arch, expected = YQ[platform.machine()]
     if hashlib.sha256((tools / "yq").read_bytes()).hexdigest() != expected:
         raise ValueError("Functional yq binary digest mismatch")
-    for name in ("yq", "envsubst"):
-        shutil.copy2(tools / name, Path("/usr/local/bin") / name)
+    current = manifest.get("environment_build_schema") == 1
+    if current:
+        prepare(bundle, manifest)
+    else:
+        # Offline attestation of legacy sealed bundles retains its original tool path.
+        for name in ("yq", "envsubst"):
+            shutil.copy2(tools / name, Path("/usr/local/bin") / name)
     bash = command_output(["bash", "--version"])
     if "GNU bash, version" not in bash or int(bash.split("version ")[1].split(".")[0]) < 4:
         raise ValueError("Functional tests require GNU Bash >=4")
-    yq = command_output(["/usr/local/bin/yq", "--version"])
+    yq = command_output(
+        [str(Path(sys.prefix) / "bin/yq") if current else "/usr/local/bin/yq", "--version"]
+    )
     if "mikefarah/yq" not in yq or f"v{YQ_VERSION}" not in yq:
         raise ValueError("Functional tests require the attested Mike Farah yq v4")
     envsubst = command_output(["envsubst", "--version"])

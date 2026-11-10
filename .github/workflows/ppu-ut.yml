@@ -27,6 +27,15 @@ on:
       control_sha:
         type: string
         required: true
+      control_digest:
+        type: string
+        required: true
+      environment_digest:
+        type: string
+        required: true
+      runtime_image_digest:
+        type: string
+        required: true
       manual_pr:
         type: boolean
         default: false
@@ -52,6 +61,20 @@ jobs:
       max-parallel: 1
       matrix: ${{ fromJSON(inputs.matrix) }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.control_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-control-environment
+          path: .ppu-control-export
+      - name: Verify and restore trusted control interpreter
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh restore-control
+          --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
+          --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - uses: actions/download-artifact@v4
         with:
           name: ppu-plan
@@ -66,7 +89,7 @@ jobs:
         id: ppu
         uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
-          image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+          image: ${{ inputs.runtime_image_digest }}
           nnodes: 0
           nproc_per_node: ${{ matrix.cards }}
           namespace: ${{ vars.PPU_NAMESPACE || 'ppu-sched' }}
@@ -79,7 +102,7 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_RESULTS_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/unit/${{ matrix.id }}
+          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_ENVIRONMENT_DIGEST=${{ inputs.environment_digest }},PPU_IMAGE_DIGEST=${{ inputs.runtime_image_digest }},PPU_RESULTS_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/unit/${{ matrix.id }}
           command: |
             set -euo pipefail
             cd /opt/megatron-lm
@@ -90,8 +113,8 @@ jobs:
               --output "$PPU_ARTIFACT_DIR" --plan .ppu-ci --bundle-digest "$PPU_BUNDLE_DIGEST"
             [[ "$(< "$PPU_ARTIFACT_DIR/commit.txt")" == "$PPU_TARGET_SHA" ]]
             [[ "$(< "$PPU_ARTIFACT_DIR/control.txt")" == "$PPU_CONTROL_SHA" ]]
-            mkdir source
-            tar -xzf "$PPU_ARTIFACT_DIR/source.tar.gz" -C source
+            bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" restore-source \
+              --artifact "$PPU_ARTIFACT_DIR" --bundle-digest "$PPU_BUNDLE_DIGEST" --destination source
             bash "$PPU_CONTROL_DIR/ppu_ci_run.sh" '${{ matrix.id }}'
       - name: Export checked public evidence
         id: public-test-100
@@ -101,7 +124,7 @@ jobs:
           PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
           PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
           EXPORT_SOURCE: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/unit/${{ matrix.id }}/
-        run: python3 -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/test-100 --kind evidence
+        run: '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/test-100 --kind evidence'
       - name: Upload actual results, logs, and coverage for each rank
         uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-test-100.outcome == 'success' }}
@@ -124,6 +147,20 @@ jobs:
     if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.control_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-control-environment
+          path: .ppu-control-export
+      - name: Verify and restore trusted control interpreter
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh restore-control
+          --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
+          --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - uses: actions/download-artifact@v4
         with:
           name: ppu-plan
@@ -135,13 +172,13 @@ jobs:
       - name: Summarize scope, gate, and timing for the trusted trigger context
         env:
           PPU_MATRIX_RESULT: ${{ needs.test.result }}
-        run: python3 -I .ppu-ci/control/ppu_ci.py summarize --results results
+        run: '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci.py summarize --results results'
       - name: Export checked public evidence
         id: public-result-132
         if: ${{ always() && !cancelled() }}
         env:
           EXPORT_SOURCE: results/summary.json
-        run: python3 -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/result-132 --kind evidence
+        run: '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/result-132 --kind evidence'
       - uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-result-132.outcome == 'success' }}
         with:

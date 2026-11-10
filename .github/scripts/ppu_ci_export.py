@@ -30,7 +30,12 @@ TEXT_SUFFIXES = {
     ".ready",
 }
 OMITTED_DIRS = {"checkpoints", "initial-checkpoints"}
-ARCHIVES = {"source.tar.gz", "environment.tar.gz"}
+ARCHIVES = {
+    "source.tar.gz",
+    "environment.tar.gz",
+    "compiled-source.tar.gz",
+    "control-runtime.tar.gz",
+}
 BUNDLE_FILES = {
     ".complete",
     "manifest.json",
@@ -43,7 +48,18 @@ BUNDLE_FILES = {
     "bundle-integrity.json",
     "functional-environment.json",
     "functional-package-install.json",
+    "packaging-install.json",
+    "build-tools-install.json",
+    "source-package-install.json",
     "installed-packages.json",
+    "docker-build.json",
+    "compatibility-patches.json",
+    "base-packages.json",
+    "vendor-bytes.json",
+    "export-files.json",
+    "constraints.txt",
+    "ppu-requirements.txt",
+    "test-requirements.txt",
 }
 OVERLAY_FILES = {"action-timing.json", "checkpoint-omissions.json"}
 ACTION_FIELDS = {

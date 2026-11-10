@@ -1,0 +1,59 @@
+# syntax=docker/dockerfile:1.7
+ARG CONTROL_IMAGE=python:3.12-slim-bookworm
+ARG PPU_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+
+FROM ${CONTROL_IMAGE} AS control
+USER root
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+ENV PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
+    PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL="" PIP_FIND_LINKS="" \
+    PIP_NO_INPUT=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive
+COPY docker/control-requirements.txt /build/control-requirements.txt
+COPY docker/export_environment.py /build/export_environment.py
+RUN python -m pip install --index-url "$PIP_INDEX_URL" --report /build/control-install.json \
+        -r /build/control-requirements.txt \
+    && python -m pip check \
+    && python /build/export_environment.py control
+FROM scratch AS control-export
+COPY --from=control /exports/ /
+
+FROM ${PPU_IMAGE} AS dependencies
+USER root
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+ENV PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
+    PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL="" PIP_FIND_LINKS="" \
+    PIP_NO_INPUT=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive TORCH_CPP_LOG_LEVEL=ERROR MAX_JOBS=16
+COPY docker/export_environment.py docker/install_ppu.sh /build/
+COPY pyproject.toml /build/pyproject.toml
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates wget gettext-base make \
+    && python3 -m pip uninstall --yes megatron-core cloud-tpu-client protobuf \
+    && python3 /build/export_environment.py isolate \
+    && bash /build/install_ppu.sh
+ENV VIRTUAL_ENV=/opt/ppu-ci-venv UV_PROJECT_ENVIRONMENT=/opt/ppu-ci-venv \
+    UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never PYTHONNOUSERSITE=1 \
+    PATH="/opt/ppu-ci-venv/bin:${PATH}"
+
+FROM dependencies AS runtime
+ARG TARGET_SHA
+ARG CONTROL_SHA
+WORKDIR /build/source
+COPY source/ ./
+COPY control/ /build/control/
+RUN --network=none test "${#TARGET_SHA}" = 40 && test "${#CONTROL_SHA}" = 40 \
+    && install -m 0644 /build/control/ppu_pytest_policy.py \
+        "$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/ppu_pytest_policy.py" \
+    && install -m 0644 /build/control/ppu_functional_pytest.py \
+        "$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/ppu_functional_pytest.py" \
+    && python -m pip wheel --no-build-isolation --no-deps --wheel-dir /build/wheels . \
+    && python setup.py build_ext --inplace \
+    && make -C megatron/core/datasets \
+    && make -q -C megatron/core/datasets \
+    && python -m pip install --no-index --no-deps --ignore-installed \
+        --report /build/source-package-install.json /build/wheels/*.whl \
+    && python -m pip check \
+    && python /build/export_environment.py runtime
+FROM scratch AS runtime-export
+COPY --from=runtime /exports/ /

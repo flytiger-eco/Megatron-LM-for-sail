@@ -31,14 +31,20 @@ trap 'finish "$?"' EXIT
 trap 'exit 143' TERM INT
 umask 022
 cd "$PPU_SOURCE_ROOT"
-python3 -m pip uninstall --yes cloud-tpu-client protobuf
-tar -xzf "$PPU_ARTIFACT_DIR/environment.tar.gz" -C /opt
+: "${PPU_ENVIRONMENT_DIGEST:?Missing trusted Dockerfile build digest}"
+bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" restore-runtime \
+    --artifact "$PPU_ARTIFACT_DIR" --digest "$PPU_ENVIRONMENT_DIGEST" \
+    --control-sha "$PPU_CONTROL_SHA" --target-sha "$PPU_TARGET_SHA" --destination /opt \
+    --source-root "$PPU_SOURCE_ROOT" \
+    --image-digest "${PPU_IMAGE_DIGEST:?Missing trusted base image digest}"
 export PATH="/opt/ppu-ci-venv/bin:$PATH"
 export VIRTUAL_ENV=/opt/ppu-ci-venv UV_PROJECT_ENVIRONMENT=/opt/ppu-ci-venv
 export PYTHONSAFEPATH=1 PYTHONPATH="$PPU_SOURCE_ROOT"
-export PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
-export PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL='' PIP_FIND_LINKS=''
-export PIP_NO_INPUT=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+export PYTHONNOUSERSITE=1 UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never
+export LD_LIBRARY_PATH="/opt/ppu-ci-venv/lib/ppu-system:${LD_LIBRARY_PATH:-}"
+export GIT_EXEC_PATH=/opt/ppu-ci-venv/libexec/git-core
+export SSL_CERT_FILE=/opt/ppu-ci-venv/etc/ssl/certs/ca-certificates.crt
+export GIT_SSL_CAINFO="$SSL_CERT_FILE"
 unset WORLD_SIZE RANK LOCAL_RANK
 python -m pip check
 make -q -C megatron/core/datasets

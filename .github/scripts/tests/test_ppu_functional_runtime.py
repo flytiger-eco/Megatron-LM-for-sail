@@ -599,9 +599,15 @@ python() {
 }
 chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
 ''')
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    # exec bypasses shell functions, so stub the restore bootstrap executable.
+    (bin_dir / "python3").write_text("#!/bin/bash\nexit 0\n")
+    (bin_dir / "python3").chmod(0o755)
     output = tmp_path / "output"
     env = {
         **os.environ,
+        "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
         "BASH_ENV": str(bootstrap),
         "FIXTURE_PYTHON": sys.executable,
         "FIXTURE_SCRIPT": str(fixture),
@@ -612,6 +618,10 @@ chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
         "PPU_SOURCE_ROOT": str(tmp_path),
         "PPU_CONTROL_DIR": str(SCRIPTS),
         "PPU_ARTIFACT_DIR": str(tmp_path),
+        "PPU_ENVIRONMENT_DIGEST": "d" * 64,
+        "PPU_IMAGE_DIGEST": functional.IMAGE.rsplit(":", 1)[0] + "@sha256:" + "e" * 64,
+        "PPU_CONTROL_SHA": "a" * 40,
+        "PPU_TARGET_SHA": "b" * 40,
     }
     process = subprocess.Popen(
         ["bash", str(SCRIPTS / "ppu_functional_run.sh"), "functional-000"],
@@ -652,12 +662,14 @@ chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
             for name in ("ppu_ci_export.py", "ppu_ci_paths.py"):
                 (local_control / name).write_bytes((SCRIPTS / name).read_bytes())
             local_result = tmp_path / ".ppu-action"
+            (tmp_path / "ppu-control-runtime").symlink_to(Path(sys.executable).parent.parent)
             subprocess.run(
                 ["bash", "-euo", "pipefail", "-c", step["run"]],
                 cwd=tmp_path,
                 env={
                     **os.environ,
                     "RESULT_DIR": str(local_result),
+                    "RUNNER_TEMP": str(tmp_path),
                     "REQUESTED_AT": "1",
                     "ACTION_OUTCOME": outcome,
                     "ACTION_STATUS": action_status,
@@ -687,6 +699,9 @@ def test_configure_archives_complete_standalone_runtime_dependencies(tmp_path):
         step for step in workflow["jobs"]["configure"]["steps"] if step.get("id") == "config"
     )
     (tmp_path / "control").symlink_to(ROOT, target_is_directory=True)
+    (tmp_path / "ppu-control-runtime").symlink_to(
+        Path(sys.executable).parent.parent, target_is_directory=True
+    )
     plan = tmp_path / ".ppu-ci"
     (plan / "control").mkdir(parents=True)
     (plan / "authorization.json").write_text(
@@ -711,6 +726,7 @@ def test_configure_archives_complete_standalone_runtime_dependencies(tmp_path):
             "PPU_INPUTS": json.dumps({"test_kind": "functional"}),
             "PPU_SOURCE_ROOT": str(ROOT),
             "PPU_CONTROL_ROOT": str(ROOT),
+            "RUNNER_TEMP": str(tmp_path),
             "GITHUB_EVENT_NAME": "workflow_dispatch",
             "GITHUB_REF": functional.BRANCH,
             "GITHUB_OUTPUT": str(tmp_path / "outputs"),
@@ -759,9 +775,61 @@ def test_workflow_functional_route_is_manual_only_and_preserves_ut():
     assert action["uses"] == "flytiger-eco/shared-workflows/cluster-task@main"
     assert action["with"]["nproc_per_node"] == 8
     assert action["with"]["node_selector"] == "board-type=ZW-M890P"
-    assert action["with"]["image"] == functional.IMAGE
+    assert action["with"]["image"] == "${{ inputs.runtime_image_digest }}"
+    assert "PPU_IMAGE_DIGEST=${{ inputs.runtime_image_digest }}" in action["with"]["extra_env"]
     assert "verify-bundle" in action["with"]["command"]
     assert "ppu_functional_run.sh" in action["with"]["command"]
+
+
+@pytest.mark.parametrize(
+    "workflow_name,job_name,prepare_name,venv,script_names",
+    [
+        (
+            "ppu-execute",
+            "configure",
+            "Verify and restore isolated configuration environment",
+            "ppu-control-runtime",
+            ("ppu_functional.py", "ppu_ci.py"),
+        ),
+        (
+            "ppu-functional",
+            "result",
+            "Verify and restore isolated upstream comparison environment",
+            "ppu-control-runtime",
+            ("ppu_functional_results.py",),
+        ),
+    ],
+)
+def test_fixed_dependencies_are_prepared_before_untrusted_downloads(
+    workflow_name, job_name, prepare_name, venv, script_names
+):
+    """Pinned dependencies are prepared before input contents, then an explicit interpreter is used
+    without modifying the job PATH.
+    """
+    workflow = yaml.safe_load((ROOT / f".github/workflows/{workflow_name}.yml").read_text())
+    steps = workflow["jobs"][job_name]["steps"]
+    prepare_index = next(
+        index for index, step in enumerate(steps) if step.get("name") == prepare_name
+    )
+    downloads = [
+        index
+        for index, step in enumerate(steps)
+        if step.get("uses") in ("actions/checkout@v4", "actions/download-artifact@v4")
+        and step.get("with", {}).get("path") not in ("control", ".ppu-control-export")
+    ]
+    assert downloads and prepare_index < min(downloads)
+    prepare = steps[prepare_index]["run"]
+    assert "restore-control" in prepare and "pip install" not in prepare
+    assert "--digest '${{ inputs.control_digest }}'" in prepare
+    assert "--control-sha '${{ inputs.control_sha }}'" in prepare
+    assert "--root" not in prepare and "requirements" not in prepare
+    for step in steps:
+        assert "$GITHUB_PATH" not in step.get("run", "")
+        for script in script_names:
+            if script in step.get("run", ""):
+                assert f'"$RUNNER_TEMP/{venv}/bin/python" -I' in step["run"]
+    for script in script_names:
+        assert any(script in step.get("run", "") for step in steps)
 
 
 def test_workflow_uploads_evidence_without_checkpoint_payloads():
@@ -799,10 +867,11 @@ def test_checkpoint_omission_report_records_excluded_payloads(tmp_path):
     control.mkdir(parents=True)
     for name in ("ppu_ci_export.py", "ppu_ci_paths.py"):
         (control / name).write_bytes((SCRIPTS / name).read_bytes())
+    (tmp_path / "ppu-control-runtime").symlink_to(Path(sys.executable).parent.parent)
     subprocess.run(
         ["bash", "-euo", "pipefail", "-c", step["run"]],
         cwd=tmp_path,
-        env={**os.environ, "RESULT_DIR": str(result)},
+        env={**os.environ, "RESULT_DIR": str(result), "RUNNER_TEMP": str(tmp_path)},
         check=True,
     )
     assert not (result / "checkpoint-omissions.json").exists()
@@ -830,10 +899,11 @@ def test_checkpoint_omission_report_does_not_create_missing_results(tmp_path):
     control.mkdir(parents=True)
     for name in ("ppu_ci_export.py", "ppu_ci_paths.py"):
         (control / name).write_bytes((SCRIPTS / name).read_bytes())
+    (tmp_path / "ppu-control-runtime").symlink_to(Path(sys.executable).parent.parent)
     subprocess.run(
         ["bash", "-euo", "pipefail", "-c", step["run"]],
         cwd=tmp_path,
-        env={**os.environ, "RESULT_DIR": str(result)},
+        env={**os.environ, "RESULT_DIR": str(result), "RUNNER_TEMP": str(tmp_path)},
         check=True,
     )
     # A case without evidence must still fail if-no-files-found: error, so no empty dir is created.

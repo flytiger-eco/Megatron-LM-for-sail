@@ -200,6 +200,7 @@ def test_pod_verifies_copy_before_unpacking(historical_bundle, tmp_path, monkeyp
 
     monkeypatch.setattr(bert.subprocess, "run", run)
     monkeypatch.setattr(bert, "install_hook", lambda *args: {"sha256": "hook"})
+    monkeypatch.setattr(bert, "isolate_historical_environment", lambda *args: None)
 
     def execute(path, command, env):
         assert path == "/bin/bash" and command[2] == bert.SETUP_SCRIPT

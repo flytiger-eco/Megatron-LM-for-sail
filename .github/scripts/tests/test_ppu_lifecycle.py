@@ -485,7 +485,12 @@ def test_workflow_authorized_concurrency_and_cancellation_contract():
     parent = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
     execute = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())
     call = parent["jobs"]["execute"]
-    assert call["needs"] == ["authorize", "pr-pending"]
+    assert call["needs"] == ["authorize", "pr-pending", "control-environment"]
+    assert "needs.control-environment.result == 'success'" in call["if"]
+    assert (
+        "needs.authorize.outputs.allowed != 'true' || needs.control-environment.result == 'success'"
+        in call["if"]
+    )
     assert "status_result == 'published'" in call["if"]
     assert "needs.authorize.result == 'success'" in call["if"]
     assert "needs.authorize.outputs.pr_number" in call["concurrency"]["group"]

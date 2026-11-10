@@ -179,6 +179,13 @@ def test_all_parent_child_secret_boundaries_are_explicit(filename):
                 assert "github.token" not in json.dumps(step["with"])
                 assert "ppu_ci_paths.py" in job["steps"][index - 1]["run"]
             if step.get("uses") == "actions/upload-artifact@v4":
+                if step["with"].get("name") == "ppu-control-environment":
+                    assert filename == "ppu-build"
+                    assert job is workflow["jobs"]["control-environment"]
+                    assert step["with"]["path"] == ".ppu-control-export/"
+                    assert "outputs.allowed == 'true'" in job["if"]
+                    assert "secrets." not in json.dumps(job)
+                    continue
                 assert step["with"]["path"].startswith(".ppu-public/")
                 assert "outcome == 'success'" in step["if"]
     assert "secrets: inherit" not in json.dumps(workflow)

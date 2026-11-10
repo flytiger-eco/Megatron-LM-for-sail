@@ -764,6 +764,38 @@ def bundle_inventory(directory: Path) -> dict:
     current_paths = manifest.get("runtime_path_schema") == 1 or (
         manifest.get("test_kind") == "functional" and manifest.get("schema_version") == 2
     )
+    if "environment_build_schema" in manifest:
+        if (
+            type(manifest["environment_build_schema"]) is not int
+            or manifest["environment_build_schema"] != 1
+        ):
+            raise ValueError("Unsupported Dockerfile environment schema")
+        for name in (
+            "docker-build.json",
+            "compiled-source.tar.gz",
+            "compatibility-patches.json",
+            "base-packages.json",
+            "vendor-bytes.json",
+            "installed-packages.json",
+            "constraints.txt",
+            "functional-package-install.json",
+            "control/ppu_ci_container.py",
+            "control/ppu_ci_container.sh",
+        ):
+            if inventory.get(name, {}).get("size", 0) == 0:
+                raise ValueError("Missing Dockerfile environment build artifact")
+        spec = importlib.util.spec_from_file_location(
+            "ppu_container_inventory", Path(__file__).with_name("ppu_ci_container.py")
+        )
+        environment = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(environment)
+        environment.verify_export(
+            directory,
+            inventory["docker-build.json"]["sha256"],
+            manifest["identity"]["control_sha"],
+            manifest["identity"]["target_sha"],
+            subset=True,
+        )
     if current_paths:
         for name in ("control/ppu_ci_paths.py", "control/ppu_ci_export.py"):
             if name not in inventory or inventory[name]["size"] == 0:

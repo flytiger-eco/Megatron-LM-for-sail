@@ -7,77 +7,24 @@ set -euo pipefail
 : "${PPU_CONTROL_SHA:?Missing trusted control commit SHA}"
 started_at=$(date +%s)
 cd "$PPU_SOURCE_ROOT"
-[[ "$(git rev-parse HEAD)" == "$PPU_TARGET_SHA" ]]
 [[ ! -e .ppu-ci && ! -L .ppu-ci ]]
 ln -s "$PPU_ARTIFACT_DIR" .ppu-ci
 [[ -f .ppu-ci/manifest.json ]] || exit 1
-export PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
-export PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL='' PIP_FIND_LINKS=''
-export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 PIP_NO_CACHE_DIR=1
-export DEBIAN_FRONTEND=noninteractive TORCH_CPP_LOG_LEVEL=ERROR
-export MAX_JOBS="${MAX_JOBS:-16}"
-python3 -m pip uninstall --yes megatron-core cloud-tpu-client protobuf
-python3 -m venv --system-site-packages /opt/ppu-ci-venv
+: "${PPU_ENVIRONMENT_DIGEST:?Missing trusted Dockerfile build digest}"
+bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" restore-runtime \
+    --artifact "$PPU_ARTIFACT_DIR" --digest "$PPU_ENVIRONMENT_DIGEST" \
+    --control-sha "$PPU_CONTROL_SHA" --target-sha "$PPU_TARGET_SHA" \
+    --source-root "$PPU_SOURCE_ROOT" --destination /opt \
+    --image-digest "${PPU_IMAGE_DIGEST:?Missing trusted base image digest}"
 export PATH="/opt/ppu-ci-venv/bin:$PATH"
-export VIRTUAL_ENV=/opt/ppu-ci-venv
-
-python - <<'PY'
-import importlib.metadata as md
-import json
-from pathlib import Path
-packages = ('torch', 'torchvision', 'triton', 'scipy', 'scikit-learn')
-lines = []
-for package in packages:
-    try:
-        lines.append(f'{package}=={md.version(package)}')
-    except md.PackageNotFoundError:
-        if package in ('torch', 'triton'):
-            raise RuntimeError(f'Base image is missing a required PPU runtime: {package}') from None
-native_requirements = [
-    'transformer-engine==2.16+v0.1.0.ppu2.2.0',
-    'flash-attn==2.8.2+v0.2.0.ppu2.2.0',
-    'mamba-ssm==2.3.1+v0.1.0.ppu2.2.0',
-    'causal-conv1d==1.7.0+v0.1.0.ppu2.2.0',
-    'pla==1.0.0+v0.1.0.ppu2.2.0',
-    'fla-core==0.4.1+v0.1.0.ppu2.2.0',
-]
-if json.loads(Path('.ppu-ci/manifest.json').read_text()).get('test_kind') == 'functional':
-    # All six dependencies are currently available from Flytiger; do not mix in extra
-    # indexes or override the PPU runtime.
-    native_requirements += [
-        'flash-linear-attention==0.4.1+v0.1.0.ppu2.2.0',
-        'emerging-optimizers==0.3.0',
-        'apex==24.4.1+v0.1.0.ppu2.2.0',
-    ]
-Path('.ppu-ci/ppu-requirements.txt').write_text('\n'.join(native_requirements) + '\n')
-Path('.ppu-ci/constraints.txt').write_text(
-    '\n'.join(lines + native_requirements + ['numpy==1.26.4', 'pyarrow==21.0.0']) + '\n'
-)
-PY
-export PIP_CONSTRAINT="$PWD/.ppu-ci/constraints.txt"
-python -m pip install --index-url "$PIP_INDEX_URL" --upgrade 'packaging>=24.2'
-python -m pip install --index-url "$PIP_INDEX_URL" 'setuptools>=80' wheel pybind11 ninja click pyyaml numpy
-python - <<'PY'
-import tomllib
-from pathlib import Path
-project = tomllib.loads(Path('pyproject.toml').read_text())
-requirements = (
-    project['project']['dependencies']
-    + project['dependency-groups']['test']
-    + project['project']['optional-dependencies']['training']
-)
-Path('.ppu-ci/test-requirements.txt').write_text('\n'.join(requirements) + '\n')
-PY
-functional_pip_args=()
-if python -c 'import json; raise SystemExit(json.load(open(".ppu-ci/manifest.json")).get("test_kind") != "functional")'; then
-    functional_pip_args=(--report .ppu-ci/functional-package-install.json)
-fi
-python -m pip install --index-url "$PIP_INDEX_URL" --no-build-isolation "${functional_pip_args[@]}" \
-    -r .ppu-ci/test-requirements.txt -r .ppu-ci/ppu-requirements.txt \
-    pytest-timeout click wrapt requests tensorstore scipy scikit-learn \
-    'pydantic<2.14' boto3 'multi-storage-client~=0.50' 'einops~=0.8' 'uv==0.13.0' \
-    'google-api-python-client>=2' pyzmq msgpack 'openai[aiohttp]' fastapi uvicorn datasets \
-    'nvidia-modelopt==0.45.0'
+export VIRTUAL_ENV=/opt/ppu-ci-venv UV_PROJECT_ENVIRONMENT=/opt/ppu-ci-venv
+export PYTHONNOUSERSITE=1 UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never
+export LD_LIBRARY_PATH="/opt/ppu-ci-venv/lib/ppu-system:${LD_LIBRARY_PATH:-}"
+export GIT_EXEC_PATH=/opt/ppu-ci-venv/libexec/git-core
+export SSL_CERT_FILE=/opt/ppu-ci-venv/etc/ssl/certs/ca-certificates.crt
+export GIT_SSL_CAINFO="$SSL_CERT_FILE"
+export TORCH_CPP_LOG_LEVEL=ERROR
+[[ "$(git rev-parse HEAD)" == "$PPU_TARGET_SHA" ]]
 python -m pip check
 python -I - <<'PY'
 import importlib
@@ -94,41 +41,6 @@ for name in ('pla', 'pla.decode', 'pla.prefill.flashqla', 'pla.prefill.flashkdap
     if not path.is_relative_to(Path(sys.prefix).resolve()):
         raise RuntimeError(f'PLA module was not loaded from the build virtual environment: {name}: {path}')
     print('PLA import check passed:', name, version, path)
-PY
-python -I - <<'PY'
-import hashlib
-import importlib.metadata as md
-import sys
-from pathlib import Path
-distribution = md.distribution('fla-core')
-if distribution.version != '0.4.1+v0.1.0.ppu2.2.0':
-    raise RuntimeError(f'FLA Core version does not match the PPU constraint: {distribution.version}')
-path = Path(distribution.locate_file('fla/modules/l2norm.py')).resolve()
-if not path.is_relative_to(Path(sys.prefix).resolve()):
-    raise RuntimeError(f'FLA Core patch target is outside the build virtual environment: {path}')
-source = path.read_text()
-original = '''def l2norm(
-    x: torch.Tensor,
-    eps: float = 1e-6,
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    return L2NormFunction.apply(x, eps, output_dtype)'''
-replacement = '''def l2norm(
-    x: torch.Tensor,
-    eps: float = 1e-6,
-    output_dtype: torch.dtype | None = None,
-    *,
-    dim: int = -1,
-) -> torch.Tensor:
-    if not isinstance(dim, int) or isinstance(dim, bool) or dim not in (-1, x.ndim - 1):
-        raise ValueError("PPU FLA Core l2norm only supports the last dimension")
-    return L2NormFunction.apply(x, eps, output_dtype)'''
-if source.count(original) != 1:
-    raise RuntimeError('FLA Core l2norm patch target is not unique or the source has changed')
-patched = source.replace(original, replacement)
-compile(patched, str(path), 'exec')
-path.write_text(patched)
-print('FLA Core l2norm last dimension argument adaptation:', path, 'sha256:', hashlib.sha256(patched.encode()).hexdigest())
 PY
 python -I - <<'PY'
 import importlib
@@ -157,37 +69,6 @@ for name, symbols in required.items():
     if name == 'fla.modules.l2norm':
         inspect.signature(module.l2norm).bind(object(), dim=-1, eps=1e-6)
     print('FLA Core import check passed:', name, version, path)
-PY
-python - <<'PY'
-import hashlib
-import importlib.metadata as md
-import sys
-from pathlib import Path
-distribution = md.distribution('transformer-engine')
-assert distribution.version == '2.16+v0.1.0.ppu2.2.0', distribution.version
-path = Path(distribution.locate_file(
-    'transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py'
-)).resolve()
-assert path.is_relative_to(Path(sys.prefix).resolve()), path
-source = path.read_text()
-original = '''            dq[cu_seqlens_q_padded[-1] :].fill_(0)
-            dk[cu_seqlens_kv_padded[-1] :].fill_(0)
-            dv[cu_seqlens_kv_padded[-1] :].fill_(0)'''
-replacement = '''            _ppu_zero_cp_padding(dq, cu_seqlens_q_padded)
-            _ppu_zero_cp_padding(dk, cu_seqlens_kv_padded)
-            _ppu_zero_cp_padding(dv, cu_seqlens_kv_padded)'''
-assert source.count(original) == 1, 'TE CP patch target is not unique or the source has changed'
-assert '_ppu_zero_cp_padding' not in source, 'TE CP patch is already present'
-patched = source.replace(original, replacement) + '''
-
-def _ppu_zero_cp_padding(gradient, cu_seqlens):
-    indices = torch.arange(gradient.shape[0], device=gradient.device)
-    mask = (indices >= cu_seqlens[-1]).view(-1, *([1] * (gradient.ndim - 1)))
-    gradient.masked_fill_(mask, 0)
-'''
-compile(patched, str(path), 'exec')
-path.write_text(patched)
-print('TE CP graph-capture zero-padding fix:', path, 'sha256:', hashlib.sha256(patched.encode()).hexdigest())
 PY
 cat > .ppu-ci/import_diagnostics.py <<'PY'
 import sys
@@ -321,20 +202,11 @@ for dtype in (torch.float32, torch.bfloat16):
             torch.testing.assert_close(gradient, expected, rtol=0, atol=0, equal_nan=True)
         print('TE CP zero-padding graph capture and dynamic-boundary replay checks passed:', dtype, 'noncontiguous=', noncontiguous)
 PY
-install -m 0644 "$PPU_CONTROL_DIR/ppu_pytest_policy.py" \
-    "$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/ppu_pytest_policy.py"
-python -m pip wheel --index-url "$PIP_INDEX_URL" --no-build-isolation --no-deps --wheel-dir dist .
-python setup.py build_ext --inplace
-make -C megatron/core/datasets
 make -q -C megatron/core/datasets
-python -m pip install --no-index --no-deps --ignore-installed dist/*.whl
 if python -c 'import json; raise SystemExit(json.load(open(".ppu-ci/manifest.json")).get("test_kind") != "functional")'; then
-    apt-get update
-    apt-get install -y --no-install-recommends gettext-base
     python -I "$PPU_CONTROL_DIR/ppu_functional_environment.py" prepare --bundle "$PPU_ARTIFACT_DIR"
 fi
 python -m pip check
-python -m pip list --format=json > .ppu-ci/installed-packages.json
 python -I - <<'PY'
 exec(compile(open('.ppu-ci/import_diagnostics.py').read(), '.ppu-ci/import_diagnostics.py', 'exec'))
 import sys
@@ -409,10 +281,11 @@ for name in json.loads(Path('.ppu-ci/data/hf-tokenizers.json').read_text()):
 PY
     touch .ppu-ci/data/.ready
 fi
+git diff --quiet HEAD --
 git ls-files -z > .ppu-ci/source-files.txt
 tar -czf .ppu-ci/source.tar.gz --null -T .ppu-ci/source-files.txt megatron/core/datasets/helpers_cpp*.so
-tar -czf .ppu-ci/environment.tar.gz -C /opt ppu-ci-venv
-cp dist/*.whl .ppu-ci/
+[[ -s .ppu-ci/environment.tar.gz ]]
+cp .ppu-ci/wheels/*.whl .ppu-ci/
 printf '%s\n' "$PPU_IMAGE" > .ppu-ci/image.txt
 printf '%s\n' "$PPU_TARGET_SHA" > .ppu-ci/commit.txt
 printf '%s\n' "$PPU_CONTROL_SHA" > .ppu-ci/control.txt

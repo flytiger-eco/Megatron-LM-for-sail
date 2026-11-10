@@ -690,11 +690,9 @@ def test_merge_snapshot_rechecked_after_parent_lookup(mutation):
 
 @pytest.mark.parametrize("test_kind", [None, "unit", "functional"])
 def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch, test_kind):
-    script = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
+    script = (ROOT / ".github/docker/install_ppu.sh").read_text()
     block = next(
-        block
-        for block in re.findall(r"<<'PY'\n(.*?)\nPY", script, re.S)
-        if "native_requirements =" in block
+        block for block in re.findall(r"<<'PY'\n(.*?)\nPY", script, re.S) if "native =" in block
     )
     runtimes = {
         "torch": "2.13.0",
@@ -708,9 +706,10 @@ def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch, t
     artifact = tmp_path / ".ppu-ci"
     artifact.mkdir()
     (artifact / "manifest.json").write_text(json.dumps({"test_kind": test_kind}))
+    (tmp_path / "pyproject.toml").write_bytes((ROOT / "pyproject.toml").read_bytes())
     exec(compile(block, "ppu-native-requirements", "exec"), {})
-    requirements = (artifact / "ppu-requirements.txt").read_text().splitlines()
-    constraints = (artifact / "constraints.txt").read_text().splitlines()
+    requirements = (tmp_path / "ppu-requirements.txt").read_text().splitlines()
+    constraints = (tmp_path / "constraints.txt").read_text().splitlines()
     assert requirements.count("pla==1.0.0+v0.1.0.ppu2.2.0") == 1
     assert requirements.count("fla-core==0.4.1+v0.1.0.ppu2.2.0") == 1
     assert set(requirements) <= set(constraints)
@@ -721,21 +720,19 @@ def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch, t
         "flash-linear-attention==0.4.1+v0.1.0.ppu2.2.0",
         "emerging-optimizers==0.3.0",
     ):
-        assert (requirement in requirements) == (test_kind == "functional")
+        assert requirement in requirements
+    dockerfile = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
     assert (
-        "export PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"
-        in script
+        "PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"
+        in dockerfile
     )
-    assert "PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL='' PIP_FIND_LINKS=''" in script
-    install = script.index("-r .ppu-ci/test-requirements.txt -r .ppu-ci/ppu-requirements.txt")
+    assert 'PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL="" PIP_FIND_LINKS=""' in dockerfile
+    install = script.index("-r /build/test-requirements.txt -r /build/ppu-requirements.txt")
     assert script.index("export PIP_CONSTRAINT=") < install
-    assert (
-        install
-        < script.index("PLA import check passed:")
-        < script.index("FLA Core l2norm last dimension argument adaptation:")
-        < script.index("ppu_functional_environment.py\" prepare")
-        < script.index("tar -czf .ppu-ci/environment.tar.gz")
-    )
+    assert install < script.index("distribution = md.distribution('fla-core')")
+    build = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
+    assert build.index("restore-runtime") < build.index("PLA import check passed:")
+    assert "pip install" not in build
 
 
 @pytest.mark.parametrize("script_name", ["ppu_ci_build.sh", "ppu_ci_run.sh"])
@@ -758,7 +755,7 @@ def test_pla_probe_checks_version_origin_and_native_imports(monkeypatch, script_
         if "md.version('pla')" in block
     )
     if script_name == "ppu_ci_run.sh":
-        assert script.index("tar -xzf .ppu-ci/environment.tar.gz") < script.index(probe)
+        assert script.index("restore-runtime") < script.index(probe)
         assert "pip install" not in script
     modules = ("pla", "pla.decode", "pla.prefill.flashqla", "pla.prefill.flashkdapro")
     imported = []
@@ -816,12 +813,12 @@ l2_norm = l2norm
     ],
 )
 def test_fla_l2norm_dependency_patch_is_restricted(tmp_path, monkeypatch, mode):
-    script = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
+    script = (ROOT / ".github/docker/install_ppu.sh").read_text()
     block = next(
         block
         for block in re.findall(r"python -I - <<'PY'\n(.*?)\nPY", script, re.S)
         if "distribution = md.distribution('fla-core')" in block
-    )
+    ).split("\ndistribution = md.distribution('transformer-engine')", 1)[0]
     prefix = tmp_path / "venv"
     target = prefix / "fla/modules/l2norm.py"
     target.parent.mkdir(parents=True)
@@ -956,14 +953,14 @@ def test_fla_patch_and_probes_preserve_ut_and_restore_contract():
     build = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
     run = (ROOT / ".github/scripts/ppu_ci_run.sh").read_text()
     assert (
-        build.index("python -m pip check")
-        < build.index("FLA Core l2norm last dimension argument adaptation:")
+        build.index("restore-runtime")
+        < build.index("python -m pip check")
         < build.index("FLA Core import check passed:")
         < build.index("assert gated_delta_net.HAVE_FLA")
-        < build.index("tar -czf .ppu-ci/environment.tar.gz")
+        < build.index("seal-bundle")
     )
     assert (
-        run.index("tar -xzf .ppu-ci/environment.tar.gz")
+        run.index("restore-runtime")
         < run.index("FLA Core import check passed:")
         < run.index("export PYTHONPATH=")
         < run.index("assert gated_delta_net.HAVE_FLA")
@@ -1143,6 +1140,8 @@ def sealed_bundle(tmp_path):
     control.mkdir(parents=True)
     (plan / "manifest.json").write_text(json.dumps({"identity": IDENTITY}))
     shutil.copyfile(ROOT / ".github/scripts/ppu_ci.py", control / "ppu_ci.py")
+    for name in ("ppu_ci_container.py", "ppu_ci_container.sh"):
+        shutil.copyfile(ROOT / ".github/scripts" / name, control / name)
     (control / "ppu_ci_run.sh").write_text('printf "UT_STARTED:%s\\n" "$1"\n')
     (control / "ppu_pytest_policy.py").write_text("POLICY = True\n")
     bundle = tmp_path / "nas" / "run-1" / "build"
@@ -1311,7 +1310,7 @@ def test_bundle_workflow_digest_and_run_scoping():
         for step in ut["jobs"]["test"]["steps"]
         if step.get("uses") == "actions/download-artifact@v4"
     ]
-    assert downloads == ["ppu-plan"]
+    assert downloads == ["ppu-control-environment", "ppu-plan"]
     action = next(step for step in ut["jobs"]["test"]["steps"] if step.get("id") == "ppu")
     assert (
         "PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build"
@@ -1320,7 +1319,10 @@ def test_bundle_workflow_digest_and_run_scoping():
     assert "PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }}" in action["with"]["extra_env"]
     command = action["with"]["command"]
     assert (
-        command.index("verify-bundle") < command.index("tar -xzf") < command.index("ppu_ci_run.sh")
+        command.index("verify-bundle")
+        < command.index("restore-source")
+        < command.index("ppu_ci_run.sh")
     )
     script = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
-    assert script.index("seal-bundle") > script.index("tar -czf .ppu-ci/environment.tar.gz")
+    assert script.index("seal-bundle") > script.index("restore-runtime")
+    assert "tar -czf .ppu-ci/environment.tar.gz" not in script

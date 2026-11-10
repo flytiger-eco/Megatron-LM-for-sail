@@ -101,7 +101,27 @@ def tool_environment(tmp_path, monkeypatch):
     digest = hashlib.sha256(content).hexdigest()
     monkeypatch.setattr(environment, "YQ", {"fixture": ("mock_arch", digest)})
     monkeypatch.setattr(environment.platform, "machine", lambda: "fixture")
-    monkeypatch.setattr(environment.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(content))
+    prefix = tmp_path / "runtime"
+    (prefix / "bin").mkdir(parents=True)
+    (bundle / "functional-tools").mkdir()
+    tool_files = {}
+    for name, payload in (("yq", content), ("envsubst", envsubst.read_bytes())):
+        (bundle / "functional-tools" / name).write_bytes(payload)
+        (prefix / "bin" / name).write_bytes(payload)
+        tool_files[f"functional-tools/{name}"] = {
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    (bundle / "docker-build.json").write_text(json.dumps({"files": tool_files}))
+    (site / "ppu_functional_pytest.py").write_bytes(
+        (bundle / "control/ppu_functional_pytest.py").read_bytes()
+    )
+    (site / environment.NAMESPACE_PTH).write_text(environment.NAMESPACE_BOOTSTRAP)
+    monkeypatch.setattr(
+        environment,
+        "sys",
+        SimpleNamespace(executable=sys.executable, prefix=str(prefix), version=sys.version),
+    )
     monkeypatch.setattr(
         environment.shutil,
         "which",
@@ -111,7 +131,7 @@ def tool_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(environment.subprocess, "run", lambda args, **kwargs: calls.append(args))
     versions = {
         "bash": "GNU bash, version 5.2.21",
-        "/usr/local/bin/yq": "yq (https://github.com/mikefarah/yq/) version v4.47.2",
+        str(prefix / "bin/yq"): "yq (https://github.com/mikefarah/yq/) version v4.47.2",
         "envsubst": "envsubst (GNU gettext-runtime) 0.21",
         "uv": "uv 0.13.0",
         "ft_launcher": "Original launcher help",
@@ -218,6 +238,7 @@ def tool_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("PPU_SOURCE_ROOT", str(ROOT))
     monkeypatch.setattr(environment, "check_postprocessing", lambda root: {"event_roundtrip": True})
     manifest = {
+        "environment_build_schema": 1,
         "functional": {"case": {"launcher": "torchrun", "nvrx_checkpoint": []}},
         "identity": {"run_id": "123"},
         "config": {"image": "fixed"},
@@ -480,7 +501,7 @@ def checkpoint_api(tool_environment, monkeypatch):
 
 @pytest.mark.parametrize("launcher", ["torchrun", "ft_launcher"])
 @pytest.mark.parametrize("checkpoint", [False, True])
-def test_prepare_attests_tools_and_installs_selected_dependencies(
+def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
     tool_environment, checkpoint_api, launcher, checkpoint
 ):
     bundle, site, manifest, calls, _, _ = tool_environment
@@ -493,13 +514,7 @@ def test_prepare_attests_tools_and_installs_selected_dependencies(
     assert (site / "ppu_functional_pytest.py").read_bytes() == (
         bundle / "control/ppu_functional_pytest.py"
     ).read_bytes()
-    assert any("nvidia-resiliency-ext==0.6.0" in command for command in calls) == (
-        launcher == "ft_launcher" or checkpoint
-    )
-    assert all(
-        command[command.index("--index-url") + 1] == "https://packages.invalid/simple"
-        for command in calls
-    )
+    assert calls == []
     environment.check(bundle, manifest, bundle / "reports")
     report = json.loads((bundle / "reports/functional-environment.json").read_text())
     assert (site / environment.NAMESPACE_PTH).read_text() == environment.NAMESPACE_BOOTSTRAP
@@ -637,29 +652,25 @@ def test_incompatible_checkpoint_api_fails_before_training(
 
 @pytest.mark.parametrize("kind", [None, "unit", "functional"])
 def test_training_packages_match_build_constraints(tmp_path, monkeypatch, kind):
-    script = (SCRIPTS / "ppu_ci_build.sh").read_text()
+    script = (ROOT / ".github/docker/install_ppu.sh").read_text()
     block = next(
-        block
-        for block in re.findall(r"<<'PY'\n(.*?)\nPY", script, re.S)
-        if "native_requirements =" in block
+        block for block in re.findall(r"<<'PY'\n(.*?)\nPY", script, re.S) if "native =" in block
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(environment.importlib.metadata, "version", lambda name: "fixed-runtime")
-    bundle = tmp_path / ".ppu-ci"
-    bundle.mkdir()
-    (bundle / "manifest.json").write_text(json.dumps({"test_kind": kind} if kind else {}))
-    exec(compile(block, "functional-build-requirements", "exec"), {})
-    requirements = (bundle / "ppu-requirements.txt").read_text().splitlines()
-    constraints = (bundle / "constraints.txt").read_text().splitlines()
-    functional_only = {"apex", "flash-linear-attention", "emerging-optimizers"}
+    (tmp_path / "pyproject.toml").write_bytes((ROOT / "pyproject.toml").read_bytes())
+    exec(compile(block, "docker-build-requirements", "exec"), {})
+    requirements = (tmp_path / "ppu-requirements.txt").read_text().splitlines()
+    constraints = (tmp_path / "constraints.txt").read_text().splitlines()
     assert environment.TRAINING_PACKAGES["apex"] == "24.4.1+v0.1.0.ppu2.2.0"
     for name, version in environment.TRAINING_PACKAGES.items():
-        expected = int(kind == "functional" or name not in functional_only)
-        assert requirements.count(f"{name}=={version}") == expected
-        assert constraints.count(f"{name}=={version}") == expected
-    assert len(requirements) == (9 if kind == "functional" else 6)
+        assert requirements.count(f"{name}=={version}") == 1
+        assert constraints.count(f"{name}=={version}") == 1
+    assert len(requirements) == 10
+    assert requirements.count("nvidia-resiliency-ext==0.6.0") == 1
     assert all(f"{name}==fixed-runtime" in constraints for name in ("torch", "triton"))
-    assert 'functional_pip_args=(--report .ppu-ci/functional-package-install.json)' in script
+    assert '--report /build/functional-package-install.json' in script
+    assert "test_kind" not in script
 
 
 @pytest.mark.parametrize("name", environment.TRAINING_PACKAGES)
@@ -1021,7 +1032,7 @@ def test_namespace_prepare_refuses_to_overwrite_existing_file(tool_environment):
     bundle, site, manifest, _, _, _ = tool_environment
     startup = site / environment.NAMESPACE_PTH
     startup.write_text("existing content\n")
-    with pytest.raises(FileExistsError):
+    with pytest.raises(ValueError, match="namespace startup"):
         environment.prepare(bundle, manifest)
     assert startup.read_text() == "existing content\n"
 
@@ -1031,12 +1042,10 @@ def test_checkpoint_requirement_is_not_optional():
         environment.nvrx_requirements({"functional": {"case": {"launcher": "torchrun"}}})
 
 
-def test_tool_download_digest_mismatch_prevents_package_installation(tool_environment, monkeypatch):
+def test_tool_export_digest_mismatch_prevents_runtime_success(tool_environment):
     bundle, _, manifest, calls, _, _ = tool_environment
-    monkeypatch.setattr(
-        environment.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(b"different")
-    )
-    with pytest.raises(ValueError, match="digest"):
+    (bundle / "functional-tools/yq").write_bytes(b"different")
+    with pytest.raises(ValueError, match="tool"):
         environment.prepare(bundle, manifest)
     assert not calls
 
@@ -1048,7 +1057,9 @@ def test_invalid_runtime_environment_fails_before_training(tool_environment, mon
     bundle, _, manifest, _, versions, cuda = tool_environment
     environment.prepare(bundle, manifest)
     if damage in ("bash", "yq", "envsubst"):
-        versions["/usr/local/bin/yq" if damage == "yq" else damage] = "Unsupported version"
+        versions[str(Path(environment.sys.prefix) / "bin/yq") if damage == "yq" else damage] = (
+            "Unsupported version"
+        )
     elif damage == "devices":
         cuda.device_count = lambda: 4
     elif damage == "nodes":

@@ -11,6 +11,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 from pathlib import Path
@@ -141,13 +142,51 @@ def install_hook(python: Path, venv: Path, hook: Path) -> dict:
     return {"module": str(destination), "sha256": hashlib.sha256(hook.read_bytes()).hexdigest()}
 
 
-# Reuse the in-image environment cleanup and check needed by the original functional
-# launch; no install, Build or retry.
+def isolate_historical_environment(venv: Path, base: Path) -> None:
+    """Expose existing base packages without executing base startup hooks.
+
+    Only the temporary restored copy changes; the sealed historical bytes and
+    the base image remain read-only. No package manager or network is used.
+    """
+    configuration = venv / "pyvenv.cfg"
+    source = configuration.read_text()
+    if source.count("include-system-site-packages = true") != 1:
+        raise ValueError("Unexpected historical venv configuration")
+    site = venv / "lib/python3.12/site-packages"
+    if not site.is_dir() or not base.is_dir() or site.is_symlink():
+        raise ValueError("Missing historical or base package directory")
+    for item in sorted(base.iterdir()):
+        normalized = item.name.lower().replace("-", "_")
+        if item.suffix == ".pth" or normalized.startswith(("cloud_tpu_client", "protobuf")):
+            continue
+        destination = site / item.name
+        if item.name == "google":
+            # Keep the restored protobuf implementation and namespace hook.
+            destination.mkdir(exist_ok=True)
+            for child in sorted(item.iterdir()):
+                target = destination / child.name
+                if (
+                    child.name not in ("protobuf", "__init__.py", "__pycache__")
+                    and not target.exists()
+                ):
+                    target.symlink_to(
+                        child.resolve(strict=True), target_is_directory=child.is_dir()
+                    )
+        elif not destination.exists() and not destination.is_symlink():
+            destination.symlink_to(item.resolve(strict=True), target_is_directory=item.is_dir())
+    configuration.write_text(
+        source.replace(
+            "include-system-site-packages = true", "include-system-site-packages = false"
+        )
+    )
+
+
+# Check the restored historical environment; no install, uninstall, Build or retry.
 SETUP_SCRIPT = r'''
 set -euo pipefail
 root="$1"; bundle="$2"; output="$3"; script="$4"
 cd "$root"
-python3 -m pip uninstall --yes cloud-tpu-client protobuf
+export PYTHONNOUSERSITE=1 UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never
 export PATH="/opt/ppu-ci-venv/bin:$PATH"
 export VIRTUAL_ENV=/opt/ppu-ci-venv UV_PROJECT_ENVIRONMENT=/opt/ppu-ci-venv
 export PYTHONSAFEPATH=1 PYTHONPATH="$root" PPU_SOURCE_ROOT="$root"
@@ -180,6 +219,7 @@ def execute(work: Path, output: Path) -> None:
         raise ValueError("Refusing to overwrite an existing diagnostic venv")
     subprocess.run(["tar", "-xzf", str(bundle / "source.tar.gz"), "-C", str(root)], check=True)
     subprocess.run(["tar", "-xzf", str(bundle / "environment.tar.gz"), "-C", "/opt"], check=True)
+    isolate_historical_environment(VENV, Path(sysconfig.get_path("purelib")))
     hook = install_hook(
         VENV / "bin/python", VENV, SCRIPT.with_name("ppu_diagnostic_sitecustomize.py")
     )
