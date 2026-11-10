@@ -53,6 +53,65 @@ ACTION_FIELDS = {
     "occupied_ppu_card_hours",
     "execution_ppu_card_hours",
 }
+FAILURE_CODES = {
+    "Private directory remained in public evidence": "private-path-bytes",
+    "Unsupported private binary field in structured evidence": "structured-private-binary",
+    "Unsupported structured evidence collection": "structured-collection",
+    "Redaction produced duplicate public JSON keys": "duplicate-public-keys",
+    "A scalar/event tag cannot be redacted": "tensorboard-private-tag",
+    "Corrupt TensorBoard record header": "tensorboard-header-crc",
+    "TensorBoard record exceeds export limit": "tensorboard-record-limit",
+    "Corrupt TensorBoard record payload": "tensorboard-payload-crc",
+    "TensorBoard export changed event identity": "tensorboard-event-identity",
+    "TensorBoard export changed scalar evidence": "tensorboard-scalar-changed",
+    "TensorBoard export changed numeric tensor evidence": "tensorboard-numeric-changed",
+    "Unsupported private text in TensorBoard record": "tensorboard-private-field",
+    "Immutable numeric/configuration/cache evidence contains a private path": "immutable-private-path",
+    "Public staging must be new and outside private evidence": "invalid-public-staging",
+    "Private evidence is missing or is a symlink": "invalid-private-root",
+    "Evidence roots must not have symlink ancestors": "linked-evidence-ancestor",
+    "Local envelope overlay must be a regular directory": "invalid-overlay-root",
+    "Unapproved local envelope overlay": "unapproved-overlay",
+    "Unsupported encoded private path in expanded model configuration": "expanded-config-encoded-path",
+    "Symlinks are not allowed in public evidence": "public-evidence-symlink",
+    "Private directory in public evidence filename": "private-evidence-filename",
+    "Special files are not allowed in public evidence": "public-special-file",
+    "No public evidence files were exported": "empty-public-evidence",
+    "Reserved public export filename": "reserved-public-filename",
+    "Public evidence root or inventory is not a regular, unlinked path": "invalid-public-root",
+    "Invalid public evidence inventory": "invalid-public-inventory",
+    "Public evidence contains an escaping link": "public-escaping-link",
+    "Public evidence contains a special file": "public-special-file",
+    "Public evidence file inventory mismatch": "public-inventory-mismatch",
+    "Malformed public evidence file metadata": "invalid-public-metadata",
+    "Public evidence failed size or digest verification": "public-digest-mismatch",
+}
+
+
+class ExportFileError(ValueError):
+    """Retain the original error internally, with only an allowlisted public file category."""
+
+    def __init__(self, category: str, error: Exception):
+        super().__init__(str(error))
+        self.category = category
+        self.error = error
+
+
+def failure_summary(error: Exception) -> str:
+    """Never expose exception messages, filenames, paths or traceback locals."""
+    category = "export-root"
+    if isinstance(error, ExportFileError):
+        category, error = error.category, error.error
+    code = FAILURE_CODES.get(str(error), "export-failed")
+    if isinstance(error, json.JSONDecodeError):
+        code = "invalid-json"
+    elif isinstance(error, UnicodeDecodeError):
+        code = "invalid-utf8"
+    elif isinstance(error, OSError):
+        code = "evidence-io-error"
+    return (
+        f"Public evidence export failed ({type(error).__name__}; code={code}; evidence={category})"
+    )
 
 
 def action_outputs(value: str) -> str:
@@ -229,14 +288,50 @@ def export_file(source: Path, destination: Path, redactor: Redactor) -> None:
             destination.write_text(json.dumps(safe, indent=2) + "\n", encoding="utf-8")
         else:
             destination.write_text(yaml.safe_dump(safe), encoding="utf-8")
+    elif source.name == "model_config.yaml.tmp" and not immutable(source):
+        import yaml
+
+        # Upstream envsubst leaves this descriptive expanded copy beside the immutable config.
+        # Preserve every non-path byte; reject encodings that would bypass structural redaction.
+        content = source.read_bytes().decode("utf-8")
+        safe = redactor.structure(yaml.safe_load(content))
+        public = redactor.text(content)
+        try:
+            public_value = yaml.safe_load(public)
+        except yaml.YAMLError as error:
+            raise ValueError(
+                "Unsupported encoded private path in expanded model configuration"
+            ) from error
+        if public_value != safe:
+            raise ValueError("Unsupported encoded private path in expanded model configuration")
+        destination.write_bytes(public.encode("utf-8"))
     elif source.suffix in TEXT_SUFFIXES and not immutable(source):
         content = source.read_bytes()
-        destination.write_text(redactor.text(content.decode("utf-8")), encoding="utf-8")
+        destination.write_bytes(redactor.text(content.decode("utf-8")).encode("utf-8"))
     else:
         # Unknown binaries are copied only if they contain no known private directory bytes.
         redactor.scan(source)
         copy_bytes(source, destination)
     redactor.scan(destination)
+
+
+def export_checked_file(source: Path, destination: Path, redactor: Redactor) -> None:
+    if source.name.startswith("events.out.tfevents."):
+        category = "tensorboard"
+    elif immutable(source):
+        category = "immutable-evidence"
+    elif source.name == "model_config.yaml.tmp":
+        category = "expanded-model-config"
+    elif source.suffix in {".json", ".jsonl", ".yaml", ".yml"}:
+        category = "structured-evidence"
+    elif source.suffix in TEXT_SUFFIXES:
+        category = "text-evidence"
+    else:
+        category = "unknown-binary"
+    try:
+        export_file(source, destination, redactor)
+    except Exception as error:
+        raise ExportFileError(category, error) from error
 
 
 def copy_bytes(source: Path, destination: Path) -> None:
@@ -304,15 +399,16 @@ def export(source: Path, destination: Path, *, kind="evidence", env=None, overla
                 raise ValueError("Unapproved local envelope overlay")
             overlay_paths[path.name] = path
     for path in candidates:
-        if path.is_symlink():
-            raise ValueError("Symlinks are not allowed in public evidence")
         relative = Path(path.name) if source.is_file() else path.relative_to(source)
+        if path.is_symlink() and not omitted(relative, kind):
+            raise ValueError("Symlinks are not allowed in public evidence")
         if relative.as_posix() in overlay_paths:
             continue
         if redactor.text("/" + relative.as_posix()) != "/" + relative.as_posix():
             raise ValueError("Private directory in public evidence filename")
         if omitted(relative, kind):
-            if path.is_file() and not path.is_symlink():
+            # Excluded links are neither exported nor followed, including dangling links.
+            if not path.is_symlink() and path.is_file():
                 omissions.append(relative.as_posix())
             continue
         mode = path.stat().st_mode
@@ -322,11 +418,11 @@ def export(source: Path, destination: Path, *, kind="evidence", env=None, overla
             raise ValueError("Special files are not allowed in public evidence")
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        export_file(path, target, redactor)
+        export_checked_file(path, target, redactor)
         files[relative.as_posix()] = {"sha256": digest_file(target), "size": target.stat().st_size}
     for name, path in overlay_paths.items():
         target = destination / name
-        export_file(path, target, redactor)
+        export_checked_file(path, target, redactor)
         files[name] = {"sha256": digest_file(target), "size": target.stat().st_size}
     if not files:
         raise ValueError("No public evidence files were exported")
@@ -455,8 +551,8 @@ def main() -> None:
     try:
         report = export(args.source, args.destination, kind=args.kind, overlay=args.overlay)
     except Exception as error:
-        # Do not echo exception text that could contain arbitrary private filenames.
-        raise SystemExit(f"Public evidence export failed ({type(error).__name__})") from None
+        # Only fixed failure codes and file categories reach the public log.
+        raise SystemExit(failure_summary(error)) from None
     print(f"Public evidence export checked: {len(report['files'])} files")
 
 
