@@ -473,6 +473,59 @@ def test_preflight_missing_builder_does_not_install_or_launch_daemon(tmp_path, m
         container.preflight(tmp_path)
 
 
+@pytest.mark.parametrize(
+    'stage,expected',
+    [
+        ('git_identity', 'Build checkout Git identity read failed'),
+        ('git_diff', 'Build checkout tracked-file validation failed'),
+        ('docker_daemon', 'CPU builder Docker daemon check failed'),
+        ('buildkit', 'CPU builder BuildKit client check failed'),
+        ('base_pull', 'CPU builder fixed base image pull failed'),
+        ('base_digest', 'CPU builder base image digest lookup failed'),
+    ],
+)
+def test_builder_failures_identify_stage_without_raw_output(tmp_path, monkeypatch, stage, expected):
+    def run(argv, **kwargs):
+        operation = {
+            'git_identity': 'rev-parse',
+            'git_diff': 'diff',
+            'docker_daemon': 'info',
+            'buildkit': 'buildx',
+            'base_pull': 'pull',
+            'base_digest': 'inspect',
+        }[stage]
+        failed = operation in argv
+        stdout = 'private-output' if failed else 'linux' if 'info' in argv else CONTROL
+        return SimpleNamespace(returncode=int(failed), stdout=stdout, stderr='private-error')
+
+    monkeypatch.setattr(container.subprocess, 'run', run)
+    monkeypatch.setattr(container.platform, 'system', lambda: 'Linux')
+    monkeypatch.setattr(container.platform, 'machine', lambda: 'x86_64')
+    monkeypatch.setattr(container.shutil, 'which', lambda name: '/usr/bin/docker')
+    with pytest.raises(container.ValidationError) as error:
+        if stage.startswith('git_'):
+            container.checked_git(tmp_path, CONTROL)
+        elif stage in ('docker_daemon', 'buildkit'):
+            container.preflight(tmp_path)
+        else:
+            monkeypatch.setattr(container, 'checked_git', lambda *args: None)
+            monkeypatch.setattr(container, 'preflight', lambda *args: None)
+            container.build_identity(
+                SimpleNamespace(control_root=tmp_path, control_sha=CONTROL, kind='control')
+            )
+    assert str(error.value) == expected
+
+
+def test_command_launch_failure_does_not_expose_os_error(monkeypatch):
+    def run(*args, **kwargs):
+        raise OSError('private-error')
+
+    monkeypatch.setattr(container.subprocess, 'run', run)
+    with pytest.raises(container.ValidationError, match='^Fixed public stage failed$') as error:
+        container.command(['fixture'], failure='Fixed public stage failed')
+    assert error.value.__suppress_context__
+
+
 @pytest.mark.parametrize('damage', ['none', 'target', 'missing_report', 'corrupt'])
 def test_new_bundle_inventory_validates_environment_metadata(exported, damage):
     root, _ = exported

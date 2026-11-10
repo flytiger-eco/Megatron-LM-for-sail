@@ -241,9 +241,12 @@ def client_env():
     return {key: os.environ[key] for key in keys if key in os.environ}
 
 
-def command(args, *, cwd=None):
-    process = subprocess.run(args, cwd=cwd, env=client_env(), capture_output=True, text=True)
-    require(process.returncode == 0, 'Container operation failed; raw output suppressed')
+def command(args, *, cwd=None, failure='Container operation failed; raw output suppressed'):
+    try:
+        process = subprocess.run(args, cwd=cwd, env=client_env(), capture_output=True, text=True)
+    except OSError:
+        raise ValidationError(failure) from None
+    require(process.returncode == 0, failure)
     return process.stdout.rstrip('\n')
 
 
@@ -255,10 +258,14 @@ def preflight(root):
     )
     require(shutil.which('docker'), 'CPU runner must provide Docker and BuildKit')
     require(
-        command(['docker', 'info', '--format', '{{.OSType}}']) == 'linux',
+        command(
+            ['docker', 'info', '--format', '{{.OSType}}'],
+            failure='CPU builder Docker daemon check failed',
+        )
+        == 'linux',
         'CPU runner Docker daemon must run Linux containers',
     )
-    command(['docker', 'buildx', 'version'])
+    command(['docker', 'buildx', 'version'], failure='CPU builder BuildKit client check failed')
     require(
         shutil.disk_usage(root).free >= 20 * 1024**3,
         'CPU runner requires at least 20 GiB free build space',
@@ -268,10 +275,17 @@ def preflight(root):
 def checked_git(root, sha):
     require(SHA.fullmatch(sha or ''), 'A full commit identity is required')
     require(
-        command(['git', '-C', str(root), 'rev-parse', 'HEAD']) == sha,
+        command(
+            ['git', '-C', str(root), 'rev-parse', 'HEAD'],
+            failure='Build checkout Git identity read failed',
+        )
+        == sha,
         'Build checkout does not match the reviewed commit',
     )
-    command(['git', '-C', str(root), 'diff', '--quiet', 'HEAD', '--'])
+    command(
+        ['git', '-C', str(root), 'diff', '--quiet', 'HEAD', '--'],
+        failure='Build checkout tracked-file validation failed',
+    )
 
 
 def trusted_controls(root):
@@ -300,9 +314,13 @@ def build_identity(args):
     image = PPU_IMAGE if args.kind == 'runtime' else CONTROL_IMAGE
     pinned = getattr(args, 'image_digest', None)
     if not pinned:
-        command(['docker', 'pull', '--platform', 'linux/amd64', image])
+        command(
+            ['docker', 'pull', '--platform', 'linux/amd64', image],
+            failure='CPU builder fixed base image pull failed',
+        )
         pinned = command(
-            ['docker', 'image', 'inspect', '--format', '{{index .RepoDigests 0}}', image]
+            ['docker', 'image', 'inspect', '--format', '{{index .RepoDigests 0}}', image],
+            failure='CPU builder base image digest lookup failed',
         )
     require(
         re.fullmatch(re.escape(image.rsplit(':', 1)[0]) + r'@sha256:[0-9a-f]{64}', pinned),
