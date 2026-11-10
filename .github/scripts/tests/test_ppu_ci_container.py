@@ -400,6 +400,21 @@ def test_workflows_never_install_software(filename):
 
 
 @pytest.mark.parametrize(
+    'filename', ['ppu-build', 'ppu-execute', 'ppu-ut', 'ppu-functional', 'ppu-compiler-diagnostic']
+)
+def test_cpu_jobs_declare_required_unprivileged_job_container(filename):
+    workflow = yaml.safe_load((ROOT / f'.github/workflows/{filename}.yml').read_text())
+    cpu_jobs = [
+        job
+        for job in workflow['jobs'].values()
+        if job.get('runs-on') == 'k8s-runner-group-cpu-flytiger'
+    ]
+    assert cpu_jobs
+    for job in cpu_jobs:
+        assert job.get('container') == {'image': 'ghcr.io/actions/actions-runner:latest'}
+
+
+@pytest.mark.parametrize(
     'filename',
     [
         'ppu_ci_build.sh',

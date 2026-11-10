@@ -213,6 +213,8 @@ jobs:
       (needs.configure.outputs.manual_pr != 'true' || github.run_attempt == 1)
     runs-on: k8s-runner-group-cpu-flytiger
     environment: ppu-ci
+    container:
+      image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 210
     outputs:
       bundle_digest: ${{ steps.bundle.outputs.bundle_digest }}
