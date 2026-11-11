@@ -186,6 +186,15 @@ def test_all_parent_child_secret_boundaries_are_explicit(filename):
                     assert "outputs.allowed == 'true'" in job["if"]
                     assert "secrets." not in json.dumps(job)
                     continue
+                if step["with"].get("name") == "ppu-runtime-environment":
+                    assert filename == "ppu-execute"
+                    assert job is workflow["jobs"]["runtime-environment"]
+                    assert step["with"]["path"] == "${{ runner.temp }}/ppu-runtime-export/"
+                    assert job["runs-on"] == "ubuntu-latest"
+                    assert "needs.admit-build.result == 'success'" in job["if"]
+                    assert "secrets." not in json.dumps(job)
+                    assert "ppu_pr_authorize.py guard" in json.dumps(job["steps"])
+                    continue
                 assert step["with"]["path"].startswith(".ppu-public/")
                 assert "outcome == 'success'" in step["if"]
     assert "secrets: inherit" not in json.dumps(workflow)

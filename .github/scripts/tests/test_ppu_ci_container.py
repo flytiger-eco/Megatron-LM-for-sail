@@ -3,8 +3,11 @@
 import importlib.util
 import io
 import json
+import os
 import re
 import shutil
+import subprocess
+import sys
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -400,7 +403,7 @@ def test_workflows_never_install_software(filename):
 
 
 @pytest.mark.parametrize(
-    'filename', ['ppu-build', 'ppu-execute', 'ppu-ut', 'ppu-functional', 'ppu-compiler-diagnostic']
+    'filename', ['ppu-execute', 'ppu-ut', 'ppu-functional', 'ppu-compiler-diagnostic']
 )
 def test_cpu_jobs_declare_required_unprivileged_job_container(filename):
     workflow = yaml.safe_load((ROOT / f'.github/workflows/{filename}.yml').read_text())
@@ -412,6 +415,177 @@ def test_cpu_jobs_declare_required_unprivileged_job_container(filename):
     assert cpu_jobs
     for job in cpu_jobs:
         assert job.get('container') == {'image': 'ghcr.io/actions/actions-runner:latest'}
+
+
+@pytest.mark.parametrize(
+    'filename,job_name,kind',
+    [
+        ('ppu-build', 'control-environment', 'control'),
+        ('ppu-execute', 'runtime-environment', 'runtime'),
+    ],
+)
+def test_docker_build_jobs_use_hosted_runner_after_authorization(filename, job_name, kind):
+    workflow = yaml.safe_load((ROOT / f'.github/workflows/{filename}.yml').read_text())
+    job = workflow['jobs'][job_name]
+    assert job['runs-on'] == 'ubuntu-latest' and 'container' not in job
+    assert 'secrets.' not in json.dumps(job)
+    assert 'PPU_CPU_RUN_ROOT' not in json.dumps(job) and 'cluster-task' not in json.dumps(job)
+    steps = job['steps']
+    guard = next(
+        i
+        for i, step in enumerate(steps)
+        if step.get('run', '').endswith('ppu_pr_authorize.py guard')
+    )
+    setup = next(
+        i
+        for i, step in enumerate(steps)
+        if step.get('uses', '').startswith('docker/setup-buildx-action@')
+    )
+    identity = next(i for i, step in enumerate(steps) if step.get('id') == 'identity')
+    restore = next(
+        i for i, step in enumerate(steps) if step.get('uses') == 'actions/cache/restore@v4'
+    )
+    build = next(
+        i for i, step in enumerate(steps) if f' build --kind {kind}' in step.get('run', '')
+    )
+    assert guard < setup < identity < restore < build
+    assert (
+        steps[setup]['uses']
+        == 'docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd'
+    )
+    assert '--image-digest' in steps[build]['run']
+    assert 'push:' not in json.dumps(job) and '--push' not in json.dumps(job)
+
+
+def test_runtime_handoff_preserves_flytiger_orchestration_and_trusted_job_outputs():
+    jobs = yaml.safe_load((ROOT / '.github/workflows/ppu-execute.yml').read_text())['jobs']
+    producer, consumer = jobs['runtime-environment'], jobs['build']
+    assert producer['needs'] == ['configure', 'admit-build']
+    assert producer['environment'] == consumer['environment'] == 'ppu-ci'
+    assert consumer['needs'] == ['configure', 'admit-build', 'runtime-environment']
+    assert "needs.runtime-environment.result == 'success'" in consumer['if']
+    assert consumer['runs-on'] == 'k8s-runner-group-cpu-flytiger'
+    assert consumer['container'] == {'image': 'ghcr.io/actions/actions-runner:latest'}
+    upload = next(
+        step for step in producer['steps'] if step.get('uses') == 'actions/upload-artifact@v4'
+    )
+    download = next(
+        step
+        for step in consumer['steps']
+        if step.get('with', {}).get('name') == 'ppu-runtime-environment'
+    )
+    assert upload['with']['name'] == download['with']['name'] == 'ppu-runtime-environment'
+    assert upload['with']['path'].rstrip('/') == download['with']['path']
+    assert upload['with']['if-no-files-found'] == 'error'
+    assert (
+        producer['outputs']['environment_digest']
+        == '${{ steps.runtime.outputs.environment_digest }}'
+    )
+    assert (
+        producer['outputs']['runtime_image_digest'] == '${{ steps.identity.outputs.image_digest }}'
+    )
+    steps = consumer['steps']
+    verify = next(
+        i
+        for i, step in enumerate(steps)
+        if step.get('name') == 'Verify Dockerfile environment handoff before requesting PPU'
+    )
+    ppu = next(i for i, step in enumerate(steps) if step.get('id') == 'ppu-build')
+    assert verify < ppu and '--check-only' in steps[verify]['run']
+    for field in ('environment_digest', 'runtime_image_digest'):
+        value = '${{ needs.runtime-environment.outputs.' + field + ' }}'
+        assert consumer['outputs'][field] == value and value in steps[verify]['run']
+    action = steps[ppu]['with']
+    assert action['image'] == '${{ needs.runtime-environment.outputs.runtime_image_digest }}'
+    assert (
+        'PPU_ENVIRONMENT_DIGEST=${{ needs.runtime-environment.outputs.environment_digest }}'
+        in action['extra_env']
+    )
+    assert (
+        'PPU_IMAGE_DIGEST=${{ needs.runtime-environment.outputs.runtime_image_digest }}'
+        in action['extra_env']
+    )
+    assert 'steps.runtime.' not in json.dumps(consumer) and 'steps.identity.' not in json.dumps(
+        consumer
+    )
+    assert action['nnodes'] == 0 and action['nproc_per_node'] == 8
+    assert action['node_selector'] == 'board-type=ZW-M890P'
+    assert not any(
+        ' fingerprint ' in step.get('run', '') or ' build --kind ' in step.get('run', '')
+        for step in steps
+    )
+    assert not any(step.get('uses', '').startswith(('actions/cache/', 'docker/')) for step in steps)
+
+
+@pytest.mark.parametrize(
+    'damage', ['none', 'digest', 'control', 'target', 'image', 'file', 'archive']
+)
+def test_runtime_handoff_shell_checks_before_copying_or_restoring(exported, tmp_path, damage):
+    root, trusted = exported
+    jobs = yaml.safe_load((ROOT / '.github/workflows/ppu-execute.yml').read_text())['jobs']
+    script = next(
+        step['run']
+        for step in jobs['build']['steps']
+        if step.get('name') == 'Verify Dockerfile environment handoff before requesting PPU'
+    )
+    runner = tmp_path / 'runner'
+    runner.mkdir()
+    shutil.copytree(root, runner / 'ppu-runtime-export')
+    artifact = runner / 'ppu-runtime-export'
+    values = {
+        'environment_digest': trusted,
+        'runtime_image_digest': PINNED,
+        'control_sha': CONTROL,
+        'target_sha': TARGET,
+    }
+    if damage in ('digest', 'control', 'target', 'image'):
+        field = {
+            'digest': 'environment_digest',
+            'control': 'control_sha',
+            'target': 'target_sha',
+            'image': 'runtime_image_digest',
+        }[damage]
+        values[field] = (
+            'f' * 64 if damage == 'digest' else 'f' * 40 if damage != 'image' else PINNED[:-1] + 'e'
+        )
+    elif damage == 'file':
+        (artifact / 'constraints.txt').write_bytes(b'corrupt')
+    elif damage == 'archive':
+        archive(artifact / 'compiled-source.tar.gz', [('evil.py', b'x', tarfile.REGTYPE)])
+        values['environment_digest'] = seal(artifact)
+    for field in ('environment_digest', 'runtime_image_digest'):
+        script = script.replace(
+            '${{ needs.runtime-environment.outputs.' + field + ' }}', values[field]
+        )
+    for field in ('control_sha', 'target_sha'):
+        script = script.replace('${{ inputs.' + field + ' }}', values[field])
+    control = tmp_path / 'control/.github/scripts'
+    control.mkdir(parents=True)
+    for name in ('ppu_ci_container.py', 'ppu_ci_container.sh'):
+        shutil.copyfile(SCRIPTS / name, control / name)
+    (tmp_path / 'source').mkdir()
+    destination = tmp_path / '.ppu-ci'
+    destination.mkdir()
+    result = subprocess.run(
+        ['bash', '-euo', 'pipefail', '-c', script],
+        cwd=tmp_path,
+        env={
+            'PATH': str(Path(sys.executable).parent) + os.pathsep + os.environ['PATH'],
+            'RUNNER_TEMP': str(runner),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert (result.returncode == 0) is (damage == 'none'), result.stderr
+    assert not (runner / 'ppu-runtime-check').exists()
+    assert not (tmp_path / 'source/megatron').exists()
+    if damage == 'none':
+        assert container.inventory(destination) == container.inventory(artifact)
+        assert (destination / 'docker-build.json').read_bytes() == (
+            artifact / 'docker-build.json'
+        ).read_bytes()
+    else:
+        assert not list(destination.iterdir())
 
 
 @pytest.mark.parametrize(

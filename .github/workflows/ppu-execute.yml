@@ -205,11 +205,96 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I .ppu-ci/control/ppu_pr_authorize.py guard
-  build:
+  runtime-environment:
     needs: [configure, admit-build]
     if: >-
       always() && !cancelled() && needs.configure.result == 'success' &&
       needs.admit-build.result == 'success' && needs.configure.outputs.build == 'true' &&
+      (needs.configure.outputs.manual_pr != 'true' || github.run_attempt == 1)
+    runs-on: ubuntu-latest
+    environment: ppu-ci
+    timeout-minutes: 210
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      environment_digest: ${{ steps.runtime.outputs.environment_digest }}
+      runtime_image_digest: ${{ steps.identity.outputs.image_digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.control_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-authorization
+          path: .ppu-ci
+      - name: Revalidate authorization before accessing build cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I control/.github/scripts/ppu_pr_authorize.py guard
+      - name: Check out source under test
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+      - name: Wait after checkout failure
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 15
+      - name: Retry source checkout (final attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+      - name: Check CPU builder and resolve immutable PPU image
+        id: identity
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh fingerprint --kind runtime
+          --control-root control --control-sha '${{ inputs.control_sha }}'
+          --source-root source --target-sha '${{ inputs.target_sha }}'
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ppu-runtime-cache
+          key: ppu-runtime-linux-amd64-${{ steps.identity.outputs.cache_key }}
+      - name: Build all UT and functional software on CPU
+        id: runtime
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh build --kind runtime
+          --control-root control --control-sha '${{ inputs.control_sha }}'
+          --source-root source --target-sha '${{ inputs.target_sha }}'
+          --image-digest '${{ steps.identity.outputs.image_digest }}'
+          --output "$RUNNER_TEMP/ppu-runtime-export" --cache-root "$RUNNER_TEMP/ppu-runtime-cache"
+      - uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ppu-runtime-cache
+          key: ppu-runtime-linux-amd64-${{ steps.identity.outputs.cache_key }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppu-runtime-environment
+          path: ${{ runner.temp }}/ppu-runtime-export/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+  build:
+    needs: [configure, admit-build, runtime-environment]
+    if: >-
+      always() && !cancelled() && needs.configure.result == 'success' &&
+      needs.admit-build.result == 'success' && needs.runtime-environment.result == 'success' &&
+      needs.configure.outputs.build == 'true' &&
       (needs.configure.outputs.manual_pr != 'true' || github.run_attempt == 1)
     runs-on: k8s-runner-group-cpu-flytiger
     environment: ppu-ci
@@ -218,8 +303,8 @@ jobs:
     timeout-minutes: 210
     outputs:
       bundle_digest: ${{ steps.bundle.outputs.bundle_digest }}
-      environment_digest: ${{ steps.runtime.outputs.environment_digest }}
-      runtime_image_digest: ${{ steps.identity.outputs.image_digest }}
+      environment_digest: ${{ needs.runtime-environment.outputs.environment_digest }}
+      runtime_image_digest: ${{ needs.runtime-environment.outputs.runtime_image_digest }}
     env:
       PPU_IMAGE: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
       MAX_JOBS: '16'
@@ -265,29 +350,19 @@ jobs:
         with:
           name: ppu-plan
           path: .ppu-ci
-      - name: Check CPU builder and resolve immutable PPU image
-        id: identity
-        run: >-
-          bash control/.github/scripts/ppu_ci_container.sh fingerprint --kind runtime
-          --control-root control --control-sha '${{ inputs.control_sha }}'
-          --source-root source --target-sha '${{ inputs.target_sha }}'
-      - uses: actions/cache/restore@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: ${{ runner.temp }}/ppu-runtime-cache
-          key: ppu-runtime-linux-amd64-${{ steps.identity.outputs.cache_key }}
-      - name: Build all UT and functional software on CPU
-        id: runtime
+          name: ppu-runtime-environment
+          path: ${{ runner.temp }}/ppu-runtime-export
+      - name: Verify Dockerfile environment handoff before requesting PPU
         run: |
-          bash control/.github/scripts/ppu_ci_container.sh build --kind runtime \
-            --control-root control --control-sha '${{ inputs.control_sha }}' \
-            --source-root source --target-sha '${{ inputs.target_sha }}' \
-            --image-digest '${{ steps.identity.outputs.image_digest }}' \
-            --output "$RUNNER_TEMP/ppu-runtime-export" --cache-root "$RUNNER_TEMP/ppu-runtime-cache"
+          bash control/.github/scripts/ppu_ci_container.sh restore-runtime \
+            --artifact "$RUNNER_TEMP/ppu-runtime-export" \
+            --digest '${{ needs.runtime-environment.outputs.environment_digest }}' \
+            --control-sha '${{ inputs.control_sha }}' --target-sha '${{ inputs.target_sha }}' \
+            --image-digest '${{ needs.runtime-environment.outputs.runtime_image_digest }}' \
+            --source-root source --destination "$RUNNER_TEMP/ppu-runtime-check" --check-only
           cp -R "$RUNNER_TEMP/ppu-runtime-export/." .ppu-ci/
-      - uses: actions/cache/save@v4
-        with:
-          path: ${{ runner.temp }}/ppu-runtime-cache
-          key: ppu-runtime-linux-amd64-${{ steps.identity.outputs.cache_key }}
       - name: Validate trusted runtime directories
         env:
           PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
@@ -298,7 +373,7 @@ jobs:
         id: ppu-build
         uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
-          image: ${{ steps.identity.outputs.image_digest }}
+          image: ${{ needs.runtime-environment.outputs.runtime_image_digest }}
           nnodes: 0
           nproc_per_node: 8
           namespace: ${{ vars.PPU_NAMESPACE || 'ppu-sched' }}
@@ -311,7 +386,7 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ needs.configure.outputs.target_sha }},PPU_CONTROL_SHA=${{ needs.configure.outputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_ENVIRONMENT_DIGEST=${{ steps.runtime.outputs.environment_digest }},PPU_IMAGE_DIGEST=${{ steps.identity.outputs.image_digest }},PPU_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build
+          extra_env: PPU_TARGET_SHA=${{ needs.configure.outputs.target_sha }},PPU_CONTROL_SHA=${{ needs.configure.outputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_ENVIRONMENT_DIGEST=${{ needs.runtime-environment.outputs.environment_digest }},PPU_IMAGE_DIGEST=${{ needs.runtime-environment.outputs.runtime_image_digest }},PPU_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build
           command: |
             set -euo pipefail
             umask 022
@@ -333,8 +408,8 @@ jobs:
           PPU_BUNDLE_DIR: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build
           PPU_TARGET_SHA: ${{ needs.configure.outputs.target_sha }}
           PPU_CONTROL_SHA: ${{ needs.configure.outputs.control_sha }}
-          PPU_ENVIRONMENT_DIGEST: ${{ steps.runtime.outputs.environment_digest }}
-          PPU_IMAGE_DIGEST: ${{ steps.identity.outputs.image_digest }}
+          PPU_ENVIRONMENT_DIGEST: ${{ needs.runtime-environment.outputs.environment_digest }}
+          PPU_IMAGE_DIGEST: ${{ needs.runtime-environment.outputs.runtime_image_digest }}
         run: |
           set -euo pipefail
           [[ "$PPU_OUTCOME" == success && "$PPU_STATUS" == succeeded ]] || exit 1

@@ -506,8 +506,10 @@ def test_workflow_authorized_concurrency_and_cancellation_contract():
     assert any(step.get("if") == "cancelled()" for step in result["steps"])
     assert "execution_success == 'true'" in result["steps"][-1]["env"]["STATE"]
     assert "--cancelled" in result["steps"][-1]["run"]
-    assert execute["jobs"]["build"]["needs"] == ["configure", "admit-build"]
-    for name in ("configure", "admit-build"):
+    assert execute["jobs"]["runtime-environment"]["needs"] == ["configure", "admit-build"]
+    assert execute["jobs"]["build"]["needs"] == ["configure", "admit-build", "runtime-environment"]
+    assert "needs.runtime-environment.result == 'success'" in execute["jobs"]["build"]["if"]
+    for name in ("configure", "admit-build", "runtime-environment"):
         steps = execute["jobs"][name]["steps"]
         assert any(step.get("run", "").endswith("ppu_pr_authorize.py guard") for step in steps)
         assert execute["jobs"][name]["runs-on"] == "ubuntu-latest"
