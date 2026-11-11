@@ -700,6 +700,130 @@ def test_command_launch_failure_does_not_expose_os_error(monkeypatch):
     assert error.value.__suppress_context__
 
 
+@pytest.mark.parametrize(
+    'text,expected',
+    [
+        ('No matching distribution found for private-package', 'package-unavailable'),
+        ('ResolutionImpossible: private constraints', 'dependency-conflict'),
+        ('CERTIFICATE_VERIFY_FAILED private-host', 'tls-verification'),
+        ('Temporary failure in name resolution: private-host', 'name-resolution'),
+        ('Read timed out: private-host', 'network-timeout'),
+        ('Connection refused: private-host', 'connection-failed'),
+        ('Permission denied: /private/file', 'access-denied'),
+        ('No space left on device: /private/file', 'disk-full'),
+        ('Dockerfile parse error: private instruction', 'dockerfile-parse'),
+        ('ModuleNotFoundError: private-module', 'python-import'),
+        ('Traceback (most recent call last): private-frame', 'python-traceback'),
+        ('Package download bypassed the fixed package index', 'export-package-source'),
+        ('A native dependency is missing in the build container', 'export-native-missing'),
+        ('Unable to inventory native dependencies', 'export-native-inventory'),
+        ('Conflicting native dependency SONAMEs', 'export-native-conflict'),
+        ('Export requires materialized files and directories', 'export-file-type'),
+        ('Restored control interpreter import check failed', 'offline-control-import'),
+        ('private error without a known marker', 'unknown'),
+    ],
+)
+@pytest.mark.parametrize('stream', ['stdout', 'stderr'])
+def test_command_diagnostics_emit_only_fixed_markers(monkeypatch, capsys, text, expected, stream):
+    output = dict(stdout='', stderr='')
+    output[stream] = 'https://private-user:private-token@private-host/private/file\n' + text
+    monkeypatch.setattr(
+        container.subprocess, 'run', lambda *args, **kwargs: SimpleNamespace(returncode=7, **output)
+    )
+    with pytest.raises(container.ValidationError) as error:
+        container.command(
+            ['private-command'], failure='Fixed public stage failed', diagnostics=True
+        )
+    assert (
+        str(error.value) == f'Fixed public stage failed; exit_code=7; diagnostic markers={expected}'
+    )
+    assert capsys.readouterr() == ('', '')
+
+
+def test_failure_markers_are_bounded_and_unknown_logs_are_not_echoed():
+    assert container.failure_markers('No space left on device' + 'x' * 1024**2, '') == 'unknown'
+    assert container.failure_markers('', '\x1b[31m::error::private-token\x00') == 'unknown'
+    assert container.failure_markers('Connection refused', 'No matching distribution found') == (
+        'package-unavailable,connection-failed'
+    )
+
+
+def test_diagnostic_command_success_preserves_stdout_without_emitting_stderr(monkeypatch, capsys):
+    monkeypatch.setattr(
+        container.subprocess,
+        'run',
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout='result\n', stderr='private-warning'
+        ),
+    )
+    assert container.command(['fixture'], diagnostics=True) == 'result'
+    assert capsys.readouterr() == ('', '')
+
+
+def test_diagnostic_command_launch_failure_keeps_os_details_private(monkeypatch):
+    def run(*args, **kwargs):
+        raise OSError('private-token /private/file')
+
+    monkeypatch.setattr(container.subprocess, 'run', run)
+    with pytest.raises(container.ValidationError) as error:
+        container.command(['fixture'], failure='Fixed public stage failed', diagnostics=True)
+    assert str(error.value) == 'Fixed public stage failed; diagnostic markers=command-launch'
+    assert error.value.__suppress_context__
+
+
+@pytest.mark.parametrize('kind', ['control', 'runtime'])
+@pytest.mark.parametrize(
+    'stage', ['dependency/cache build', 'environment export build', 'fresh-base offline probe']
+)
+def test_build_stage_failures_stop_before_publishing_environment_digest(
+    build_inputs, monkeypatch, tmp_path, kind, stage
+):
+    args = build_inputs
+    args.kind = kind
+    if kind == 'control':
+        args.target_sha = None
+        args.image_digest = container.CONTROL_IMAGE.rsplit(':', 1)[0] + '@sha256:' + 'c' * 64
+    output = tmp_path / 'github-output'
+    monkeypatch.setenv('GITHUB_OUTPUT', str(output))
+    calls = []
+
+    def command(argv, **kwargs):
+        if argv[0] == 'git':
+            return (
+                '.github/scripts/ppu_ci_container.py\0'
+                if argv[2] == str(args.control_root)
+                else 'pyproject.toml\0'
+            )
+        calls.append(kwargs['failure'])
+        assert kwargs['diagnostics'] is True
+        if kwargs['failure'] == f'Dockerfile {kind} {stage} failed':
+            raise container.ValidationError(kwargs['failure'])
+        assert argv[:3] == ['docker', 'buildx', 'build']
+        assert argv[argv.index('--progress') + 1] == 'plain'
+        if '--output' in argv:
+            if kind == 'runtime':
+                runtime_export(args.output)
+            else:
+                args.output.mkdir()
+                archive(
+                    args.output / 'control-runtime.tar.gz',
+                    [('bin/python', b'python', tarfile.REGTYPE)],
+                )
+                (args.output / 'control-package-install.json').write_text('{}')
+        return ''
+
+    monkeypatch.setattr(container, 'command', command)
+    with pytest.raises(container.ValidationError) as error:
+        container.build(args)
+    assert str(error.value) == f'Dockerfile {kind} {stage} failed'
+    assert calls[-1] == str(error.value)
+    assert not output.exists()
+    if (args.output / 'docker-build.json').exists():
+        assert 'offline_verification' not in json.loads(
+            (args.output / 'docker-build.json').read_text()
+        )
+
+
 @pytest.mark.parametrize('damage', ['none', 'target', 'missing_report', 'corrupt'])
 def test_new_bundle_inventory_validates_environment_metadata(exported, damage):
     root, _ = exported

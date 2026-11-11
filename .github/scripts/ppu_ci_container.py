@@ -241,12 +241,60 @@ def client_env():
     return {key: os.environ[key] for key in keys if key in os.environ}
 
 
-def command(args, *, cwd=None, failure='Container operation failed; raw output suppressed'):
+def failure_markers(stdout, stderr):
+    """Return fixed log markers, not raw excerpts or a claimed root cause."""
+    text = '\n'.join(value[-1024 * 1024 :] for value in (stdout, stderr)).lower()
+    patterns = (
+        (
+            'package-unavailable',
+            r'no matching distribution found|could not find a version that satisfies',
+        ),
+        ('dependency-conflict', r'resolutionimpossible|conflicting dependencies'),
+        ('tls-verification', r'certificate_verify_failed|certificate verify failed|x509:'),
+        (
+            'name-resolution',
+            r'temporary failure in name resolution|name or service not known|no such host',
+        ),
+        ('network-timeout', r'read timed out|connecttimeout|connection timed out|i/o timeout'),
+        ('connection-failed', r'connection refused|connection reset|network is unreachable'),
+        ('access-denied', r'permission denied|unauthorized|403 forbidden|401 unauthorized'),
+        ('disk-full', r'no space left on device'),
+        ('dockerfile-parse', r'dockerfile parse error|unknown instruction'),
+        ('python-import', r'modulenotfounderror:|importerror:'),
+        ('python-traceback', r'traceback \(most recent call last\)'),
+        (
+            'export-package-source',
+            r'package download bypassed the fixed package index|transitive dependency url bypasses the fixed package index',
+        ),
+        ('export-native-missing', r'a native dependency is missing in the build container'),
+        ('export-native-inventory', r'unable to inventory native dependencies'),
+        ('export-native-conflict', r'conflicting native dependency sonames'),
+        ('export-file-type', r'export requires materialized files and directories'),
+        ('offline-control-import', r'restored control interpreter import check failed'),
+    )
+    return ','.join(label for label, pattern in patterns if re.search(pattern, text)) or 'unknown'
+
+
+def command(
+    args,
+    *,
+    cwd=None,
+    failure='Container operation failed; raw output suppressed',
+    diagnostics=False,
+):
     try:
         process = subprocess.run(args, cwd=cwd, env=client_env(), capture_output=True, text=True)
     except OSError:
-        raise ValidationError(failure) from None
-    require(process.returncode == 0, failure)
+        suffix = '; diagnostic markers=command-launch' if diagnostics else ''
+        raise ValidationError(failure + suffix) from None
+    if process.returncode:
+        suffix = (
+            f'; exit_code={process.returncode}; diagnostic markers='
+            + failure_markers(process.stdout, process.stderr)
+            if diagnostics
+            else ''
+        )
+        raise ValidationError(failure + suffix)
     return process.stdout.rstrip('\n')
 
 
@@ -290,7 +338,8 @@ def checked_git(root, sha):
 
 def trusted_controls(root):
     names = command(
-        ['git', '-C', str(root), 'ls-files', '-z', '--', '.github/scripts/ppu*.py']
+        ['git', '-C', str(root), 'ls-files', '-z', '--', '.github/scripts/ppu*.py'],
+        failure='Build trusted control inventory read failed',
     ).split('\0')
     paths = []
     for name in names:
@@ -373,7 +422,10 @@ def build(args):
             shutil.copyfile(source / 'pyproject.toml', context / 'pyproject.toml')
             inputs['pyproject.toml'] = digest(context / 'pyproject.toml')
             (context / 'source').mkdir()
-            for name in command(['git', '-C', str(source), 'ls-files', '-z']).split('\0'):
+            for name in command(
+                ['git', '-C', str(source), 'ls-files', '-z'],
+                failure='Build tracked source inventory read failed',
+            ).split('\0'):
                 if not name:
                     continue
                 relative(name)
@@ -394,6 +446,8 @@ def build(args):
             'docker',
             'buildx',
             'build',
+            '--progress',
+            'plain',
             '--platform',
             'linux/amd64',
             '--file',
@@ -417,7 +471,9 @@ def build(args):
                     '--cache-to',
                     f'type=local,dest={cache},mode=max',
                     str(context),
-                ]
+                ],
+                failure=f'Dockerfile {args.kind} dependency/cache build failed',
+                diagnostics=True,
             )
             common += ['--cache-from', f'type=local,src={cache}']
         started = time.time()
@@ -429,7 +485,9 @@ def build(args):
                 '--output',
                 f'type=local,dest={output}',
                 str(context),
-            ]
+            ],
+            failure=f'Dockerfile {args.kind} environment export build failed',
+            diagnostics=True,
         )
         metadata = {
             'schema_version': 1,
@@ -484,7 +542,9 @@ def build(args):
                 *mounts,
                 pinned,
                 *probe,
-            ]
+            ],
+            failure=f'Dockerfile {args.kind} fresh-base offline probe failed',
+            diagnostics=True,
         )
         metadata['offline_verification'] = {
             'passed': True,
@@ -525,7 +585,9 @@ def restore_control(args):
             'from tensorboard.compat.proto.event_pb2 import Event; '
             'assert sys.version_info[:2] == (3, 12); '
             'assert Event.FromString(Event(step=1).SerializeToString()).step == 1',
-        ]
+        ],
+        failure='Restored control interpreter import check failed',
+        diagnostics=True,
     )
 
 
