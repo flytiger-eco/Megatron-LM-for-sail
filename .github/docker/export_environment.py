@@ -3,6 +3,7 @@
 import hashlib
 import importlib.metadata as md
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -65,38 +66,65 @@ def vendor_bytes(base):
 
 def libraries(files, directory):
     directory.mkdir(parents=True, exist_ok=True)
+    pending = []
     for path in files:
         if not path.is_file():
             continue
         with path.open('rb') as stream:
-            if stream.read(4) != b'\x7fELF':
+            if stream.read(4) == b'\x7fELF':
+                pending.append(path)
+    # A wheel's secondary libraries can rely on the extension's inherited RPATH.
+    # Seed only dependencies from successful ldd closures, then retry pending ELFs
+    # against those materialized libraries. Never ignore an unresolved dependency.
+    env = dict(os.environ, LD_LIBRARY_PATH=str(directory), LC_ALL='C')
+    known = {
+        'libstdc++.so.6': 'missing-native-libstdcxx',
+        'libgcc_s.so.1': 'missing-native-libgcc',
+        'libgomp.so.1': 'missing-native-libgomp',
+        'libatomic.so.1': 'missing-native-libatomic',
+        'libgfortran.so.5': 'missing-native-libgfortran',
+        'libquadmath.so.0': 'missing-native-libquadmath',
+        'libgfortran-040039e1.so.5.0.0': 'missing-native-libgfortran',
+        'libquadmath-96973f99.so.0.0.0': 'missing-native-libquadmath',
+        'libssl.so.3': 'missing-native-libssl',
+        'libcrypto.so.3': 'missing-native-libcrypto',
+    }
+    while pending:
+        unresolved, markers = [], set()
+        progress = False
+        for path in pending:
+            result = subprocess.run(
+                ['ldd', str(path)], env=env, capture_output=True, text=True, check=False
+            )
+            if 'not found' in result.stdout:
+                unresolved.append(path)
+                names = re.findall(
+                    r'^\s*([^\s/]+)\s+=>\s+not found\s*$', result.stdout, re.MULTILINE
+                )
+                markers.update(known.get(name, 'missing-native-unknown') for name in names)
+                if not names:
+                    markers.add('missing-native-unknown')
                 continue
-        result = subprocess.run(['ldd', str(path)], capture_output=True, text=True, check=False)
-        if 'not found' in result.stdout:
-            known = {
-                'libstdc++.so.6': 'missing-native-libstdcxx',
-                'libgcc_s.so.1': 'missing-native-libgcc',
-                'libgomp.so.1': 'missing-native-libgomp',
-                'libatomic.so.1': 'missing-native-libatomic',
-                'libgfortran.so.5': 'missing-native-libgfortran',
-                'libquadmath.so.0': 'missing-native-libquadmath',
-                'libssl.so.3': 'missing-native-libssl',
-                'libcrypto.so.3': 'missing-native-libcrypto',
-            }
-            names = re.findall(r'^\s*([^\s/]+)\s+=>\s+not found\s*$', result.stdout, re.MULTILINE)
-            markers = ','.join(sorted({known[name] for name in names if name in known}))
+            if (
+                result.returncode
+                and 'not a dynamic executable' not in result.stderr + result.stdout
+            ):
+                raise RuntimeError('Unable to inventory native dependencies')
+            for name in re.findall(r'(/[^\s()]+)', result.stdout):
+                source = Path(name).resolve(strict=True)
+                target = directory / Path(name).name
+                if target.exists():
+                    if sha256(target) != sha256(source):
+                        raise RuntimeError('Conflicting native dependency SONAMEs')
+                else:
+                    copy(source, target)
+                    progress = True
+        if unresolved and not progress:
             raise RuntimeError(
                 'A native dependency is missing in the build container; '
-                + (markers or 'missing-native-unknown')
+                + ','.join(sorted(markers))
             )
-        if result.returncode and 'not a dynamic executable' not in result.stderr + result.stdout:
-            raise RuntimeError('Unable to inventory native dependencies')
-        for name in re.findall(r'(/[^\s()]+)', result.stdout):
-            source = Path(name).resolve(strict=True)
-            target = directory / Path(name).name
-            if target.exists() and sha256(target) != sha256(source):
-                raise RuntimeError('Conflicting native dependency SONAMEs')
-            copy(source, target)
+        pending = unresolved
 
 
 def archive(root, name, paths):
