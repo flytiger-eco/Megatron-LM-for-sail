@@ -1003,6 +1003,34 @@ def test_runtime_helpers_never_install_or_compile(filename):
     assert 'urllib.request' not in text
 
 
+def test_control_dockerfile_completes_slim_tkinter_runtime():
+    dockerfile = (ROOT / '.github/docker/Dockerfile.ppu-ci').read_text()
+    control = dockerfile.split('FROM ${CONTROL_IMAGE} AS control', 1)[1].split(
+        'FROM scratch AS control-export', 1
+    )[0]
+    install = control.index('apt-get install -y --no-install-recommends libtk8.6')
+    probe = control.index("python -c 'import _tkinter'")
+    export = control.index('python /build/export_environment.py control')
+    assert install < probe < export
+    assert 'FROM ${PPU_IMAGE} AS dependencies' in dockerfile
+
+
+def test_restored_control_probes_tkinter_without_installing_dependencies(tmp_path, monkeypatch):
+    destination = tmp_path / 'control'
+    monkeypatch.setattr(container, 'verify_export', lambda *args, **kwargs: None)
+    monkeypatch.setattr(container, 'extract_archive', lambda *args, **kwargs: None)
+    calls = []
+    monkeypatch.setattr(container, 'command', lambda argv, **kwargs: calls.append(argv))
+    container.restore_control(
+        SimpleNamespace(
+            artifact=tmp_path, digest='a' * 64, control_sha=CONTROL, destination=destination
+        )
+    )
+    assert len(calls) == 1
+    assert calls[0][:3] == [str(destination / 'bin/python'), '-I', '-c']
+    assert 'import sys, _tkinter,' in calls[0][3]
+
+
 def test_tools_vendor_byte_checks_and_native_compilation_stay_in_build():
     dockerfile = (ROOT / '.github/docker/Dockerfile.ppu-ci').read_text()
     assert (
@@ -1140,6 +1168,8 @@ def test_native_library_closure_catches_missing_dependencies(tmp_path, monkeypat
         ('libcrypto.so.3', 'libcrypto'),
         ('libpython3.12.so.1.0', 'libpython'),
         ('libpython3.so', 'libpython'),
+        ('libtk8.6.so', 'libtk'),
+        ('libtcl8.6.so', 'libtcl'),
         ('private-library.so', 'unknown'),
         ('/private/library.so', 'unknown'),
     ],

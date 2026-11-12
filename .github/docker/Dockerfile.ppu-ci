@@ -11,7 +11,11 @@ ENV PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/s
     DEBIAN_FRONTEND=noninteractive
 COPY docker/control-requirements.txt /build/control-requirements.txt
 COPY docker/export_environment.py /build/export_environment.py
-RUN python -m pip install --index-url "$PIP_INDEX_URL" --report /build/control-install.json \
+# The slim base retains _tkinter but excludes its Tcl/Tk runtime dependency closure.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libtk8.6 \
+    && python -c 'import _tkinter' \
+    && python -m pip install --index-url "$PIP_INDEX_URL" --report /build/control-install.json \
         -r /build/control-requirements.txt \
     && python -m pip check \
     && python /build/export_environment.py control

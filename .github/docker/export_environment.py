@@ -90,6 +90,8 @@ def libraries(files, directory):
         'libcrypto.so.3': 'missing-native-libcrypto',
         'libpython3.12.so.1.0': 'missing-native-libpython',
         'libpython3.so': 'missing-native-libpython',
+        'libtk8.6.so': 'missing-native-libtk',
+        'libtcl8.6.so': 'missing-native-libtcl',
     }
     while pending:
         unresolved, markers = [], set()

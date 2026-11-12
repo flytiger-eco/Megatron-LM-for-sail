@@ -299,6 +299,8 @@ def failure_markers(stdout, stderr):
         ('native-libcrypto', r'\bmissing-native-libcrypto\b'),
         ('native-unknown', r'\bmissing-native-unknown\b'),
         ('native-libpython', r'\bmissing-native-libpython\b'),
+        ('native-libtk', r'\bmissing-native-libtk\b'),
+        ('native-libtcl', r'\bmissing-native-libtcl\b'),
         ('native-version', r'\bmissing-native-version\b'),
         ('native-unparsed', r'\bmissing-native-unparsed\b'),
         ('native-object-python', r'\bmissing-native-object-python\b'),
@@ -837,7 +839,7 @@ def restore_control(args):
             str(interpreter),
             '-I',
             '-c',
-            'import sys, click, yaml, numpy, pydantic, pytest, google_crc32c; '
+            'import sys, _tkinter, click, yaml, numpy, pydantic, pytest, google_crc32c; '
             'from tensorboard.compat.proto.event_pb2 import Event; '
             'assert sys.version_info[:2] == (3, 12); '
             'assert Event.FromString(Event(step=1).SerializeToString()).step == 1',
