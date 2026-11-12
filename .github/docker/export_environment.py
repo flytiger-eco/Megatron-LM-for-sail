@@ -88,6 +88,8 @@ def libraries(files, directory):
         'libquadmath-96973f99.so.0.0.0': 'missing-native-libquadmath',
         'libssl.so.3': 'missing-native-libssl',
         'libcrypto.so.3': 'missing-native-libcrypto',
+        'libpython3.12.so.1.0': 'missing-native-libpython',
+        'libpython3.so': 'missing-native-libpython',
     }
     while pending:
         unresolved, markers = [], set()
@@ -104,6 +106,11 @@ def libraries(files, directory):
                 markers.update(known.get(name, 'missing-native-unknown') for name in names)
                 if not names:
                     markers.add('missing-native-unknown')
+                    markers.add(
+                        'missing-native-version'
+                        if re.search(r"version\s+[^\n]+not found", result.stdout)
+                        else 'missing-native-unparsed'
+                    )
                 continue
             if (
                 result.returncode
@@ -120,6 +127,21 @@ def libraries(files, directory):
                     copy(source, target)
                     progress = True
         if unresolved and not progress:
+            # Emit only fixed component labels, never ELF names, paths or ldd output.
+            owners = {
+                'numpy': 'numpy',
+                'numpy.libs': 'numpy',
+                'google_crc32c': 'crc32c',
+                'google_crc32c.libs': 'crc32c',
+                'grpc': 'grpc',
+                'pydantic_core': 'pydantic',
+                'lib-dynload': 'stdlib',
+            }
+            for path in unresolved:
+                owner = next((owners[part] for part in path.parts if part in owners), 'other')
+                if path.name in ('python3.12', 'libpython3.12.so.1.0', 'libpython3.so'):
+                    owner = 'python'
+                markers.add('missing-native-object-' + owner)
             raise RuntimeError(
                 'A native dependency is missing in the build container; '
                 + ','.join(sorted(markers))

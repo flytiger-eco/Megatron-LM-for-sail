@@ -1087,7 +1087,7 @@ def test_native_closure_still_rejects_missing_dependencies_after_progress(tmp_pa
         exporter.libraries([missing, extension], tmp_path / 'ppu-system')
     assert str(error.value) == (
         'A native dependency is missing in the build container; '
-        'missing-native-libgcc,missing-native-unknown'
+        'missing-native-libgcc,missing-native-object-other,missing-native-unknown'
     )
     assert calls == [missing, extension, missing]
 
@@ -1138,6 +1138,8 @@ def test_native_library_closure_catches_missing_dependencies(tmp_path, monkeypat
         ('libquadmath-96973f99.so.0.0.0', 'libquadmath'),
         ('libssl.so.3', 'libssl'),
         ('libcrypto.so.3', 'libcrypto'),
+        ('libpython3.12.so.1.0', 'libpython'),
+        ('libpython3.so', 'libpython'),
         ('private-library.so', 'unknown'),
         ('/private/library.so', 'unknown'),
     ],
@@ -1158,11 +1160,15 @@ def test_missing_native_libraries_only_emit_allowlisted_markers(
     )
     with pytest.raises(RuntimeError) as error:
         exporter.libraries([elf], tmp_path / 'libs')
-    message = 'A native dependency is missing in the build container; missing-native-' + marker
+    markers = {'missing-native-' + marker, 'missing-native-object-other'}
+    if soname.startswith('/'):
+        markers.add('missing-native-unparsed')
+    message = 'A native dependency is missing in the build container; ' + ','.join(sorted(markers))
     assert str(error.value) == message
-    assert container.failure_markers('', str(error.value)) == (
-        'export-native-missing,native-' + marker
-    )
+    expected = 'export-native-missing,native-' + marker
+    if soname.startswith('/'):
+        expected += ',native-unparsed'
+    assert container.failure_markers('', str(error.value)) == expected + ',native-object-other'
     assert not list((tmp_path / 'libs').iterdir())
 
 
@@ -1185,11 +1191,59 @@ def test_missing_native_markers_are_deduplicated_and_loaded_libraries_are_not_re
         exporter.libraries([elf], tmp_path / 'libs')
     assert str(error.value) == (
         'A native dependency is missing in the build container; '
-        'missing-native-libgcc,missing-native-libstdcxx'
+        'missing-native-libgcc,missing-native-libstdcxx,missing-native-object-other'
     )
     assert container.failure_markers('', str(error.value)) == (
-        'export-native-missing,native-libstdcxx,native-libgcc'
+        'export-native-missing,native-libstdcxx,native-libgcc,native-object-other'
     )
+
+
+@pytest.mark.parametrize(
+    'name,owner',
+    [
+        ('bin/python3.12', 'python'),
+        ('lib/libpython3.12.so.1.0', 'python'),
+        ('lib/python3.12/site-packages/numpy/core/extension.so', 'numpy'),
+        ('lib/python3.12/site-packages/numpy.libs/extension.so', 'numpy'),
+        ('lib/python3.12/site-packages/google_crc32c/extension.so', 'crc32c'),
+        ('lib/python3.12/site-packages/google_crc32c.libs/extension.so', 'crc32c'),
+        ('lib/python3.12/site-packages/grpc/extension.so', 'grpc'),
+        ('lib/python3.12/site-packages/pydantic_core/extension.so', 'pydantic'),
+        ('lib/python3.12/lib-dynload/extension.so', 'stdlib'),
+        ('private-token/extension.so', 'other'),
+    ],
+)
+@pytest.mark.parametrize('shape', ['soname', 'version', 'unparsed'])
+def test_native_diagnostics_emit_only_fixed_component_and_failure_labels(
+    tmp_path, monkeypatch, name, owner, shape
+):
+    elf = tmp_path / name
+    elf.parent.mkdir(parents=True)
+    elf.write_bytes(b'\x7fELF')
+    output = {
+        'soname': 'private-library.so => not found\n',
+        'version': '/private/file: version `private-version` not found\n',
+        'unparsed': 'private-token not found\n',
+    }[shape]
+    monkeypatch.setattr(
+        exporter.subprocess,
+        'run',
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1, stdout=output, stderr='private-token'
+        ),
+    )
+    with pytest.raises(RuntimeError) as error:
+        exporter.libraries([elf], tmp_path / 'ppu-system')
+    markers = {'missing-native-unknown', 'missing-native-object-' + owner}
+    if shape != 'soname':
+        markers.add('missing-native-' + shape)
+    assert str(error.value) == (
+        'A native dependency is missing in the build container; ' + ','.join(sorted(markers))
+    )
+    public = container.failure_markers('', str(error.value))
+    assert 'native-object-' + owner in public.split(',')
+    assert ('native-' + shape in public.split(',')) is (shape != 'soname')
+    assert not any(private in public for private in ('private', str(tmp_path), 'extension.so'))
 
 
 def test_preflight_missing_builder_does_not_install_or_launch_daemon(tmp_path, monkeypatch):
