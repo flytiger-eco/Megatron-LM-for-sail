@@ -314,6 +314,26 @@ def failure_markers(stdout, stderr):
         ('export-native-conflict', r'conflicting native dependency sonames'),
         ('export-file-type', r'export requires materialized files and directories'),
         ('offline-control-import', r'restored control interpreter import check failed'),
+        (
+            'restore-archive-invalid',
+            r'invalid environment member path|invalid environment archive size|unsupported or repeated archive member|invalid archive member size|archive file conflicts with a parent directory|environment archive exceeds the size limit',
+        ),
+        (
+            'restore-path-invalid',
+            r'environment path contains a symlink|archive member escapes the restore root|refusing to overwrite an environment member|refusing to overwrite the control interpreter',
+        ),
+        ('restore-space', r'insufficient environment restore space'),
+        (
+            'restore-integrity',
+            r'environment metadata does not match the trusted job digest|missing or corrupted environment member|unexpected environment export members',
+        ),
+        ('probe-file-missing', r'ppu environment operation failed: filenotfounderror;'),
+        ('probe-file-permission', r'ppu environment operation failed: permissionerror;'),
+        ('probe-type-error', r'ppu environment operation failed: typeerror;'),
+        ('probe-attribute-error', r'ppu environment operation failed: attributeerror;'),
+        ('probe-os-error', r'ppu environment operation failed: oserror;'),
+        ('probe-tar-error', r'ppu environment operation failed: (?:readerror|compressionerror);'),
+        ('probe-json-error', r'ppu environment operation failed: jsondecodeerror;'),
     )
     return ','.join(label for label, pattern in patterns if re.search(pattern, text)) or 'unknown'
 
