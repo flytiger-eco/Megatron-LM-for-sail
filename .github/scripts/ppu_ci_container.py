@@ -465,13 +465,24 @@ def fingerprint(args):
             stream.write(f'cache_key={key}\nimage_digest={pinned}\n')
 
 
+def readable_probe_export(output, context):
+    """Prepare a readable bind root inside the private, temporary build context."""
+    snapshot = context / 'probe-exports'
+    shutil.copytree(no_links(output), snapshot)
+    for path in (snapshot, *snapshot.rglob('*')):
+        no_links(path)
+        require(path.is_dir() or path.is_file(), 'Invalid offline probe export member')
+        path.chmod(0o755 if path.is_dir() else 0o644)
+    return snapshot
+
+
 def build(args):
     image_mode = getattr(args, 'mode', '') == 'build-image'
     root = no_links(args.control_root)
     image, pinned, _, inputs = build_identity(args)
     output = no_links(args.output)
     require(not output.exists(), 'Refusing to overwrite a container export')
-    with tempfile.TemporaryDirectory(prefix='ppu-docker-context-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='ppu-docker-context-', dir=root) as temporary:
         context = Path(temporary)
         docker = context / 'docker'
         docker.mkdir()
@@ -574,6 +585,10 @@ def build(args):
         (output / 'docker-build.json').write_text(json.dumps(metadata, sort_keys=True) + '\n')
         sha = digest(output / 'docker-build.json')
         verify_export(output, sha, args.control_sha, args.target_sha, schema=2 if image_mode else 1)
+        # BuildKit local exports may be owned by the runner with mode 0700.
+        # A root container without DAC capabilities cannot read that bind mount.
+        # Keep original evidence private and mount a readable temporary snapshot.
+        probe_export = readable_probe_export(output, context)
         if image_mode:
             release = context / 'release'
             release.mkdir()
@@ -601,7 +616,7 @@ def build(args):
                     '--cap-drop=ALL',
                     '--security-opt=no-new-privileges',
                     '--mount',
-                    f'type=bind,source={output},target=/exports,readonly',
+                    f'type=bind,source={probe_export},target=/exports,readonly',
                     '--mount',
                     f'type=bind,source={root / ".github/scripts"},target=/trusted,readonly',
                     '--mount',
@@ -629,7 +644,7 @@ def build(args):
             return
         mounts = [
             '--mount',
-            f'type=bind,source={output},target=/exports,readonly',
+            f'type=bind,source={probe_export},target=/exports,readonly',
             '--mount',
             f'type=bind,source={root / ".github/scripts"},target=/trusted,readonly',
         ]

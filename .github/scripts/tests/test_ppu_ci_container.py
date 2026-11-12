@@ -344,6 +344,27 @@ def test_cache_is_dependency_based_but_build_inputs_bind_full_identities(build_i
     assert container.build_identity(args)[2] != first_key
 
 
+def test_probe_export_is_readable_without_changing_private_evidence(tmp_path):
+    output = tmp_path / 'private-export'
+    output.mkdir(mode=0o700)
+    report = output / 'nested/report.json'
+    report.parent.mkdir(mode=0o700)
+    report.write_bytes(b'private-evidence')
+    report.chmod(0o600)
+    context = tmp_path / 'private-context'
+    context.mkdir(mode=0o700)
+    before = container.inventory(output)
+    snapshot = container.readable_probe_export(output, context)
+    assert snapshot != output
+    assert container.inventory(snapshot) == before == container.inventory(output)
+    assert output.stat().st_mode & 0o777 == 0o700
+    assert report.stat().st_mode & 0o777 == 0o600
+    assert context.stat().st_mode & 0o777 == 0o700
+    assert snapshot.stat().st_mode & 0o777 == 0o755
+    assert (snapshot / 'nested').stat().st_mode & 0o777 == 0o755
+    assert (snapshot / 'nested/report.json').stat().st_mode & 0o777 == 0o644
+
+
 def test_build_uses_only_trusted_dockerfile_and_offline_unprivileged_probe(
     build_inputs, monkeypatch
 ):
@@ -362,6 +383,9 @@ def test_build_uses_only_trusted_dockerfile_and_offline_unprivileged_probe(
             runtime_export(args.output)
         if argv[:2] == ['docker', 'run']:
             assert '--network=none' in argv and '--cap-drop=ALL' in argv
+            exports = next(item for item in argv if 'target=/exports' in item)
+            assert exports.endswith('/probe-exports,target=/exports,readonly')
+            assert str(args.output) not in exports
             assert all('docker.sock' not in item and 'secret' not in item for item in argv)
             return '{"environment_restore_seconds": 0.1}'
         if argv[:3] == ['docker', 'buildx', 'build']:
@@ -480,6 +504,9 @@ def test_complete_image_build_loads_and_probes_exact_id_without_publication(
             assert LOCAL_ID in argv and args.local_image not in argv
             assert '--network=none' in argv and '--cap-drop=ALL' in argv
             assert '--security-opt=no-new-privileges' in argv
+            exports = next(item for item in argv if 'target=/exports' in item)
+            assert exports.endswith('/probe-exports,target=/exports,readonly')
+            assert str(args.output) not in exports
             if stage == 'probe':
                 raise container.ValidationError('probe failed')
         assert 'fixture-secret' not in str(argv)
