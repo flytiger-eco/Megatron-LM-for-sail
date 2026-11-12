@@ -182,7 +182,10 @@ def test_all_parent_child_secret_boundaries_are_explicit(filename):
                 if step["with"].get("name") == "ppu-control-environment":
                     assert filename == "ppu-build"
                     assert job is workflow["jobs"]["control-environment"]
-                    assert step["with"]["path"] == ".ppu-control-export/"
+                    assert step["with"]["path"] == "${{ runner.temp }}/ppu-control-export/"
+                    build = next(item for item in job["steps"] if item.get("id") == "control")
+                    assert '--output "$RUNNER_TEMP/ppu-control-export"' in build["run"]
+                    assert not step["with"].get("include-hidden-files", False)
                     assert "outputs.allowed == 'true'" in job["if"]
                     assert "secrets." not in json.dumps(job)
                     continue

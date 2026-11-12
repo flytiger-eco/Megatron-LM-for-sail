@@ -227,7 +227,7 @@ jobs:
           bash control/.github/scripts/ppu_ci_container.sh build --kind control
           --control-root control --control-sha '${{ needs.authorize.outputs.control_sha }}'
           --image-digest '${{ steps.identity.outputs.image_digest }}'
-          --output .ppu-control-export --cache-root "$RUNNER_TEMP/ppu-control-cache"
+          --output "$RUNNER_TEMP/ppu-control-export" --cache-root "$RUNNER_TEMP/ppu-control-cache"
       - uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/ppu-control-cache
@@ -235,7 +235,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ppu-control-environment
-          path: .ppu-control-export/
+          path: ${{ runner.temp }}/ppu-control-export/
           if-no-files-found: error
           retention-days: 7
   compiler-diagnostic:
