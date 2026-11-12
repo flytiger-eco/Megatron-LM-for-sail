@@ -465,6 +465,62 @@ def fingerprint(args):
             stream.write(f'cache_key={key}\nimage_digest={pinned}\n')
 
 
+def materialize_tracked_source(source, destination, names):
+    """仅将仓库内指向已跟踪普通文件的单层别名实体化到空构建目录。"""
+    source, destination = no_links(source), no_links(destination)
+    require(
+        destination.is_dir() and not any(destination.iterdir()),
+        'Build source destination must be an empty directory',
+    )
+    names = sorted({name for name in names if name})
+    for name in names:
+        relative(name)
+    planned = {}
+    for name in names:
+        original = source / name
+        no_links(original.parent)
+        rows = [(name, original)]
+        if original.is_symlink():
+            resolved = Path(os.path.abspath(original.parent / os.readlink(original)))
+            require(resolved.is_relative_to(source), 'Build source alias escapes the checkout')
+            no_links(resolved)
+            try:
+                require(
+                    original.resolve(strict=True) == resolved,
+                    'Build source alias target is not a direct repository member',
+                )
+            except (OSError, RuntimeError):
+                raise ValidationError('Build source alias target cannot be resolved') from None
+            alias = resolved.relative_to(source).as_posix()
+            if resolved.is_dir():
+                rows = [
+                    (name + '/' + item[len(alias) + 1 :], source / item)
+                    for item in names
+                    if item.startswith(alias + '/')
+                ]
+                require(rows, 'Build source alias has no tracked targets')
+            else:
+                require(alias in names, 'Build source alias target is not tracked')
+                rows = [(name, resolved)]
+        for target_name, original in rows:
+            original = no_links(original)
+            require(original.is_file(), 'Build source must contain only regular tracked files')
+            require(target_name not in planned, 'Build source aliases conflict')
+            planned[target_name] = original
+    require(
+        not any(
+            str(parent) in planned for name in planned for parent in PurePosixPath(name).parents
+        ),
+        'Build source file conflicts with a parent directory',
+    )
+    for name, original in planned.items():
+        target = no_links(destination / name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with original.open('rb') as stream, target.open('xb') as output:
+            shutil.copyfileobj(stream, output)
+        target.chmod(original.stat().st_mode & 0o755)
+
+
 def readable_probe_export(output, context):
     """Prepare a readable bind root inside the private, temporary build context."""
     snapshot = context / 'probe-exports'
@@ -497,19 +553,11 @@ def build(args):
             shutil.copyfile(source / 'pyproject.toml', context / 'pyproject.toml')
             inputs['pyproject.toml'] = digest(context / 'pyproject.toml')
             (context / 'source').mkdir()
-            for name in command(
+            names = command(
                 ['git', '-C', str(source), 'ls-files', '-z'],
                 failure='Build tracked source inventory read failed',
-            ).split('\0'):
-                if not name:
-                    continue
-                relative(name)
-                original = no_links(source / name)
-                require(original.is_file(), 'Build source must contain only regular tracked files')
-                target = context / 'source' / name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(original, target)
-                target.chmod(original.stat().st_mode & 0o755)
+            ).split('\0')
+            materialize_tracked_source(source, context / 'source', names)
             control = context / 'control'
             control.mkdir()
             for original in trusted_controls(root):

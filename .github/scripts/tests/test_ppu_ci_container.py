@@ -344,6 +344,199 @@ def test_cache_is_dependency_based_but_build_inputs_bind_full_identities(build_i
     assert container.build_identity(args)[2] != first_key
 
 
+@pytest.fixture
+def tracked_source(tmp_path):
+    source, destination = tmp_path / 'tracked-source', tmp_path / 'build-source'
+    source.mkdir()
+    destination.mkdir()
+    member = source / 'skills/nested/run.sh'
+    member.parent.mkdir(parents=True)
+    member.write_bytes(b'#!/bin/sh\nexit 0\n')
+    member.chmod(0o6755)
+    return source, destination, ['skills/nested/run.sh']
+
+
+@pytest.mark.parametrize('absolute', [False, True])
+def test_materialized_source_copies_tracked_file_and_directory_aliases(tracked_source, absolute):
+    source, destination, names = tracked_source
+    member = source / names[0]
+    (source / 'run.sh').symlink_to(member if absolute else names[0])
+    agent = source / '.agents'
+    agent.mkdir()
+    (agent / 'skills').symlink_to(source / 'skills' if absolute else '../skills')
+    (source / 'skills/untracked-private').write_bytes(b'not exported')
+    (source / 'skills/untracked-link').symlink_to(destination)
+    before, mode = container.digest(member), member.stat().st_mode
+    container.materialize_tracked_source(
+        source, destination, [*names, 'run.sh', '.agents/skills', '']
+    )
+    assert set(container.inventory(destination, exclude=())) == {
+        names[0],
+        'run.sh',
+        '.agents/skills/nested/run.sh',
+    }
+    for path in destination.rglob('*'):
+        assert not path.is_symlink()
+        if path.is_file():
+            assert container.digest(path) == before
+            assert path.stat().st_mode & 0o7777 == 0o755
+    assert container.digest(member) == before and member.stat().st_mode == mode
+    assert (source / 'run.sh').is_symlink() and (agent / 'skills').is_symlink()
+
+
+@pytest.mark.parametrize('kind', ['relative-file', 'absolute-file', 'directory'])
+def test_materialized_source_rejects_external_aliases_before_writes(tracked_source, kind):
+    source, destination, names = tracked_source
+    outside = source.parent / 'external-private'
+    if kind == 'directory':
+        outside.mkdir()
+    else:
+        outside.write_bytes(b'private')
+    (source / 'alias').symlink_to('../external-private' if kind == 'relative-file' else outside)
+    with pytest.raises(container.ValidationError, match='escapes the checkout'):
+        container.materialize_tracked_source(source, destination, [*names, 'alias'])
+    assert not list(destination.iterdir())
+
+
+@pytest.mark.parametrize(
+    'kind', ['untracked-file', 'untracked-directory', 'dangling', 'cycle', 'chain']
+)
+def test_materialized_source_rejects_untracked_or_indirect_aliases(tracked_source, kind):
+    source, destination, names = tracked_source
+    target = source / 'untracked'
+    if kind == 'untracked-file':
+        target.write_bytes(b'private')
+    elif kind == 'untracked-directory':
+        target.mkdir()
+        (target / 'private').write_bytes(b'private')
+    elif kind == 'cycle':
+        target.symlink_to('alias')
+    elif kind == 'chain':
+        target.symlink_to(names[0])
+        names.append('untracked')
+    (source / 'alias').symlink_to('untracked')
+    with pytest.raises(container.ValidationError):
+        container.materialize_tracked_source(source, destination, [*names, 'alias'])
+    assert not list(destination.iterdir())
+
+
+@pytest.mark.parametrize('kind', ['file-link', 'parent-link', 'special', 'missing', 'directory'])
+def test_materialized_source_rejects_nonregular_directory_members(tracked_source, kind):
+    source, destination, names = tracked_source
+    (source / 'alias').symlink_to('skills')
+    extra = source / 'skills/extra'
+    if kind == 'file-link':
+        extra.symlink_to('nested/run.sh')
+    elif kind == 'parent-link':
+        extra.symlink_to('nested')
+        names.append('skills/extra/run.sh')
+    elif kind == 'special':
+        os.mkfifo(extra)
+    elif kind == 'directory':
+        extra.mkdir()
+    if kind != 'parent-link':
+        names.append('skills/extra')
+    with pytest.raises(container.ValidationError):
+        container.materialize_tracked_source(source, destination, [*names, 'alias'])
+    assert not list(destination.iterdir())
+
+
+@pytest.mark.parametrize('name', ['../escape', '/absolute', 'skills/../escape', 'a\\b', 'a\nfile'])
+def test_materialized_source_rejects_invalid_inventory_before_writes(tracked_source, name):
+    source, destination, names = tracked_source
+    with pytest.raises(container.ValidationError, match='Invalid environment member path'):
+        container.materialize_tracked_source(source, destination, [*names, name])
+    assert not list(destination.iterdir())
+
+
+@pytest.mark.parametrize(
+    'kind', ['destination-link', 'parent-link', 'existing-file', 'existing-dir']
+)
+def test_materialized_source_refuses_unsafe_or_nonempty_destination(tracked_source, kind):
+    source, destination, names = tracked_source
+    existing = destination / 'existing'
+    if kind == 'destination-link':
+        destination = source.parent / 'linked-destination'
+        destination.symlink_to(source)
+    elif kind == 'parent-link':
+        linked = source.parent / 'linked-parent'
+        linked.symlink_to(source.parent)
+        destination = linked / 'build-source'
+    elif kind == 'existing-file':
+        existing.write_bytes(b'original')
+    else:
+        existing.mkdir()
+    with pytest.raises(container.ValidationError):
+        container.materialize_tracked_source(source, destination, names)
+    if kind == 'existing-file':
+        assert existing.read_bytes() == b'original'
+    assert not (source / 'nested/run.sh').exists()
+
+
+@pytest.mark.parametrize('kind', ['source-root', 'tracked-parent', 'alias-collision'])
+def test_materialized_source_rejects_linked_source_and_conflicts(tracked_source, kind):
+    source, destination, names = tracked_source
+    if kind == 'source-root':
+        linked = source.parent / 'linked-source'
+        linked.symlink_to(source)
+        source = linked
+    elif kind == 'tracked-parent':
+        (source / 'linked').symlink_to('skills')
+        names.append('linked/nested/run.sh')
+    else:
+        (source / 'alias').symlink_to('skills')
+        names.extend(['alias', 'alias/nested/run.sh'])
+    with pytest.raises(container.ValidationError):
+        container.materialize_tracked_source(source, destination, names)
+    assert not list(destination.iterdir())
+
+
+def test_materialized_source_handles_actual_git_tracked_checkout_aliases(tmp_path):
+    names = subprocess.run(
+        ['git', '-C', str(ROOT), 'ls-files', '-z'], check=True, capture_output=True, text=True
+    ).stdout.split('\0')
+    names = [name for name in names if name]
+    aliases = [name for name in names if (ROOT / name).is_symlink()]
+    assert {
+        '.agents/skills',
+        '.claude/skills',
+        'CLAUDE.md',
+        'examples/post_training/modelopt/conf/nvidia/NVIDIA-Nemotron-Nano-9B-v2-Base.sh',
+        'megatron/core/models/hybrid/CLAUDE.md',
+    }.issubset(aliases)
+    expected = {}
+    for name in names:
+        original = ROOT / name
+        if original.is_symlink() and original.is_dir():
+            prefix = original.resolve().relative_to(ROOT).as_posix() + '/'
+            rows = [
+                (name + '/' + item[len(prefix) :], ROOT / item)
+                for item in names
+                if item.startswith(prefix)
+            ]
+        else:
+            rows = [(name, original.resolve())]
+        for target_name, member in rows:
+            expected[target_name] = {
+                'size': member.stat().st_size,
+                'sha256': container.digest(member),
+            }
+    destination = tmp_path / 'actual-source'
+    destination.mkdir()
+    before = {name: os.readlink(ROOT / name) for name in aliases}
+    container.materialize_tracked_source(ROOT, destination, names)
+    assert container.inventory(destination, exclude=()) == expected
+    assert all(
+        (ROOT / name).is_symlink() and os.readlink(ROOT / name) == value
+        for name, value in before.items()
+    )
+    for name in names:
+        if (ROOT / name).is_file():
+            assert (destination / name).stat().st_mode & 0o755 == (
+                ROOT / name
+            ).stat().st_mode & 0o755
+
+
 def test_probe_export_is_readable_without_changing_private_evidence(tmp_path):
     output = tmp_path / 'private-export'
     output.mkdir(mode=0o700)
@@ -371,6 +564,7 @@ def test_build_uses_only_trusted_dockerfile_and_offline_unprivileged_probe(
     args = build_inputs
     malicious = args.source_root / 'Dockerfile'
     malicious.write_text('RUN steal-credentials')
+    (args.source_root / 'Dockerfile-alias').symlink_to('Dockerfile')
     calls = []
 
     def command(argv, **kwargs):
@@ -378,7 +572,7 @@ def test_build_uses_only_trusted_dockerfile_and_offline_unprivileged_probe(
         if argv[0] == 'git':
             if argv[2] == str(args.control_root):
                 return '.github/scripts/ppu_ci_container.py\0.github/scripts/ppu_functional_pytest.py\0'
-            return 'pyproject.toml\0Dockerfile\0'
+            return 'pyproject.toml\0Dockerfile\0Dockerfile-alias\0'
         if '--output' in argv:
             runtime_export(args.output)
         if argv[:2] == ['docker', 'run']:
@@ -395,6 +589,9 @@ def test_build_uses_only_trusted_dockerfile_and_offline_unprivileged_probe(
             ).read_bytes()
             if '--target' in argv and argv[argv.index('--target') + 1] == 'runtime-export':
                 assert (context / 'source/Dockerfile').read_text() == 'RUN steal-credentials'
+                alias = context / 'source/Dockerfile-alias'
+                assert alias.is_file() and not alias.is_symlink()
+                assert alias.read_text() == 'RUN steal-credentials'
         return ''
 
     monkeypatch.setenv('GITHUB_TOKEN', 'fixture-token')
