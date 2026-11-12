@@ -925,7 +925,8 @@ def test_suite_runner_with_fake_hardware(tmp_path, failure):
         "PPU_TARGET_SHA": SHA,
         "PPU_CONTROL_SHA": CONTROL_SHA,
         "PPU_ENVIRONMENT_DIGEST": "d" * 64,
-        "PPU_IMAGE_DIGEST": "pkg.flytiger-eco.com/docker_release/pytorch@sha256:" + "e" * 64,
+        "PPU_IMAGE_DIGEST": "ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci@sha256:" + "e" * 64,
+        "PPU_BASE_IMAGE_DIGEST": "pkg.flytiger-eco.com/docker_release/pytorch@sha256:" + "f" * 64,
         "NPROC_PER_NODE": "8",
         "NNODES": "1",
     }
@@ -934,8 +935,16 @@ def test_suite_runner_with_fake_hardware(tmp_path, failure):
     )
     assert run.returncode == (0 if failure == "none" else 1), run.stdout + run.stderr
     commands = [json.loads(line) for line in (tmp_path / "commands.jsonl").read_text().splitlines()]
-    restores = [c for c in commands if c['name'] == 'python3' and 'restore-runtime' in c['args']]
-    assert len(restores) == 1
+    verifications = [c for c in commands if c['name'] == 'python3' and 'verify-image' in c['args']]
+    assert len(verifications) == 1
+    for flag, variable in (
+        ('--digest', 'PPU_ENVIRONMENT_DIGEST'),
+        ('--image-digest', 'PPU_IMAGE_DIGEST'),
+        ('--base-image-digest', 'PPU_BASE_IMAGE_DIGEST'),
+    ):
+        args = verifications[0]['args']
+        assert args[args.index(flag) + 1] == env[variable]
+    assert not any('restore-runtime' in c['args'] for c in commands)
     calls = [
         c
         for c in commands

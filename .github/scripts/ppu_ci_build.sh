@@ -11,11 +11,12 @@ cd "$PPU_SOURCE_ROOT"
 ln -s "$PPU_ARTIFACT_DIR" .ppu-ci
 [[ -f .ppu-ci/manifest.json ]] || exit 1
 : "${PPU_ENVIRONMENT_DIGEST:?Missing trusted Dockerfile build digest}"
-bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" restore-runtime \
+bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" verify-image \
     --artifact "$PPU_ARTIFACT_DIR" --digest "$PPU_ENVIRONMENT_DIGEST" \
     --control-sha "$PPU_CONTROL_SHA" --target-sha "$PPU_TARGET_SHA" \
-    --source-root "$PPU_SOURCE_ROOT" --destination /opt \
-    --image-digest "${PPU_IMAGE_DIGEST:?Missing trusted base image digest}"
+    --source-root "$PPU_SOURCE_ROOT" \
+    --base-image-digest "${PPU_BASE_IMAGE_DIGEST:?Missing trusted base image digest}" \
+    --image-digest "${PPU_IMAGE_DIGEST:?Missing trusted execution image digest}"
 export PATH="/opt/ppu-ci-venv/bin:$PATH"
 export VIRTUAL_ENV=/opt/ppu-ci-venv UV_PROJECT_ENVIRONMENT=/opt/ppu-ci-venv
 export PYTHONNOUSERSITE=1 UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never
@@ -284,9 +285,8 @@ fi
 git diff --quiet HEAD --
 git ls-files -z > .ppu-ci/source-files.txt
 tar -czf .ppu-ci/source.tar.gz --null -T .ppu-ci/source-files.txt megatron/core/datasets/helpers_cpp*.so
-[[ -s .ppu-ci/environment.tar.gz ]]
-cp .ppu-ci/wheels/*.whl .ppu-ci/
-printf '%s\n' "$PPU_IMAGE" > .ppu-ci/image.txt
+[[ -s .ppu-ci/runtime-image.json && ! -e .ppu-ci/environment.tar.gz ]]
+printf '%s\n' "$PPU_IMAGE_DIGEST" > .ppu-ci/image.txt
 printf '%s\n' "$PPU_TARGET_SHA" > .ppu-ci/commit.txt
 printf '%s\n' "$PPU_CONTROL_SHA" > .ppu-ci/control.txt
 ended_at=$(date +%s)

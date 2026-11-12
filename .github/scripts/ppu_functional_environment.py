@@ -283,8 +283,10 @@ print(json.dumps({{
 
 
 def prepare(bundle: Path, manifest: dict):
-    """Attest the already restored Dockerfile output; never acquire software here."""
-    if manifest.get("environment_build_schema") != 1:
+    """Attest the existing Dockerfile environment; never acquire software here."""
+    if type(manifest.get("environment_build_schema")) is not int or manifest[
+        "environment_build_schema"
+    ] not in (1, 2):
         raise ValueError("Functional preparation requires a Dockerfile environment export")
     metadata = json.loads((bundle / "docker-build.json").read_text())
     for name in ("yq", "envsubst"):
@@ -370,7 +372,21 @@ def check(bundle: Path, manifest: dict, output: Path):
     arch, expected = YQ[platform.machine()]
     if hashlib.sha256((tools / "yq").read_bytes()).hexdigest() != expected:
         raise ValueError("Functional yq binary digest mismatch")
-    current = manifest.get("environment_build_schema") == 1
+    schema = manifest.get("environment_build_schema")
+    if schema is not None and (type(schema) is not int or schema not in (1, 2)):
+        raise ValueError("Unsupported functional Dockerfile environment schema")
+    current = schema in (1, 2)
+    delivery = {}
+    if schema == 2:
+        record = json.loads((bundle / "runtime-image.json").read_text())
+        for field, variable in (
+            ("runtime_image_digest", "PPU_IMAGE_DIGEST"),
+            ("base_image_digest", "PPU_BASE_IMAGE_DIGEST"),
+            ("environment_digest", "PPU_ENVIRONMENT_DIGEST"),
+        ):
+            if not os.environ.get(variable) or record[field] != os.environ[variable]:
+                raise ValueError("Functional execution image handoff mismatch")
+            delivery[field] = record[field]
     if current:
         prepare(bundle, manifest)
     else:
@@ -425,6 +441,7 @@ def check(bundle: Path, manifest: dict, output: Path):
             {
                 "identity": manifest["identity"],
                 "image": manifest["config"]["image"],
+                **delivery,
                 "python": sys.version,
                 "packages": packages,
                 "nvrx": nvrx,

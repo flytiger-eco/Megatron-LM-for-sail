@@ -218,9 +218,11 @@ jobs:
       contents: read
       pull-requests: read
       actions: read
+      packages: write
     outputs:
-      environment_digest: ${{ steps.runtime.outputs.environment_digest }}
-      runtime_image_digest: ${{ steps.identity.outputs.image_digest }}
+      environment_digest: ${{ steps.publish.outputs.environment_digest }}
+      runtime_image_digest: ${{ steps.publish.outputs.runtime_image_digest }}
+      base_image_digest: ${{ steps.publish.outputs.base_image_digest }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -259,8 +261,8 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
-      - name: Check CPU builder and resolve immutable PPU image
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Check CPU builder and resolve immutable PPU base image
         id: identity
         run: >-
           bash control/.github/scripts/ppu_ci_container.sh fingerprint --kind runtime
@@ -270,14 +272,38 @@ jobs:
         with:
           path: ${{ runner.temp }}/ppu-runtime-cache
           key: ppu-runtime-linux-amd64-${{ steps.identity.outputs.cache_key }}
-      - name: Build all UT and functional software on CPU
+      - name: Build and offline-verify the complete execution image on CPU
         id: runtime
         run: >-
-          bash control/.github/scripts/ppu_ci_container.sh build --kind runtime
+          bash control/.github/scripts/ppu_ci_container.sh build-image
+          --local-image 'ppu-ci-runtime:run-${{ github.run_id }}-${{ github.run_attempt }}'
           --control-root control --control-sha '${{ inputs.control_sha }}'
           --source-root source --target-sha '${{ inputs.target_sha }}'
           --image-digest '${{ steps.identity.outputs.image_digest }}'
           --output "$RUNNER_TEMP/ppu-runtime-export" --cache-root "$RUNNER_TEMP/ppu-runtime-cache"
+      - name: Revalidate authorization before private image publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I control/.github/scripts/ppu_pr_authorize.py guard
+      - name: Login to private GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish the verified local image without rebuilding source
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh publish-image
+          --artifact "$RUNNER_TEMP/ppu-runtime-export"
+          --digest '${{ steps.runtime.outputs.environment_digest }}'
+          --control-sha '${{ inputs.control_sha }}' --target-sha '${{ inputs.target_sha }}'
+          --base-image-digest '${{ steps.runtime.outputs.base_image_digest }}'
+          --local-image 'ppu-ci-runtime:run-${{ github.run_id }}-${{ github.run_attempt }}'
+          --local-image-id '${{ steps.runtime.outputs.local_image_id }}'
+          --image-tag 'ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci:run-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.target_sha }}'
       - uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/ppu-runtime-cache
@@ -305,8 +331,9 @@ jobs:
       bundle_digest: ${{ steps.bundle.outputs.bundle_digest }}
       environment_digest: ${{ needs.runtime-environment.outputs.environment_digest }}
       runtime_image_digest: ${{ needs.runtime-environment.outputs.runtime_image_digest }}
+      base_image_digest: ${{ needs.runtime-environment.outputs.base_image_digest }}
     env:
-      PPU_IMAGE: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+      PPU_IMAGE: ${{ needs.runtime-environment.outputs.runtime_image_digest }}
       MAX_JOBS: '16'
     steps:
       - uses: actions/checkout@v4
@@ -356,12 +383,13 @@ jobs:
           path: ${{ runner.temp }}/ppu-runtime-export
       - name: Verify Dockerfile environment handoff before requesting PPU
         run: |
-          bash control/.github/scripts/ppu_ci_container.sh restore-runtime \
+          bash control/.github/scripts/ppu_ci_container.sh verify-image \
             --artifact "$RUNNER_TEMP/ppu-runtime-export" \
             --digest '${{ needs.runtime-environment.outputs.environment_digest }}' \
             --control-sha '${{ inputs.control_sha }}' --target-sha '${{ inputs.target_sha }}' \
             --image-digest '${{ needs.runtime-environment.outputs.runtime_image_digest }}' \
-            --source-root source --destination "$RUNNER_TEMP/ppu-runtime-check" --check-only
+            --base-image-digest '${{ needs.runtime-environment.outputs.base_image_digest }}' \
+            --source-root source --check-only
           cp -R "$RUNNER_TEMP/ppu-runtime-export/." .ppu-ci/
       - name: Validate trusted runtime directories
         env:
@@ -386,7 +414,7 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ needs.configure.outputs.target_sha }},PPU_CONTROL_SHA=${{ needs.configure.outputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_ENVIRONMENT_DIGEST=${{ needs.runtime-environment.outputs.environment_digest }},PPU_IMAGE_DIGEST=${{ needs.runtime-environment.outputs.runtime_image_digest }},PPU_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build
+          extra_env: PPU_TARGET_SHA=${{ needs.configure.outputs.target_sha }},PPU_CONTROL_SHA=${{ needs.configure.outputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_ENVIRONMENT_DIGEST=${{ needs.runtime-environment.outputs.environment_digest }},PPU_IMAGE_DIGEST=${{ needs.runtime-environment.outputs.runtime_image_digest }},PPU_BASE_IMAGE_DIGEST=${{ needs.runtime-environment.outputs.base_image_digest }},PPU_IMAGE=${{ needs.runtime-environment.outputs.runtime_image_digest }},PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build
           command: |
             set -euo pipefail
             umask 022
@@ -410,6 +438,7 @@ jobs:
           PPU_CONTROL_SHA: ${{ needs.configure.outputs.control_sha }}
           PPU_ENVIRONMENT_DIGEST: ${{ needs.runtime-environment.outputs.environment_digest }}
           PPU_IMAGE_DIGEST: ${{ needs.runtime-environment.outputs.runtime_image_digest }}
+          PPU_BASE_IMAGE_DIGEST: ${{ needs.runtime-environment.outputs.base_image_digest }}
         run: |
           set -euo pipefail
           [[ "$PPU_OUTCOME" == success && "$PPU_STATUS" == succeeded ]] || exit 1
@@ -418,11 +447,11 @@ jobs:
           [[ "$(< "$PPU_BUNDLE_DIR/control.txt")" == "$PPU_CONTROL_SHA" ]] || exit 1
           diff -r .ppu-ci/control "$PPU_BUNDLE_DIR/control"
           [[ "$(< "$PPU_BUNDLE_DIR/image.txt")" == "$PPU_IMAGE" ]] || exit 1
-          [[ -s "$PPU_BUNDLE_DIR/source.tar.gz" && -s "$PPU_BUNDLE_DIR/environment.tar.gz" ]] || exit 1
-          "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_container.py restore-runtime \
+          [[ -s "$PPU_BUNDLE_DIR/source.tar.gz" && -s "$PPU_BUNDLE_DIR/runtime-image.json" ]] || exit 1
+          "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_container.py verify-image \
             --artifact "$PPU_BUNDLE_DIR" --digest "$PPU_ENVIRONMENT_DIGEST" \
             --control-sha "$PPU_CONTROL_SHA" --target-sha "$PPU_TARGET_SHA" \
-            --image-digest "$PPU_IMAGE_DIGEST" --destination "$RUNNER_TEMP/ppu-runtime-check" --check-only
+            --image-digest "$PPU_IMAGE_DIGEST" --base-image-digest "$PPU_BASE_IMAGE_DIGEST" --check-only
           cmp .ppu-ci/manifest.json "$PPU_BUNDLE_DIR/manifest.json"
           digest=$(sha256sum "$PPU_BUNDLE_DIR/bundle-integrity.json")
           digest=${digest%% *}
@@ -464,6 +493,7 @@ jobs:
       bundle_digest: ${{ needs.build.outputs.bundle_digest }}
       environment_digest: ${{ needs.build.outputs.environment_digest }}
       runtime_image_digest: ${{ needs.build.outputs.runtime_image_digest }}
+      base_image_digest: ${{ needs.build.outputs.base_image_digest }}
       control_digest: ${{ inputs.control_digest }}
       target_sha: ${{ needs.configure.outputs.target_sha }}
       control_sha: ${{ needs.configure.outputs.control_sha }}
@@ -489,6 +519,7 @@ jobs:
       bundle_digest: ${{ needs.build.outputs.bundle_digest }}
       environment_digest: ${{ needs.build.outputs.environment_digest }}
       runtime_image_digest: ${{ needs.build.outputs.runtime_image_digest }}
+      base_image_digest: ${{ needs.build.outputs.base_image_digest }}
       control_digest: ${{ inputs.control_digest }}
       target_sha: ${{ needs.configure.outputs.target_sha }}
       control_sha: ${{ needs.configure.outputs.control_sha }}

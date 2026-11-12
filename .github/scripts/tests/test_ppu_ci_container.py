@@ -33,6 +33,8 @@ ci = load('ppu_container_bundle_test', SCRIPTS / 'ppu_ci.py')
 CONTROL = 'a' * 40
 TARGET = 'b' * 40
 PINNED = container.PPU_IMAGE.rsplit(':', 1)[0] + '@sha256:' + 'c' * 64
+PUBLISHED = container.GHCR_IMAGE + '@sha256:' + 'e' * 64
+LOCAL_ID = 'sha256:' + 'f' * 64
 
 
 def archive(path, rows):
@@ -49,9 +51,12 @@ def archive(path, rows):
                 stream.addfile(member)
 
 
-def runtime_export(root):
+def runtime_export(root, *, schema=1):
     root.mkdir(exist_ok=True)
-    archive(root / 'environment.tar.gz', [('ppu-ci-venv/bin/python', b'python', tarfile.REGTYPE)])
+    if schema == 1:
+        archive(
+            root / 'environment.tar.gz', [('ppu-ci-venv/bin/python', b'python', tarfile.REGTYPE)]
+        )
     archive(
         root / 'compiled-source.tar.gz',
         [
@@ -82,12 +87,12 @@ def runtime_export(root):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b'{}')
-    return seal(root)
+    return seal(root, schema=schema)
 
 
-def seal(root):
+def seal(root, *, schema=1):
     metadata = dict(
-        schema_version=1,
+        schema_version=schema,
         kind='runtime',
         platform='linux/amd64',
         control_sha=CONTROL,
@@ -95,10 +100,38 @@ def seal(root):
         image=container.PPU_IMAGE,
         image_digest=PINNED,
         inputs_sha256='d' * 64,
-        files=container.inventory(root),
+        files=container.inventory(root, exclude=('docker-build.json', 'runtime-image.json')),
     )
     (root / 'docker-build.json').write_text(json.dumps(metadata))
     return container.digest(root / 'docker-build.json')
+
+
+def write_image_record(root, trusted):
+    metadata = json.loads((root / 'docker-build.json').read_text())
+    (root / 'runtime-image.json').write_text(
+        json.dumps(container.image_record(metadata, trusted, PUBLISHED))
+    )
+
+
+@pytest.fixture
+def image_exported(tmp_path):
+    root = tmp_path / 'image-export'
+    trusted = runtime_export(root, schema=2)
+    write_image_record(root, trusted)
+    return root, trusted
+
+
+def image_args(root, trusted, tmp_path):
+    return SimpleNamespace(
+        artifact=root,
+        digest=trusted,
+        control_sha=CONTROL,
+        target_sha=TARGET,
+        image_digest=PUBLISHED,
+        base_image_digest=PINNED,
+        source_root=tmp_path / 'source',
+        check_only=True,
+    )
 
 
 @pytest.fixture
@@ -357,6 +390,321 @@ def test_build_uses_only_trusted_dockerfile_and_offline_unprivileged_probe(
     assert not any('--cache-to' in call and 'runtime-export' in call for call in calls)
 
 
+@pytest.mark.parametrize(
+    'damage', ['none', 'digest', 'base', 'image', 'record', 'file', 'legacy', 'archive', 'software']
+)
+def test_image_handoff_checks_all_identities_without_restoring_software(
+    image_exported, tmp_path, damage
+):
+    root, trusted = image_exported
+    args = image_args(root, trusted, tmp_path)
+    if damage == 'digest':
+        args.digest = 'f' * 64
+    elif damage == 'base':
+        args.base_image_digest = PUBLISHED
+    elif damage == 'image':
+        args.image_digest = PINNED
+    elif damage == 'record':
+        (root / 'runtime-image.json').write_text('{}')
+    elif damage == 'file':
+        (root / 'constraints.txt').write_text('corrupt')
+    elif damage == 'legacy':
+        args.digest = seal(root)
+        write_image_record(root, args.digest)
+    elif damage == 'archive':
+        archive(root / 'compiled-source.tar.gz', [('evil.py', b'exec', tarfile.REGTYPE)])
+        args.digest = seal(root, schema=2)
+        write_image_record(root, args.digest)
+    elif damage == 'software':
+        (root / 'environment.tar.gz').write_bytes(b'unexpected')
+    if damage == 'none':
+        container.verify_image(args)
+    else:
+        with pytest.raises(container.ValidationError):
+            container.verify_image(args)
+    assert not args.source_root.exists()
+    assert not (tmp_path / 'opt').exists()
+    with pytest.raises(container.ValidationError):
+        container.restore_runtime(restore_args(root, trusted, tmp_path))
+
+
+def test_image_check_only_without_source_does_not_create_paths(
+    image_exported, tmp_path, monkeypatch
+):
+    root, trusted = image_exported
+    args = image_args(root, trusted, tmp_path)
+    args.source_root = None
+    before = container.inventory(root)
+    monkeypatch.setattr(
+        container,
+        'verify_installed_image',
+        lambda *a: pytest.fail('CPU check must not access the installed environment'),
+    )
+    container.verify_image(args)
+    assert container.inventory(root) == before
+    assert not (root / '.compiled-check').exists()
+
+
+@pytest.mark.parametrize('stage', ['none', 'export', 'load', 'probe'])
+def test_complete_image_build_loads_and_probes_exact_id_without_publication(
+    build_inputs, monkeypatch, tmp_path, stage
+):
+    args = build_inputs
+    args.mode, args.local_image = 'build-image', 'ppu-ci-runtime:run-12-1'
+    outputs = tmp_path / 'job-outputs'
+    monkeypatch.setenv('GITHUB_OUTPUT', str(outputs))
+    monkeypatch.setenv('GH_TOKEN', 'fixture-secret')
+    calls = []
+
+    def command(argv, **kwargs):
+        calls.append(argv)
+        if argv[0] == 'git':
+            return (
+                '.github/scripts/ppu_ci_container.py\0'
+                if argv[2] == str(args.control_root)
+                else 'pyproject.toml\0'
+            )
+        if '--output' in argv:
+            if stage == 'export':
+                raise container.ValidationError('export failed')
+            runtime_export(args.output, schema=2)
+        if '--load' in argv:
+            assert '--push' not in argv and 'EXPORT_FORMAT=image' in argv
+            metadata = Path(argv[-1]) / 'release/docker-build.json'
+            assert metadata.read_bytes() == (args.output / 'docker-build.json').read_bytes()
+            if stage == 'load':
+                raise container.ValidationError('load failed')
+        if argv[:3] == ['docker', 'image', 'inspect']:
+            return LOCAL_ID
+        if argv[:2] == ['docker', 'run']:
+            assert LOCAL_ID in argv and args.local_image not in argv
+            assert '--network=none' in argv and '--cap-drop=ALL' in argv
+            assert '--security-opt=no-new-privileges' in argv
+            if stage == 'probe':
+                raise container.ValidationError('probe failed')
+        assert 'fixture-secret' not in str(argv)
+        return ''
+
+    monkeypatch.setattr(container, 'command', command)
+    if stage == 'none':
+        container.build(args)
+        assert f'local_image_id={LOCAL_ID}' in outputs.read_text()
+        assert 'runtime_image_digest=' not in outputs.read_text()
+        assert not (args.output / 'environment.tar.gz').exists()
+        assert not (args.output / 'runtime-image.json').exists()
+    else:
+        with pytest.raises(container.ValidationError):
+            container.build(args)
+        assert not outputs.exists()
+    assert not any(call[:2] in (['docker', 'push'], ['docker', 'login']) for call in calls)
+    assert 'GH_TOKEN' not in container.client_env()
+
+
+@pytest.mark.parametrize('damage', ['none', 'id', 'tag', 'push', 'lookup', 'public'])
+def test_publication_only_pushes_verified_image_and_never_builds_or_runs_source(
+    image_exported, tmp_path, monkeypatch, damage
+):
+    root, trusted = image_exported
+    # Publication begins with build evidence, before any publication record exists.
+    record_path = root / 'runtime-image.json'
+    record_path.unlink()
+    args = image_args(root, trusted, tmp_path)
+    args.local_image, args.local_image_id = 'ppu-ci-runtime:run-12-1', LOCAL_ID
+    args.image_tag = f'{container.GHCR_IMAGE}:run-12-1-{TARGET}'
+    if damage == 'tag':
+        args.image_tag = f'{container.GHCR_IMAGE}:latest'
+    output = tmp_path / 'outputs'
+    monkeypatch.setenv('GITHUB_OUTPUT', str(output))
+    visibility_calls, calls = [], []
+
+    def visibility(*, allow_missing):
+        visibility_calls.append(allow_missing)
+        if damage == 'public':
+            raise container.ValidationError('GHCR execution package must remain private')
+
+    def command(argv, **kwargs):
+        calls.append(argv)
+        assert argv[:2] not in (['docker', 'run'], ['docker', 'build'])
+        assert argv[:3] != ['docker', 'buildx', 'build']
+        if '{{.Id}}' in argv:
+            return 'sha256:' + '0' * 64 if damage == 'id' else LOCAL_ID
+        if argv[:2] == ['docker', 'push'] and damage == 'push':
+            raise container.ValidationError('push failed')
+        if '{{json .RepoDigests}}' in argv:
+            return json.dumps([PUBLISHED])
+        if argv[:3] == ['docker', 'buildx', 'imagetools']:
+            assert argv[-1] == PUBLISHED
+            if damage == 'lookup':
+                raise container.ValidationError('lookup failed')
+        return ''
+
+    monkeypatch.setattr(container, 'command', command)
+    monkeypatch.setattr(container, 'check_private_package', visibility)
+    if damage == 'none':
+        container.publish_image(args)
+        assert visibility_calls == [True, False]
+        assert f'runtime_image_digest={PUBLISHED}' in output.read_text()
+        container.verify_image(args)
+    else:
+        with pytest.raises(container.ValidationError):
+            container.publish_image(args)
+        assert not output.exists() and not record_path.exists()
+    if damage in ('id', 'tag', 'public'):
+        assert not any(call[:2] == ['docker', 'push'] for call in calls)
+
+
+@pytest.mark.parametrize(
+    'damage', ['none', 'embedded', 'missing_environment', 'record_schema', 'linked_metadata']
+)
+def test_baked_image_checks_metadata_before_overlay_and_never_restores_venv(
+    image_exported, tmp_path, monkeypatch, damage
+):
+    root, trusted = image_exported
+    args = image_args(root, trusted, tmp_path)
+    args.check_only = False
+    venv = tmp_path / 'baked-venv'
+    (venv / 'bin').mkdir(parents=True)
+    (venv / 'bin/python').write_bytes(b'baked interpreter')
+    baked = tmp_path / 'baked-metadata.json'
+    baked.write_bytes((root / 'docker-build.json').read_bytes())
+    original_no_links = container.no_links
+
+    def no_links(path):
+        mapping = {'/opt/ppu-ci-venv': venv, '/opt/ppu-ci-image/docker-build.json': baked}
+        return original_no_links(mapping.get(str(path), path))
+
+    monkeypatch.setattr(container, 'no_links', no_links)
+    monkeypatch.setattr(
+        container,
+        'command',
+        lambda *a, **k: pytest.fail('Activation must never install or run software'),
+    )
+    if damage == 'embedded':
+        baked.write_text('corrupt')
+    elif damage == 'missing_environment':
+        (venv / 'bin/python').unlink()
+    elif damage == 'record_schema':
+        record = json.loads((root / 'runtime-image.json').read_text())
+        record['schema_version'] = True
+        (root / 'runtime-image.json').write_text(json.dumps(record))
+    elif damage == 'linked_metadata':
+        original = tmp_path / 'original-metadata.json'
+        original.write_bytes(baked.read_bytes())
+        baked.unlink()
+        baked.symlink_to(original)
+    if damage == 'none':
+        container.verify_image(args)
+        assert next(args.source_root.rglob('*.so')).read_bytes() == b'extension'
+        assert (venv / 'bin/python').read_bytes() == b'baked interpreter'
+        assert len(list(venv.rglob('*'))) == 2
+    else:
+        with pytest.raises(container.ValidationError):
+            container.verify_image(args)
+        assert not args.source_root.exists()
+
+
+@pytest.mark.parametrize(
+    'visibility,status,allow_missing,passed',
+    [
+        ('private', 200, False, True),
+        ('public', 200, True, False),
+        ('internal', 200, True, False),
+        ('private', 404, True, True),
+        ('private', 404, False, False),
+        ('private', 403, True, False),
+    ],
+)
+def test_private_package_preflight_does_not_change_visibility_or_expose_token(
+    monkeypatch, capsys, visibility, status, allow_missing, passed
+):
+    monkeypatch.setenv('GH_TOKEN', 'fixture-private-token')
+
+    def urlopen(request, **kwargs):
+        assert (
+            request.full_url
+            == 'https://api.github.com/orgs/flytiger-eco/packages/container/megatron-lm-for-sail%2Fppu-ci'
+        )
+        assert request.get_method() == 'GET'
+        assert 'fixture-private-token' not in request.full_url
+        assert request.headers['Authorization'] == 'Bearer fixture-private-token'
+        if status != 200:
+            raise container.HTTPError(request.full_url, status, 'fixture-private-token', None, None)
+        return io.BytesIO(json.dumps({'visibility': visibility}).encode())
+
+    monkeypatch.setattr(container, 'urlopen', urlopen)
+    if passed:
+        container.check_private_package(allow_missing=allow_missing)
+    else:
+        with pytest.raises(container.ValidationError) as error:
+            container.check_private_package(allow_missing=allow_missing)
+        assert 'fixture-private-token' not in str(error.value)
+    assert capsys.readouterr() == ('', '')
+
+
+@pytest.mark.parametrize('damage', ['none', 'image', 'record', 'legacy', 'missing_report'])
+def test_schema_two_bundle_is_sealed_without_environment_archive(image_exported, damage):
+    root, _ = image_exported
+    for name in (
+        'source.tar.gz',
+        'commit.txt',
+        'control.txt',
+        'build-timing.json',
+        'control/ppu_ci.py',
+        'control/ppu_ci_run.sh',
+        'control/ppu_pytest_policy.py',
+        'control/ppu_ci_container.py',
+        'control/ppu_ci_container.sh',
+    ):
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'fixture')
+    (root / 'image.txt').write_text(PUBLISHED + '\n')
+    (root / 'manifest.json').write_text(
+        json.dumps(
+            {
+                'environment_build_schema': 1 if damage == 'legacy' else 2,
+                'identity': {'control_sha': CONTROL, 'target_sha': TARGET},
+            }
+        )
+    )
+    if damage == 'image':
+        (root / 'image.txt').write_text(PINNED)
+    elif damage == 'record':
+        (root / 'runtime-image.json').write_text('{}')
+    elif damage == 'missing_report':
+        (root / 'packaging-install.json').unlink()
+    if damage == 'none':
+        ci.seal_bundle(root)
+        files = json.loads((root / 'bundle-integrity.json').read_text())['files']
+        assert 'runtime-image.json' in files and 'environment.tar.gz' not in files
+    else:
+        with pytest.raises((ValueError, KeyError)):
+            ci.seal_bundle(root)
+        assert not (root / 'bundle-integrity.json').exists()
+
+
+def test_only_guarded_runtime_job_receives_package_publication_permission():
+    for filename in (
+        'ppu-build',
+        'ppu-execute',
+        'ppu-ut',
+        'ppu-functional',
+        'ppu-compiler-diagnostic',
+    ):
+        jobs = yaml.safe_load((ROOT / f'.github/workflows/{filename}.yml').read_text())['jobs']
+        allowed_job = {'ppu-build': 'execute', 'ppu-execute': 'runtime-environment'}.get(filename)
+        for name, job in jobs.items():
+            assert (job.get('permissions', {}).get('packages') == 'write') is (name == allowed_job)
+            if name != allowed_job:
+                assert not any(
+                    'publish-image' in step.get('run', '') for step in job.get('steps', [])
+                )
+    for filename in ('ppu_ci_build.sh', 'ppu_ci_run.sh', 'ppu_functional_run.sh'):
+        text = (SCRIPTS / filename).read_text()
+        assert 'verify-image' in text and 'restore-runtime' not in text
+        assert 'PPU_BASE_IMAGE_DIGEST' in text and 'PPU_IMAGE_DIGEST' in text
+
+
 def test_namespace_legacy_restore_keeps_historical_bytes_and_does_not_run_base_hooks(tmp_path):
     venv, base = tmp_path / 'venv', tmp_path / 'base'
     site = venv / 'lib/python3.12/site-packages'
@@ -424,10 +772,11 @@ def test_cpu_jobs_declare_required_unprivileged_job_container(filename):
         ('ppu-execute', 'runtime-environment', 'runtime'),
     ],
 )
-def test_docker_build_jobs_use_hosted_runner_after_authorization(filename, job_name, kind):
+def test_docker_build_jobs_use_ubuntu_runner_after_authorization(filename, job_name, kind):
     workflow = yaml.safe_load((ROOT / f'.github/workflows/{filename}.yml').read_text())
     job = workflow['jobs'][job_name]
-    assert job['runs-on'] == 'ubuntu-latest' and 'container' not in job
+    assert job['runs-on'] == 'ubuntu-latest'
+    assert 'container' not in job
     assert 'secrets.' not in json.dumps(job)
     assert 'PPU_CPU_RUN_ROOT' not in json.dumps(job) and 'cluster-task' not in json.dumps(job)
     steps = job['steps']
@@ -439,22 +788,44 @@ def test_docker_build_jobs_use_hosted_runner_after_authorization(filename, job_n
     setup = next(
         i
         for i, step in enumerate(steps)
-        if step.get('uses', '').startswith('docker/setup-buildx-action@')
+        if step.get('uses') == 'docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f'
     )
+    assert guard < setup
     identity = next(i for i, step in enumerate(steps) if step.get('id') == 'identity')
+    assert f' fingerprint --kind {kind}' in steps[identity]['run']
     restore = next(
         i for i, step in enumerate(steps) if step.get('uses') == 'actions/cache/restore@v4'
     )
     build = next(
-        i for i, step in enumerate(steps) if f' build --kind {kind}' in step.get('run', '')
+        i
+        for i, step in enumerate(steps)
+        if (f' build --kind {kind}' if kind == 'control' else ' build-image ')
+        in step.get('run', '')
     )
     assert guard < setup < identity < restore < build
-    assert (
-        steps[setup]['uses']
-        == 'docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd'
-    )
     assert '--image-digest' in steps[build]['run']
     assert 'push:' not in json.dumps(job) and '--push' not in json.dumps(job)
+    if kind == 'runtime':
+        guards = [
+            i
+            for i, step in enumerate(steps)
+            if step.get('run', '').endswith('ppu_pr_authorize.py guard')
+        ]
+        login = next(
+            i
+            for i, step in enumerate(steps)
+            if step.get('uses') == 'docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9'
+        )
+        publish = next(i for i, step in enumerate(steps) if step.get('id') == 'publish')
+        assert build < guards[-1] < login < publish
+        assert steps[login]['with']['password'] == '${{ github.token }}'
+        assert (
+            'publish-image' in steps[publish]['run'] and 'source-root' not in steps[publish]['run']
+        )
+        assert job['permissions']['packages'] == 'write'
+    else:
+        assert 'packages' not in job['permissions']
+        assert not any('publish-image' in step.get('run', '') for step in steps)
 
 
 def test_runtime_handoff_preserves_flytiger_orchestration_and_trusted_job_outputs():
@@ -479,10 +850,11 @@ def test_runtime_handoff_preserves_flytiger_orchestration_and_trusted_job_output
     assert upload['with']['if-no-files-found'] == 'error'
     assert (
         producer['outputs']['environment_digest']
-        == '${{ steps.runtime.outputs.environment_digest }}'
+        == '${{ steps.publish.outputs.environment_digest }}'
     )
     assert (
-        producer['outputs']['runtime_image_digest'] == '${{ steps.identity.outputs.image_digest }}'
+        producer['outputs']['runtime_image_digest']
+        == '${{ steps.publish.outputs.runtime_image_digest }}'
     )
     steps = consumer['steps']
     verify = next(
@@ -492,7 +864,7 @@ def test_runtime_handoff_preserves_flytiger_orchestration_and_trusted_job_output
     )
     ppu = next(i for i, step in enumerate(steps) if step.get('id') == 'ppu-build')
     assert verify < ppu and '--check-only' in steps[verify]['run']
-    for field in ('environment_digest', 'runtime_image_digest'):
+    for field in ('environment_digest', 'runtime_image_digest', 'base_image_digest'):
         value = '${{ needs.runtime-environment.outputs.' + field + ' }}'
         assert consumer['outputs'][field] == value and value in steps[verify]['run']
     action = steps[ppu]['with']
@@ -517,46 +889,69 @@ def test_runtime_handoff_preserves_flytiger_orchestration_and_trusted_job_output
     assert not any(step.get('uses', '').startswith(('actions/cache/', 'docker/')) for step in steps)
 
 
+@pytest.mark.parametrize('filename', ['ppu-execute', 'ppu-ut', 'ppu-functional'])
 @pytest.mark.parametrize(
-    'damage', ['none', 'digest', 'control', 'target', 'image', 'file', 'archive']
+    'damage', ['none', 'digest', 'control', 'target', 'image', 'base', 'file', 'archive']
 )
-def test_runtime_handoff_shell_checks_before_copying_or_restoring(exported, tmp_path, damage):
-    root, trusted = exported
-    jobs = yaml.safe_load((ROOT / '.github/workflows/ppu-execute.yml').read_text())['jobs']
-    script = next(
-        step['run']
-        for step in jobs['build']['steps']
-        if step.get('name') == 'Verify Dockerfile environment handoff before requesting PPU'
-    )
+def test_runtime_handoff_shell_checks_before_copying_or_restoring(
+    image_exported, tmp_path, damage, filename
+):
+    root, trusted = image_exported
+    jobs = yaml.safe_load((ROOT / f'.github/workflows/{filename}.yml').read_text())['jobs']
+    steps = jobs['build' if filename == 'ppu-execute' else 'test']['steps']
+    verify = next(i for i, step in enumerate(steps) if 'verify-image' in step.get('run', ''))
+    ppu = next(i for i, step in enumerate(steps) if step.get('id') in ('ppu-build', 'ppu'))
+    assert verify < ppu
+    assert not steps[verify].get('continue-on-error', False)
+    script = steps[verify]['run']
+    assert '--check-only' in script
+    action = steps[ppu]['with']
+    for field, variable in (
+        ('environment_digest', 'PPU_ENVIRONMENT_DIGEST'),
+        ('runtime_image_digest', 'PPU_IMAGE_DIGEST'),
+        ('base_image_digest', 'PPU_BASE_IMAGE_DIGEST'),
+    ):
+        prefix = 'needs.runtime-environment.outputs.' if filename == 'ppu-execute' else 'inputs.'
+        value = '${{ ' + prefix + field + ' }}'
+        assert value in script
+        assert variable + '=' + value in action['extra_env']
+        if field == 'runtime_image_digest':
+            assert action['image'] == value
     runner = tmp_path / 'runner'
     runner.mkdir()
     shutil.copytree(root, runner / 'ppu-runtime-export')
     artifact = runner / 'ppu-runtime-export'
     values = {
         'environment_digest': trusted,
-        'runtime_image_digest': PINNED,
+        'runtime_image_digest': PUBLISHED,
+        'base_image_digest': PINNED,
         'control_sha': CONTROL,
         'target_sha': TARGET,
     }
-    if damage in ('digest', 'control', 'target', 'image'):
+    if damage in ('digest', 'control', 'target', 'image', 'base'):
         field = {
             'digest': 'environment_digest',
             'control': 'control_sha',
             'target': 'target_sha',
             'image': 'runtime_image_digest',
+            'base': 'base_image_digest',
         }[damage]
-        values[field] = (
-            'f' * 64 if damage == 'digest' else 'f' * 40 if damage != 'image' else PINNED[:-1] + 'e'
-        )
+        values[field] = {
+            'digest': 'f' * 64,
+            'control': 'f' * 40,
+            'target': 'f' * 40,
+            'image': PUBLISHED[:-1] + 'f',
+            'base': PUBLISHED,
+        }[damage]
     elif damage == 'file':
         (artifact / 'constraints.txt').write_bytes(b'corrupt')
     elif damage == 'archive':
         archive(artifact / 'compiled-source.tar.gz', [('evil.py', b'x', tarfile.REGTYPE)])
-        values['environment_digest'] = seal(artifact)
-    for field in ('environment_digest', 'runtime_image_digest'):
-        script = script.replace(
-            '${{ needs.runtime-environment.outputs.' + field + ' }}', values[field]
-        )
+        values['environment_digest'] = seal(artifact, schema=2)
+        write_image_record(artifact, values['environment_digest'])
+    for field in ('environment_digest', 'runtime_image_digest', 'base_image_digest'):
+        prefix = 'needs.runtime-environment.outputs.' if filename == 'ppu-execute' else 'inputs.'
+        script = script.replace('${{ ' + prefix + field + ' }}', values[field])
     for field in ('control_sha', 'target_sha'):
         script = script.replace('${{ inputs.' + field + ' }}', values[field])
     control = tmp_path / 'control/.github/scripts'
@@ -579,13 +974,14 @@ def test_runtime_handoff_shell_checks_before_copying_or_restoring(exported, tmp_
     assert (result.returncode == 0) is (damage == 'none'), result.stderr
     assert not (runner / 'ppu-runtime-check').exists()
     assert not (tmp_path / 'source/megatron').exists()
-    if damage == 'none':
+    if damage == 'none' and filename == 'ppu-execute':
         assert container.inventory(destination) == container.inventory(artifact)
         assert (destination / 'docker-build.json').read_bytes() == (
             artifact / 'docker-build.json'
         ).read_bytes()
     else:
         assert not list(destination.iterdir())
+    assert not (artifact / '.compiled-check').exists()
 
 
 @pytest.mark.parametrize(
@@ -634,6 +1030,71 @@ def test_native_library_closure_catches_missing_dependencies(tmp_path, monkeypat
     )
     with pytest.raises(RuntimeError, match='native dependency'):
         exporter.libraries([elf], tmp_path / 'libs')
+
+
+@pytest.mark.parametrize(
+    'soname,marker',
+    [
+        ('libstdc++.so.6', 'libstdcxx'),
+        ('libgcc_s.so.1', 'libgcc'),
+        ('libgomp.so.1', 'libgomp'),
+        ('libatomic.so.1', 'libatomic'),
+        ('libgfortran.so.5', 'libgfortran'),
+        ('libquadmath.so.0', 'libquadmath'),
+        ('libssl.so.3', 'libssl'),
+        ('libcrypto.so.3', 'libcrypto'),
+        ('private-library.so', 'unknown'),
+        ('/private/library.so', 'unknown'),
+    ],
+)
+def test_missing_native_libraries_only_emit_allowlisted_markers(
+    tmp_path, monkeypatch, soname, marker
+):
+    elf = tmp_path / 'private-extension.so'
+    elf.write_bytes(b'\x7fELF')
+    monkeypatch.setattr(
+        exporter.subprocess,
+        'run',
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=f'\t{soname} => not found\n\tprivate-library.so => /private/path (0x1234)\n',
+            stderr='private-token',
+        ),
+    )
+    with pytest.raises(RuntimeError) as error:
+        exporter.libraries([elf], tmp_path / 'libs')
+    message = 'A native dependency is missing in the build container; missing-native-' + marker
+    assert str(error.value) == message
+    assert container.failure_markers('', str(error.value)) == (
+        'export-native-missing,native-' + marker
+    )
+    assert not list((tmp_path / 'libs').iterdir())
+
+
+def test_missing_native_markers_are_deduplicated_and_loaded_libraries_are_not_reported(
+    tmp_path, monkeypatch
+):
+    elf = tmp_path / 'extension.so'
+    elf.write_bytes(b'\x7fELF')
+    monkeypatch.setattr(
+        exporter.subprocess,
+        'run',
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout='libstdc++.so.6 => not found\nlibgcc_s.so.1 => not found\n'
+            'libstdc++.so.6 => not found\nlibgomp.so.1 => /private/library (0x1234)\n',
+            stderr='',
+        ),
+    )
+    with pytest.raises(RuntimeError) as error:
+        exporter.libraries([elf], tmp_path / 'libs')
+    assert str(error.value) == (
+        'A native dependency is missing in the build container; '
+        'missing-native-libgcc,missing-native-libstdcxx'
+    )
+    assert container.failure_markers('', str(error.value)) == (
+        'export-native-missing,native-libstdcxx,native-libgcc'
+    )
 
 
 def test_preflight_missing_builder_does_not_install_or_launch_daemon(tmp_path, monkeypatch):

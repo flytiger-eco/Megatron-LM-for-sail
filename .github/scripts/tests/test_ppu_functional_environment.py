@@ -501,10 +501,26 @@ def checkpoint_api(tool_environment, monkeypatch):
 
 @pytest.mark.parametrize("launcher", ["torchrun", "ft_launcher"])
 @pytest.mark.parametrize("checkpoint", [False, True])
+@pytest.mark.parametrize("schema", [1, 2])
 def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
-    tool_environment, checkpoint_api, launcher, checkpoint
+    tool_environment, checkpoint_api, launcher, checkpoint, schema, monkeypatch
 ):
     bundle, site, manifest, calls, _, _ = tool_environment
+    manifest["environment_build_schema"] = schema
+    delivery = {
+        "runtime_image_digest": "ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci@sha256:"
+        + "e" * 64,
+        "base_image_digest": functional.IMAGE.rsplit(":", 1)[0] + "@sha256:" + "f" * 64,
+        "environment_digest": "a" * 64,
+    }
+    if schema == 2:
+        (bundle / "runtime-image.json").write_text(json.dumps(delivery))
+        for name, field in (
+            ("PPU_IMAGE_DIGEST", "runtime_image_digest"),
+            ("PPU_BASE_IMAGE_DIGEST", "base_image_digest"),
+            ("PPU_ENVIRONMENT_DIGEST", "environment_digest"),
+        ):
+            monkeypatch.setenv(name, delivery[field])
     manifest["functional"]["case"]["launcher"] = launcher
     if checkpoint:
         manifest["functional"]["case"]["nvrx_checkpoint"] = [
@@ -521,6 +537,10 @@ def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
     assert report["postprocessing"] == {"event_roundtrip": True}
     assert "protobuf" in report["packages"]
     assert report["identity"] == manifest["identity"] and report["devices"] == 8
+    if schema == 2:
+        assert {field: report[field] for field in delivery} == delivery
+    else:
+        assert not any(field in report for field in delivery)
     assert report["training_dependencies"]["packages"] == environment.TRAINING_PACKAGES
     assert environment.TRAINING_PACKAGES.items() <= report["packages"].items()
     assert report["training_dependencies"]["emerging_optimizers_enabled"]
@@ -538,6 +558,38 @@ def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
             == manifest["functional"]["case"]["nvrx_checkpoint"]
         )
         assert "mp_mode" in report["nvrx"]["signatures"]["get_write_results_queue"]
+
+
+@pytest.mark.parametrize("schema", [True, 2.0, 3, "2"])
+def test_functional_environment_rejects_unknown_or_downgraded_schema(tool_environment, schema):
+    bundle, _, manifest, _, _, _ = tool_environment
+    manifest["environment_build_schema"] = schema
+    with pytest.raises(ValueError):
+        environment.prepare(bundle, manifest)
+    with pytest.raises(ValueError, match="Unsupported functional"):
+        environment.check(bundle, manifest, bundle / "reports")
+    assert not (bundle / "reports/functional-environment.json").exists()
+
+
+@pytest.mark.parametrize(
+    "variable", ["PPU_IMAGE_DIGEST", "PPU_BASE_IMAGE_DIGEST", "PPU_ENVIRONMENT_DIGEST"]
+)
+def test_functional_image_evidence_requires_job_identities(tool_environment, monkeypatch, variable):
+    bundle, _, manifest, _, _, _ = tool_environment
+    manifest["environment_build_schema"] = 2
+    values = {
+        "runtime_image_digest": "execution",
+        "base_image_digest": "base",
+        "environment_digest": "metadata",
+    }
+    (bundle / "runtime-image.json").write_text(json.dumps(values))
+    monkeypatch.setenv("PPU_IMAGE_DIGEST", values["runtime_image_digest"])
+    monkeypatch.setenv("PPU_BASE_IMAGE_DIGEST", values["base_image_digest"])
+    monkeypatch.setenv("PPU_ENVIRONMENT_DIGEST", values["environment_digest"])
+    monkeypatch.setenv(variable, "mismatch")
+    with pytest.raises(ValueError, match="image handoff mismatch"):
+        environment.check(bundle, manifest, bundle / "reports")
+    assert not (bundle / "reports/functional-environment.json").exists()
 
 
 def test_cpu_shm_checkpoint_uses_writer_parameter_name(tool_environment, checkpoint_api):

@@ -73,7 +73,22 @@ def libraries(files, directory):
                 continue
         result = subprocess.run(['ldd', str(path)], capture_output=True, text=True, check=False)
         if 'not found' in result.stdout:
-            raise RuntimeError('A native dependency is missing in the build container')
+            known = {
+                'libstdc++.so.6': 'missing-native-libstdcxx',
+                'libgcc_s.so.1': 'missing-native-libgcc',
+                'libgomp.so.1': 'missing-native-libgomp',
+                'libatomic.so.1': 'missing-native-libatomic',
+                'libgfortran.so.5': 'missing-native-libgfortran',
+                'libquadmath.so.0': 'missing-native-libquadmath',
+                'libssl.so.3': 'missing-native-libssl',
+                'libcrypto.so.3': 'missing-native-libcrypto',
+            }
+            names = re.findall(r'^\s*([^\s/]+)\s+=>\s+not found\s*$', result.stdout, re.MULTILINE)
+            markers = ','.join(sorted({known[name] for name in names if name in known}))
+            raise RuntimeError(
+                'A native dependency is missing in the build container; '
+                + (markers or 'missing-native-unknown')
+            )
         if result.returncode and 'not a dynamic executable' not in result.stderr + result.stdout:
             raise RuntimeError('Unable to inventory native dependencies')
         for name in re.findall(r'(/[^\s()]+)', result.stdout):
@@ -148,7 +163,7 @@ exec "$prefix/lib/ppu-system/ld-linux-x86-64.so.2" --library-path "$LD_LIBRARY_P
     copy('/build/control-install.json', EXPORT / 'control-package-install.json')
 
 
-def runtime():
+def runtime(*, image=False):
     verify_reports(
         Path('/build') / name
         for name in (
@@ -172,7 +187,8 @@ def runtime():
         + list((VENV / 'libexec/git-core').iterdir()),
         VENV / 'lib/ppu-system',
     )
-    archive(Path('/opt'), 'environment.tar.gz', [VENV])
+    if not image:
+        archive(Path('/opt'), 'environment.tar.gz', [VENV])
     source = Path('/build/source')
     extension = list((source / 'megatron/core/datasets').glob('helpers_cpp*.so'))
     if len(extension) != 1:
@@ -215,4 +231,9 @@ def runtime():
 
 
 if __name__ == '__main__':
-    {'isolate': isolate, 'control': control, 'runtime': runtime}[sys.argv[1]]()
+    {
+        'isolate': isolate,
+        'control': control,
+        'runtime': runtime,
+        'runtime-image': lambda: runtime(image=True),
+    }[sys.argv[1]]()

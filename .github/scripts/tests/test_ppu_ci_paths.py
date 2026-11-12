@@ -191,6 +191,8 @@ def test_all_parent_child_secret_boundaries_are_explicit(filename):
                     assert job is workflow["jobs"]["runtime-environment"]
                     assert step["with"]["path"] == "${{ runner.temp }}/ppu-runtime-export/"
                     assert job["runs-on"] == "ubuntu-latest"
+                    assert "container" not in job
+                    assert job["permissions"]["packages"] == "write"
                     assert "needs.admit-build.result == 'success'" in job["if"]
                     assert "secrets." not in json.dumps(job)
                     assert "ppu_pr_authorize.py guard" in json.dumps(job["steps"])

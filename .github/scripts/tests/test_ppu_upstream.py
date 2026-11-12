@@ -731,7 +731,7 @@ def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch, t
     assert script.index("export PIP_CONSTRAINT=") < install
     assert install < script.index("distribution = md.distribution('fla-core')")
     build = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
-    assert build.index("restore-runtime") < build.index("PLA import check passed:")
+    assert build.index("verify-image") < build.index("PLA import check passed:")
     assert "pip install" not in build
 
 
@@ -755,7 +755,7 @@ def test_pla_probe_checks_version_origin_and_native_imports(monkeypatch, script_
         if "md.version('pla')" in block
     )
     if script_name == "ppu_ci_run.sh":
-        assert script.index("restore-runtime") < script.index(probe)
+        assert script.index("verify-image") < script.index(probe)
         assert "pip install" not in script
     modules = ("pla", "pla.decode", "pla.prefill.flashqla", "pla.prefill.flashkdapro")
     imported = []
@@ -953,14 +953,14 @@ def test_fla_patch_and_probes_preserve_ut_and_restore_contract():
     build = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
     run = (ROOT / ".github/scripts/ppu_ci_run.sh").read_text()
     assert (
-        build.index("restore-runtime")
+        build.index("verify-image")
         < build.index("python -m pip check")
         < build.index("FLA Core import check passed:")
         < build.index("assert gated_delta_net.HAVE_FLA")
         < build.index("seal-bundle")
     )
     assert (
-        run.index("restore-runtime")
+        run.index("verify-image")
         < run.index("FLA Core import check passed:")
         < run.index("export PYTHONPATH=")
         < run.index("assert gated_delta_net.HAVE_FLA")
@@ -1310,7 +1310,7 @@ def test_bundle_workflow_digest_and_run_scoping():
         for step in ut["jobs"]["test"]["steps"]
         if step.get("uses") == "actions/download-artifact@v4"
     ]
-    assert downloads == ["ppu-control-environment", "ppu-plan"]
+    assert downloads == ["ppu-control-environment", "ppu-plan", "ppu-runtime-environment"]
     action = next(step for step in ut["jobs"]["test"]["steps"] if step.get("id") == "ppu")
     assert (
         "PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build"
@@ -1324,5 +1324,5 @@ def test_bundle_workflow_digest_and_run_scoping():
         < command.index("ppu_ci_run.sh")
     )
     script = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
-    assert script.index("seal-bundle") > script.index("restore-runtime")
+    assert script.index("seal-bundle") > script.index("verify-image")
     assert "tar -czf .ppu-ci/environment.tar.gz" not in script

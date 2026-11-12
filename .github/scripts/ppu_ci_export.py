@@ -53,6 +53,7 @@ BUNDLE_FILES = {
     "source-package-install.json",
     "installed-packages.json",
     "docker-build.json",
+    "runtime-image.json",
     "compatibility-patches.json",
     "base-packages.json",
     "vendor-bytes.json",

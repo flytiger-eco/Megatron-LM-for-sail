@@ -512,7 +512,12 @@ def test_workflow_authorized_concurrency_and_cancellation_contract():
     for name in ("configure", "admit-build", "runtime-environment"):
         steps = execute["jobs"][name]["steps"]
         assert any(step.get("run", "").endswith("ppu_pr_authorize.py guard") for step in steps)
+    for name in ("configure", "admit-build", "runtime-environment"):
         assert execute["jobs"][name]["runs-on"] == "ubuntu-latest"
+    runtime = execute["jobs"]["runtime-environment"]
+    assert "container" not in runtime
+    assert runtime["permissions"]["packages"] == "write"
+    assert call["permissions"]["packages"] == "write"
     for name in ("build", "unit-tests"):
         assert "statuses" not in execute["jobs"][name].get("permissions", {})
         assert "actions" not in execute["jobs"][name].get("permissions", {})

@@ -39,6 +39,7 @@ ENV VIRTUAL_ENV=/opt/ppu-ci-venv UV_PROJECT_ENVIRONMENT=/opt/ppu-ci-venv \
 FROM dependencies AS runtime
 ARG TARGET_SHA
 ARG CONTROL_SHA
+ARG EXPORT_FORMAT=archive
 WORKDIR /build/source
 COPY source/ ./
 COPY control/ /build/control/
@@ -54,6 +55,26 @@ RUN --network=none test "${#TARGET_SHA}" = 40 && test "${#CONTROL_SHA}" = 40 \
     && python -m pip install --no-index --no-deps --ignore-installed \
         --report /build/source-package-install.json /build/wheels/*.whl \
     && python -m pip check \
-    && python /build/export_environment.py runtime
+    && if [[ "$EXPORT_FORMAT" == image ]]; then python /build/export_environment.py runtime-image; \
+       elif [[ "$EXPORT_FORMAT" == archive ]]; then python /build/export_environment.py runtime; \
+       else exit 1; fi
 FROM scratch AS runtime-export
 COPY --from=runtime /exports/ /
+
+FROM runtime AS execution
+ARG TARGET_SHA
+ARG CONTROL_SHA
+ARG PPU_IMAGE
+LABEL org.opencontainers.image.source="https://github.com/flytiger-eco/Megatron-LM-for-sail" \
+    org.opencontainers.image.revision="${TARGET_SHA}" \
+    org.opencontainers.image.base.name="${PPU_IMAGE}" \
+    io.flytiger.ppu-ci.control="${CONTROL_SHA}"
+COPY release/docker-build.json /opt/ppu-ci-image/docker-build.json
+RUN --network=none python -c 'import shutil; shutil.rmtree("/build"); shutil.rmtree("/exports")'
+ENV LD_LIBRARY_PATH="/opt/ppu-ci-venv/lib/ppu-system:${LD_LIBRARY_PATH}" \
+    GIT_EXEC_PATH=/opt/ppu-ci-venv/libexec/git-core \
+    SSL_CERT_FILE=/opt/ppu-ci-venv/etc/ssl/certs/ca-certificates.crt \
+    GIT_SSL_CAINFO=/opt/ppu-ci-venv/etc/ssl/certs/ca-certificates.crt
+WORKDIR /opt/megatron-lm
+ENTRYPOINT []
+CMD ["/bin/bash"]

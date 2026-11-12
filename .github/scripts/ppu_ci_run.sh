@@ -29,11 +29,12 @@ umask 022
 mkdir -p "$PPU_RESULTS_DIR" /opt/data /workspace/data/cache /tmp/checkpoints
 export PPU_REPORT_DIR="$PPU_RESULTS_DIR"
 : "${PPU_ENVIRONMENT_DIGEST:?Missing trusted Dockerfile build digest}"
-bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" restore-runtime \
+bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" verify-image \
     --artifact "$PPU_ARTIFACT_DIR" --digest "$PPU_ENVIRONMENT_DIGEST" \
-    --control-sha "$PPU_CONTROL_SHA" --target-sha "$PPU_TARGET_SHA" --destination /opt \
+    --control-sha "$PPU_CONTROL_SHA" --target-sha "$PPU_TARGET_SHA" \
     --source-root "$PPU_SOURCE_ROOT" \
-    --image-digest "${PPU_IMAGE_DIGEST:?Missing trusted base image digest}"
+    --base-image-digest "${PPU_BASE_IMAGE_DIGEST:?Missing trusted base image digest}" \
+    --image-digest "${PPU_IMAGE_DIGEST:?Missing trusted execution image digest}"
 export PATH="/opt/ppu-ci-venv/bin:$PATH"
 export VIRTUAL_ENV=/opt/ppu-ci-venv UV_PROJECT_ENVIRONMENT=/opt/ppu-ci-venv
 export PYTHONNOUSERSITE=1 UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never

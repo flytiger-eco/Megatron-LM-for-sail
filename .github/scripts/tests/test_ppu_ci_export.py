@@ -316,20 +316,51 @@ def test_private_archives_and_checkpoint_cache_payloads_are_not_public(tmp_path,
     for name in (
         "source.tar.gz",
         "environment.tar.gz",
+        "compiled-source.tar.gz",
+        "control-runtime.tar.gz",
+        "wheels/megatron.whl",
+        "functional-tools/yq",
         "checkpoints/model.bin",
         "cache/compiler/kernel.so",
         "data/private.bin",
         "control/ppu_ci_paths.py",
         "manifest.json",
         "build-timing.json",
+        "runtime-image.json",
     ):
         path = source / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"{}" if path.suffix == ".json" else b"retained privately\n")
+    record = {
+        "schema_version": 1,
+        "runtime_image_digest": "ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci@sha256:"
+        + "e" * 64,
+        "base_image_digest": functional.IMAGE.rsplit(":", 1)[0] + "@sha256:" + "f" * 64,
+        "environment_digest": "a" * 64,
+        "control_sha": "b" * 40,
+        "target_sha": "c" * 40,
+    }
+    (source / "runtime-image.json").write_text(json.dumps(record, indent=2) + "\n")
     before = snapshot(source)
     report = exporter.export(source, tmp_path / "public", kind="bundle", env=path_env)
-    assert set(report["files"]) == {"control/ppu_ci_paths.py", "manifest.json", "build-timing.json"}
-    assert {"source.tar.gz", "environment.tar.gz", "data/private.bin"} <= set(report["omitted"])
+    assert set(report["files"]) == {
+        "control/ppu_ci_paths.py",
+        "manifest.json",
+        "build-timing.json",
+        "runtime-image.json",
+    }
+    assert (tmp_path / "public/runtime-image.json").read_bytes() == (
+        source / "runtime-image.json"
+    ).read_bytes()
+    assert {
+        "source.tar.gz",
+        "environment.tar.gz",
+        "compiled-source.tar.gz",
+        "control-runtime.tar.gz",
+        "wheels/megatron.whl",
+        "functional-tools/yq",
+        "data/private.bin",
+    } <= set(report["omitted"])
     assert report["original_digest_applies_to"] == "private NAS originals only"
     assert snapshot(source) == before
 

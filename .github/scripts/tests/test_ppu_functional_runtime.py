@@ -619,7 +619,8 @@ chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
         "PPU_CONTROL_DIR": str(SCRIPTS),
         "PPU_ARTIFACT_DIR": str(tmp_path),
         "PPU_ENVIRONMENT_DIGEST": "d" * 64,
-        "PPU_IMAGE_DIGEST": functional.IMAGE.rsplit(":", 1)[0] + "@sha256:" + "e" * 64,
+        "PPU_IMAGE_DIGEST": "ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci@sha256:" + "e" * 64,
+        "PPU_BASE_IMAGE_DIGEST": functional.IMAGE.rsplit(":", 1)[0] + "@sha256:" + "f" * 64,
         "PPU_CONTROL_SHA": "a" * 40,
         "PPU_TARGET_SHA": "b" * 40,
     }
@@ -777,6 +778,7 @@ def test_workflow_functional_route_is_manual_only_and_preserves_ut():
     assert action["with"]["node_selector"] == "board-type=ZW-M890P"
     assert action["with"]["image"] == "${{ inputs.runtime_image_digest }}"
     assert "PPU_IMAGE_DIGEST=${{ inputs.runtime_image_digest }}" in action["with"]["extra_env"]
+    assert "PPU_BASE_IMAGE_DIGEST=${{ inputs.base_image_digest }}" in action["with"]["extra_env"]
     assert "verify-bundle" in action["with"]["command"]
     assert "ppu_functional_run.sh" in action["with"]["command"]
 
