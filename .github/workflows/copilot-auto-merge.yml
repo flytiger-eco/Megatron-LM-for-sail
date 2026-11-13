@@ -1,6 +1,11 @@
 name: Copilot upstream merge (CI branch)
 
 on:
+  push:
+    branches: ['CI/auto_merge']
+    # Bootstrap and test from this branch without touching main.
+    # Merge-result pushes do not change this file, so they cannot loop.
+    paths: ['.github/workflows/copilot-auto-merge.yml']
   workflow_dispatch:
   schedule:
     # 16:00 UTC = 00:00 Asia/Shanghai on the following day.
