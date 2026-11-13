@@ -284,7 +284,10 @@ PY
 fi
 git diff --quiet HEAD --
 git ls-files -z > .ppu-ci/source-files.txt
-tar -czf .ppu-ci/source.tar.gz --null -T .ppu-ci/source-files.txt megatron/core/datasets/helpers_cpp*.so
+bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" archive-source \
+    --artifact "$PPU_ARTIFACT_DIR" --source-root "$PPU_SOURCE_ROOT" \
+    --digest "$PPU_ENVIRONMENT_DIGEST" \
+    --control-sha "$PPU_CONTROL_SHA" --target-sha "$PPU_TARGET_SHA"
 [[ -s .ppu-ci/runtime-image.json && ! -e .ppu-ci/environment.tar.gz ]]
 printf '%s\n' "$PPU_IMAGE_DIGEST" > .ppu-ci/image.txt
 printf '%s\n' "$PPU_TARGET_SHA" > .ppu-ci/commit.txt

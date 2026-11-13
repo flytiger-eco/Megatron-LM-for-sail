@@ -296,6 +296,298 @@ def test_source_restore_requires_sealed_archive_identity(tmp_path):
         container.restore_source(args)
 
 
+def source_git(source, *args):
+    return subprocess.run(
+        ['git', '-C', str(source), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            'GIT_AUTHOR_NAME': 'Source fixture',
+            'GIT_AUTHOR_EMAIL': 'fixture@example.com',
+            'GIT_COMMITTER_NAME': 'Source fixture',
+            'GIT_COMMITTER_EMAIL': 'fixture@example.com',
+        },
+    ).stdout.strip()
+
+
+@pytest.fixture
+def source_archive_inputs(tmp_path):
+    source = tmp_path / 'checkout'
+    source.mkdir()
+    rows = {
+        'AGENTS.md': b'guidelines\n',
+        'skills/nested/run.sh': b'#!/bin/sh\nexit 0\n',
+        'megatron/core/datasets/Makefile': b'all:\n\ttrue\n',
+        'hardlink-a': b'same bytes\n',
+        '-leading name.txt': b'not a tar option\n',
+    }
+    for name, data in rows.items():
+        member = source / name
+        member.parent.mkdir(parents=True, exist_ok=True)
+        member.write_bytes(data)
+    (source / 'skills/nested/run.sh').chmod(0o755)
+    os.link(source / 'hardlink-a', source / 'hardlink-b')
+    (source / 'CLAUDE.md').symlink_to('AGENTS.md')
+    (source / '.agents').mkdir()
+    (source / '.agents/skills').symlink_to('../skills')
+    source_git(source, 'init', '--quiet')
+    source_git(source, 'add', '--all')
+    tree = source_git(source, 'write-tree')
+    target = source_git(source, 'commit-tree', tree, '-m', 'source archive fixture')
+    source_git(source, 'update-ref', 'HEAD', target)
+    (source / 'skills/untracked-private').write_bytes(b'not exported')
+    (source / 'skills/untracked-link').symlink_to(tmp_path)
+    (source / 'megatron/core/datasets/helpers_cpp.untrusted.so').write_bytes(b'not exported')
+    root = tmp_path / 'runtime-evidence'
+    runtime_export(root, schema=2)
+    metadata = json.loads((root / 'docker-build.json').read_text())
+    metadata['target_sha'] = target
+    (root / 'docker-build.json').write_text(json.dumps(metadata))
+    trusted = container.digest(root / 'docker-build.json')
+    write_image_record(root, trusted)
+    return SimpleNamespace(
+        artifact=root, source_root=source, digest=trusted, control_sha=CONTROL, target_sha=target
+    )
+
+
+def source_archive_cli(args):
+    return subprocess.run(
+        [
+            sys.executable,
+            '-I',
+            '-B',
+            str(SCRIPTS / 'ppu_ci_container.py'),
+            'archive-source',
+            '--source-root',
+            str(args.source_root),
+            '--artifact',
+            str(args.artifact),
+            '--digest',
+            args.digest,
+            '--control-sha',
+            args.control_sha,
+            '--target-sha',
+            args.target_sha,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+def seal_source_archive(args, destination):
+    sealed = args.artifact / 'bundle-integrity.json'
+    sealed.write_text(
+        json.dumps({'schema_version': 1, 'files': container.inventory(args.artifact, exclude=())})
+    )
+    return SimpleNamespace(
+        artifact=args.artifact, bundle_digest=container.digest(sealed), destination=destination
+    )
+
+
+@pytest.mark.parametrize('tracked_extension', [False, True])
+def test_real_source_archive_materializes_aliases_and_restores_authenticated_helper(
+    source_archive_inputs, tmp_path, tracked_extension
+):
+    args = source_archive_inputs
+    helper = 'megatron/core/datasets/helpers_cpp.cpython-312-x86_64-linux-gnu.so'
+    if tracked_extension:
+        (args.source_root / helper).write_bytes(b'tracked-old-extension')
+        source_git(args.source_root, 'add', '--', helper)
+        tree = source_git(args.source_root, 'write-tree')
+        args.target_sha = source_git(args.source_root, 'commit-tree', tree, '-m', 'tracked helper')
+        source_git(args.source_root, 'update-ref', 'HEAD', args.target_sha)
+        metadata = json.loads((args.artifact / 'docker-build.json').read_text())
+        metadata['target_sha'] = args.target_sha
+        (args.artifact / 'docker-build.json').write_text(json.dumps(metadata))
+        args.digest = container.digest(args.artifact / 'docker-build.json')
+        write_image_record(args.artifact, args.digest)
+    evidence = tree_bytes(args.artifact)
+    result = source_archive_cli(args)
+    assert result.returncode == 0, result.stderr
+    expected = {
+        'AGENTS.md': b'guidelines\n',
+        'CLAUDE.md': b'guidelines\n',
+        'skills/nested/run.sh': b'#!/bin/sh\nexit 0\n',
+        '.agents/skills/nested/run.sh': b'#!/bin/sh\nexit 0\n',
+        'megatron/core/datasets/Makefile': b'all:\n\ttrue\n',
+        'hardlink-a': b'same bytes\n',
+        'hardlink-b': b'same bytes\n',
+        '-leading name.txt': b'not a tar option\n',
+        helper: b'extension',
+    }
+    with tarfile.open(args.artifact / 'source.tar.gz') as stream:
+        members = stream.getmembers()
+        assert len(members) == len(expected)
+        assert {member.name for member in members} == set(expected)
+        assert all(member.isfile() and not member.issparse() for member in members)
+        assert {member.name: stream.extractfile(member).read() for member in members} == expected
+    restore = seal_source_archive(args, tmp_path / 'restored')
+    result = subprocess.run(
+        [
+            sys.executable,
+            '-I',
+            '-B',
+            str(SCRIPTS / 'ppu_ci_container.py'),
+            'restore-source',
+            '--artifact',
+            str(args.artifact),
+            '--bundle-digest',
+            restore.bundle_digest,
+            '--destination',
+            str(restore.destination),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert tree_bytes(restore.destination) == expected
+    assert all(not path.is_symlink() for path in restore.destination.rglob('*'))
+    assert (restore.destination / 'skills/nested/run.sh').stat().st_mode & 0o7777 == 0o755
+    assert (restore.destination / helper).stat().st_mode & 0o6000 == 0
+    assert (args.source_root / 'CLAUDE.md').is_symlink()
+    assert (args.source_root / '.agents/skills').is_symlink()
+    assert source_git(args.source_root, 'diff', '--quiet', 'HEAD', '--') == ''
+    assert all((args.artifact / name).read_bytes() == value for name, value in evidence.items())
+    assert not list(args.artifact.glob('ppu-source-archive-*'))
+    result = source_archive_cli(args)
+    assert result.returncode != 0 and 'Refusing to overwrite a source archive' in result.stderr
+
+
+@pytest.mark.parametrize(
+    'damage', ['digest', 'control', 'target', 'dirty', 'staged', 'compiled-bytes', 'output-link']
+)
+def test_real_source_archive_rejects_changed_identity_without_output(source_archive_inputs, damage):
+    args = source_archive_inputs
+    if damage == 'digest':
+        args.digest = 'f' * 64
+    elif damage == 'control':
+        args.control_sha = 'e' * 40
+    elif damage == 'target':
+        args.target_sha = 'e' * 40
+    elif damage == 'dirty':
+        (args.source_root / 'AGENTS.md').write_bytes(b'changed')
+    elif damage == 'staged':
+        (args.source_root / 'staged-new').write_bytes(b'new')
+        source_git(args.source_root, 'add', '--', 'staged-new')
+    elif damage == 'compiled-bytes':
+        (args.artifact / 'compiled-source.tar.gz').write_bytes(b'corrupt')
+    else:
+        (args.artifact / 'source.tar.gz').symlink_to(args.source_root / 'AGENTS.md')
+    before = (args.source_root / 'AGENTS.md').read_bytes()
+    result = source_archive_cli(args)
+    assert result.returncode != 0
+    assert 'raw details suppressed' in result.stderr
+    assert not (args.artifact / 'source.tar.gz').is_file() or damage == 'output-link'
+    assert (args.source_root / 'AGENTS.md').read_bytes() == before
+    assert not list(args.artifact.glob('ppu-source-archive-*'))
+
+
+@pytest.mark.parametrize('kind', ['external', 'untracked', 'chain', 'fifo'])
+def test_real_source_archive_rejects_unsafe_checkout_members(source_archive_inputs, tmp_path, kind):
+    args = source_archive_inputs
+    alias = args.source_root / 'CLAUDE.md'
+    alias.unlink()
+    if kind == 'external':
+        outside = tmp_path / 'private'
+        outside.write_bytes(b'private')
+        alias.symlink_to(outside)
+    elif kind == 'untracked':
+        alias.symlink_to('skills/untracked-private')
+    elif kind == 'chain':
+        (args.source_root / 'indirect').symlink_to('AGENTS.md')
+        alias.symlink_to('indirect')
+    else:
+        os.mkfifo(alias)
+    if kind != 'fifo':
+        source_git(args.source_root, 'add', '--', 'CLAUDE.md')
+        if kind == 'chain':
+            source_git(args.source_root, 'add', '--', 'indirect')
+        tree = source_git(args.source_root, 'write-tree')
+        args.target_sha = source_git(args.source_root, 'commit-tree', tree, '-m', 'unsafe source')
+        source_git(args.source_root, 'update-ref', 'HEAD', args.target_sha)
+        metadata = json.loads((args.artifact / 'docker-build.json').read_text())
+        metadata['target_sha'] = args.target_sha
+        (args.artifact / 'docker-build.json').write_text(json.dumps(metadata))
+        args.digest = container.digest(args.artifact / 'docker-build.json')
+    result = source_archive_cli(args)
+    assert result.returncode != 0
+    expected_error = {
+        'external': 'Build source alias escapes the checkout',
+        'untracked': 'Build source alias target is not tracked',
+        'chain': 'Environment path contains a symlink',
+        'fifo': 'Build checkout tracked-file validation failed',
+    }[kind]
+    assert expected_error in result.stderr
+    assert not (args.artifact / 'source.tar.gz').exists()
+    assert not list(args.artifact.glob('ppu-source-archive-*'))
+
+
+@pytest.mark.parametrize(
+    'rows',
+    [
+        [
+            ('megatron/core/datasets/helpers_cpp.so', b'one', tarfile.REGTYPE),
+            ('megatron/core/datasets/helpers_cpp.so', b'two', tarfile.REGTYPE),
+        ],
+        [('megatron/core/datasets/helpers_cpp.so', b'AGENTS.md', tarfile.SYMTYPE)],
+        [('megatron/core/datasets/helpers_cpp.so', b'AGENTS.md', tarfile.LNKTYPE)],
+        [('megatron/core/datasets/helpers_cpp.so', b'', tarfile.FIFOTYPE)],
+        [('../helpers_cpp.so', b'escape', tarfile.REGTYPE)],
+        [('megatron/core/datasets/helpers_cpp.so', b'x', tarfile.GNUTYPE_SPARSE)],
+        [('megatron/core/datasets/evil.py', b'pass', tarfile.REGTYPE)],
+    ],
+)
+def test_source_archive_rejects_unsafe_authenticated_compiled_members(source_archive_inputs, rows):
+    args = source_archive_inputs
+    archive(args.artifact / 'compiled-source.tar.gz', rows)
+    metadata = json.loads((args.artifact / 'docker-build.json').read_text())
+    metadata['files']['compiled-source.tar.gz'] = {
+        'size': (args.artifact / 'compiled-source.tar.gz').stat().st_size,
+        'sha256': container.digest(args.artifact / 'compiled-source.tar.gz'),
+    }
+    (args.artifact / 'docker-build.json').write_text(json.dumps(metadata))
+    args.digest = container.digest(args.artifact / 'docker-build.json')
+    result = source_archive_cli(args)
+    assert result.returncode != 0
+    assert not (args.artifact / 'source.tar.gz').exists()
+    assert not list(args.artifact.glob('ppu-source-archive-*'))
+
+
+@pytest.mark.parametrize(
+    'rows',
+    [
+        [('source.py', b'one', tarfile.REGTYPE), ('source.py', b'two', tarfile.REGTYPE)],
+        [('source.py', b'AGENTS.md', tarfile.SYMTYPE)],
+        [('source.py', b'AGENTS.md', tarfile.LNKTYPE)],
+        [('source.py', b'', tarfile.FIFOTYPE)],
+        [('../source.py', b'escape', tarfile.REGTYPE)],
+        [('source.py', b'x', tarfile.GNUTYPE_SPARSE)],
+        [('source.py/nested', b'pass', tarfile.REGTYPE), ('source.py', b'pass', tarfile.REGTYPE)],
+    ],
+)
+def test_source_restore_still_rejects_unsafe_sealed_members_before_writes(
+    source_archive_inputs, tmp_path, rows
+):
+    args = source_archive_inputs
+    archive(args.artifact / 'source.tar.gz', rows)
+    restore = seal_source_archive(args, tmp_path / 'restore')
+    with pytest.raises(container.ValidationError):
+        container.restore_source(restore)
+    assert not restore.destination.exists()
+
+
+def test_build_source_archiver_uses_trusted_helper_and_environment_identity():
+    text = (SCRIPTS / 'ppu_ci_build.sh').read_text()
+    pack = text[text.index('git diff --quiet HEAD --') : text.index('ended_at=$(date +%s)')]
+    assert 'bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" archive-source' in pack
+    for value in ('ARTIFACT_DIR', 'SOURCE_ROOT', 'ENVIRONMENT_DIGEST', 'CONTROL_SHA', 'TARGET_SHA'):
+        assert f'"$PPU_{value}"' in pack
+    assert 'tar -' not in pack and 'helpers_cpp*.so' not in pack
+    assert '--exclude' not in pack
+
+
 @pytest.fixture
 def build_inputs(tmp_path, monkeypatch):
     control, source = tmp_path / 'control', tmp_path / 'source'

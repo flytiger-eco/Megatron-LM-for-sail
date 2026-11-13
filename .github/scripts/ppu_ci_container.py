@@ -984,6 +984,36 @@ def portable_checks(source):
         )
 
 
+def archive_source(args):
+    """Package materialized tracked source and authenticated compiled extensions."""
+    source, directory = no_links(args.source_root), no_links(args.artifact)
+    checked_git(source, args.target_sha)
+    verify_export(directory, args.digest, args.control_sha, args.target_sha, subset=True, schema=2)
+    output = no_links(directory / 'source.tar.gz')
+    require(not output.exists(), 'Refusing to overwrite a source archive')
+    names = command(
+        ['git', '-C', str(source), 'ls-files', '-z'],
+        failure='Source archive tracked inventory read failed',
+    ).split('\0')
+    require(any(names), 'Missing tracked source archive members')
+    with tempfile.TemporaryDirectory(prefix='ppu-source-archive-', dir=directory) as temporary:
+        context = Path(temporary)
+        stage = context / 'source'
+        stage.mkdir()
+        materialize_tracked_source(source, stage, names)
+        extract_archive(directory / 'compiled-source.tar.gz', stage, overlay=True, compiled=True)
+        checked_git(source, args.target_sha)
+        candidate = context / 'source.tar.gz'
+        files = inventory(stage, exclude=())
+        with tarfile.open(candidate, 'w:gz', dereference=True) as stream:
+            for name in sorted(files):
+                stream.add(stage / name, arcname=name, recursive=False)
+        extract_archive(candidate, context / 'check', check_only=True)
+        with candidate.open('rb') as stream, output.open('xb') as target:
+            shutil.copyfileobj(stream, target)
+    print('Source archive creation and safety check passed')
+
+
 def restore_source(args):
     directory = no_links(args.artifact)
     require(DIGEST.fullmatch(args.bundle_digest or ''), 'Missing trusted source bundle digest')
@@ -1059,6 +1089,12 @@ def main():
             image.add_argument('--image-digest', required=True)
             image.add_argument('--source-root', type=Path)
             image.add_argument('--check-only', action='store_true')
+    pack = sub.add_parser('archive-source')
+    pack.add_argument('--artifact', type=Path, required=True)
+    pack.add_argument('--source-root', type=Path, required=True)
+    pack.add_argument('--digest', required=True)
+    pack.add_argument('--control-sha', required=True)
+    pack.add_argument('--target-sha', required=True)
     source = sub.add_parser('restore-source')
     source.add_argument('--artifact', type=Path, required=True)
     source.add_argument('--bundle-digest', required=True)
@@ -1076,6 +1112,7 @@ def main():
         'restore-control': restore_control,
         'restore-runtime': restore_runtime,
         'restore-source': restore_source,
+        'archive-source': archive_source,
         'offline-probe': offline_probe,
         'mark-plan': mark_plan,
     }[args.mode](args)
