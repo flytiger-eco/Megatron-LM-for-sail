@@ -21,16 +21,14 @@ on:
       control_sha:
         type: string
         required: true
+      control_digest:
+        type: string
+        required: true
       diagnostic_context:
         type: string
         default: bda
 permissions:
   contents: read
-env:
-  PIP_INDEX_URL: https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
-  PIP_CONFIG_FILE: /dev/null
-  PIP_EXTRA_INDEX_URL: ''
-  PIP_FIND_LINKS: ''
 jobs:
   diagnose:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.run_attempt == 1
@@ -40,19 +38,20 @@ jobs:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 20
     steps:
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Prepare isolated public evidence exporter
-        run: |
-          python3 -m venv "$RUNNER_TEMP/ppu-public-export"
-          "$RUNNER_TEMP/ppu-public-export/bin/python" -m pip install --index-url "$PIP_INDEX_URL" \
-            'tensorboard==2.20.0' 'google-crc32c==1.7.1' 'pyyaml==6.0.3'
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.control_sha }}
           path: source
           persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-control-environment
+          path: .ppu-control-export
+      - name: Verify and restore isolated public evidence exporter
+        run: >-
+          bash source/.github/scripts/ppu_ci_container.sh restore-control
+          --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
+          --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - uses: actions/download-artifact@v4
         with:
           name: ppu-authorization
@@ -111,7 +110,7 @@ jobs:
           ACTION_OUTPUTS: ${{ toJSON(steps.ppu.outputs) }}
         run: |
           mkdir -p "$RESULT_DIR"
-          ACTION_OUTPUTS=$(python3 -I source/.github/scripts/ppu_ci_export.py --action-outputs)
+          ACTION_OUTPUTS=$("$RUNNER_TEMP/ppu-control-runtime/bin/python" -I source/.github/scripts/ppu_ci_export.py --action-outputs)
           printf '{"numerical_validation":false,"action_status":"%s","action_outcome":"%s","outputs":%s}\n' \
             "$ACTION_STATUS" "$ACTION_OUTCOME" "$ACTION_OUTPUTS" > "$RESULT_DIR/action.json"
           printf '%s\n' 'Standalone compiler diagnostic; Build, UT and formal model regression were not run and it does not count toward the pass rate.' >> "$GITHUB_STEP_SUMMARY"
@@ -123,7 +122,7 @@ jobs:
           PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
           PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
           EXPORT_SOURCE: .ppu-diagnostic-action/
-        run: '"$RUNNER_TEMP/ppu-public-export/bin/python" -I source/.github/scripts/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/diagnose-110 --kind evidence'
+        run: '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I source/.github/scripts/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/diagnose-110 --kind evidence'
       - name: Archive CPU-local execution status
         uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-diagnose-110.outcome == 'success' }}
@@ -141,7 +140,7 @@ jobs:
           PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
           PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
           EXPORT_SOURCE: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/compiler-diagnostic/pod/
-        run: '"$RUNNER_TEMP/ppu-public-export/bin/python" -I source/.github/scripts/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/diagnose-119 --kind evidence'
+        run: '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I source/.github/scripts/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/diagnose-119 --kind evidence'
       - name: Archive Pod diagnostic evidence read-only
         uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-diagnose-119.outcome == 'success' }}

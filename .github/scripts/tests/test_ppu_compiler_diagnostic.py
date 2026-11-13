@@ -190,7 +190,7 @@ def test_workflow_dispatch_defaults_and_job_exclusion():
         "outputs.allowed == 'true'",
     ):
         assert guard in jobs["compiler-diagnostic"]["if"]
-    assert jobs["compiler-diagnostic"]["needs"] == "authorize"
+    assert jobs["compiler-diagnostic"]["needs"] == ["authorize", "control-environment"]
     assert "strategy" not in jobs["compiler-diagnostic"]
     assert "pr_number != '0'" in jobs["pr-result"]["if"]
 
@@ -226,13 +226,19 @@ def test_fixed_single_pod_budget_and_no_build_or_test_entrypoints():
     prepare = next(
         i
         for i, step in enumerate(steps)
-        if step.get("name") == "Prepare isolated public evidence exporter"
+        if step.get("name") == "Verify and restore isolated public evidence exporter"
     )
     assert all(
         prepare < i
         for i, step in enumerate(steps)
         if step.get("uses") in ("actions/checkout@v4", "actions/download-artifact@v4")
+        and step.get("with", {}).get("path") != ".ppu-control-export"
+        and not (
+            step.get("uses") == "actions/checkout@v4"
+            and step["with"]["ref"] == "${{ inputs.control_sha }}"
+        )
     )
+    assert "--digest '${{ inputs.control_digest }}'" in steps[prepare]["run"]
 
 
 def test_cold_cache_variant_environments(tmp_path):
@@ -548,10 +554,12 @@ def test_cpu_envelope_runs_without_nas_write_permission(tmp_path, outcome, statu
     scripts.mkdir(parents=True)
     for name in ("ppu_ci_export.py", "ppu_ci_paths.py"):
         (scripts / name).write_bytes((SCRIPTS / name).read_bytes())
+    (workspace / "ppu-control-runtime").symlink_to(Path(sys.executable).parent.parent)
     outputs = {"job_status": status} if status else {}
     env = {
         **os.environ,
         **envelope["env"],
+        "RUNNER_TEMP": str(workspace),
         "ACTION_OUTCOME": outcome,
         "ACTION_STATUS": status,
         "ACTION_OUTPUTS": json.dumps(outputs),

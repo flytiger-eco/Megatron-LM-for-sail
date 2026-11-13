@@ -2,9 +2,11 @@
 
 import copy
 import json
+from types import SimpleNamespace
 
 import pytest
 import yaml
+from test_ppu_ci_container import container
 from test_ppu_functional import ROOT, functional
 from test_ppu_functional_results import results
 from test_ppu_lifecycle import FakeGitHub
@@ -184,6 +186,31 @@ def test_combine_attaches_verified_functional_plan(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "trigger,labels", [("push", ()), ("merge_group", ()), ("pull_request_target", ("Run tests",))]
+)
+def test_docker_mark_plan_preserves_combined_policy_and_sidecar_digest(tmp_path, trigger, labels):
+    output = combined_output(tmp_path, trigger, labels)
+    plan = functional.combine(ROOT, ROOT, output)
+    top = json.loads((output / "manifest.json").read_text())
+    container.mark_plan(SimpleNamespace(artifact=output))
+    marked = json.loads((output / "manifest.json").read_text())
+    expected = {**plan, "environment_build_schema": 2}
+    assert functional.load_manifest(output / "manifest.json") == expected
+    assert marked["environment_build_schema"] == 2
+    assert marked["functional_plan"]["sha256"] == container.digest(
+        output / functional.FUNCTIONAL_MANIFEST
+    )
+    assert {
+        key: value
+        for key, value in marked.items()
+        if key not in ("environment_build_schema", "functional_plan")
+    } == {key: value for key, value in top.items() if key != "functional_plan"}
+    (output / functional.FUNCTIONAL_MANIFEST).write_text(json.dumps(plan))
+    with pytest.raises(ValueError):
+        functional.load_manifest(output / "manifest.json")
+
+
+@pytest.mark.parametrize(
     "changes,match",
     [
         ({"allowed": False}, "authorized combined"),
@@ -354,6 +381,13 @@ def test_workflows_route_label_events_and_share_one_build():
         step["run"] for step in jobs["configure"]["steps"] if step.get("id") == "config"
     )
     assert "combined" in jobs["functional-assets"]["if"]
+    assert "needs.configure.outputs.test_kind != 'functional'" in jobs["admit-build"]["if"]
+    assert "needs.functional-assets.result == 'success'" in jobs["functional-tests"]["if"]
+    assert jobs["build"]["needs"] == ["configure", "admit-build", "runtime-environment"]
+    assert jobs["runtime-environment"]["runs-on"] == "ubuntu-latest"
+    assert jobs["runtime-environment"]["permissions"]["packages"] == "write"
+    assert build["jobs"]["execute"]["permissions"]["packages"] == "write"
+    assert "functional-assets" not in jobs["unit-tests"]["needs"]
     assert jobs["functional-tests"]["needs"] == [
         "configure",
         "functional-assets",

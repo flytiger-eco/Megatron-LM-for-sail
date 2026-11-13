@@ -98,6 +98,63 @@ def test_combined_bundle_carries_the_trusted_functional_plan(combined_bundle):
         ci.seal_bundle(bundle)
 
 
+@pytest.mark.parametrize("previous", [False, True])
+@pytest.mark.parametrize("import_failure", [False, True])
+@pytest.mark.parametrize("kind", ["functional", "combined"])
+def test_environment_plan_loading_preserves_control_bytes(
+    tmp_path, monkeypatch, previous, import_failure, kind
+):
+    control = tmp_path / "control"
+    control.mkdir()
+    for path in SCRIPTS.glob("ppu*.py"):
+        shutil.copy2(path, control / path.name)
+    helper = control / "ppu_functional.py"
+    if import_failure:
+        helper.write_text(helper.read_text() + '\nraise RuntimeError("fixture import failure")\n')
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    identity = {"target_sha": "a" * 40, "control_sha": "b" * 40}
+    manifest = {
+        "schema_version": 1,
+        "test_kind": "functional",
+        "config": {"build": True},
+        "identity": identity,
+        "environment_build_schema": 2,
+    }
+    top = manifest
+    if kind == "combined":
+        sidecar = bundle / "functional-manifest.json"
+        sidecar.write_text(json.dumps(manifest))
+        top = {
+            "schema_version": 4,
+            "test_kind": kind,
+            "identity": identity,
+            "functional_plan": {
+                "path": sidecar.name,
+                "sha256": hashlib.sha256(sidecar.read_bytes()).hexdigest(),
+            },
+        }
+    (bundle / "manifest.json").write_text(json.dumps(top))
+    args = SimpleNamespace(command="prepare", bundle=bundle, output=None)
+    monkeypatch.setattr(environment.argparse.ArgumentParser, "parse_args", lambda _: args)
+    monkeypatch.setattr(environment, "__file__", str(control / "ppu_functional_environment.py"))
+    monkeypatch.setattr(sys, "dont_write_bytecode", previous)
+    calls = []
+    monkeypatch.setattr(environment, "prepare", lambda *values: calls.append(values))
+    monkeypatch.setattr(environment, "check", lambda *values: calls.append(values))
+    before = {path.name: path.read_bytes() for path in control.iterdir()}
+    if import_failure:
+        with pytest.raises(RuntimeError, match="fixture import failure"):
+            environment.main()
+        assert calls == []
+    else:
+        environment.main()
+        assert calls == [(bundle, manifest), (bundle, manifest, bundle)]
+    assert sys.dont_write_bytecode is previous
+    assert not list(control.rglob("*.pyc"))
+    assert {path.name: path.read_bytes() for path in control.iterdir()} == before
+
+
 @pytest.fixture
 def tool_environment(tmp_path, monkeypatch):
     bundle = tmp_path / "bundle"
@@ -125,7 +182,29 @@ def tool_environment(tmp_path, monkeypatch):
     digest = hashlib.sha256(content).hexdigest()
     monkeypatch.setattr(environment, "YQ", {"fixture": ("mock_arch", digest)})
     monkeypatch.setattr(environment.platform, "machine", lambda: "fixture")
-    monkeypatch.setattr(environment.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(content))
+    prefix = tmp_path / "runtime"
+    (prefix / "bin").mkdir(parents=True)
+    (bundle / "functional-tools").mkdir()
+    tool_files = {}
+    for name, payload in (("yq", content), ("envsubst", envsubst.read_bytes())):
+        (bundle / "functional-tools" / name).write_bytes(payload)
+        (prefix / "bin" / name).write_bytes(payload)
+        tool_files[f"functional-tools/{name}"] = {
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    (local / "yq").write_bytes(content)
+    (local / "yq").chmod(0o755)
+    (bundle / "docker-build.json").write_text(json.dumps({"files": tool_files}))
+    (site / "ppu_functional_pytest.py").write_bytes(
+        (bundle / "control/ppu_functional_pytest.py").read_bytes()
+    )
+    (site / environment.NAMESPACE_PTH).write_text(environment.NAMESPACE_BOOTSTRAP)
+    monkeypatch.setattr(
+        environment,
+        "sys",
+        SimpleNamespace(executable=sys.executable, prefix=str(prefix), version=sys.version),
+    )
     monkeypatch.setattr(
         environment.shutil,
         "which",
@@ -135,6 +214,7 @@ def tool_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(environment.subprocess, "run", lambda args, **kwargs: calls.append(args))
     versions = {
         "bash": "GNU bash, version 5.2.21",
+        str(prefix / "bin/yq"): "yq (https://github.com/mikefarah/yq/) version v4.47.2",
         "/usr/local/bin/yq": "yq (https://github.com/mikefarah/yq/) version v4.47.2",
         "envsubst": "envsubst (GNU gettext-runtime) 0.21",
         "uv": "uv 0.13.0",
@@ -242,6 +322,7 @@ def tool_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("PPU_SOURCE_ROOT", str(ROOT))
     monkeypatch.setattr(environment, "check_postprocessing", lambda root: {"event_roundtrip": True})
     manifest = {
+        "environment_build_schema": 1,
         "functional": {"case": {"launcher": "torchrun", "nvrx_checkpoint": []}},
         "identity": {"run_id": "123"},
         "config": {"image": "fixed"},
@@ -504,10 +585,26 @@ def checkpoint_api(tool_environment, monkeypatch):
 
 @pytest.mark.parametrize("launcher", ["torchrun", "ft_launcher"])
 @pytest.mark.parametrize("checkpoint", [False, True])
-def test_prepare_attests_tools_and_installs_selected_dependencies(
-    tool_environment, checkpoint_api, launcher, checkpoint
+@pytest.mark.parametrize("schema", [1, 2])
+def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
+    tool_environment, checkpoint_api, launcher, checkpoint, schema, monkeypatch
 ):
     bundle, site, manifest, calls, _, _ = tool_environment
+    manifest["environment_build_schema"] = schema
+    delivery = {
+        "runtime_image_digest": "ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci@sha256:"
+        + "e" * 64,
+        "base_image_digest": functional.IMAGE.rsplit(":", 1)[0] + "@sha256:" + "f" * 64,
+        "environment_digest": "a" * 64,
+    }
+    if schema == 2:
+        (bundle / "runtime-image.json").write_text(json.dumps(delivery))
+        for name, field in (
+            ("PPU_IMAGE_DIGEST", "runtime_image_digest"),
+            ("PPU_BASE_IMAGE_DIGEST", "base_image_digest"),
+            ("PPU_ENVIRONMENT_DIGEST", "environment_digest"),
+        ):
+            monkeypatch.setenv(name, delivery[field])
     manifest["functional"]["case"]["launcher"] = launcher
     if checkpoint:
         manifest["functional"]["case"]["nvrx_checkpoint"] = [
@@ -517,19 +614,17 @@ def test_prepare_attests_tools_and_installs_selected_dependencies(
     assert (site / "ppu_functional_pytest.py").read_bytes() == (
         bundle / "control/ppu_functional_pytest.py"
     ).read_bytes()
-    assert any("nvidia-resiliency-ext==0.6.0" in command for command in calls) == (
-        launcher == "ft_launcher" or checkpoint
-    )
-    assert all(
-        command[command.index("--index-url") + 1] == "https://packages.invalid/simple"
-        for command in calls
-    )
+    assert calls == []
     environment.check(bundle, manifest, bundle / "reports")
     report = json.loads((bundle / "reports/functional-environment.json").read_text())
     assert (site / environment.NAMESPACE_PTH).read_text() == environment.NAMESPACE_BOOTSTRAP
     assert report["postprocessing"] == {"event_roundtrip": True}
     assert "protobuf" in report["packages"]
     assert report["identity"] == manifest["identity"] and report["devices"] == 8
+    if schema == 2:
+        assert {field: report[field] for field in delivery} == delivery
+    else:
+        assert not any(field in report for field in delivery)
     assert report["training_dependencies"]["packages"] == environment.TRAINING_PACKAGES
     assert environment.TRAINING_PACKAGES.items() <= report["packages"].items()
     assert report["training_dependencies"]["emerging_optimizers_enabled"]
@@ -547,6 +642,89 @@ def test_prepare_attests_tools_and_installs_selected_dependencies(
             == manifest["functional"]["case"]["nvrx_checkpoint"]
         )
         assert "mp_mode" in report["nvrx"]["signatures"]["get_write_results_queue"]
+
+
+@pytest.mark.parametrize("damage", ["missing", "modified", "not_executable", "symlink"])
+def test_prepare_rejects_invalid_upstream_yq_without_repairing(tool_environment, damage):
+    bundle, _, manifest, calls, _, _ = tool_environment
+    manifest["environment_build_schema"] = 2
+    local = environment.Path("/usr/local/bin") / "yq"
+    if damage == "missing":
+        local.unlink()
+    elif damage == "modified":
+        local.write_bytes(b"Changed yq")
+    elif damage == "not_executable":
+        local.chmod(0o644)
+    else:
+        local.unlink()
+        local.symlink_to(bundle / "functional-tools/yq")
+    before = (local.is_symlink(), local.exists(), local.read_bytes() if local.exists() else None)
+    with pytest.raises(ValueError, match="Upstream yq path"):
+        environment.prepare(bundle, manifest)
+    assert calls == []
+    assert before == (
+        local.is_symlink(),
+        local.exists(),
+        local.read_bytes() if local.exists() else None,
+    )
+    assert not (bundle / "reports").exists()
+
+
+@pytest.mark.parametrize("version", ["yq v4.47.2", "mikefarah/yq version v4.46.0"])
+def test_image_environment_checks_version_at_original_driver_path(
+    tool_environment, version, monkeypatch
+):
+    bundle, _, manifest, calls, versions, _ = tool_environment
+    manifest["environment_build_schema"] = 2
+    delivery = {
+        "runtime_image_digest": "execution",
+        "base_image_digest": "base",
+        "environment_digest": "environment",
+    }
+    (bundle / "runtime-image.json").write_text(json.dumps(delivery))
+    for field, variable in (
+        ("runtime_image_digest", "PPU_IMAGE_DIGEST"),
+        ("base_image_digest", "PPU_BASE_IMAGE_DIGEST"),
+        ("environment_digest", "PPU_ENVIRONMENT_DIGEST"),
+    ):
+        monkeypatch.setenv(variable, delivery[field])
+    versions["/usr/local/bin/yq"] = version
+    with pytest.raises(ValueError, match="attested Mike Farah yq"):
+        environment.check(bundle, manifest, bundle / "reports")
+    assert calls == []
+    assert not (bundle / "reports").exists()
+
+
+@pytest.mark.parametrize("schema", [True, 2.0, 3, "2"])
+def test_functional_environment_rejects_unknown_or_downgraded_schema(tool_environment, schema):
+    bundle, _, manifest, _, _, _ = tool_environment
+    manifest["environment_build_schema"] = schema
+    with pytest.raises(ValueError):
+        environment.prepare(bundle, manifest)
+    with pytest.raises(ValueError, match="Unsupported functional"):
+        environment.check(bundle, manifest, bundle / "reports")
+    assert not (bundle / "reports/functional-environment.json").exists()
+
+
+@pytest.mark.parametrize(
+    "variable", ["PPU_IMAGE_DIGEST", "PPU_BASE_IMAGE_DIGEST", "PPU_ENVIRONMENT_DIGEST"]
+)
+def test_functional_image_evidence_requires_job_identities(tool_environment, monkeypatch, variable):
+    bundle, _, manifest, _, _, _ = tool_environment
+    manifest["environment_build_schema"] = 2
+    values = {
+        "runtime_image_digest": "execution",
+        "base_image_digest": "base",
+        "environment_digest": "metadata",
+    }
+    (bundle / "runtime-image.json").write_text(json.dumps(values))
+    monkeypatch.setenv("PPU_IMAGE_DIGEST", values["runtime_image_digest"])
+    monkeypatch.setenv("PPU_BASE_IMAGE_DIGEST", values["base_image_digest"])
+    monkeypatch.setenv("PPU_ENVIRONMENT_DIGEST", values["environment_digest"])
+    monkeypatch.setenv(variable, "mismatch")
+    with pytest.raises(ValueError, match="image handoff mismatch"):
+        environment.check(bundle, manifest, bundle / "reports")
+    assert not (bundle / "reports/functional-environment.json").exists()
 
 
 def test_cpu_shm_checkpoint_uses_writer_parameter_name(tool_environment, checkpoint_api):
@@ -661,29 +839,25 @@ def test_incompatible_checkpoint_api_fails_before_training(
 
 @pytest.mark.parametrize("kind", [None, "unit", "functional"])
 def test_training_packages_match_build_constraints(tmp_path, monkeypatch, kind):
-    script = (SCRIPTS / "ppu_ci_build.sh").read_text()
+    script = (ROOT / ".github/docker/install_ppu.sh").read_text()
     block = next(
-        block
-        for block in re.findall(r"<<'PY'\n(.*?)\nPY", script, re.S)
-        if "native_requirements =" in block
+        block for block in re.findall(r"<<'PY'\n(.*?)\nPY", script, re.S) if "native =" in block
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(environment.importlib.metadata, "version", lambda name: "fixed-runtime")
-    bundle = tmp_path / ".ppu-ci"
-    bundle.mkdir()
-    (bundle / "manifest.json").write_text(json.dumps({"test_kind": kind} if kind else {}))
-    exec(compile(block, "functional-build-requirements", "exec"), {})
-    requirements = (bundle / "ppu-requirements.txt").read_text().splitlines()
-    constraints = (bundle / "constraints.txt").read_text().splitlines()
-    functional_only = {"apex", "flash-linear-attention", "emerging-optimizers"}
+    (tmp_path / "pyproject.toml").write_bytes((ROOT / "pyproject.toml").read_bytes())
+    exec(compile(block, "docker-build-requirements", "exec"), {})
+    requirements = (tmp_path / "ppu-requirements.txt").read_text().splitlines()
+    constraints = (tmp_path / "constraints.txt").read_text().splitlines()
     assert environment.TRAINING_PACKAGES["apex"] == "24.4.1+v0.1.0.ppu2.2.0"
     for name, version in environment.TRAINING_PACKAGES.items():
-        expected = int(kind == "functional" or name not in functional_only)
-        assert requirements.count(f"{name}=={version}") == expected
-        assert constraints.count(f"{name}=={version}") == expected
-    assert len(requirements) == (9 if kind == "functional" else 6)
+        assert requirements.count(f"{name}=={version}") == 1
+        assert constraints.count(f"{name}=={version}") == 1
+    assert len(requirements) == 10
+    assert requirements.count("nvidia-resiliency-ext==0.6.0") == 1
     assert all(f"{name}==fixed-runtime" in constraints for name in ("torch", "triton"))
-    assert 'functional_pip_args=(--report .ppu-ci/functional-package-install.json)' in script
+    assert '--report /build/functional-package-install.json' in script
+    assert "test_kind" not in script
 
 
 @pytest.mark.parametrize("name", environment.TRAINING_PACKAGES)
@@ -1045,7 +1219,7 @@ def test_namespace_prepare_refuses_to_overwrite_existing_file(tool_environment):
     bundle, site, manifest, _, _, _ = tool_environment
     startup = site / environment.NAMESPACE_PTH
     startup.write_text("existing content\n")
-    with pytest.raises(FileExistsError):
+    with pytest.raises(ValueError, match="namespace startup"):
         environment.prepare(bundle, manifest)
     assert startup.read_text() == "existing content\n"
 
@@ -1055,12 +1229,10 @@ def test_checkpoint_requirement_is_not_optional():
         environment.nvrx_requirements({"functional": {"case": {"launcher": "torchrun"}}})
 
 
-def test_tool_download_digest_mismatch_prevents_package_installation(tool_environment, monkeypatch):
+def test_tool_export_digest_mismatch_prevents_runtime_success(tool_environment):
     bundle, _, manifest, calls, _, _ = tool_environment
-    monkeypatch.setattr(
-        environment.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(b"different")
-    )
-    with pytest.raises(ValueError, match="digest"):
+    (bundle / "functional-tools/yq").write_bytes(b"different")
+    with pytest.raises(ValueError, match="tool"):
         environment.prepare(bundle, manifest)
     assert not calls
 
@@ -1072,7 +1244,9 @@ def test_invalid_runtime_environment_fails_before_training(tool_environment, mon
     bundle, _, manifest, _, versions, cuda = tool_environment
     environment.prepare(bundle, manifest)
     if damage in ("bash", "yq", "envsubst"):
-        versions["/usr/local/bin/yq" if damage == "yq" else damage] = "Unsupported version"
+        versions[str(Path(environment.sys.prefix) / "bin/yq") if damage == "yq" else damage] = (
+            "Unsupported version"
+        )
     elif damage == "devices":
         cuda.device_count = lambda: 4
     elif damage == "nodes":

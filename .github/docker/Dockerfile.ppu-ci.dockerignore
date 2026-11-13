@@ -1,0 +1,8 @@
+**/.git
+**/.ppu*
+**/__pycache__
+**/.pytest_cache
+**/*.pyc
+**/.venv
+**/dist
+**/*.egg-info

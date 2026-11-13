@@ -30,6 +30,9 @@ on:
       request_inputs:
         type: string
         required: true
+      control_digest:
+        type: string
+        required: true
     outputs:
       scope:
         value: ${{ jobs.configure.outputs.scope }}
@@ -41,11 +44,6 @@ on:
         value: ${{ jobs.result.outputs.execution_success }}
 permissions:
   contents: read
-env:
-  PIP_INDEX_URL: https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
-  PIP_CONFIG_FILE: /dev/null
-  PIP_EXTRA_INDEX_URL: ''
-  PIP_FIND_LINKS: ''
 jobs:
   lifecycle:
     if: ${{ !inputs.allowed }}
@@ -76,17 +74,20 @@ jobs:
       control_sha: ${{ inputs.control_sha }}
       manual_pr: ${{ inputs.manual_pr }}
     steps:
-      - name: Prepare isolated configuration environment
-        run: |
-          # Install pinned dependencies before checking out sources or downloading
-          # artifacts; never modify the job PATH.
-          python3 -m venv "$RUNNER_TEMP/ppu-configure-venv"
-          "$RUNNER_TEMP/ppu-configure-venv/bin/python" -m pip install --index-url "$PIP_INDEX_URL" click pyyaml
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.control_sha }}
           path: control
           persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-control-environment
+          path: .ppu-control-export
+      - name: Verify and restore isolated configuration environment
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh restore-control
+          --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
+          --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - uses: actions/download-artifact@v4
         with:
           name: ppu-authorization
@@ -111,16 +112,16 @@ jobs:
         run: |
           test_kind=$(python3 -c 'import json; print(json.load(open(".ppu-ci/authorization.json")).get("test_kind", "unit"))')
           if [[ "$test_kind" == functional ]]; then
-            "$RUNNER_TEMP/ppu-configure-venv/bin/python" -I control/.github/scripts/ppu_functional.py configure
+            "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I control/.github/scripts/ppu_functional.py configure
             cp control/.github/scripts/ppu_functional*.py .ppu-ci/control/
             cp control/.github/scripts/ppu_compiler_diagnostic.py .ppu-ci/control/
             cp control/.github/scripts/ppu_functional_run.sh .ppu-ci/control/
           else
-            "$RUNNER_TEMP/ppu-configure-venv/bin/python" -I control/.github/scripts/ppu_ci.py configure
+            "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I control/.github/scripts/ppu_ci.py configure
             if [[ "$test_kind" == combined ]] &&
               python3 -c 'import json; raise SystemExit(json.load(open(".ppu-ci/manifest.json"))["config"]["build"] is not True)'; then
               # Automatic triggers append the functional plan to the UT manifest; both share one Build.
-              "$RUNNER_TEMP/ppu-configure-venv/bin/python" -I control/.github/scripts/ppu_functional.py combine
+              "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I control/.github/scripts/ppu_functional.py combine
               cp control/.github/scripts/ppu_functional*.py .ppu-ci/control/
               cp control/.github/scripts/ppu_compiler_diagnostic.py .ppu-ci/control/
               cp control/.github/scripts/ppu_functional_run.sh .ppu-ci/control/
@@ -128,12 +129,13 @@ jobs:
               echo 'test_kind=unit' >> "$GITHUB_OUTPUT"
             fi
           fi
-          cp control/.github/scripts/{ppu_ci.py,ppu_ci_build.sh,ppu_ci_run.sh,ppu_pytest_policy.py,ppu_ci_paths.py,ppu_ci_export.py} .ppu-ci/control/
+          cp control/.github/scripts/{ppu_ci.py,ppu_ci_build.sh,ppu_ci_run.sh,ppu_pytest_policy.py,ppu_ci_paths.py,ppu_ci_export.py,ppu_ci_container.py,ppu_ci_container.sh} .ppu-ci/control/
+          bash control/.github/scripts/ppu_ci_container.sh mark-plan --artifact .ppu-ci
       - name: Export checked public evidence
         id: public-configure-131
         env:
           EXPORT_SOURCE: .ppu-ci/
-        run: python3 -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/configure-131 --kind evidence
+        run: '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/configure-131 --kind evidence'
       - uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-configure-131.outcome == 'success' }}
         with:
@@ -155,9 +157,20 @@ jobs:
         with:
           name: ppu-plan
           path: .ppu-ci
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
         with:
-          python-version: '3.12'
+          ref: ${{ inputs.control_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-control-environment
+          path: .ppu-control-export
+      - name: Verify and restore trusted control interpreter
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh restore-control
+          --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
+          --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - name: Read-only NAS asset preflight (no PPU requested)
         env:
           PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
@@ -166,7 +179,7 @@ jobs:
           PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
         run: |
           python3 -I .ppu-ci/control/ppu_ci_paths.py assets
-          python3 -I .ppu-ci/control/ppu_functional.py assets --output .ppu-ci \
+          "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_functional.py assets --output .ppu-ci \
             --tokenizer-receipts "$PPU_TOKENIZER_RECEIPTS_ROOT"
       - name: Export checked public evidence
         id: public-functional-assets-166
@@ -177,7 +190,7 @@ jobs:
           PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
           PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
           EXPORT_SOURCE: .ppu-ci/assets-report.json
-        run: python3 -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/functional-assets-166 --kind evidence
+        run: '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/functional-assets-166 --kind evidence'
       - uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-functional-assets-166.outcome == 'success' }}
         with:
@@ -205,23 +218,149 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I .ppu-ci/control/ppu_pr_authorize.py guard
-  build:
+  runtime-environment:
     needs: [configure, admit-build]
     if: >-
       always() && !cancelled() && needs.configure.result == 'success' &&
       needs.admit-build.result == 'success' && needs.configure.outputs.build == 'true' &&
       (needs.configure.outputs.manual_pr != 'true' || github.run_attempt == 1)
+    runs-on: ubuntu-latest
+    environment: ppu-ci
+    timeout-minutes: 210
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      packages: write
+    outputs:
+      environment_digest: ${{ steps.publish.outputs.environment_digest }}
+      runtime_image_digest: ${{ steps.publish.outputs.runtime_image_digest }}
+      base_image_digest: ${{ steps.publish.outputs.base_image_digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.control_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-authorization
+          path: .ppu-ci
+      - name: Revalidate authorization before accessing build cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I control/.github/scripts/ppu_pr_authorize.py guard
+      - name: Check out source under test
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+      - name: Wait after checkout failure
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 15
+      - name: Retry source checkout (final attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Check CPU builder and resolve immutable PPU base image
+        id: identity
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh fingerprint --kind runtime
+          --control-root control --control-sha '${{ inputs.control_sha }}'
+          --source-root source --target-sha '${{ inputs.target_sha }}'
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ppu-runtime-cache
+          key: ppu-runtime-linux-amd64-${{ steps.identity.outputs.cache_key }}
+      - name: Build and offline-verify the complete execution image on CPU
+        id: runtime
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh build-image
+          --local-image 'ppu-ci-runtime:run-${{ github.run_id }}-${{ github.run_attempt }}'
+          --control-root control --control-sha '${{ inputs.control_sha }}'
+          --source-root source --target-sha '${{ inputs.target_sha }}'
+          --image-digest '${{ steps.identity.outputs.image_digest }}'
+          --output "$RUNNER_TEMP/ppu-runtime-export" --cache-root "$RUNNER_TEMP/ppu-runtime-cache"
+      - name: Revalidate authorization before GHCR image publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I control/.github/scripts/ppu_pr_authorize.py guard
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish the verified local image without rebuilding source
+        id: publish
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh publish-image
+          --artifact "$RUNNER_TEMP/ppu-runtime-export"
+          --digest '${{ steps.runtime.outputs.environment_digest }}'
+          --control-sha '${{ inputs.control_sha }}' --target-sha '${{ inputs.target_sha }}'
+          --base-image-digest '${{ steps.runtime.outputs.base_image_digest }}'
+          --local-image 'ppu-ci-runtime:run-${{ github.run_id }}-${{ github.run_attempt }}'
+          --local-image-id '${{ steps.runtime.outputs.local_image_id }}'
+          --image-tag 'ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci:run-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.target_sha }}'
+      - uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ppu-runtime-cache
+          key: ppu-runtime-linux-amd64-${{ steps.identity.outputs.cache_key }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppu-runtime-environment
+          path: ${{ runner.temp }}/ppu-runtime-export/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+  build:
+    needs: [configure, admit-build, runtime-environment]
+    if: >-
+      always() && !cancelled() && needs.configure.result == 'success' &&
+      needs.admit-build.result == 'success' && needs.runtime-environment.result == 'success' &&
+      needs.configure.outputs.build == 'true' &&
+      (needs.configure.outputs.manual_pr != 'true' || github.run_attempt == 1)
     runs-on: k8s-runner-group-cpu-flytiger
     environment: ppu-ci
+    container:
+      image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 210
     outputs:
       bundle_digest: ${{ steps.bundle.outputs.bundle_digest }}
-    container:
-      image: ghcr.io/actions/actions-runner:latest
+      environment_digest: ${{ needs.runtime-environment.outputs.environment_digest }}
+      runtime_image_digest: ${{ needs.runtime-environment.outputs.runtime_image_digest }}
+      base_image_digest: ${{ needs.runtime-environment.outputs.base_image_digest }}
     env:
-      PPU_IMAGE: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+      PPU_IMAGE: ${{ needs.runtime-environment.outputs.runtime_image_digest }}
       MAX_JOBS: '16'
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.control_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-control-environment
+          path: .ppu-control-export
+      - name: Verify and restore trusted control interpreter
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh restore-control
+          --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
+          --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - name: Check out source under test
         id: checkout
         continue-on-error: true
@@ -249,17 +388,31 @@ jobs:
         with:
           name: ppu-plan
           path: .ppu-ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-runtime-environment
+          path: ${{ runner.temp }}/ppu-runtime-export
+      - name: Verify Dockerfile environment handoff before requesting PPU
+        run: |
+          bash control/.github/scripts/ppu_ci_container.sh verify-image \
+            --artifact "$RUNNER_TEMP/ppu-runtime-export" \
+            --digest '${{ needs.runtime-environment.outputs.environment_digest }}' \
+            --control-sha '${{ inputs.control_sha }}' --target-sha '${{ inputs.target_sha }}' \
+            --image-digest '${{ needs.runtime-environment.outputs.runtime_image_digest }}' \
+            --base-image-digest '${{ needs.runtime-environment.outputs.base_image_digest }}' \
+            --source-root source --check-only
+          cp -R "$RUNNER_TEMP/ppu-runtime-export/." .ppu-ci/
       - name: Validate trusted runtime directories
         env:
           PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
           PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
           PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
-        run: python3 -I .ppu-ci/control/ppu_ci_paths.py run
-      - name: Build shared DEV/LTS artifacts in an eight-card 890P Pod
+        run: '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_paths.py run'
+      - name: Validate shared DEV/LTS artifacts in an eight-card 890P Pod
         id: ppu-build
         uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
-          image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+          image: ${{ needs.runtime-environment.outputs.runtime_image_digest }}
           nnodes: 0
           nproc_per_node: 8
           namespace: ${{ vars.PPU_NAMESPACE || 'ppu-sched' }}
@@ -272,16 +425,12 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ needs.configure.outputs.target_sha }},PPU_CONTROL_SHA=${{ needs.configure.outputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build
+          extra_env: PPU_TARGET_SHA=${{ needs.configure.outputs.target_sha }},PPU_CONTROL_SHA=${{ needs.configure.outputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_ENVIRONMENT_DIGEST=${{ needs.runtime-environment.outputs.environment_digest }},PPU_IMAGE_DIGEST=${{ needs.runtime-environment.outputs.runtime_image_digest }},PPU_BASE_IMAGE_DIGEST=${{ needs.runtime-environment.outputs.base_image_digest }},PPU_IMAGE=${{ needs.runtime-environment.outputs.runtime_image_digest }},PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build
           command: |
             set -euo pipefail
             umask 022
             cd /opt/megatron-lm
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            apt-get install -y --no-install-recommends git ca-certificates wget
             chown -R "$(id -u):$(id -g)" .
-            [[ "$(git -C source rev-parse HEAD)" == "$PPU_TARGET_SHA" ]] || exit 1
             unset WORLD_SIZE RANK LOCAL_RANK
             bash "$PPU_CONTROL_DIR/ppu_ci_build.sh"
             mkdir -p "$PPU_BUNDLE_DIR"
@@ -298,6 +447,9 @@ jobs:
           PPU_BUNDLE_DIR: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build
           PPU_TARGET_SHA: ${{ needs.configure.outputs.target_sha }}
           PPU_CONTROL_SHA: ${{ needs.configure.outputs.control_sha }}
+          PPU_ENVIRONMENT_DIGEST: ${{ needs.runtime-environment.outputs.environment_digest }}
+          PPU_IMAGE_DIGEST: ${{ needs.runtime-environment.outputs.runtime_image_digest }}
+          PPU_BASE_IMAGE_DIGEST: ${{ needs.runtime-environment.outputs.base_image_digest }}
         run: |
           set -euo pipefail
           [[ "$PPU_OUTCOME" == success && "$PPU_STATUS" == succeeded ]] || exit 1
@@ -306,7 +458,11 @@ jobs:
           [[ "$(< "$PPU_BUNDLE_DIR/control.txt")" == "$PPU_CONTROL_SHA" ]] || exit 1
           diff -r .ppu-ci/control "$PPU_BUNDLE_DIR/control"
           [[ "$(< "$PPU_BUNDLE_DIR/image.txt")" == "$PPU_IMAGE" ]] || exit 1
-          [[ -s "$PPU_BUNDLE_DIR/source.tar.gz" && -s "$PPU_BUNDLE_DIR/environment.tar.gz" ]] || exit 1
+          [[ -s "$PPU_BUNDLE_DIR/source.tar.gz" && -s "$PPU_BUNDLE_DIR/runtime-image.json" ]] || exit 1
+          "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_container.py verify-image \
+            --artifact "$PPU_BUNDLE_DIR" --digest "$PPU_ENVIRONMENT_DIGEST" \
+            --control-sha "$PPU_CONTROL_SHA" --target-sha "$PPU_TARGET_SHA" \
+            --image-digest "$PPU_IMAGE_DIGEST" --base-image-digest "$PPU_BASE_IMAGE_DIGEST" --check-only
           cmp .ppu-ci/manifest.json "$PPU_BUNDLE_DIR/manifest.json"
           [[ ! -e .ppu-ci/functional-manifest.json ]] ||
             cmp .ppu-ci/functional-manifest.json "$PPU_BUNDLE_DIR/functional-manifest.json"
@@ -321,7 +477,7 @@ jobs:
           PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
           PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
           EXPORT_SOURCE: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build/
-        run: python3 -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/build-305 --kind bundle
+        run: '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/build-305 --kind bundle'
       - uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-build-305.outcome == 'success' }}
         with:
@@ -348,6 +504,10 @@ jobs:
     with:
       matrix: ${{ needs.configure.outputs.unit_matrix }}
       bundle_digest: ${{ needs.build.outputs.bundle_digest }}
+      environment_digest: ${{ needs.build.outputs.environment_digest }}
+      runtime_image_digest: ${{ needs.build.outputs.runtime_image_digest }}
+      base_image_digest: ${{ needs.build.outputs.base_image_digest }}
+      control_digest: ${{ inputs.control_digest }}
       target_sha: ${{ needs.configure.outputs.target_sha }}
       control_sha: ${{ needs.configure.outputs.control_sha }}
       manual_pr: ${{ needs.configure.outputs.manual_pr == 'true' }}
@@ -375,6 +535,10 @@ jobs:
     with:
       matrix: ${{ needs.configure.outputs.functional_matrix }}
       bundle_digest: ${{ needs.build.outputs.bundle_digest }}
+      environment_digest: ${{ needs.build.outputs.environment_digest }}
+      runtime_image_digest: ${{ needs.build.outputs.runtime_image_digest }}
+      base_image_digest: ${{ needs.build.outputs.base_image_digest }}
+      control_digest: ${{ inputs.control_digest }}
       target_sha: ${{ needs.configure.outputs.target_sha }}
       control_sha: ${{ needs.configure.outputs.control_sha }}
   result:

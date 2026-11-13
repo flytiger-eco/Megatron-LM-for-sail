@@ -863,9 +863,13 @@ def test_workflow_trust_and_resource_boundaries():
                     assert step["with"]["persist-credentials"] is False
     text = (ROOT / ".github/workflows/ppu-ut.yml").read_text()
     assert 'bash "$PPU_CONTROL_DIR/ppu_ci_run.sh"' in text
-    assert "python3 -I .ppu-ci/control/ppu_ci.py summarize" in text
+    assert (
+        '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci.py summarize'
+        in text
+    )
     build_script = (SCRIPTS / "ppu_ci_build.sh").read_text()
-    assert 'install -m 0644 "$PPU_CONTROL_DIR/ppu_pytest_policy.py"' in build_script
+    dockerfile = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
+    assert 'install -m 0644 /build/control/ppu_pytest_policy.py' in dockerfile
     assert "install -m 0644 .github/scripts/ppu_pytest_policy.py" not in build_script
     assert "secrets: inherit" not in (ROOT / ".github/workflows/ppu-build.yml").read_text()
     assert "release-{0}" in build["concurrency"]["group"]
@@ -958,6 +962,9 @@ def test_suite_runner_with_fake_hardware(tmp_path, failure):
         "PPU_CONTROL_DIR": str(SCRIPTS),
         "PPU_TARGET_SHA": SHA,
         "PPU_CONTROL_SHA": CONTROL_SHA,
+        "PPU_ENVIRONMENT_DIGEST": "d" * 64,
+        "PPU_IMAGE_DIGEST": "ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci@sha256:" + "e" * 64,
+        "PPU_BASE_IMAGE_DIGEST": "pkg.flytiger-eco.com/docker_release/pytorch@sha256:" + "f" * 64,
         "NPROC_PER_NODE": "8",
         "NNODES": "1",
     }
@@ -966,10 +973,16 @@ def test_suite_runner_with_fake_hardware(tmp_path, failure):
     )
     assert run.returncode == (0 if failure == "none" else 1), run.stdout + run.stderr
     commands = [json.loads(line) for line in (tmp_path / "commands.jsonl").read_text().splitlines()]
-    restores = [
-        c for c in commands if c['name'] == 'tar' and 'environment.tar.gz' in ' '.join(c['args'])
-    ]
-    assert len(restores) == 1
+    verifications = [c for c in commands if c['name'] == 'python3' and 'verify-image' in c['args']]
+    assert len(verifications) == 1
+    for flag, variable in (
+        ('--digest', 'PPU_ENVIRONMENT_DIGEST'),
+        ('--image-digest', 'PPU_IMAGE_DIGEST'),
+        ('--base-image-digest', 'PPU_BASE_IMAGE_DIGEST'),
+    ):
+        args = verifications[0]['args']
+        assert args[args.index(flag) + 1] == env[variable]
+    assert not any('restore-runtime' in c['args'] for c in commands)
     calls = [
         c
         for c in commands

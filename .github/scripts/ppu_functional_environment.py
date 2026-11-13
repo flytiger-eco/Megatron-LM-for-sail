@@ -11,7 +11,6 @@ import platform
 import shutil
 import subprocess
 import sys
-import urllib.request
 from pathlib import Path
 
 NVRX_VERSION = "0.6.0"
@@ -284,58 +283,44 @@ print(json.dumps({{
 
 
 def prepare(bundle: Path, manifest: dict):
-    tools = bundle / "functional-tools"
-    tools.mkdir(exist_ok=False)
-    arch, digest = YQ[platform.machine()]
-    url = f"https://github.com/mikefarah/yq/releases/download/v{YQ_VERSION}/yq_linux_{arch}"
-    with urllib.request.urlopen(url, timeout=60) as response:
-        content = response.read()
-    if hashlib.sha256(content).hexdigest() != digest:
-        raise ValueError("Official Mike Farah yq binary digest mismatch")
-    (tools / "yq").write_bytes(content)
-    (tools / "yq").chmod(0o755)
-    envsubst = shutil.which("envsubst")
-    if not envsubst:
-        raise ValueError("GNU envsubst must be installed by the Build preparation step")
-    shutil.copy2(envsubst, tools / "envsubst")
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--index-url",
-            os.environ["PIP_INDEX_URL"],
-            "tensorboard",
-            "click",
-            "pyyaml",
-        ],
-        check=True,
-    )
-    if nvrx_requirements(manifest):
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--index-url",
-                os.environ["PIP_INDEX_URL"],
-                f"nvidia-resiliency-ext=={NVRX_VERSION}",
-            ],
-            check=True,
+    """Attest the existing Dockerfile environment; never acquire software here."""
+    if type(manifest.get("environment_build_schema")) is not int or manifest[
+        "environment_build_schema"
+    ] not in (1, 2):
+        raise ValueError("Functional preparation requires a Dockerfile environment export")
+    metadata = json.loads((bundle / "docker-build.json").read_text())
+    for name in ("yq", "envsubst"):
+        path = bundle / "functional-tools" / name
+        expected = metadata["files"][f"functional-tools/{name}"]
+        installed = Path(sys.prefix) / "bin" / name
+        if (
+            path.is_symlink()
+            or path.stat().st_size != expected["size"]
+            or hashlib.sha256(path.read_bytes()).hexdigest() != expected["sha256"]
+            or installed.read_bytes() != path.read_bytes()
+        ):
+            raise ValueError("Restored functional tool does not match the Dockerfile export")
+    if manifest["environment_build_schema"] == 2:
+        # 只验证构建期副本，不在 PPU 运行期修补或安装工具。
+        upstream_yq = Path("/usr/local/bin") / "yq"
+        if (
+            upstream_yq.is_symlink()
+            or not upstream_yq.is_file()
+            or not os.access(upstream_yq, os.X_OK)
+            or upstream_yq.read_bytes() != (bundle / "functional-tools/yq").read_bytes()
+        ):
+            raise ValueError("Upstream yq path does not match the Dockerfile export")
+    site = Path(
+        command_output(
+            [sys.executable, "-c", 'import sysconfig; print(sysconfig.get_path("purelib"))']
         )
-    site = command_output(
-        [sys.executable, "-c", 'import sysconfig; print(sysconfig.get_path("purelib"))']
     )
-    shutil.copy2(
-        bundle / "control/ppu_functional_pytest.py", Path(site) / "ppu_functional_pytest.py"
-    )
-    startup = Path(site) / NAMESPACE_PTH
-    # Only add to this functional venv; never remove the system google directory or
-    # startup hooks of other distributions.
-    with startup.open("x") as stream:
-        stream.write(NAMESPACE_BOOTSTRAP)
+    if (site / NAMESPACE_PTH).read_text() != NAMESPACE_BOOTSTRAP:
+        raise ValueError("Missing Dockerfile namespace startup hook")
+    if (site / "ppu_functional_pytest.py").read_bytes() != (
+        bundle / "control/ppu_functional_pytest.py"
+    ).read_bytes():
+        raise ValueError("Restored pytest policy does not match trusted control")
 
 
 COMPILER_PROBE = '''
@@ -397,12 +382,33 @@ def check(bundle: Path, manifest: dict, output: Path):
     arch, expected = YQ[platform.machine()]
     if hashlib.sha256((tools / "yq").read_bytes()).hexdigest() != expected:
         raise ValueError("Functional yq binary digest mismatch")
-    for name in ("yq", "envsubst"):
-        shutil.copy2(tools / name, Path("/usr/local/bin") / name)
+    schema = manifest.get("environment_build_schema")
+    if schema is not None and (type(schema) is not int or schema not in (1, 2)):
+        raise ValueError("Unsupported functional Dockerfile environment schema")
+    current = schema in (1, 2)
+    delivery = {}
+    if schema == 2:
+        record = json.loads((bundle / "runtime-image.json").read_text())
+        for field, variable in (
+            ("runtime_image_digest", "PPU_IMAGE_DIGEST"),
+            ("base_image_digest", "PPU_BASE_IMAGE_DIGEST"),
+            ("environment_digest", "PPU_ENVIRONMENT_DIGEST"),
+        ):
+            if not os.environ.get(variable) or record[field] != os.environ[variable]:
+                raise ValueError("Functional execution image handoff mismatch")
+            delivery[field] = record[field]
+    if current:
+        prepare(bundle, manifest)
+    else:
+        # Offline attestation of legacy sealed bundles retains its original tool path.
+        for name in ("yq", "envsubst"):
+            shutil.copy2(tools / name, Path("/usr/local/bin") / name)
     bash = command_output(["bash", "--version"])
     if "GNU bash, version" not in bash or int(bash.split("version ")[1].split(".")[0]) < 4:
         raise ValueError("Functional tests require GNU Bash >=4")
-    yq = command_output(["/usr/local/bin/yq", "--version"])
+    yq = command_output(
+        [str(Path(sys.prefix) / "bin/yq") if schema == 1 else "/usr/local/bin/yq", "--version"]
+    )
     if "mikefarah/yq" not in yq or f"v{YQ_VERSION}" not in yq:
         raise ValueError("Functional tests require the attested Mike Farah yq v4")
     envsubst = command_output(["envsubst", "--version"])
@@ -445,6 +451,7 @@ def check(bundle: Path, manifest: dict, output: Path):
             {
                 "identity": manifest["identity"],
                 "image": manifest["config"]["image"],
+                **delivery,
                 "python": sys.version,
                 "packages": packages,
                 "nvrx": nvrx,
@@ -474,8 +481,13 @@ def main():
         "ppu_functional_control", Path(__file__).with_name("ppu_functional.py")
     )
     control = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(control)
-    manifest = control.load_manifest(args.bundle / "manifest.json")
+    previous_dont_write_bytecode = sys.dont_write_bytecode
+    try:
+        sys.dont_write_bytecode = True
+        spec.loader.exec_module(control)
+        manifest = control.load_manifest(args.bundle / "manifest.json")
+    finally:
+        sys.dont_write_bytecode = previous_dont_write_bytecode
     if manifest.get("test_kind") != "functional" or not manifest["config"]["build"]:
         raise ValueError("Functional environment setup requires a regression build")
     if args.command == "prepare":
