@@ -13,8 +13,6 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path, PurePosixPath
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
 
 GHCR_IMAGE = 'ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci'
 PPU_IMAGE = 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001'
@@ -779,25 +777,6 @@ def image_record(metadata, environment_digest, runtime_image_digest):
     }
 
 
-def check_private_package(*, allow_missing):
-    """Check visibility without changing package access or printing credentials."""
-    token = os.environ.get('GH_TOKEN')
-    require(token, 'Missing scoped package publication token')
-    request = Request(
-        'https://api.github.com/orgs/flytiger-eco/packages/container/megatron-lm-for-sail%2Fppu-ci',
-        headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'},
-    )
-    try:
-        with urlopen(request, timeout=30) as response:
-            package = json.load(response)
-    except HTTPError as error:
-        if error.code == 404 and allow_missing:
-            # An unseen new GHCR package defaults to private; never change visibility.
-            return
-        raise ValidationError('Unable to verify private GHCR package access') from None
-    require(package.get('visibility') == 'private', 'GHCR execution package must remain private')
-
-
 def publish_image(args):
     metadata = verify_export(
         args.artifact, args.digest, args.control_sha, args.target_sha, schema=2
@@ -821,7 +800,6 @@ def publish_image(args):
     )
     record_path = no_links(Path(args.artifact) / 'runtime-image.json')
     require(not record_path.exists(), 'Refusing to overwrite an image publication record')
-    check_private_package(allow_missing=True)
     command(['docker', 'tag', args.local_image_id, args.image_tag])
     command(
         ['docker', 'push', args.image_tag],
@@ -845,7 +823,6 @@ def publish_image(args):
         ['docker', 'buildx', 'imagetools', 'inspect', published],
         failure='GHCR immutable image lookup failed',
     )
-    check_private_package(allow_missing=False)
     record_path.write_text(
         json.dumps(image_record(metadata, args.digest, published), sort_keys=True) + '\n'
     )

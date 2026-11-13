@@ -724,7 +724,23 @@ def test_complete_image_build_loads_and_probes_exact_id_without_publication(
     assert 'GH_TOKEN' not in container.client_env()
 
 
-@pytest.mark.parametrize('damage', ['none', 'id', 'tag', 'push', 'lookup', 'public'])
+@pytest.mark.parametrize(
+    'damage',
+    [
+        'none',
+        'id',
+        'tag',
+        'repository',
+        'base',
+        'evidence',
+        'missing_digest',
+        'wrong_digest',
+        'ambiguous_digest',
+        'invalid_digest_inventory',
+        'push',
+        'lookup',
+    ],
+)
 def test_publication_only_pushes_verified_image_and_never_builds_or_runs_source(
     image_exported, tmp_path, monkeypatch, damage
 ):
@@ -737,14 +753,20 @@ def test_publication_only_pushes_verified_image_and_never_builds_or_runs_source(
     args.image_tag = f'{container.GHCR_IMAGE}:run-12-1-{TARGET}'
     if damage == 'tag':
         args.image_tag = f'{container.GHCR_IMAGE}:latest'
+    elif damage == 'repository':
+        args.image_tag = f'ghcr.io/other/ppu-ci:run-12-1-{TARGET}'
+    elif damage == 'base':
+        args.base_image_digest = PINNED[:-1] + '0'
+    elif damage == 'evidence':
+        args.digest = '0' * 64
     output = tmp_path / 'outputs'
     monkeypatch.setenv('GITHUB_OUTPUT', str(output))
-    visibility_calls, calls = [], []
-
-    def visibility(*, allow_missing):
-        visibility_calls.append(allow_missing)
-        if damage == 'public':
-            raise container.ValidationError('GHCR execution package must remain private')
+    monkeypatch.delenv('GH_TOKEN', raising=False)
+    monkeypatch.setattr(
+        'urllib.request.urlopen',
+        lambda *a, **k: pytest.fail('Publication must not query package visibility APIs'),
+    )
+    calls = []
 
     def command(argv, **kwargs):
         calls.append(argv)
@@ -755,7 +777,13 @@ def test_publication_only_pushes_verified_image_and_never_builds_or_runs_source(
         if argv[:2] == ['docker', 'push'] and damage == 'push':
             raise container.ValidationError('push failed')
         if '{{json .RepoDigests}}' in argv:
-            return json.dumps([PUBLISHED])
+            refs = {
+                'missing_digest': [],
+                'wrong_digest': ['ghcr.io/other/ppu-ci@sha256:' + 'e' * 64],
+                'ambiguous_digest': [PUBLISHED, PUBLISHED[:-1] + '0'],
+                'invalid_digest_inventory': [None],
+            }.get(damage, [PUBLISHED])
+            return json.dumps(refs)
         if argv[:3] == ['docker', 'buildx', 'imagetools']:
             assert argv[-1] == PUBLISHED
             if damage == 'lookup':
@@ -763,18 +791,27 @@ def test_publication_only_pushes_verified_image_and_never_builds_or_runs_source(
         return ''
 
     monkeypatch.setattr(container, 'command', command)
-    monkeypatch.setattr(container, 'check_private_package', visibility)
     if damage == 'none':
         container.publish_image(args)
-        assert visibility_calls == [True, False]
+        assert not hasattr(container, 'check_private_package')
         assert f'runtime_image_digest={PUBLISHED}' in output.read_text()
+        assert f'base_image_digest={PINNED}' in output.read_text()
+        assert f'environment_digest={trusted}' in output.read_text()
+        assert [argv[:2] for argv in calls] == [
+            ['docker', 'image'],
+            ['docker', 'tag'],
+            ['docker', 'push'],
+            ['docker', 'image'],
+            ['docker', 'buildx'],
+        ]
+        assert calls[1] == ['docker', 'tag', LOCAL_ID, args.image_tag]
         container.verify_image(args)
     else:
         with pytest.raises(container.ValidationError):
             container.publish_image(args)
         assert not output.exists() and not record_path.exists()
-    if damage in ('id', 'tag', 'public'):
-        assert not any(call[:2] == ['docker', 'push'] for call in calls)
+    if damage in ('id', 'tag', 'repository', 'base', 'evidence'):
+        assert not any(call[:2] in (['docker', 'tag'], ['docker', 'push']) for call in calls)
 
 
 @pytest.mark.parametrize(
@@ -827,42 +864,28 @@ def test_baked_image_checks_metadata_before_overlay_and_never_restores_venv(
         assert not args.source_root.exists()
 
 
-@pytest.mark.parametrize(
-    'visibility,status,allow_missing,passed',
-    [
-        ('private', 200, False, True),
-        ('public', 200, True, False),
-        ('internal', 200, True, False),
-        ('private', 404, True, True),
-        ('private', 404, False, False),
-        ('private', 403, True, False),
-    ],
-)
-def test_private_package_preflight_does_not_change_visibility_or_expose_token(
-    monkeypatch, capsys, visibility, status, allow_missing, passed
-):
-    monkeypatch.setenv('GH_TOKEN', 'fixture-private-token')
-
-    def urlopen(request, **kwargs):
-        assert (
-            request.full_url
-            == 'https://api.github.com/orgs/flytiger-eco/packages/container/megatron-lm-for-sail%2Fppu-ci'
-        )
-        assert request.get_method() == 'GET'
-        assert 'fixture-private-token' not in request.full_url
-        assert request.headers['Authorization'] == 'Bearer fixture-private-token'
-        if status != 200:
-            raise container.HTTPError(request.full_url, status, 'fixture-private-token', None, None)
-        return io.BytesIO(json.dumps({'visibility': visibility}).encode())
-
-    monkeypatch.setattr(container, 'urlopen', urlopen)
-    if passed:
-        container.check_private_package(allow_missing=allow_missing)
-    else:
-        with pytest.raises(container.ValidationError) as error:
-            container.check_private_package(allow_missing=allow_missing)
-        assert 'fixture-private-token' not in str(error.value)
-    assert capsys.readouterr() == ('', '')
+def test_ghcr_publication_retains_authenticated_login_and_authorization_guard():
+    workflow = yaml.safe_load((ROOT / '.github/workflows/ppu-execute.yml').read_text())
+    job = workflow['jobs']['runtime-environment']
+    steps = job['steps']
+    publish_index = next(index for index, step in enumerate(steps) if step.get('id') == 'publish')
+    publish, login, guard = steps[publish_index], steps[publish_index - 1], steps[publish_index - 2]
+    assert 'ppu_pr_authorize.py guard' in guard['run']
+    assert guard['env']['GH_TOKEN'] == '${{ github.token }}'
+    assert login['uses'] == 'docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9'
+    assert login['with'] == {
+        'registry': 'ghcr.io',
+        'username': '${{ github.actor }}',
+        'password': '${{ github.token }}',
+    }
+    assert 'GH_TOKEN' not in publish.get('env', {})
+    assert 'secrets.' not in json.dumps(publish)
+    assert '--source-root' not in publish['run']
+    assert job['permissions']['packages'] == 'write'
+    runtime_index = next(index for index, step in enumerate(steps) if step.get('id') == 'runtime')
+    assert runtime_index < publish_index - 2
+    for identity in ('runtime_image_digest', 'base_image_digest', 'environment_digest'):
+        assert job['outputs'][identity] == '${{ steps.publish.outputs.' + identity + ' }}'
 
 
 @pytest.mark.parametrize('damage', ['none', 'image', 'record', 'legacy', 'missing_report'])

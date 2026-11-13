@@ -281,11 +281,11 @@ jobs:
           --source-root source --target-sha '${{ inputs.target_sha }}'
           --image-digest '${{ steps.identity.outputs.image_digest }}'
           --output "$RUNNER_TEMP/ppu-runtime-export" --cache-root "$RUNNER_TEMP/ppu-runtime-cache"
-      - name: Revalidate authorization before private image publication
+      - name: Revalidate authorization before GHCR image publication
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I control/.github/scripts/ppu_pr_authorize.py guard
-      - name: Login to private GHCR
+      - name: Login to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io
@@ -293,8 +293,6 @@ jobs:
           password: ${{ github.token }}
       - name: Publish the verified local image without rebuilding source
         id: publish
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: >-
           bash control/.github/scripts/ppu_ci_container.sh publish-image
           --artifact "$RUNNER_TEMP/ppu-runtime-export"
