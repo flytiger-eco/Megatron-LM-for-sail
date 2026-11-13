@@ -120,7 +120,7 @@ jobs:
             [[ -d "$PPU_BUNDLE_DIR" ]]
             mkdir .ppu-bundle
             cp -a "$PPU_BUNDLE_DIR/." .ppu-bundle/
-            python3 -I "$PPU_CONTROL_DIR/ppu_ci.py" verify-bundle \
+            python3 -I -B "$PPU_CONTROL_DIR/ppu_ci.py" verify-bundle \
               --output "$PPU_ARTIFACT_DIR" --plan .ppu-ci --bundle-digest "$PPU_BUNDLE_DIGEST"
             [[ "$(< "$PPU_ARTIFACT_DIR/commit.txt")" == "$PPU_TARGET_SHA" ]]
             [[ "$(< "$PPU_ARTIFACT_DIR/control.txt")" == "$PPU_CONTROL_SHA" ]]

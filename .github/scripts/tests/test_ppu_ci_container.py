@@ -930,6 +930,174 @@ def test_schema_two_bundle_is_sealed_without_environment_archive(image_exported,
         assert not (root / 'bundle-integrity.json').exists()
 
 
+@pytest.fixture
+def subprocess_bundle(tmp_path):
+    plan = tmp_path / 'plan'
+    control = plan / 'control'
+    control.mkdir(parents=True)
+    for path in SCRIPTS.glob('ppu_*'):
+        if path.suffix in ('.py', '.sh'):
+            shutil.copyfile(path, control / path.name)
+    (plan / 'manifest.json').write_text(
+        json.dumps(
+            {
+                'schema_version': 2,
+                'test_kind': 'functional',
+                'runtime_path_schema': 1,
+                'environment_build_schema': 2,
+                'identity': {'control_sha': CONTROL, 'target_sha': TARGET},
+            }
+        )
+    )
+    root = tmp_path / 'bundle'
+    trusted = runtime_export(root, schema=2)
+    write_image_record(root, trusted)
+    shutil.copytree(control, root / 'control')
+    shutil.copyfile(plan / 'manifest.json', root / 'manifest.json')
+    archive(root / 'source.tar.gz', [('source.py', b'VALUE = 1\n', tarfile.REGTYPE)])
+    for name, content in (
+        ('commit.txt', TARGET),
+        ('control.txt', CONTROL),
+        ('.complete', TARGET),
+        ('image.txt', PUBLISHED),
+        ('build-timing.json', '{"elapsed_seconds":1}'),
+        ('functional-environment.json', '{}'),
+    ):
+        (root / name).write_text(content + '\n')
+    return plan, root
+
+
+def tree_bytes(root):
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob('*')
+        if path.is_file()
+    }
+
+
+@pytest.mark.parametrize('flags', [('-I',), ('-I', '-B')])
+@pytest.mark.parametrize('executor', ['bundle', 'plan'])
+def test_real_bundle_seal_and_verify_do_not_mutate_control(subprocess_bundle, flags, executor):
+    plan, root = subprocess_bundle
+    before = tree_bytes(root)
+    trusted_control = tree_bytes(plan / 'control')
+    assert not list(root.rglob('*.pyc'))
+    script = (root if executor == 'bundle' else plan) / 'control/ppu_ci.py'
+    environment = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
+    command = [sys.executable, *flags, str(script)]
+    sealed = subprocess.run(
+        [*command, 'seal-bundle', '--output', str(root)],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert sealed.returncode == 0, sealed.stderr
+    assert tree_bytes(root / 'control') == trusted_control
+    assert tree_bytes(plan / 'control') == trusted_control
+    assert not list(root.rglob('*.pyc')) and not list(plan.rglob('*.pyc'))
+    files = json.loads((root / 'bundle-integrity.json').read_text())['files']
+    assert set(files) == set(before) - {'.complete'}
+    after_seal = tree_bytes(root)
+    assert {
+        name: content for name, content in after_seal.items() if name != 'bundle-integrity.json'
+    } == before
+    for _ in range(2):
+        checked = subprocess.run(
+            [
+                *command,
+                'verify-bundle',
+                '--output',
+                str(root),
+                '--plan',
+                str(plan),
+                '--bundle-digest',
+                container.digest(root / 'bundle-integrity.json'),
+            ],
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        assert checked.returncode == 0, checked.stderr
+        assert tree_bytes(root) == after_seal
+        assert tree_bytes(plan / 'control') == trusted_control
+
+
+@pytest.mark.parametrize('previous', [False, True])
+@pytest.mark.parametrize('import_failure', [False, True])
+def test_inventory_restores_bytecode_flag_even_when_import_fails(
+    subprocess_bundle, monkeypatch, previous, import_failure
+):
+    _, root = subprocess_bundle
+    monkeypatch.setattr(ci, '__file__', str(root / 'control/ppu_ci.py'))
+    monkeypatch.setattr(sys, 'dont_write_bytecode', previous)
+    helper = root / 'control/ppu_ci_container.py'
+    helper.write_text(
+        helper.read_text()
+        + '\nassert sys.dont_write_bytecode\n'
+        + ('raise RuntimeError("fixture import failure")\n' if import_failure else '')
+    )
+    before = tree_bytes(root)
+    if import_failure:
+        with pytest.raises(RuntimeError, match='fixture import failure'):
+            ci.bundle_inventory(root)
+    else:
+        ci.bundle_inventory(root)
+    assert sys.dont_write_bytecode is previous
+    assert tree_bytes(root) == before
+    assert not list(root.rglob('*.pyc'))
+
+
+def test_bundle_entrypoints_disable_bytecode_without_weakening_integrity():
+    build = (SCRIPTS / 'ppu_ci_build.sh').read_text()
+    assert 'python -I -B "$PPU_CONTROL_DIR/ppu_ci.py" seal-bundle' in build
+    for name in ('ppu-functional', 'ppu-ut'):
+        workflow = yaml.safe_load((ROOT / f'.github/workflows/{name}.yml').read_text())
+        commands = [
+            step.get('with', {}).get('command', '')
+            for job in workflow['jobs'].values()
+            for step in job.get('steps', [])
+        ]
+        verify = next(command for command in commands if 'verify-bundle' in command)
+        assert 'python3 -I -B "$PPU_CONTROL_DIR/ppu_ci.py" verify-bundle' in verify
+        assert '--bundle-digest "$PPU_BUNDLE_DIGEST"' in verify
+    execute = (ROOT / '.github/workflows/ppu-execute.yml').read_text()
+    assert 'diff -r .ppu-ci/control "$PPU_BUNDLE_DIR/control"' in execute
+    assert '--exclude' not in execute
+
+
+@pytest.mark.parametrize('reseal', [False, True])
+def test_real_bundle_verification_still_rejects_added_bytecode(subprocess_bundle, reseal):
+    plan, root = subprocess_bundle
+    command = [sys.executable, '-I', '-B', str(plan / 'control/ppu_ci.py')]
+    subprocess.run([*command, 'seal-bundle', '--output', str(root)], check=True, timeout=30)
+    cache = root / 'control/__pycache__/unexpected.cpython-312.pyc'
+    cache.parent.mkdir()
+    cache.write_bytes(b'untrusted bytecode')
+    if reseal:
+        subprocess.run([*command, 'seal-bundle', '--output', str(root)], check=True, timeout=30)
+    checked = subprocess.run(
+        [
+            *command,
+            'verify-bundle',
+            '--output',
+            str(root),
+            '--plan',
+            str(plan),
+            '--bundle-digest',
+            container.digest(root / 'bundle-integrity.json'),
+        ],
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert checked.returncode != 0
+    expected = 'control script inventory mismatch' if reseal else 'failed content verification'
+    assert expected in checked.stderr
+    assert cache.read_bytes() == b'untrusted bytecode'
+
+
 def test_only_guarded_runtime_job_receives_package_publication_permission():
     for filename in (
         'ppu-build',

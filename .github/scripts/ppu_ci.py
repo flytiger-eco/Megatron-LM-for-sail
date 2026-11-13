@@ -788,7 +788,13 @@ def bundle_inventory(directory: Path) -> dict:
             "ppu_container_inventory", Path(__file__).with_name("ppu_ci_container.py")
         )
         environment = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(environment)
+        # Inventory validation must not add bytecode to the trusted control tree.
+        previous_dont_write_bytecode = sys.dont_write_bytecode
+        try:
+            sys.dont_write_bytecode = True
+            spec.loader.exec_module(environment)
+        finally:
+            sys.dont_write_bytecode = previous_dont_write_bytecode
         environment.verify_export(
             directory,
             inventory["docker-build.json"]["sha256"],
