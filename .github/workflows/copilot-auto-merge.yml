@@ -1,0 +1,263 @@
+name: Copilot upstream merge (CI branch)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 16:00 UTC = 00:00 Asia/Shanghai on the following day.
+    # GitHub only schedules workflows present on the default branch.
+    - cron: '0 16 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: copilot-upstream-merge-ci
+  cancel-in-progress: false
+
+env:
+  SYNC_BRANCH: CI/auto_merge
+  UPSTREAM_REPOSITORY: NVIDIA/Megatron-LM
+  UPSTREAM_BRANCH: main
+
+jobs:
+  merge:
+    if: github.repository == 'flytiger-eco/Megatron-LM-for-sail'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      copilot-requests: write
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SYNC_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare merge on the CI branch only
+        id: merge
+        run: |
+          set -euo pipefail
+          [[ "$SYNC_BRANCH" == 'CI/auto_merge' ]] || exit 1
+          [[ "$(git branch --show-current)" == "$SYNC_BRANCH" ]] || exit 1
+          [[ -z "$(git status --porcelain)" ]] || exit 1
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git config merge.conflictStyle diff3
+          # Copilot's job has no contents-write permission or push credentials.
+          git remote set-url --push origin DISABLED
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream \
+            "refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          BASE_SHA=$(git rev-parse HEAD)
+          UPSTREAM_SHA=$(git rev-parse "upstream/$UPSTREAM_BRANCH")
+          printf 'base_sha=%s\nupstream_sha=%s\n' "$BASE_SHA" "$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" "$BASE_SHA"; then
+            printf 'changed=false\n' >> "$GITHUB_OUTPUT"
+            printf '社区主线已包含在 `%s` 中，无需合并。\n' "$SYNC_BRANCH" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          printf 'changed=true\n' >> "$GITHUB_OUTPUT"
+          merge_status=0
+          git merge --no-ff --no-commit "$UPSTREAM_SHA" || merge_status=$?
+          git diff --name-only --diff-filter=U -z > "$RUNNER_TEMP/sync-conflicts"
+          if [[ "$merge_status" -ne 0 ]] && \
+             { [[ "$merge_status" -ne 1 ]] || [[ ! -s "$RUNNER_TEMP/sync-conflicts" ]]; }; then
+            echo '::error::Merge failed for a reason other than resolvable conflicts.'
+            exit "$merge_status"
+          fi
+          [[ "$(git rev-parse MERGE_HEAD)" == "$UPSTREAM_SHA" ]] || exit 1
+          git ls-files --stage -z > "$RUNNER_TEMP/sync-index"
+
+      - uses: actions/setup-node@v7
+        if: steps.merge.outputs.changed == 'true'
+        with:
+          node-version: '24'
+
+      - name: Install Copilot CLI
+        if: steps.merge.outputs.changed == 'true'
+        run: npm install -g @github/copilot
+
+      - name: Resolve conflict hunks and review PPU adaptation with Copilot
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ steps.merge.outputs.base_sha }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          PROMPT=$(cat <<EOF
+          将社区主线 ${UPSTREAM_REPOSITORY}:${UPSTREAM_BRANCH} merge 到我方 ${SYNC_BRANCH}。
+          git merge --no-ff --no-commit 已由工作流执行。当前 HEAD（ours/local_branch）
+          为 ${BASE_SHA}，MERGE_HEAD（theirs/baseline_branch）为 ${UPSTREAM_SHA}。
+          你只负责逐 hunk 解决已有冲突，并审阅 PPU 适配的完整性。
+
+          冲突原则（优先于仓库中的其他同步规则）：
+          1. 纯上游内容取上游侧 theirs，即 baseline_branch。
+          2. 我方 PPU 适配完整保留 ours，即 local_branch 一侧。
+          3. 混合内容以上游新结构为骨架，重新嵌入我方 PPU 适配意图；
+             保住功能意图而非字面文本，检查调用方和被调用方 API 是否一致。
+          必须查看冲突的 base/ours/theirs 与相关提交历史，不能只按文件名或
+          关键字判断归属。禁止全局 -X ours/theirs，禁止整文件批量覆盖，
+          不采用 skills/nightly-sync 的上游整文件覆盖清单。
+
+          使用 git status、git diff、git ls-files -u、git show :1:path、
+          git show :2:path、git show :3:path 和 git log 读取证据。
+          只修改有冲突的路径；没有冲突时仅审阅，不改动任何文件。
+          保留 .github/workflows/copilot-auto-merge.yml 的我方版本。
+          不运行 git add/commit/merge/rebase/reset/checkout/push，不修改任何
+          Git 引用或配置，不创建 PR，不调用远程写 API，不读取或输出凭据。
+          无法可靠解决时明确报告并保留冲突标记，后续检查会阻止推送。
+          输出中文摘要：同步范围、逐个冲突 hunk 的归属和处理依据、PPU
+          功能保留及 API 适配情况、未验证事项。不要声称完成了 PPU 硬件测试。
+          EOF
+          )
+          timeout 30m copilot -p "$PROMPT" -s \
+            --no-ask-user --no-custom-instructions --disable-builtin-mcps \
+            --disallow-temp-dir --secret-env-vars=GITHUB_TOKEN,GH_TOKEN \
+            --allow-tool='write' \
+            --allow-tool='shell(git status:*)' \
+            --allow-tool='shell(git diff:*)' \
+            --allow-tool='shell(git show:*)' \
+            --allow-tool='shell(git log:*)' \
+            --allow-tool='shell(git ls-files:*)' \
+            | tee "$RUNNER_TEMP/copilot-sync-summary.md"
+          cat "$RUNNER_TEMP/copilot-sync-summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate resolution and create a two-parent merge candidate
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          BASE_SHA: ${{ steps.merge.outputs.base_sha }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SYNC_BRANCH" == 'CI/auto_merge' ]] || exit 1
+          [[ "$(git branch --show-current)" == "$SYNC_BRANCH" ]] || exit 1
+          [[ "$(git rev-parse HEAD)" == "$BASE_SHA" ]] || exit 1
+          [[ "$(git rev-parse MERGE_HEAD)" == "$UPSTREAM_SHA" ]] || exit 1
+          python3 -I - <<'PY'
+          import os
+          import subprocess
+          from pathlib import Path
+
+          def paths(*args):
+              return set(subprocess.check_output(["git", *args]).split(b"\0")) - {b""}
+
+          conflicts = set((Path(os.environ["RUNNER_TEMP"]) / "sync-conflicts").read_bytes().split(b"\0")) - {b""}
+          modified = paths("diff", "--name-only", "-z") | paths("ls-files", "--others", "--exclude-standard", "-z")
+          if not modified <= conflicts:
+              raise SystemExit(f"Copilot modified non-conflict paths: {modified - conflicts!r}")
+          def non_conflict_entries(raw):
+              return {entry for entry in raw.split(b"\0") if entry and entry.split(b"\t", 1)[1] not in conflicts}
+
+          original_index = (Path(os.environ["RUNNER_TEMP"]) / "sync-index").read_bytes()
+          current_index = subprocess.check_output(["git", "ls-files", "--stage", "-z"])
+          if non_conflict_entries(original_index) != non_conflict_entries(current_index):
+              raise SystemExit("Copilot changed non-conflict index entries")
+          PY
+          while IFS= read -r -d '' conflict; do
+            git add --all -- "$conflict"
+          done < "$RUNNER_TEMP/sync-conflicts"
+          [[ -z "$(git ls-files -u)" ]] || exit 1
+          git diff --cached --check
+          git diff --cached --quiet "$BASE_SHA" -- .github/workflows/copilot-auto-merge.yml
+          python3 -I - <<'PY'
+          import ast
+          import subprocess
+          from pathlib import Path
+
+          names = subprocess.check_output([
+              "git", "diff", "--cached", "--name-only", "--diff-filter=ACMRT", "-z"
+          ]).split(b"\0")
+          for name in names:
+              if name.endswith(b".py"):
+                  path = Path(name.decode("utf-8"))
+                  if not path.is_symlink():
+                      ast.parse(path.read_bytes(), filename=str(path))
+          PY
+          # DCO sign-off; no private signing key is exposed to the agent.
+          git commit --signoff -m "Merge ${UPSTREAM_REPOSITORY}:${UPSTREAM_BRANCH} into ${SYNC_BRANCH}"
+          [[ "$(git rev-parse HEAD^1)" == "$BASE_SHA" ]] || exit 1
+          [[ "$(git rev-parse HEAD^2)" == "$UPSTREAM_SHA" ]] || exit 1
+          mkdir -p "$RUNNER_TEMP/sync-candidate"
+          git bundle create "$RUNNER_TEMP/sync-candidate/candidate.bundle" \
+            "refs/heads/$SYNC_BRANCH" "^$BASE_SHA"
+          CANDIDATE_SHA=$(git rev-parse HEAD)
+          jq -n --arg base "$BASE_SHA" --arg upstream "$UPSTREAM_SHA" --arg candidate "$CANDIDATE_SHA" \
+            '{base: $base, upstream: $upstream, candidate: $candidate}' \
+            > "$RUNNER_TEMP/sync-candidate/metadata.json"
+          printf '\n已通过冲突标记、改动范围、Python 语法和双亲 merge 检查；未执行 PPU 硬件测试。\n' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.merge.outputs.changed == 'true'
+        with:
+          name: copilot-sync-candidate
+          path: ${{ runner.temp }}/sync-candidate/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: merge
+    if: needs.merge.outputs.changed == 'true' && github.repository == 'flytiger-eco/Megatron-LM-for-sail'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SYNC_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: copilot-sync-candidate
+          path: ${{ runner.temp }}/sync-candidate
+
+      - name: Publish only to CI/auto_merge without force push
+        shell: bash
+        env:
+          # Only this publishing step receives a workflow-write credential.
+          # Fine-grained PAT: this repo only, Contents + Workflows read/write.
+          GITHUB_TOKEN: ${{ secrets.SYNC_PUSH_TOKEN || github.token }}
+          WORKFLOW_TOKEN_CONFIGURED: ${{ secrets.SYNC_PUSH_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          [[ "$SYNC_BRANCH" == 'CI/auto_merge' ]] || exit 1
+          [[ "$(git branch --show-current)" == "$SYNC_BRANCH" ]] || exit 1
+          [[ "$(git remote get-url origin)" == 'https://github.com/flytiger-eco/Megatron-LM-for-sail' || \
+             "$(git remote get-url origin)" == 'https://github.com/flytiger-eco/Megatron-LM-for-sail.git' ]] || exit 1
+          metadata="$RUNNER_TEMP/sync-candidate/metadata.json"
+          BASE_SHA=$(jq -er '.base | select(test("^[0-9a-f]{40}$"))' "$metadata")
+          UPSTREAM_SHA=$(jq -er '.upstream | select(test("^[0-9a-f]{40}$"))' "$metadata")
+          CANDIDATE_SHA=$(jq -er '.candidate | select(test("^[0-9a-f]{40}$"))' "$metadata")
+          git fetch --no-tags origin "refs/heads/$SYNC_BRANCH:refs/remotes/origin/$SYNC_BRANCH"
+          [[ "$(git rev-parse "origin/$SYNC_BRANCH")" == "$BASE_SHA" ]] || {
+            echo '::error::CI branch changed during the merge; aborting without overwriting it.'
+            exit 1
+          }
+          git fetch "$RUNNER_TEMP/sync-candidate/candidate.bundle" \
+            "refs/heads/$SYNC_BRANCH:refs/remotes/candidate/sync"
+          [[ "$(git rev-parse refs/remotes/candidate/sync)" == "$CANDIDATE_SHA" ]] || exit 1
+          read -r -a parents <<< "$(git rev-list --parents -n 1 "$CANDIDATE_SHA")"
+          [[ ${#parents[@]} -eq 3 && "${parents[1]}" == "$BASE_SHA" && "${parents[2]}" == "$UPSTREAM_SHA" ]] || exit 1
+          git diff --quiet "$BASE_SHA" "$CANDIDATE_SHA" -- .github/workflows/copilot-auto-merge.yml
+          if ! git diff --quiet "$BASE_SHA" "$CANDIDATE_SHA" -- .github/workflows && \
+             [[ "$WORKFLOW_TOKEN_CONFIGURED" != 'true' ]]; then
+            echo '::error::Upstream changed workflow files. Configure SYNC_PUSH_TOKEN with Contents and Workflows write permissions.'
+            exit 1
+          fi
+          # Never execute scripts from the candidate in this contents-write job.
+          # An explicit refspec and non-force push cannot replace main or others' work.
+          git -c credential.helper= \
+            -c 'credential.helper=!f() { printf "username=x-access-token\npassword=%s\n" "$GITHUB_TOKEN"; }; f' \
+            push origin "$CANDIDATE_SHA:refs/heads/$SYNC_BRANCH"
+          printf '社区 `%s:%s` 已 merge 到 `%s`，提交 `%s`。main 未作为推送目标。\n' \
+            "$UPSTREAM_REPOSITORY" "$UPSTREAM_BRANCH" "$SYNC_BRANCH" "$CANDIDATE_SHA" >> "$GITHUB_STEP_SUMMARY"
