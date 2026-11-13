@@ -112,6 +112,8 @@ def tool_environment(tmp_path, monkeypatch):
             "size": len(payload),
             "sha256": hashlib.sha256(payload).hexdigest(),
         }
+    (local / "yq").write_bytes(content)
+    (local / "yq").chmod(0o755)
     (bundle / "docker-build.json").write_text(json.dumps({"files": tool_files}))
     (site / "ppu_functional_pytest.py").write_bytes(
         (bundle / "control/ppu_functional_pytest.py").read_bytes()
@@ -132,6 +134,7 @@ def tool_environment(tmp_path, monkeypatch):
     versions = {
         "bash": "GNU bash, version 5.2.21",
         str(prefix / "bin/yq"): "yq (https://github.com/mikefarah/yq/) version v4.47.2",
+        "/usr/local/bin/yq": "yq (https://github.com/mikefarah/yq/) version v4.47.2",
         "envsubst": "envsubst (GNU gettext-runtime) 0.21",
         "uv": "uv 0.13.0",
         "ft_launcher": "Original launcher help",
@@ -558,6 +561,57 @@ def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
             == manifest["functional"]["case"]["nvrx_checkpoint"]
         )
         assert "mp_mode" in report["nvrx"]["signatures"]["get_write_results_queue"]
+
+
+@pytest.mark.parametrize("damage", ["missing", "modified", "not_executable", "symlink"])
+def test_prepare_rejects_invalid_upstream_yq_without_repairing(tool_environment, damage):
+    bundle, _, manifest, calls, _, _ = tool_environment
+    manifest["environment_build_schema"] = 2
+    local = environment.Path("/usr/local/bin") / "yq"
+    if damage == "missing":
+        local.unlink()
+    elif damage == "modified":
+        local.write_bytes(b"Changed yq")
+    elif damage == "not_executable":
+        local.chmod(0o644)
+    else:
+        local.unlink()
+        local.symlink_to(bundle / "functional-tools/yq")
+    before = (local.is_symlink(), local.exists(), local.read_bytes() if local.exists() else None)
+    with pytest.raises(ValueError, match="Upstream yq path"):
+        environment.prepare(bundle, manifest)
+    assert calls == []
+    assert before == (
+        local.is_symlink(),
+        local.exists(),
+        local.read_bytes() if local.exists() else None,
+    )
+    assert not (bundle / "reports").exists()
+
+
+@pytest.mark.parametrize("version", ["yq v4.47.2", "mikefarah/yq version v4.46.0"])
+def test_image_environment_checks_version_at_original_driver_path(
+    tool_environment, version, monkeypatch
+):
+    bundle, _, manifest, calls, versions, _ = tool_environment
+    manifest["environment_build_schema"] = 2
+    delivery = {
+        "runtime_image_digest": "execution",
+        "base_image_digest": "base",
+        "environment_digest": "environment",
+    }
+    (bundle / "runtime-image.json").write_text(json.dumps(delivery))
+    for field, variable in (
+        ("runtime_image_digest", "PPU_IMAGE_DIGEST"),
+        ("base_image_digest", "PPU_BASE_IMAGE_DIGEST"),
+        ("environment_digest", "PPU_ENVIRONMENT_DIGEST"),
+    ):
+        monkeypatch.setenv(variable, delivery[field])
+    versions["/usr/local/bin/yq"] = version
+    with pytest.raises(ValueError, match="attested Mike Farah yq"):
+        environment.check(bundle, manifest, bundle / "reports")
+    assert calls == []
+    assert not (bundle / "reports").exists()
 
 
 @pytest.mark.parametrize("schema", [True, 2.0, 3, "2"])

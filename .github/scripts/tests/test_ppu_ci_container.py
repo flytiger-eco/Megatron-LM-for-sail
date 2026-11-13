@@ -1738,6 +1738,96 @@ def test_restored_control_probes_tkinter_without_installing_dependencies(tmp_pat
     assert 'import sys, _tkinter,' in calls[0][3]
 
 
+@pytest.mark.parametrize('execution_image', [False, True])
+def test_portable_checks_probe_upstream_yq_only_for_execution_images(
+    tmp_path, monkeypatch, execution_image
+):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        assert kwargs['env']['UV_NO_SYNC'] == '1'
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(container.subprocess, 'run', run)
+    container.portable_checks(tmp_path, execution_image=execution_image)
+    assert (['/usr/local/bin/yq', '--version'] in calls) == execution_image
+    assert any('input="TEST_TYPE: regular' in argv[-1] for argv in calls) == execution_image
+
+
+@pytest.mark.parametrize(
+    'damage', ['none', 'missing', 'modified', 'not_executable', 'symlink', 'wrong_output']
+)
+def test_execution_yq_probe_executes_parse_and_rejects_invalid_copy(tmp_path, monkeypatch, damage):
+    calls = []
+    real_run = subprocess.run
+    monkeypatch.setattr(
+        container.subprocess,
+        'run',
+        lambda argv, **kwargs: calls.append(argv) or SimpleNamespace(returncode=0),
+    )
+    container.portable_checks(tmp_path, execution_image=True)
+    code = next(argv[-1] for argv in calls if 'input="TEST_TYPE: regular' in argv[-1])
+    local, baked = tmp_path / 'yq', tmp_path / 'baked-yq'
+    payload = '#!/bin/sh\ncat >/dev/null\nprintf "regular\\n"\n'
+    if damage == 'wrong_output':
+        payload = payload.replace('regular', 'wrong')
+    baked.write_text(payload)
+    local.write_text(payload)
+    local.chmod(0o755)
+    if damage == 'missing':
+        local.unlink()
+    elif damage == 'modified':
+        local.write_text(payload + '# changed\n')
+    elif damage == 'not_executable':
+        local.chmod(0o644)
+    elif damage == 'symlink':
+        local.unlink()
+        local.symlink_to(baked)
+    code = code.replace('/usr/local/bin/yq', str(local)).replace(
+        '/opt/ppu-ci-venv/bin/yq', str(baked)
+    )
+    result = real_run([sys.executable, '-I', '-c', code], capture_output=True, text=True)
+    assert (result.returncode == 0) == (damage == 'none')
+
+
+def test_image_probe_enforces_upstream_tool_contract(tmp_path, monkeypatch):
+    monkeypatch.setattr(container, 'verify_export', lambda *a, **k: {})
+    monkeypatch.setattr(container.shutil, 'copytree', lambda *a, **k: None)
+    monkeypatch.setattr(container, 'verify_installed_image', lambda *a, **k: None)
+    calls = []
+    monkeypatch.setattr(container, 'portable_checks', lambda source, **kwargs: calls.append(kwargs))
+    container.image_probe(
+        SimpleNamespace(artifact=tmp_path, digest='a' * 64, control_sha=CONTROL, target_sha=TARGET)
+    )
+    assert calls == [{'execution_image': True}]
+
+
+def test_execution_dockerfile_installs_upstream_yq_offline_before_cleanup(tmp_path):
+    text = (
+        (ROOT / '.github/docker/Dockerfile.ppu-ci')
+        .read_text()
+        .split('FROM runtime AS execution', 1)[1]
+    )
+    step = text.split('RUN --network=none ', 1)[1].split('\nENV ', 1)[0]
+    install = 'install -m 0755 /opt/ppu-ci-venv/bin/yq /usr/local/bin/yq'
+    assert step.index(install) < step.index("/usr/local/bin/yq '.TEST_TYPE'")
+    assert 'cmp /opt/ppu-ci-venv/bin/yq /usr/local/bin/yq' in step
+    assert step.index(install) < step.index('&& python -c')
+    local, baked = tmp_path / 'yq', tmp_path / 'baked-yq'
+    baked.write_text('#!/bin/sh\ncat >/dev/null\nprintf "regular\\n"\n')
+    step = step.split('&& python -c', 1)[0].rstrip().rstrip('\\').rstrip()
+    step = step.replace('/opt/ppu-ci-venv/bin/yq', str(baked)).replace(
+        '/usr/local/bin/yq', str(local)
+    )
+    result = subprocess.run(
+        ['/bin/bash', '-euo', 'pipefail', '-c', step], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert not local.is_symlink() and os.access(local, os.X_OK)
+    assert local.read_bytes() == baked.read_bytes()
+
+
 def test_tools_vendor_byte_checks_and_native_compilation_stay_in_build():
     dockerfile = (ROOT / '.github/docker/Dockerfile.ppu-ci').read_text()
     assert (

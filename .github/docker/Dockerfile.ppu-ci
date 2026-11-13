@@ -74,7 +74,11 @@ LABEL org.opencontainers.image.source="https://github.com/flytiger-eco/Megatron-
     org.opencontainers.image.base.name="${PPU_IMAGE}" \
     io.flytiger.ppu-ci.control="${CONTROL_SHA}"
 COPY release/docker-build.json /opt/ppu-ci-image/docker-build.json
-RUN --network=none python -c 'import shutil; shutil.rmtree("/build"); shutil.rmtree("/exports")'
+# 原训练驱动固定使用此绝对路径；只在构建期复制已校验摘要的工具。
+RUN --network=none install -m 0755 /opt/ppu-ci-venv/bin/yq /usr/local/bin/yq \
+    && cmp /opt/ppu-ci-venv/bin/yq /usr/local/bin/yq \
+    && test "$(printf 'TEST_TYPE: regular\n' | /usr/local/bin/yq '.TEST_TYPE')" = regular \
+    && python -c 'import shutil; shutil.rmtree("/build"); shutil.rmtree("/exports")'
 ENV LD_LIBRARY_PATH="/opt/ppu-ci-venv/lib/ppu-system:${LD_LIBRARY_PATH}" \
     GIT_EXEC_PATH=/opt/ppu-ci-venv/libexec/git-core \
     SSL_CERT_FILE=/opt/ppu-ci-venv/etc/ssl/certs/ca-certificates.crt \

@@ -885,7 +885,7 @@ def image_probe(args):
     shutil.copytree('/source', source)
     args.source_root = source
     verify_installed_image(args, metadata)
-    portable_checks(source)
+    portable_checks(source, execution_image=True)
 
 
 def restore_control(args):
@@ -946,7 +946,7 @@ def offline_probe(args):
     portable_checks(source)
 
 
-def portable_checks(source):
+def portable_checks(source, *, execution_image=False):
     environment = client_env()
     environment.update(
         {
@@ -976,6 +976,23 @@ def portable_checks(source):
         ['/opt/ppu-ci-venv/bin/yq', '--version'],
         ['/opt/ppu-ci-venv/bin/make', '-q', '-C', str(source / 'megatron/core/datasets')],
     ]
+    if execution_image:
+        # 检查原训练驱动的绝对路径，不能只验证 PATH 中的 venv 工具。
+        checks.extend(
+            [
+                ['/usr/local/bin/yq', '--version'],
+                [
+                    '/opt/ppu-ci-venv/bin/python',
+                    '-I',
+                    '-c',
+                    'import os, pathlib, subprocess; tool = pathlib.Path("/usr/local/bin/yq"); '
+                    'assert tool.is_file() and not tool.is_symlink() and os.access(tool, os.X_OK); '
+                    'assert tool.read_bytes() == pathlib.Path("/opt/ppu-ci-venv/bin/yq").read_bytes(); '
+                    'assert subprocess.check_output([str(tool), ".TEST_TYPE"], '
+                    'input="TEST_TYPE: regular\\n", text=True, timeout=30).strip() == "regular"',
+                ],
+            ]
+        )
     for check in checks:
         result = subprocess.run(check, env=environment, capture_output=True, text=True)
         require(

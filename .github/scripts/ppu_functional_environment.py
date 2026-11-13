@@ -300,6 +300,16 @@ def prepare(bundle: Path, manifest: dict):
             or installed.read_bytes() != path.read_bytes()
         ):
             raise ValueError("Restored functional tool does not match the Dockerfile export")
+    if manifest["environment_build_schema"] == 2:
+        # 只验证构建期副本，不在 PPU 运行期修补或安装工具。
+        upstream_yq = Path("/usr/local/bin") / "yq"
+        if (
+            upstream_yq.is_symlink()
+            or not upstream_yq.is_file()
+            or not os.access(upstream_yq, os.X_OK)
+            or upstream_yq.read_bytes() != (bundle / "functional-tools/yq").read_bytes()
+        ):
+            raise ValueError("Upstream yq path does not match the Dockerfile export")
     site = Path(
         command_output(
             [sys.executable, "-c", 'import sysconfig; print(sysconfig.get_path("purelib"))']
@@ -397,7 +407,7 @@ def check(bundle: Path, manifest: dict, output: Path):
     if "GNU bash, version" not in bash or int(bash.split("version ")[1].split(".")[0]) < 4:
         raise ValueError("Functional tests require GNU Bash >=4")
     yq = command_output(
-        [str(Path(sys.prefix) / "bin/yq") if current else "/usr/local/bin/yq", "--version"]
+        [str(Path(sys.prefix) / "bin/yq") if schema == 1 else "/usr/local/bin/yq", "--version"]
     )
     if "mikefarah/yq" not in yq or f"v{YQ_VERSION}" not in yq:
         raise ValueError("Functional tests require the attested Mike Farah yq v4")
