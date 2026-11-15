@@ -77,6 +77,14 @@ jobs:
             exit "$merge_status"
           fi
           [[ "$(git rev-parse MERGE_HEAD)" == "$UPSTREAM_SHA" ]] || exit 1
+          # Keep our entire CI subtree, including files deleted/added by upstream.
+          # Restore only the index; leave disposable runner files untouched.
+          git restore --source="$BASE_SHA" --staged -- .github/workflows
+          git diff --cached --quiet "$BASE_SHA" -- .github/workflows || {
+            echo '::error::Protected workflow files differ from our branch.'
+            exit 1
+          }
+          git diff --name-only --diff-filter=U -z > "$RUNNER_TEMP/sync-conflicts"
           git ls-files --stage -z > "$RUNNER_TEMP/sync-index"
 
       - uses: actions/setup-node@v7
@@ -113,8 +121,10 @@ jobs:
 
           使用 git status、git diff、git ls-files -u、git show :1:path、
           git show :2:path、git show :3:path 和 git log 读取证据。
-          只修改有冲突的路径；没有冲突时仅审阅，不改动任何文件。
-          保留 .github/workflows/copilot-auto-merge.yml 的我方版本。
+          只修改仍有冲突的路径；没有冲突时仅审阅，不改动任何文件。
+          整个 .github/workflows/ 已在索引中恢复我方版本，禁止修改该目录。
+          工作树中残留的上游 workflow 与索引的差异不属于合并候选，忽略它们。
+          用 git diff --cached 审阅候选内容，不要把这些残留文件暂存或提交。
           不运行 git add/commit/merge/rebase/reset/checkout/push，不修改任何
           Git 引用或配置，不创建 PR，不调用远程写 API，不读取或输出凭据。
           无法可靠解决时明确报告并保留冲突标记，后续检查会阻止推送。
@@ -154,7 +164,9 @@ jobs:
               return set(subprocess.check_output(["git", *args]).split(b"\0")) - {b""}
 
           conflicts = set((Path(os.environ["RUNNER_TEMP"]) / "sync-conflicts").read_bytes().split(b"\0")) - {b""}
-          modified = paths("diff", "--name-only", "-z") | paths("ls-files", "--others", "--exclude-standard", "-z")
+          # Protected workflows may differ in the disposable worktree, never in the index.
+          scope = ["--", ".", ":(exclude).github/workflows"]
+          modified = paths("diff", "--name-only", "-z", *scope) | paths("ls-files", "--others", "--exclude-standard", "-z", *scope)
           if not modified <= conflicts:
               raise SystemExit(f"Copilot modified non-conflict paths: {modified - conflicts!r}")
           def non_conflict_entries(raw):
@@ -172,7 +184,10 @@ jobs:
           # Preserve upstream whitespace verbatim; only conflict markers block this check.
           # Range, syntax and merge-parent checks below remain mandatory.
           git -c core.whitespace=-trailing-space,-space-before-tab diff --cached --check
-          git diff --cached --quiet "$BASE_SHA" -- .github/workflows/copilot-auto-merge.yml
+          git diff --cached --quiet "$BASE_SHA" -- .github/workflows || {
+            echo '::error::Protected workflow files differ from our branch.'
+            exit 1
+          }
           python3 -I - <<'PY'
           import ast
           import subprocess
@@ -231,10 +246,8 @@ jobs:
       - name: Publish only to CI/auto_merge without force push
         shell: bash
         env:
-          # Only this publishing step receives a workflow-write credential.
-          # Fine-grained PAT: this repo only, Contents + Workflows read/write.
-          GITHUB_TOKEN: ${{ secrets.SYNC_PUSH_TOKEN || github.token }}
-          WORKFLOW_TOKEN_CONFIGURED: ${{ secrets.SYNC_PUSH_TOKEN != '' }}
+          # Workflow files stay unchanged, so the built-in token is sufficient.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           [[ "$SYNC_BRANCH" == 'CI/auto_merge' ]] || exit 1
@@ -255,16 +268,14 @@ jobs:
           [[ "$(git rev-parse refs/remotes/candidate/sync)" == "$CANDIDATE_SHA" ]] || exit 1
           read -r -a parents <<< "$(git rev-list --parents -n 1 "$CANDIDATE_SHA")"
           [[ ${#parents[@]} -eq 3 && "${parents[1]}" == "$BASE_SHA" && "${parents[2]}" == "$UPSTREAM_SHA" ]] || exit 1
-          git diff --quiet "$BASE_SHA" "$CANDIDATE_SHA" -- .github/workflows/copilot-auto-merge.yml
-          if ! git diff --quiet "$BASE_SHA" "$CANDIDATE_SHA" -- .github/workflows && \
-             [[ "$WORKFLOW_TOKEN_CONFIGURED" != 'true' ]]; then
-            echo '::error::Upstream changed workflow files. Configure SYNC_PUSH_TOKEN with Contents and Workflows write permissions.'
+          git diff --quiet "$BASE_SHA" "$CANDIDATE_SHA" -- .github/workflows || {
+            echo '::error::Candidate changed protected workflow files; publishing is forbidden.'
             exit 1
-          fi
+          }
           # Never execute scripts from the candidate in this contents-write job.
           # An explicit refspec and non-force push cannot replace main or others' work.
           git -c credential.helper= \
             -c 'credential.helper=!f() { printf "username=x-access-token\npassword=%s\n" "$GITHUB_TOKEN"; }; f' \
             push origin "$CANDIDATE_SHA:refs/heads/$SYNC_BRANCH"
-          printf '社区 `%s:%s` 已 merge 到 `%s`，提交 `%s`。main 未作为推送目标。\n' \
+          printf '社区 `%s:%s` 已 merge 到 `%s`，提交 `%s`；保留我方整个 workflow 目录。main 未作为推送目标。\n' \
             "$UPSTREAM_REPOSITORY" "$UPSTREAM_BRANCH" "$SYNC_BRANCH" "$CANDIDATE_SHA" >> "$GITHUB_STEP_SUMMARY"
