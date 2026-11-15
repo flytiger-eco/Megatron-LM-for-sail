@@ -169,7 +169,9 @@ jobs:
             git add --all -- "$conflict"
           done < "$RUNNER_TEMP/sync-conflicts"
           [[ -z "$(git ls-files -u)" ]] || exit 1
-          git diff --cached --check
+          # Preserve upstream whitespace verbatim; only conflict markers block this check.
+          # Range, syntax and merge-parent checks below remain mandatory.
+          git -c core.whitespace=-trailing-space,-space-before-tab diff --cached --check
           git diff --cached --quiet "$BASE_SHA" -- .github/workflows/copilot-auto-merge.yml
           python3 -I - <<'PY'
           import ast
