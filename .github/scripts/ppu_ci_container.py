@@ -23,7 +23,6 @@ DOCKER_FILES = (
     'Dockerfile.ppu-ci',
     'Dockerfile.ppu-ci.dockerignore',
     'control-requirements.txt',
-    'install_ppu.sh',
     'export_environment.py',
 )
 

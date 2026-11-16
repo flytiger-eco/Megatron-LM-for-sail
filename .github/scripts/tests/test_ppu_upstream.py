@@ -690,7 +690,7 @@ def test_merge_snapshot_rechecked_after_parent_lookup(mutation):
 
 @pytest.mark.parametrize("test_kind", [None, "unit", "functional"])
 def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch, test_kind):
-    script = (ROOT / ".github/docker/install_ppu.sh").read_text()
+    script = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
     block = next(
         block for block in re.findall(r"<<'PY'\n(.*?)\nPY", script, re.S) if "native =" in block
     )
@@ -813,7 +813,7 @@ l2_norm = l2norm
     ],
 )
 def test_fla_l2norm_dependency_patch_is_restricted(tmp_path, monkeypatch, mode):
-    script = (ROOT / ".github/docker/install_ppu.sh").read_text()
+    script = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
     block = next(
         block
         for block in re.findall(r"python -I - <<'PY'\n(.*?)\nPY", script, re.S)

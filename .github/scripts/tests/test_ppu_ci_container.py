@@ -37,6 +37,36 @@ PUBLISHED = container.GHCR_IMAGE + '@sha256:' + 'e' * 64
 LOCAL_ID = 'sha256:' + 'f' * 64
 
 
+def test_dependency_installation_is_inline_with_valid_shell_and_python():
+    docker = ROOT / '.github/docker'
+    assert set(container.DOCKER_FILES) == {
+        'Dockerfile.ppu-ci',
+        'Dockerfile.ppu-ci.dockerignore',
+        'control-requirements.txt',
+        'export_environment.py',
+    }
+    assert {path.name for path in docker.iterdir() if path.is_file()} == set(container.DOCKER_FILES)
+    dockerfile = (docker / 'Dockerfile.ppu-ci').read_text()
+    assert dockerfile.startswith('# syntax=docker/dockerfile:1.7\n')
+    dependencies = dockerfile.split('AS dependencies\n', 1)[1].split('FROM dependencies', 1)[0]
+    assert 'SHELL ["/bin/bash", "-euo", "pipefail", "-c"]' in dependencies
+    assert 'COPY docker/export_environment.py /build/export_environment.py' in dependencies
+    assert 'COPY pyproject.toml /build/pyproject.toml' in dependencies
+    blocks = re.findall(
+        r"^RUN <<'PPU_DEPENDENCIES'\n(.*?)\nPPU_DEPENDENCIES$", dockerfile, re.M | re.S
+    )
+    assert len(blocks) == 1
+    script = blocks[0] + '\n'
+    result = subprocess.run(
+        ['bash', '-n'], input=script, text=True, capture_output=True, timeout=10
+    )
+    assert result.returncode == 0, result.stderr
+    python_blocks = re.findall(r"python (?:-I )?- <<'PY'\n(.*?)\nPY", script, re.S)
+    assert len(python_blocks) == 3
+    for block in python_blocks:
+        compile(block, 'inline-dependencies', 'exec')
+
+
 def archive(path, rows):
     with tarfile.open(path, 'w:gz') as stream:
         for name, content, kind in rows:
@@ -627,7 +657,7 @@ def test_cache_is_dependency_based_but_build_inputs_bind_full_identities(build_i
     assert container.build_identity(args)[2] == first_key
     for path in (
         args.source_root / 'pyproject.toml',
-        args.control_root / '.github/docker/install_ppu.sh',
+        args.control_root / '.github/docker/Dockerfile.ppu-ci',
     ):
         path.write_text(path.read_text() + '\n# changed\n')
         assert container.build_identity(args)[2] != first_key
@@ -850,6 +880,19 @@ def test_probe_export_is_readable_without_changing_private_evidence(tmp_path):
     assert (snapshot / 'nested/report.json').stat().st_mode & 0o777 == 0o644
 
 
+def assert_build_arguments(argv, args):
+    expected = [
+        f'{"PPU_IMAGE" if args.kind == "runtime" else "CONTROL_IMAGE"}={args.image_digest}',
+        f'TARGET_SHA={args.target_sha or ""}',
+        f'CONTROL_SHA={args.control_sha}',
+    ]
+    if getattr(args, 'mode', '') == 'build-image':
+        expected.append('EXPORT_FORMAT=image')
+    actual = [argv[index + 1] for index, value in enumerate(argv) if value == '--build-arg']
+    assert actual == expected
+    assert not any(value.endswith('--build-arg') for value in argv if value != '--build-arg')
+
+
 def test_build_uses_only_trusted_dockerfile_and_offline_unprivileged_probe(
     build_inputs, monkeypatch
 ):
@@ -875,6 +918,7 @@ def test_build_uses_only_trusted_dockerfile_and_offline_unprivileged_probe(
             assert all('docker.sock' not in item and 'secret' not in item for item in argv)
             return '{"environment_restore_seconds": 0.1}'
         if argv[:3] == ['docker', 'buildx', 'build']:
+            assert_build_arguments(argv, args)
             context = Path(argv[-1])
             assert (context / 'docker/Dockerfile.ppu-ci').read_bytes() == (
                 ROOT / '.github/docker/Dockerfile.ppu-ci'
@@ -977,6 +1021,8 @@ def test_complete_image_build_loads_and_probes_exact_id_without_publication(
                 if argv[2] == str(args.control_root)
                 else 'pyproject.toml\0'
             )
+        if argv[:3] == ['docker', 'buildx', 'build']:
+            assert_build_arguments(argv, args)
         if '--output' in argv:
             if stage == 'export':
                 raise container.ValidationError('export failed')
