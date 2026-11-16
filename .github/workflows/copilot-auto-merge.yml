@@ -4,6 +4,7 @@ on:
   push:
     branches: ['CI/auto_merge']
     # Bootstrap and test from this branch without touching main.
+    # Manual CI recheck.
     # Merge-result pushes do not change this file, so they cannot loop.
     paths: ['.github/workflows/copilot-auto-merge.yml']
   workflow_dispatch:
