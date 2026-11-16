@@ -758,7 +758,7 @@ def test_incompatible_checkpoint_api_fails_before_training(
 
 @pytest.mark.parametrize("kind", [None, "unit", "functional"])
 def test_training_packages_match_build_constraints(tmp_path, monkeypatch, kind):
-    script = (ROOT / ".github/docker/install_ppu.sh").read_text()
+    script = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
     block = next(
         block for block in re.findall(r"<<'PY'\n(.*?)\nPY", script, re.S) if "native =" in block
     )

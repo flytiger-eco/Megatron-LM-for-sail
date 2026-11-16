@@ -1,5 +1,7 @@
 import copy
 import json
+import os
+import subprocess
 import sys
 
 import pytest
@@ -481,16 +483,59 @@ def test_base_invalidation_requires_new_full_sha_dispatch(github, monkeypatch):
     assert auth.publish_status(previous, "success", "Late success", github) == "stale"
 
 
+@pytest.mark.parametrize(
+    'cancelled,pending,finalized,execution,expected',
+    [
+        ('false', 'success', 'published', 'success', None),
+        ('false', 'success', '', 'failure', 'failure'),
+        ('false', 'success', '', 'cancelled', 'failure'),
+        ('false', 'success', 'published', 'failure', 'failure'),
+        ('true', 'success', 'published', 'success', 'error'),
+        ('true', 'success', '', 'cancelled', 'error'),
+        ('false', 'failure', '', 'failure', 'error'),
+    ],
+)
+def test_host_fallback_never_publishes_success_after_missing_image_or_container_failure(
+    tmp_path, cancelled, pending, finalized, execution, expected
+):
+    parent = yaml.safe_load((ROOT / '.github/workflows/ppu-build.yml').read_text())
+    job = parent['jobs']['pr-result']
+    step = job['steps'][-1]
+    assert 'always()' in job['if'] and '!cancelled()' not in job['if']
+    assert step['env']['STATE'] == 'failure'
+    record = tmp_path / 'status-call'
+    script = 'python3() { printf "%s\\n" "$@" > "$STATUS_CALL"; }\n' + step['run']
+    result = subprocess.run(
+        ['bash', '-euo', 'pipefail', '-c', script],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            'CANCELLED': cancelled,
+            'PENDING_RESULT': pending,
+            'PR_STATUS_RESULT': finalized,
+            'EXECUTE_RESULT': execution,
+            'STATE': 'failure',
+            'DESCRIPTION': 'validation failed',
+            'STATUS_CALL': str(record),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    if expected is None:
+        assert not record.exists()
+    else:
+        args = record.read_text().splitlines()
+        assert args[:2] == ['-I', '-B']
+        assert args[args.index('--state') + 1] == expected
+        assert ('--cancelled' in args) is (cancelled == 'true')
+
+
 def test_workflow_authorized_concurrency_and_cancellation_contract():
     parent = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
     execute = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())
     call = parent["jobs"]["execute"]
-    assert call["needs"] == ["authorize", "pr-pending", "control-environment"]
-    assert "needs.control-environment.result == 'success'" in call["if"]
-    assert (
-        "needs.authorize.outputs.allowed != 'true' || needs.control-environment.result == 'success'"
-        in call["if"]
-    )
+    assert call['needs'] == ['authorize', 'pr-pending']
+    assert 'control-environment' not in parent['jobs']
     assert "status_result == 'published'" in call["if"]
     assert "needs.authorize.result == 'success'" in call["if"]
     assert "needs.authorize.outputs.pr_number" in call["concurrency"]["group"]
@@ -504,16 +549,29 @@ def test_workflow_authorized_concurrency_and_cancellation_contract():
     assert "always()" in result["if"] and "!cancelled()" not in result["if"]
     assert result["timeout-minutes"] == 5
     assert any(step.get("if") == "cancelled()" for step in result["steps"])
-    assert "execution_success == 'true'" in result["steps"][-1]["env"]["STATE"]
+    assert result['steps'][-1]['env']['STATE'] == 'failure'
+    assert 'PR_STATUS_RESULT' in result['steps'][-1]['env']
+    status = execute['jobs']['pr-status']
+    assert (
+        status['container']['image']
+        == '${{ needs.runtime-environment.outputs.runtime_image_digest }}'
+    )
+    assert "execution_success == 'true'" in status['steps'][-1]['env']['STATE']
     assert "--cancelled" in result["steps"][-1]["run"]
-    assert execute["jobs"]["runtime-environment"]["needs"] == ["configure", "admit-build"]
+    assert not execute['jobs']['runtime-environment'].get('needs')
+    assert execute['jobs']['configure']['needs'] == 'runtime-environment'
     assert execute["jobs"]["build"]["needs"] == ["configure", "admit-build", "runtime-environment"]
     assert "needs.runtime-environment.result == 'success'" in execute["jobs"]["build"]["if"]
     for name in ("configure", "admit-build", "runtime-environment"):
         steps = execute["jobs"][name]["steps"]
         assert any(step.get("run", "").endswith("ppu_pr_authorize.py guard") for step in steps)
-    for name in ("configure", "admit-build", "runtime-environment"):
-        assert execute["jobs"][name]["runs-on"] == "ubuntu-latest"
+    for name in ('configure', 'admit-build'):
+        assert execute['jobs'][name]['runs-on'] == 'k8s-runner-group-cpu-flytiger'
+        assert (
+            execute['jobs'][name]['container']['image']
+            == '${{ needs.runtime-environment.outputs.runtime_image_digest }}'
+        )
+    assert execute['jobs']['runtime-environment']['runs-on'] == 'ubuntu-latest'
     runtime = execute["jobs"]["runtime-environment"]
     assert "container" not in runtime
     assert runtime["permissions"]["packages"] == "write"

@@ -16,14 +16,24 @@ from pathlib import Path, PurePosixPath
 
 GHCR_IMAGE = 'ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci'
 PPU_IMAGE = 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001'
-CONTROL_IMAGE = 'python:3.12-slim-bookworm'
+# Historical schema 1 identity only; never used for new builds.
+LEGACY_CONTROL_IMAGE = 'python:3.12-slim-bookworm'
+TASK_CAPABILITIES = {
+    'schema_version': 1,
+    'capability_version': 1,
+    'training_venv': '/opt/ppu-ci-venv',
+    'control_venv': '/opt/ppu-ci-control-venv',
+    'control_system_site_packages': False,
+    'runtime_installation': False,
+    'diagnostic_hook': 'opt-in',
+    'kubectl': 'platform-mount-required',
+}
 SHA = re.compile(r'[0-9a-f]{40}')
 DIGEST = re.compile(r'[0-9a-f]{64}')
 DOCKER_FILES = (
     'Dockerfile.ppu-ci',
     'Dockerfile.ppu-ci.dockerignore',
     'control-requirements.txt',
-    'install_ppu.sh',
     'export_environment.py',
 )
 
@@ -107,7 +117,7 @@ def verify_export(
         (target_sha is None or SHA.fullmatch(target_sha)) and metadata['target_sha'] == target_sha,
         'Environment target identity mismatch',
     )
-    image = PPU_IMAGE if kind == 'runtime' else CONTROL_IMAGE
+    image = PPU_IMAGE if kind == 'runtime' else LEGACY_CONTROL_IMAGE
     repository = image.rsplit(':', 1)[0]
     require(
         metadata['image'] == image
@@ -126,8 +136,10 @@ def verify_export(
         )
     if schema == 2:
         require(
-            'environment.tar.gz' not in files
-            and not no_links(directory / 'environment.tar.gz').exists(),
+            all(
+                name not in files and not no_links(directory / name).exists()
+                for name in ('environment.tar.gz', 'control-runtime.tar.gz')
+            ),
             'Image evidence must not contain a software environment archive',
         )
     if not subset:
@@ -167,8 +179,68 @@ def verify_export(
         ),
         'Incomplete Dockerfile environment export',
     )
+    if schema == 2:
+        verify_task_capabilities(directory, metadata)
     require(DIGEST.fullmatch(metadata.get('inputs_sha256', '')), 'Missing build inputs digest')
     return metadata
+
+
+def verify_task_capabilities(directory, metadata):
+    require(
+        type(metadata.get('task_image_capability_version')) is int
+        and metadata['task_image_capability_version'] == 1,
+        'Missing unified task image capability',
+    )
+    for name in (
+        'task-image-capabilities.json',
+        'control-installed-packages.json',
+        'control-package-install.json',
+    ):
+        require(
+            metadata['files'].get(name, {}).get('size', 0) > 0,
+            'Missing unified control environment evidence',
+        )
+    capabilities = json.loads((Path(directory) / 'task-image-capabilities.json').read_text())
+    require(
+        capabilities == TASK_CAPABILITIES
+        and type(capabilities.get('schema_version')) is int
+        and type(capabilities.get('capability_version')) is int
+        and capabilities.get('control_system_site_packages') is False
+        and capabilities.get('runtime_installation') is False,
+        'Unified task image capability mismatch',
+    )
+    controls = metadata.get('control_files')
+    require(
+        isinstance(controls, dict)
+        and controls
+        and all(
+            re.fullmatch(r'ppu[A-Za-z0-9_]*\.py', name) and DIGEST.fullmatch(value)
+            for name, value in controls.items()
+        ),
+        'Missing trusted control script identity',
+    )
+    packages = json.loads((Path(directory) / 'control-installed-packages.json').read_text())
+    require(isinstance(packages, list) and packages, 'Missing isolated control package inventory')
+    names = set()
+    for item in packages:
+        require(
+            isinstance(item, dict)
+            and set(item) == {'name', 'version'}
+            and isinstance(item['name'], str)
+            and isinstance(item['version'], str),
+            'Invalid isolated control package inventory',
+        )
+        name = item['name'].lower().replace('_', '-')
+        require(
+            name not in names
+            and name not in ('torch', 'triton', 'megatron-core', 'transformer-engine'),
+            'Unsafe isolated control package inventory',
+        )
+        names.add(name)
+    require(
+        {'numpy', 'pyyaml', 'pydantic', 'pytest', 'tensorboard', 'google-crc32c', 'click'} <= names,
+        'Incomplete isolated control package inventory',
+    )
 
 
 def extract_archive(
@@ -418,10 +490,11 @@ def trusted_controls(root):
 
 
 def build_identity(args):
+    require(args.kind == 'runtime', 'Only unified runtime image builds are supported')
     root = no_links(args.control_root)
     checked_git(root, args.control_sha)
     preflight(root)
-    image = PPU_IMAGE if args.kind == 'runtime' else CONTROL_IMAGE
+    image = PPU_IMAGE
     pinned = getattr(args, 'image_digest', None)
     if not pinned:
         command(
@@ -464,7 +537,7 @@ def fingerprint(args):
 
 
 def materialize_tracked_source(source, destination, names):
-    """仅将仓库内指向已跟踪普通文件的单层别名实体化到空构建目录。"""
+    """Materialize tracked files and single-level internal aliases into an empty build directory."""
     source, destination = no_links(source), no_links(destination)
     require(
         destination.is_dir() and not any(destination.iterdir()),
@@ -574,7 +647,7 @@ def build(args):
             '--file',
             str(docker / 'Dockerfile.ppu-ci'),
             '--build-arg',
-            f'{"PPU_IMAGE" if args.kind == "runtime" else "CONTROL_IMAGE"}={pinned}',
+            f'PPU_IMAGE={pinned}',
             '--build-arg',
             f'TARGET_SHA={args.target_sha or ""}',
             '--build-arg',
@@ -589,7 +662,7 @@ def build(args):
         if cache and (cache / 'index.json').is_file():
             common += ['--cache-from', f'type=local,src={cache}']
         if cache:
-            dependency = 'dependencies' if args.kind == 'runtime' else 'control'
+            dependency = 'dependencies'
             command(
                 common
                 + [
@@ -628,6 +701,9 @@ def build(args):
             'elapsed_seconds': round(time.time() - started, 3),
             'files': inventory(output),
         }
+        if image_mode:
+            metadata['task_image_capability_version'] = 1
+            metadata['control_files'] = {path.name: digest(path) for path in trusted_controls(root)}
         (output / 'docker-build.json').write_text(json.dumps(metadata, sort_keys=True) + '\n')
         sha = digest(output / 'docker-build.json')
         verify_export(output, sha, args.control_sha, args.target_sha, schema=2 if image_mode else 1)
@@ -668,8 +744,9 @@ def build(args):
                     '--mount',
                     f'type=bind,source={context / "source"},target=/source,readonly',
                     local_id,
-                    'python3',
+                    '/opt/ppu-ci-control-venv/bin/python',
                     '-I',
+                    '-B',
                     '/trusted/ppu_ci_container.py',
                     'image-probe',
                     '--artifact',
@@ -774,6 +851,7 @@ def image_record(metadata, environment_digest, runtime_image_digest):
         'environment_digest': environment_digest,
         'control_sha': metadata['control_sha'],
         'target_sha': metadata['target_sha'],
+        'task_image_capability_version': metadata['task_image_capability_version'],
     }
 
 
@@ -841,12 +919,96 @@ def verify_installed_image(args, metadata):
     require((venv / 'bin/python').is_file(), 'Missing baked execution environment')
     embedded = no_links('/opt/ppu-ci-image/docker-build.json')
     require(embedded.is_file() and digest(embedded) == args.digest, 'Baked image metadata mismatch')
+    verify_control_environment(args, metadata)
     require(args.source_root is not None, 'Missing execution source directory')
     extract_archive(
         Path(args.artifact) / 'compiled-source.tar.gz',
         args.source_root,
         overlay=True,
         compiled=True,
+    )
+
+
+def verify_control_environment(args, metadata):
+    """Cold-start trusted CPU modules without loading training packages or startup hooks."""
+    embedded = no_links('/opt/ppu-ci-image/docker-build.json')
+    require(embedded.is_file() and digest(embedded) == args.digest, 'Baked image metadata mismatch')
+    for name in (
+        'task-image-capabilities.json',
+        'control-installed-packages.json',
+        'control-package-install.json',
+    ):
+        path = no_links(Path('/opt/ppu-ci-image') / name)
+        require(
+            path.is_file()
+            and metadata['files'][name] == {'size': path.stat().st_size, 'sha256': digest(path)},
+            'Baked control evidence mismatch',
+        )
+    python = '/opt/ppu-ci-control-venv/bin/python'
+    script = '''import importlib, importlib.metadata as md, json, pathlib, sys
+assert sys.prefix == "/opt/ppu-ci-control-venv"
+assert sys.flags.isolated and sys.dont_write_bytecode
+assert "include-system-site-packages = false" in pathlib.Path(sys.prefix, "pyvenv.cfg").read_text()
+assert not any("ppu-ci-venv" in p or "source" in p for p in sys.path)
+for d in md.distributions():
+    assert pathlib.Path(d.locate_file("")).resolve().is_relative_to(sys.prefix)
+expected = json.loads(pathlib.Path("/opt/ppu-ci-image/control-installed-packages.json").read_text())
+actual = sorted([{"name": d.metadata["Name"], "version": d.version} for d in md.distributions()], key=lambda d: d["name"].lower())
+assert expected == actual
+import click, numpy, yaml, pydantic, pytest, google_crc32c
+from tensorboard.compat.proto.event_pb2 import Event
+assert Event.FromString(Event(step=1).SerializeToString()).step == 1
+sys.path.insert(0, sys.argv[1])
+for name in ("ppu_ci", "ppu_functional", "ppu_ci_paths", "ppu_ci_export", "ppu_functional_results", "ppu_pr_authorize", "ppu_compiler_diagnostic"):
+    importlib.import_module(name)
+assert not any(n.split(".")[0] in {"torch", "triton", "megatron", "transformer_engine"} for n in sys.modules)
+'''
+    control = no_links('/opt/ppu-ci-control-scripts')
+    for name, expected in metadata['control_files'].items():
+        path = no_links(control / name)
+        require(
+            path.is_file() and digest(path) == expected, 'Baked control script identity mismatch'
+        )
+    for check in (
+        [python, '-I', '-B', '-m', 'pip', 'check'],
+        [python, '-I', '-B', '-c', script, str(control)],
+    ):
+        command(
+            check, failure='Unified control environment cold-start check failed', diagnostics=True
+        )
+    for tool in (
+        'bash',
+        'git',
+        'tar',
+        'gzip',
+        'curl',
+        'jq',
+        'file',
+        'envsubst',
+        'sha256sum',
+        'timeout',
+    ):
+        executable = shutil.which(tool)
+        require(executable, 'Missing CPU orchestration tool')
+        command(
+            [executable, '--version'],
+            failure='CPU orchestration tool execution failed',
+            diagnostics=True,
+        )
+    certificates = no_links('/etc/ssl/certs/ca-certificates.crt')
+    require(certificates.is_file(), 'Missing CPU trust certificates')
+    command(
+        [
+            python,
+            '-I',
+            '-B',
+            '-c',
+            'import ssl, sys; context = ssl.create_default_context(cafile=sys.argv[1]); '
+            'assert context.cert_store_stats()["x509_ca"] > 0',
+            str(certificates),
+        ],
+        failure='CPU trust certificate validation failed',
+        diagnostics=True,
     )
 
 
@@ -872,6 +1034,8 @@ def verify_image(args):
         check_only=True,
         compiled=True,
     )
+    if getattr(args, 'task_container', False):
+        verify_control_environment(args, metadata)
     if args.check_only:
         return
     verify_installed_image(args, metadata)
@@ -977,7 +1141,7 @@ def portable_checks(source, *, execution_image=False):
         ['/opt/ppu-ci-venv/bin/make', '-q', '-C', str(source / 'megatron/core/datasets')],
     ]
     if execution_image:
-        # 检查原训练驱动的绝对路径，不能只验证 PATH 中的 venv 工具。
+        # Verify the original training driver's absolute path, not just the venv tool in PATH.
         checks.extend(
             [
                 ['/usr/local/bin/yq', '--version'],
@@ -1052,10 +1216,40 @@ def mark_plan(args):
     path = no_links(Path(args.artifact) / 'manifest.json')
     manifest = json.loads(path.read_text())
     manifest['environment_build_schema'] = 2
+    identity = getattr(args, 'image_digest', None)
+    if identity is not None:
+        require(
+            SHA.fullmatch(args.control_sha or '')
+            and SHA.fullmatch(args.target_sha or '')
+            and manifest.get('identity', {}).get('control_sha') == args.control_sha
+            and manifest.get('identity', {}).get('target_sha') == args.target_sha,
+            'Unified plan source identity mismatch',
+        )
+        require(DIGEST.fullmatch(args.digest or ''), 'Missing unified plan environment digest')
+        record = image_record(
+            {
+                'image_digest': args.base_image_digest,
+                'control_sha': args.control_sha,
+                'target_sha': args.target_sha,
+                'task_image_capability_version': 1,
+            },
+            args.digest,
+            identity,
+        )
+        require(
+            re.fullmatch(
+                re.escape(PPU_IMAGE.rsplit(':', 1)[0]) + r'@sha256:[0-9a-f]{64}',
+                args.base_image_digest or '',
+            ),
+            'Invalid unified plan base image',
+        )
+        manifest['task_image'] = record
     if manifest.get('test_kind') == 'combined':
         sidecar = no_links(path.with_name('functional-manifest.json'))
         functional = json.loads(sidecar.read_text())
         functional['environment_build_schema'] = 2
+        if identity is not None:
+            functional['task_image'] = record
         sidecar.write_text(json.dumps(functional, indent=2) + '\n')
         manifest['functional_plan']['sha256'] = digest(sidecar)
     path.write_text(json.dumps(manifest, indent=2) + '\n')
@@ -1071,7 +1265,7 @@ def main():
             create.set_defaults(kind='runtime')
             create.add_argument('--local-image', required=True)
         else:
-            create.add_argument('--kind', choices=('control', 'runtime'), required=True)
+            create.add_argument('--kind', choices=('runtime',), required=True)
         create.add_argument('--control-root', type=Path, required=True)
         create.add_argument('--control-sha', required=True)
         create.add_argument('--source-root', type=Path)
@@ -1106,6 +1300,7 @@ def main():
             image.add_argument('--image-digest', required=True)
             image.add_argument('--source-root', type=Path)
             image.add_argument('--check-only', action='store_true')
+            image.add_argument('--task-container', action='store_true')
     pack = sub.add_parser('archive-source')
     pack.add_argument('--artifact', type=Path, required=True)
     pack.add_argument('--source-root', type=Path, required=True)
@@ -1118,6 +1313,11 @@ def main():
     source.add_argument('--destination', type=Path, required=True)
     mark = sub.add_parser('mark-plan')
     mark.add_argument('--artifact', type=Path, required=True)
+    mark.add_argument('--image-digest')
+    mark.add_argument('--base-image-digest')
+    mark.add_argument('--digest')
+    mark.add_argument('--control-sha')
+    mark.add_argument('--target-sha')
     args = parser.parse_args()
     {
         'build': build,

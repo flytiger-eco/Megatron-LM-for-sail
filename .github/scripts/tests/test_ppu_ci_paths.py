@@ -177,7 +177,12 @@ def test_all_parent_child_secret_boundaries_are_explicit(filename):
                 assert "PPU_CPU_RUN_ROOT" not in step["with"]["extra_env"]
                 assert "GH_TOKEN" not in step["with"]["extra_env"]
                 assert "github.token" not in json.dumps(step["with"])
-                assert "ppu_ci_paths.py" in job["steps"][index - 1]["run"]
+                check = job['steps'][index - 1]['run']
+                assert '[[ -x /opt/bin/kubectl ]]' in check and 'exit 1' in check
+                assert 'curl' not in check
+                assert any(
+                    'ppu_ci_paths.py' in prior.get('run', '') for prior in job['steps'][: index - 1]
+                )
             if step.get("uses") == "actions/upload-artifact@v4":
                 if step["with"].get("name") == "ppu-control-environment":
                     assert filename == "ppu-build"
@@ -196,7 +201,8 @@ def test_all_parent_child_secret_boundaries_are_explicit(filename):
                     assert job["runs-on"] == "ubuntu-latest"
                     assert "container" not in job
                     assert job["permissions"]["packages"] == "write"
-                    assert "needs.admit-build.result == 'success'" in job["if"]
+                    assert 'inputs.allowed' in job['if']
+                    assert not job.get('needs')
                     assert "secrets." not in json.dumps(job)
                     assert "ppu_pr_authorize.py guard" in json.dumps(job["steps"])
                     continue

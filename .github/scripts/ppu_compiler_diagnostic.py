@@ -32,6 +32,33 @@ def write_json(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
+def current_image_identity() -> dict:
+    """Authenticate current software independently of historical diagnostic source."""
+    spec = importlib.util.spec_from_file_location(
+        "ppu_diagnostic_image", SCRIPT.with_name("ppu_ci_container.py")
+    )
+    image = importlib.util.module_from_spec(spec)
+    previous = sys.dont_write_bytecode
+    try:
+        sys.dont_write_bytecode = True
+        spec.loader.exec_module(image)
+    finally:
+        sys.dont_write_bytecode = previous
+    args = types.SimpleNamespace(
+        artifact=Path(os.environ["PPU_CURRENT_IMAGE_ARTIFACT"]),
+        digest=os.environ["PPU_ENVIRONMENT_DIGEST"],
+        image_digest=os.environ["PPU_IMAGE_DIGEST"],
+        base_image_digest=os.environ["PPU_BASE_IMAGE_DIGEST"],
+        control_sha=os.environ["PPU_CONTROL_SHA"],
+        target_sha=os.environ["PPU_TARGET_SHA"],
+        source_root=None,
+        check_only=True,
+        task_container=True,
+    )
+    image.verify_image(args)
+    return json.loads((args.artifact / "runtime-image.json").read_text())
+
+
 def verify_authorization(authorization: dict, env: dict) -> None:
     """Require maintainer authorization from the same run; reject PRs, reruns
     and different source snapshots.
@@ -388,6 +415,11 @@ def run_diagnostic(root: Path, output: Path, authorization: dict) -> int:
     runner = DiagnosticRunner()
     handlers = {sig: signal.signal(sig, runner.cancel) for sig in (signal.SIGTERM, signal.SIGINT)}
     try:
+        report.update(
+            environment_mode="unified-image",
+            task_image=current_image_identity(),
+            historical_environment_reproduced=False,
+        )
         for name in (
             BDA,
             "megatron/core/jit.py",
@@ -486,6 +518,8 @@ def main() -> None:
         return
     authorization = json.loads(args.authorization.read_text())
     verify_authorization(authorization, os.environ)
+    if args.mode == "authorize":
+        current_image_identity()
     if context == "bert":
         spec = importlib.util.spec_from_file_location(
             "ppu_bert_diagnostic", SCRIPT.with_name("ppu_bert_diagnostic.py")

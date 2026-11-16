@@ -798,7 +798,10 @@ def test_workflow_trust_and_resource_boundaries():
     assert events["push"]["tags"] == ["v*"]
     assert events["pull_request_target"]["branches"] == ["ci/ppu-validation"]
     assert build["jobs"]["authorize"]["runs-on"] == "ubuntu-latest"
-    assert execute["jobs"]["configure"]["if"] == "inputs.allowed"
+    assert (
+        execute['jobs']['configure']['if']
+        == "inputs.allowed && inputs.test_kind != 'compiler_diagnostic'"
+    )
     for name in ("build", "unit-tests"):
         assert "github.run_attempt == 1" in execute["jobs"][name]["if"]
     assert "github.run_attempt == 1" in ut["jobs"]["test"]["if"]
@@ -818,17 +821,18 @@ def test_workflow_trust_and_resource_boundaries():
     assert "GH_TOKEN" not in execute["jobs"]["build"].get("env", {})
     for workflow in (build, execute, ut):
         for job in workflow["jobs"].values():
-            if job.get("permissions", {}).get("statuses") == "write":
-                assert job["runs-on"] == "ubuntu-latest"
+            if job.get('permissions', {}).get('statuses') == 'write' and 'uses' not in job:
+                assert job['runs-on'] == (
+                    'k8s-runner-group-cpu-flytiger'
+                    if job is execute['jobs']['pr-status']
+                    else 'ubuntu-latest'
+                )
             for step in job.get("steps", []):
                 if step.get("uses") == "actions/checkout@v4":
                     assert step["with"]["persist-credentials"] is False
     text = (ROOT / ".github/workflows/ppu-ut.yml").read_text()
     assert 'bash "$PPU_CONTROL_DIR/ppu_ci_run.sh"' in text
-    assert (
-        '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci.py summarize'
-        in text
-    )
+    assert '/opt/ppu-ci-control-venv/bin/python -I -B .ppu-ci/control/ppu_ci.py summarize' in text
     build_script = (SCRIPTS / "ppu_ci_build.sh").read_text()
     dockerfile = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
     assert 'install -m 0644 /build/control/ppu_pytest_policy.py' in dockerfile
@@ -913,6 +917,13 @@ def test_suite_runner_with_fake_hardware(tmp_path, failure):
         path = bin_dir / name
         path.write_text(f"#!{sys.executable}\n" + TOOL_STUB)
         path.chmod(0o755)
+    control = tmp_path / 'control'
+    control.mkdir()
+    (control / 'ppu_ci.py').write_bytes((SCRIPTS / 'ppu_ci.py').read_bytes())
+    wrapper = (SCRIPTS / 'ppu_ci_container.sh').read_text()
+    (control / 'ppu_ci_container.sh').write_text(
+        wrapper.replace('/opt/ppu-ci-control-venv/bin/python', 'python3')
+    )
     env = {
         **os.environ,
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
@@ -921,7 +932,7 @@ def test_suite_runner_with_fake_hardware(tmp_path, failure):
         "PPU_RESULTS_DIR": str(results),
         "PPU_SOURCE_ROOT": str(source),
         "PPU_ARTIFACT_DIR": str(artifacts),
-        "PPU_CONTROL_DIR": str(SCRIPTS),
+        "PPU_CONTROL_DIR": str(control),
         "PPU_TARGET_SHA": SHA,
         "PPU_CONTROL_SHA": CONTROL_SHA,
         "PPU_ENVIRONMENT_DIGEST": "d" * 64,

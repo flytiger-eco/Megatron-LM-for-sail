@@ -601,9 +601,16 @@ chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
 ''')
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    # exec bypasses shell functions, so stub the restore bootstrap executable.
+    # Simulate the fixed control interpreter at the task-image boundary.
     (bin_dir / "python3").write_text("#!/bin/bash\nexit 0\n")
     (bin_dir / "python3").chmod(0o755)
+    control = tmp_path / 'control-scripts'
+    control.mkdir()
+    (control / 'ppu_ci_container.sh').write_text(
+        (SCRIPTS / 'ppu_ci_container.sh')
+        .read_text()
+        .replace('/opt/ppu-ci-control-venv/bin/python', 'python3')
+    )
     output = tmp_path / "output"
     env = {
         **os.environ,
@@ -616,7 +623,7 @@ chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
         "FIXTURE_ARCHIVE_FAILURE": str(archive_failure).lower(),
         "PPU_RESULTS_DIR": str(output),
         "PPU_SOURCE_ROOT": str(tmp_path),
-        "PPU_CONTROL_DIR": str(SCRIPTS),
+        "PPU_CONTROL_DIR": str(control),
         "PPU_ARTIFACT_DIR": str(tmp_path),
         "PPU_ENVIRONMENT_DIGEST": "d" * 64,
         "PPU_IMAGE_DIGEST": "ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci@sha256:" + "e" * 64,
@@ -665,7 +672,13 @@ chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
             local_result = tmp_path / ".ppu-action"
             (tmp_path / "ppu-control-runtime").symlink_to(Path(sys.executable).parent.parent)
             subprocess.run(
-                ["bash", "-euo", "pipefail", "-c", step["run"]],
+                [
+                    "bash",
+                    "-euo",
+                    "pipefail",
+                    "-c",
+                    step['run'].replace('/opt/ppu-ci-control-venv/bin/python', sys.executable),
+                ],
                 cwd=tmp_path,
                 env={
                     **os.environ,
@@ -718,12 +731,30 @@ def test_configure_archives_complete_standalone_runtime_dependencies(tmp_path):
             }
         )
     )
+    script = step['run'].replace('/opt/ppu-ci-control-venv/bin/python', sys.executable)
+    script = script.replace(
+        'bash control/.github/scripts/ppu_ci_container.sh mark-plan',
+        sys.executable + ' -I -B control/.github/scripts/ppu_ci_container.py mark-plan',
+    )
+    identities = {
+        'needs.runtime-environment.outputs.runtime_image_digest': 'ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci@sha256:'
+        + 'e' * 64,
+        'needs.runtime-environment.outputs.base_image_digest': functional.IMAGE.rsplit(':', 1)[0]
+        + '@sha256:'
+        + 'f' * 64,
+        'needs.runtime-environment.outputs.environment_digest': 'd' * 64,
+        'inputs.control_sha': 'a' * 40,
+        'inputs.target_sha': 'a' * 40,
+    }
+    for key, value in identities.items():
+        script = script.replace('${{ ' + key + ' }}', value)
     run = subprocess.run(
-        ["bash", "-euo", "pipefail", "-c", step["run"]],
+        ['bash', '-euo', 'pipefail', '-c', script],
         cwd=tmp_path,
         env={
             **os.environ,
             "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+            'TEST_KIND': 'functional',
             "PPU_INPUTS": json.dumps({"test_kind": "functional"}),
             "PPU_SOURCE_ROOT": str(ROOT),
             "PPU_CONTROL_ROOT": str(ROOT),
@@ -789,15 +820,15 @@ def test_workflow_functional_route_is_manual_only_and_preserves_ut():
         (
             "ppu-execute",
             "configure",
-            "Verify and restore isolated configuration environment",
-            "ppu-control-runtime",
+            "Verify unified task container before configuration",
+            "ppu-ci-control-venv",
             ("ppu_functional.py", "ppu_ci.py"),
         ),
         (
             "ppu-functional",
             "result",
-            "Verify and restore isolated upstream comparison environment",
-            "ppu-control-runtime",
+            "Verify unified comparison container",
+            "ppu-ci-control-venv",
             ("ppu_functional_results.py",),
         ),
     ],
@@ -817,19 +848,21 @@ def test_fixed_dependencies_are_prepared_before_untrusted_downloads(
         index
         for index, step in enumerate(steps)
         if step.get("uses") in ("actions/checkout@v4", "actions/download-artifact@v4")
-        and step.get("with", {}).get("path") not in ("control", ".ppu-control-export")
+        and step.get('with', {}).get('path') != 'control'
+        and step.get('with', {}).get('name') != 'ppu-runtime-environment'
     ]
     assert downloads and prepare_index < min(downloads)
     prepare = steps[prepare_index]["run"]
-    assert "restore-control" in prepare and "pip install" not in prepare
-    assert "--digest '${{ inputs.control_digest }}'" in prepare
+    assert 'verify-image' in prepare and '--task-container' in prepare
+    assert 'restore-control' not in prepare and 'pip install' not in prepare
+    assert '--digest' in prepare and 'environment_digest' in prepare
     assert "--control-sha '${{ inputs.control_sha }}'" in prepare
     assert "--root" not in prepare and "requirements" not in prepare
     for step in steps:
         assert "$GITHUB_PATH" not in step.get("run", "")
         for script in script_names:
             if script in step.get("run", ""):
-                assert f'"$RUNNER_TEMP/{venv}/bin/python" -I' in step["run"]
+                assert f'/opt/{venv}/bin/python -I -B' in step['run']
     for script in script_names:
         assert any(script in step.get("run", "") for step in steps)
 
@@ -871,7 +904,13 @@ def test_checkpoint_omission_report_records_excluded_payloads(tmp_path):
         (control / name).write_bytes((SCRIPTS / name).read_bytes())
     (tmp_path / "ppu-control-runtime").symlink_to(Path(sys.executable).parent.parent)
     subprocess.run(
-        ["bash", "-euo", "pipefail", "-c", step["run"]],
+        [
+            "bash",
+            "-euo",
+            "pipefail",
+            "-c",
+            step['run'].replace('/opt/ppu-ci-control-venv/bin/python', sys.executable),
+        ],
         cwd=tmp_path,
         env={**os.environ, "RESULT_DIR": str(result), "RUNNER_TEMP": str(tmp_path)},
         check=True,
@@ -903,7 +942,13 @@ def test_checkpoint_omission_report_does_not_create_missing_results(tmp_path):
         (control / name).write_bytes((SCRIPTS / name).read_bytes())
     (tmp_path / "ppu-control-runtime").symlink_to(Path(sys.executable).parent.parent)
     subprocess.run(
-        ["bash", "-euo", "pipefail", "-c", step["run"]],
+        [
+            "bash",
+            "-euo",
+            "pipefail",
+            "-c",
+            step['run'].replace('/opt/ppu-ci-control-venv/bin/python', sys.executable),
+        ],
         cwd=tmp_path,
         env={**os.environ, "RESULT_DIR": str(result), "RUNNER_TEMP": str(tmp_path)},
         check=True,

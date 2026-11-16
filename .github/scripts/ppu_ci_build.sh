@@ -204,7 +204,7 @@ for dtype in (torch.float32, torch.bfloat16):
         print('TE CP zero-padding graph capture and dynamic-boundary replay checks passed:', dtype, 'noncontiguous=', noncontiguous)
 PY
 make -q -C megatron/core/datasets
-if python -c 'import json; raise SystemExit(json.load(open(".ppu-ci/manifest.json")).get("test_kind") != "functional")'; then
+if /opt/ppu-ci-control-venv/bin/python -I -B -c 'import json; raise SystemExit(json.load(open(".ppu-ci/manifest.json")).get("test_kind") != "functional")'; then
     python -I "$PPU_CONTROL_DIR/ppu_functional_environment.py" prepare --bundle "$PPU_ARTIFACT_DIR"
 fi
 python -m pip check
@@ -248,7 +248,7 @@ for module in (megatron.post_training.model_builder, megatron.rl.rl_utils):
     print('UT source import check passed:', module.__name__, module.__file__)
 PY
 mkdir -p .ppu-ci/data
-if python -c 'import json; raise SystemExit(not json.load(open(".ppu-ci/manifest.json"))["config"]["unit_test"])'; then
+if /opt/ppu-ci-control-venv/bin/python -I -B -c 'import json; raise SystemExit(not json.load(open(".ppu-ci/manifest.json"))["config"]["unit_test"])'; then
     python -m tests.test_utils.python_scripts.download_unit_tests_dataset --assets-dir "$PWD/.ppu-ci/data"
     export HF_HOME="$PWD/.ppu-ci/data/huggingface-cache"
     export HF_HUB_CACHE="$HF_HOME/hub" HF_HUB_DISABLE_TELEMETRY=1
@@ -295,4 +295,4 @@ printf '%s\n' "$PPU_CONTROL_SHA" > .ppu-ci/control.txt
 ended_at=$(date +%s)
 printf '{"started_at":%s,"completed_at":%s,"elapsed_seconds":%s}\n' \
     "$started_at" "$ended_at" "$((ended_at - started_at))" > .ppu-ci/build-timing.json
-python -I -B "$PPU_CONTROL_DIR/ppu_ci.py" seal-bundle --output "$PPU_ARTIFACT_DIR"
+/opt/ppu-ci-control-venv/bin/python -I -B "$PPU_CONTROL_DIR/ppu_ci.py" seal-bundle --output "$PPU_ARTIFACT_DIR"

@@ -690,7 +690,7 @@ def test_merge_snapshot_rechecked_after_parent_lookup(mutation):
 
 @pytest.mark.parametrize("test_kind", [None, "unit", "functional"])
 def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch, test_kind):
-    script = (ROOT / ".github/docker/install_ppu.sh").read_text()
+    script = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
     block = next(
         block for block in re.findall(r"<<'PY'\n(.*?)\nPY", script, re.S) if "native =" in block
     )
@@ -813,7 +813,7 @@ l2_norm = l2norm
     ],
 )
 def test_fla_l2norm_dependency_patch_is_restricted(tmp_path, monkeypatch, mode):
-    script = (ROOT / ".github/docker/install_ppu.sh").read_text()
+    script = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
     block = next(
         block
         for block in re.findall(r"python -I - <<'PY'\n(.*?)\nPY", script, re.S)
@@ -1274,6 +1274,11 @@ def test_ut_workflow_restores_same_run_bundle_before_execution(sealed_bundle, tm
         action["with"]["command"]
         .replace("cd /opt/megatron-lm", 'cd "$TEST_WORKSPACE"')
         .replace("${{ matrix.id }}", "dev-023")
+        .replace('/opt/ppu-ci-control-venv/bin/python', sys.executable)
+        .replace(
+            'bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" restore-source',
+            sys.executable + ' -I -B "$PPU_CONTROL_DIR/ppu_ci_container.py" restore-source',
+        )
     )
     env = {
         **os.environ,
@@ -1310,7 +1315,7 @@ def test_bundle_workflow_digest_and_run_scoping():
         for step in ut["jobs"]["test"]["steps"]
         if step.get("uses") == "actions/download-artifact@v4"
     ]
-    assert downloads == ["ppu-control-environment", "ppu-plan", "ppu-runtime-environment"]
+    assert downloads == ['ppu-plan', 'ppu-runtime-environment']
     action = next(step for step in ut["jobs"]["test"]["steps"] if step.get("id") == "ppu")
     assert (
         "PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build"
