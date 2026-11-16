@@ -27,6 +27,9 @@ on:
       control_sha:
         type: string
         required: true
+      control_digest:
+        type: string
+        required: true
       environment_digest:
         type: string
         required: true
@@ -44,10 +47,7 @@ jobs:
     runs-on: k8s-runner-group-cpu-flytiger
     environment: ppu-ci
     container:
-      image: ${{ inputs.runtime_image_digest }}
-    defaults:
-      run:
-        shell: bash
+      image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: ${{ matrix.job_minutes }}
     strategy:
       fail-fast: false
@@ -59,7 +59,15 @@ jobs:
           ref: ${{ inputs.control_sha }}
           path: control
           persist-credentials: false
-
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-control-environment
+          path: .ppu-control-export
+      - name: Verify and restore isolated public evidence exporter
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh restore-control
+          --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
+          --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - uses: actions/download-artifact@v4
         with:
           name: ppu-plan
@@ -79,7 +87,7 @@ jobs:
           --digest '${{ inputs.environment_digest }}'
           --control-sha '${{ inputs.control_sha }}' --target-sha '${{ inputs.target_sha }}'
           --image-digest '${{ inputs.runtime_image_digest }}'
-          --base-image-digest '${{ inputs.base_image_digest }}' --check-only --task-container
+          --base-image-digest '${{ inputs.base_image_digest }}' --check-only
       - name: Validate trusted runtime directories
         env:
           PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
@@ -87,11 +95,7 @@ jobs:
           PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
           PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
           PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
-        run: /opt/ppu-ci-control-venv/bin/python -I -B .ppu-ci/control/ppu_ci_paths.py functional
-      - name: Require platform kubectl before requesting PPU
-        run: |
-          [[ -x /opt/bin/kubectl ]] || { echo 'Missing platform kubectl; no PPU requested.' >&2; exit 1; }
-          /opt/bin/kubectl version --client=true
+        run: python3 -I .ppu-ci/control/ppu_ci_paths.py functional
       - name: Run unchanged upstream functional case on eight PPU cards
         id: ppu
         uses: flytiger-eco/shared-workflows/cluster-task@main
@@ -116,7 +120,7 @@ jobs:
             [[ -d "$PPU_BUNDLE_DIR" ]]
             mkdir .ppu-bundle
             cp -a "$PPU_BUNDLE_DIR/." .ppu-bundle/
-            /opt/ppu-ci-control-venv/bin/python -I -B "$PPU_CONTROL_DIR/ppu_ci.py" verify-bundle \
+            python3 -I -B "$PPU_CONTROL_DIR/ppu_ci.py" verify-bundle \
               --output "$PPU_ARTIFACT_DIR" --plan .ppu-ci --bundle-digest "$PPU_BUNDLE_DIGEST"
             [[ "$(< "$PPU_ARTIFACT_DIR/commit.txt")" == "$PPU_TARGET_SHA" ]]
             [[ "$(< "$PPU_ARTIFACT_DIR/control.txt")" == "$PPU_CONTROL_SHA" ]]
@@ -134,7 +138,7 @@ jobs:
           RESULT_DIR: .ppu-action
         run: |
           mkdir -p "$RESULT_DIR"
-          ACTION_OUTPUTS=$(/opt/ppu-ci-control-venv/bin/python -I -B .ppu-ci/control/ppu_ci_export.py --action-outputs)
+          ACTION_OUTPUTS=$("$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --action-outputs)
           printf '{"requested_at":%s,"completed_at":%s,"action_outcome":"%s","action_status":"%s","outputs":%s}\n' \
             "${REQUESTED_AT:-0}" "$(date +%s)" "$ACTION_OUTCOME" "$ACTION_STATUS" "$ACTION_OUTPUTS" > "$RESULT_DIR/action-timing.json"
       - name: Record omitted checkpoint payloads
@@ -144,7 +148,7 @@ jobs:
           RESULT_DIR: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
         run: |
           # Advisory and read-only; unreadable checkpoint payloads do not change the case gate.
-          /opt/ppu-ci-control-venv/bin/python -I -B .ppu-ci/control/ppu_ci_export.py --checkpoint-audit \
+          "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --checkpoint-audit \
             --source "$RESULT_DIR" --destination .ppu-action/checkpoint-omissions.json
       - name: Export checked public evidence
         id: public-test-152
@@ -157,7 +161,7 @@ jobs:
           PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
           EXPORT_SOURCE: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
         run: >-
-          /opt/ppu-ci-control-venv/bin/python -I -B .ppu-ci/control/ppu_ci_export.py
+          "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py
           --source "$EXPORT_SOURCE" --destination .ppu-public/test-152 --kind evidence --overlay .ppu-action
       - name: Upload every attempt, rank log, actual value and comparison report
         uses: actions/upload-artifact@v4
@@ -179,12 +183,7 @@ jobs:
     name: Functional integrity and 100% numeric gate
     needs: test
     if: ${{ always() && !cancelled() }}
-    runs-on: k8s-runner-group-cpu-flytiger
-    container:
-      image: ${{ inputs.runtime_image_digest }}
-    defaults:
-      run:
-        shell: bash
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -194,16 +193,13 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-runtime-environment
-          path: ${{ runner.temp }}/ppu-runtime-export
-      - name: Verify unified comparison container
+          name: ppu-control-environment
+          path: .ppu-control-export
+      - name: Verify and restore isolated upstream comparison environment
         run: >-
-          bash control/.github/scripts/ppu_ci_container.sh verify-image
-          --artifact "$RUNNER_TEMP/ppu-runtime-export"
-          --digest '${{ inputs.environment_digest }}'
-          --control-sha '${{ inputs.control_sha }}' --target-sha '${{ inputs.target_sha }}'
-          --image-digest '${{ inputs.runtime_image_digest }}'
-          --base-image-digest '${{ inputs.base_image_digest }}' --check-only --task-container
+          bash control/.github/scripts/ppu_ci_container.sh restore-control
+          --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
+          --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.target_sha }}
@@ -219,7 +215,7 @@ jobs:
           path: results
       - name: Independently verify all required repetitions using original comparators
         run: |
-          /opt/ppu-ci-control-venv/bin/python -I -B .ppu-ci/control/ppu_functional_results.py \
+          "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_functional_results.py \
             --manifest .ppu-ci/manifest.json --root source --results results
       - name: Require successful execution and artifact upload for every matrix job
         if: ${{ always() && !cancelled() }}
@@ -231,7 +227,7 @@ jobs:
         if: ${{ always() && !cancelled() }}
         env:
           EXPORT_SOURCE: results/summary.json
-        run: '/opt/ppu-ci-control-venv/bin/python -I -B .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/result-208 --kind evidence'
+        run: '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/result-208 --kind evidence'
       - uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-result-208.outcome == 'success' }}
         with:

@@ -31,22 +31,6 @@ spec.loader.exec_module(functional)
 REQUEST = {"test_kind": "functional", "compiler_diagnostic": True}
 
 
-@pytest.fixture
-def current_task_image(monkeypatch):
-    identity = {
-        'schema_version': 1,
-        'task_image_capability_version': 1,
-        'control_sha': context()['control_sha'],
-        'target_sha': context()['sha'],
-        'environment_digest': 'd' * 64,
-        'base_image_digest': functional.IMAGE.rsplit(':', 1)[0] + '@sha256:' + 'f' * 64,
-        'runtime_image_digest': 'ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci@sha256:'
-        + 'e' * 64,
-    }
-    monkeypatch.setattr(diagnostic, 'current_image_identity', lambda: identity)
-    return identity
-
-
 @pytest.mark.parametrize("flag", [True, "true"])
 def test_diagnostic_is_explicit_separate_route(flag):
     request = {**REQUEST, "compiler_diagnostic": flag}
@@ -154,47 +138,6 @@ def authorization_and_env():
     return authorized, env
 
 
-@pytest.mark.parametrize('damage', ['none', 'digest', 'import'])
-@pytest.mark.parametrize('previous', [False, True])
-def test_current_image_authentication_requires_baked_task_checks_and_no_bytecode(
-    tmp_path, monkeypatch, damage, previous
-):
-    monkeypatch.setattr(diagnostic, 'SCRIPT', tmp_path / 'ppu_compiler_diagnostic.py')
-    helper = tmp_path / 'ppu_ci_container.py'
-    helper.write_text(
-        'import sys\nassert sys.dont_write_bytecode\n'
-        + (
-            'raise RuntimeError("import rejected")\n'
-            if damage == 'import'
-            else 'def verify_image(args):\n'
-            '    assert args.check_only is True and args.task_container is True\n'
-            '    assert args.source_root is None\n'
-            '    assert args.control_sha == "' + 'a' * 40 + '"\n'
-            '    assert args.target_sha == "' + 'a' * 40 + '"\n'
-            '    if args.digest != "' + 'd' * 64 + '": raise ValueError("image rejected")\n'
-        )
-    )
-    record = {'environment_mode': 'unified-image'}
-    (tmp_path / 'runtime-image.json').write_text(json.dumps(record))
-    for name, value in {
-        'PPU_CURRENT_IMAGE_ARTIFACT': str(tmp_path),
-        'PPU_ENVIRONMENT_DIGEST': 'invalid' if damage == 'digest' else 'd' * 64,
-        'PPU_IMAGE_DIGEST': 'runtime@sha256:' + 'e' * 64,
-        'PPU_BASE_IMAGE_DIGEST': 'base@sha256:' + 'f' * 64,
-        'PPU_CONTROL_SHA': 'a' * 40,
-        'PPU_TARGET_SHA': 'a' * 40,
-    }.items():
-        monkeypatch.setenv(name, value)
-    monkeypatch.setattr(sys, 'dont_write_bytecode', previous)
-    if damage == 'none':
-        assert diagnostic.current_image_identity() == record
-    else:
-        with pytest.raises(RuntimeError if damage == 'import' else ValueError):
-            diagnostic.current_image_identity()
-    assert sys.dont_write_bytecode is previous
-    assert not list(tmp_path.rglob('*.pyc'))
-
-
 def test_pod_authorization_matches_current_run():
     authorized, env = authorization_and_env()
     diagnostic.verify_authorization(authorized, env)
@@ -238,14 +181,17 @@ def test_workflow_dispatch_defaults_and_job_exclusion():
         "default": False,
     }
     jobs = workflow["jobs"]
-    assert 'compiler-diagnostic' not in jobs and 'control-environment' not in jobs
-    assert jobs['execute']['with']['test_kind'] == '${{ needs.authorize.outputs.test_kind }}'
-    execution = yaml.safe_load((ROOT / '.github/workflows/ppu-execute.yml').read_text())['jobs']
-    branch = execution['compiler-diagnostic']
-    assert "test_kind == 'compiler_diagnostic'" in branch['if']
-    assert branch['needs'] == 'runtime-environment'
-    assert 'strategy' not in branch
-    assert "test_kind != 'compiler_diagnostic'" in execution['configure']['if']
+    assert "test_kind != 'compiler_diagnostic'" in jobs["execute"]["if"]
+    assert "test_kind == 'compiler_diagnostic'" in jobs["compiler-diagnostic"]["if"]
+    for guard in (
+        "workflow_dispatch",
+        functional.BRANCH,
+        "github.run_attempt == 1",
+        "outputs.allowed == 'true'",
+    ):
+        assert guard in jobs["compiler-diagnostic"]["if"]
+    assert jobs["compiler-diagnostic"]["needs"] == ["authorize", "control-environment"]
+    assert "strategy" not in jobs["compiler-diagnostic"]
     assert "pr_number != '0'" in jobs["pr-result"]["if"]
 
 
@@ -260,8 +206,7 @@ def test_fixed_single_pod_budget_and_no_build_or_test_entrypoints():
     action = [step for step in job["steps"] if step.get("uses", "").startswith("flytiger-eco/")]
     assert len(action) == 1
     config = action[0]["with"]
-    assert config['image'] == '${{ inputs.runtime_image_digest }}'
-    assert job['container']['image'] == config['image']
+    assert config["image"] == functional.IMAGE
     assert config["nnodes"] == 0 and config["nproc_per_node"] == 8
     assert config["node_selector"] == "board-type=ZW-M890P"
     assert config["timeout_minutes"] == 10 and config["cleanup_policy"] == "always"
@@ -281,20 +226,19 @@ def test_fixed_single_pod_budget_and_no_build_or_test_entrypoints():
     prepare = next(
         i
         for i, step in enumerate(steps)
-        if step.get('name') == 'Verify unified diagnostic image before requesting PPU'
+        if step.get("name") == "Verify and restore isolated public evidence exporter"
     )
     assert all(
         prepare < i
         for i, step in enumerate(steps)
         if step.get("uses") in ("actions/checkout@v4", "actions/download-artifact@v4")
-        and step.get('with', {}).get('name') != 'ppu-runtime-environment'
+        and step.get("with", {}).get("path") != ".ppu-control-export"
         and not (
             step.get("uses") == "actions/checkout@v4"
             and step["with"]["ref"] == "${{ inputs.control_sha }}"
         )
     )
-    assert "--digest '${{ inputs.environment_digest }}'" in steps[prepare]['run']
-    assert '--task-container' in steps[prepare]['run']
+    assert "--digest '${{ inputs.control_digest }}'" in steps[prepare]["run"]
 
 
 def test_cold_cache_variant_environments(tmp_path):
@@ -397,9 +341,7 @@ def test_sitecustomize_emits_all_thread_python_stack(tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["complete", "missing_rank", "timeout", "cancelled"])
-def test_orchestration_preserves_evidence_and_never_retries(
-    tmp_path, monkeypatch, mode, current_task_image
-):
+def test_orchestration_preserves_evidence_and_never_retries(tmp_path, monkeypatch, mode):
     monkeypatch.setattr(
         diagnostic.subprocess,
         "check_output",
@@ -430,9 +372,6 @@ def test_orchestration_preserves_evidence_and_never_retries(
     assert len(commands) == (1 if mode == "cancelled" else 2)
     assert (result == 0) is (mode == "complete")
     assert report["completed"] is (mode == "complete")
-    assert report['task_image'] == current_task_image
-    assert report['environment_mode'] == 'unified-image'
-    assert report['historical_environment_reproduced'] is False
     assert report["numerical_validation"] is False
     assert set(report["source_sha256"]) == {
         diagnostic.BDA,
@@ -442,7 +381,7 @@ def test_orchestration_preserves_evidence_and_never_retries(
     }
 
 
-def test_changed_source_aborts_before_gpu_process(tmp_path, monkeypatch, current_task_image):
+def test_changed_source_aborts_before_gpu_process(tmp_path, monkeypatch):
     monkeypatch.setattr(diagnostic.subprocess, "check_output", lambda *_, **__: b"changed")
     monkeypatch.setattr(
         diagnostic.subprocess, "Popen", lambda *_, **__: pytest.fail("GPU process must not start")
@@ -631,16 +570,7 @@ def test_cpu_envelope_runs_without_nas_write_permission(tmp_path, outcome, statu
             with pytest.raises(PermissionError):
                 (nas / "run").mkdir()
         result = subprocess.run(
-            [
-                "bash",
-                "--noprofile",
-                "--norc",
-                "-e",
-                "-o",
-                "pipefail",
-                "-c",
-                envelope['run'].replace('/opt/ppu-ci-control-venv/bin/python', sys.executable),
-            ],
+            ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", envelope["run"]],
             cwd=workspace,
             env=env,
             capture_output=True,

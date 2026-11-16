@@ -127,14 +127,14 @@ jobs:
           PPU_CONTROL_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.workflow_sha }}
           PPU_WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
-          python3 -I -B control/.github/scripts/ppu_pr_authorize.py authorize
+          python3 -I control/.github/scripts/ppu_pr_authorize.py authorize
           mkdir -p .ppu-ci/control
           cp control/.github/scripts/{ppu_pr_authorize.py,ppu_functional.py,ppu_ci_paths.py,ppu_ci_export.py} .ppu-ci/control/
       - name: Export checked public evidence
         id: public-authorize-140
         env:
           EXPORT_SOURCE: .ppu-ci/
-        run: python3 -I -B control/.github/scripts/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/authorize-140 --kind evidence
+        run: python3 -I control/.github/scripts/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/authorize-140 --kind evidence
       - uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-authorize-140.outcome == 'success' }}
         with:
@@ -163,7 +163,7 @@ jobs:
       - id: status
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -I -B .ppu-ci/control/ppu_pr_authorize.py status
+        run: python3 -I .ppu-ci/control/ppu_pr_authorize.py status
   invalidate-base:
     needs: authorize
     if: github.event_name == 'push' && github.ref == 'refs/heads/ci/ppu-validation'
@@ -180,11 +180,91 @@ jobs:
           path: .ppu-ci
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -I -B .ppu-ci/control/ppu_pr_authorize.py invalidate-base
-  execute:
+        run: python3 -I .ppu-ci/control/ppu_pr_authorize.py invalidate-base
+  control-environment:
     needs: [authorize, pr-pending]
     if: >-
       always() && !cancelled() && needs.authorize.result == 'success' &&
+      needs.authorize.outputs.allowed == 'true' &&
+      (needs.authorize.outputs.pr_number == '0' ||
+       (needs.pr-pending.result == 'success' && needs.pr-pending.outputs.status_result == 'published'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      control_digest: ${{ steps.control.outputs.environment_digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.control_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-authorization
+          path: .ppu-ci
+      - name: Revalidate authorization before accessing build cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I control/.github/scripts/ppu_pr_authorize.py guard
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Check CPU builder and resolve immutable control image
+        id: identity
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh fingerprint --kind control
+          --control-root control --control-sha '${{ needs.authorize.outputs.control_sha }}'
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ppu-control-cache
+          key: ppu-control-linux-amd64-${{ steps.identity.outputs.cache_key }}
+      - name: Build control environment from trusted Dockerfile
+        id: control
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh build --kind control
+          --control-root control --control-sha '${{ needs.authorize.outputs.control_sha }}'
+          --image-digest '${{ steps.identity.outputs.image_digest }}'
+          --output "$RUNNER_TEMP/ppu-control-export" --cache-root "$RUNNER_TEMP/ppu-control-cache"
+      - uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ppu-control-cache
+          key: ppu-control-linux-amd64-${{ steps.identity.outputs.cache_key }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppu-control-environment
+          path: ${{ runner.temp }}/ppu-control-export/
+          if-no-files-found: error
+          retention-days: 7
+  compiler-diagnostic:
+    needs: [authorize, control-environment]
+    if: >-
+      github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/ci/ppu-validation' &&
+      github.run_attempt == 1 && needs.authorize.outputs.allowed == 'true' &&
+      needs.authorize.outputs.test_kind == 'compiler_diagnostic'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ppu-compiler-diagnostic.yml
+    secrets:
+      PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+      PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+      PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+      PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+      PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
+      PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
+    with:
+      target_sha: ${{ needs.authorize.outputs.target_sha }}
+      control_sha: ${{ needs.authorize.outputs.control_sha }}
+      diagnostic_context: ${{ inputs.compiler_diagnostic_context || 'bda' }}
+      control_digest: ${{ needs.control-environment.outputs.control_digest }}
+  execute:
+    needs: [authorize, pr-pending, control-environment]
+    if: >-
+      always() && !cancelled() && needs.authorize.result == 'success' &&
+      needs.authorize.outputs.test_kind != 'compiler_diagnostic' &&
+      (needs.authorize.outputs.allowed != 'true' || needs.control-environment.result == 'success') &&
       (needs.authorize.outputs.pr_number == '0' ||
        (needs.pr-pending.result == 'success' && needs.pr-pending.outputs.status_result == 'published'))
     concurrency:
@@ -195,7 +275,6 @@ jobs:
       pull-requests: read
       actions: read
       packages: write
-      statuses: write
     uses: ./.github/workflows/ppu-execute.yml
     secrets:
       PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
@@ -210,8 +289,7 @@ jobs:
       control_sha: ${{ needs.authorize.outputs.control_sha }}
       manual_pr: ${{ needs.authorize.outputs.manual_pr == 'true' }}
       request_inputs: ${{ toJSON(inputs) }}
-      test_kind: ${{ needs.authorize.outputs.test_kind }}
-      pr_number: ${{ needs.authorize.outputs.pr_number }}
+      control_digest: ${{ needs.control-environment.outputs.control_digest }}
   pr-result:
     needs: [authorize, pr-pending, execute]
     if: >-
@@ -239,17 +317,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CANCELLED: ${{ steps.cancellation.outputs.cancelled == 'true' || needs.execute.result == 'cancelled' }}
           PENDING_RESULT: ${{ needs.pr-pending.result }}
-          PR_STATUS_RESULT: ${{ needs.execute.outputs.pr_status_result }}
-          EXECUTE_RESULT: ${{ needs.execute.result }}
-          STATE: failure
+          STATE: ${{ needs.pr-pending.result == 'success' && needs.execute.result == 'success' && needs.execute.outputs.execution_success == 'true' && 'success' || 'failure' }}
           DESCRIPTION: PPU ${{ needs.execute.outputs.scope }} check finished; gate ${{ needs.execute.outputs.threshold_percent }}%
         run: |
           if [[ "$CANCELLED" == true ]]; then
-            python3 -I -B .ppu-ci/control/ppu_pr_authorize.py status --state error --cancelled --description 'PPU run cancelled; revalidate'
+            python3 -I .ppu-ci/control/ppu_pr_authorize.py status --state error --cancelled --description 'PPU run cancelled; revalidate'
           elif [[ "$PENDING_RESULT" != success ]]; then
-            python3 -I -B .ppu-ci/control/ppu_pr_authorize.py status --state error --description 'PPU status initialization failed; tests not started'
-          elif [[ "$PR_STATUS_RESULT" == published && "$EXECUTE_RESULT" == success ]]; then
-            echo 'PR status already finalized in the unified image.'
+            python3 -I .ppu-ci/control/ppu_pr_authorize.py status --state error --description 'PPU status initialization failed; tests not started'
           else
-            python3 -I -B .ppu-ci/control/ppu_pr_authorize.py status --state "$STATE" --description "$DESCRIPTION"
+            python3 -I .ppu-ci/control/ppu_pr_authorize.py status --state "$STATE" --description "$DESCRIPTION"
           fi

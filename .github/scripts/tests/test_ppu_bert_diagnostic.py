@@ -18,7 +18,6 @@ from test_ppu_compiler_diagnostic import (
     REQUEST,
     authorization_and_env,
     context,
-    current_task_image,
     diagnostic,
     functional,
 )
@@ -187,18 +186,12 @@ def test_missing_historical_nas_stops_locally(tmp_path, monkeypatch):
     assert not json.loads((tmp_path / "envelope/historical-preflight.json").read_text())["ok"]
 
 
-def test_pod_verifies_copy_before_unpacking(
-    historical_bundle, tmp_path, monkeypatch, current_task_image
-):
+def test_pod_verifies_copy_before_unpacking(historical_bundle, tmp_path, monkeypatch):
     bundle, _ = historical_bundle
     work, output = tmp_path / "work", tmp_path / "output"
     work.mkdir()
     output.mkdir()
-    destination = tmp_path / 'venv'
-    (destination / 'bin').mkdir(parents=True)
-    (destination / 'bin/python').write_bytes(b'baked')
-    monkeypatch.setattr(bert, 'VENV', destination)
-    monkeypatch.setattr(bert.diagnostic, 'current_image_identity', lambda: current_task_image)
+    monkeypatch.setattr(bert, "VENV", tmp_path / "venv")
     calls = []
 
     def run(command, **kwargs):
@@ -206,15 +199,8 @@ def test_pod_verifies_copy_before_unpacking(
         calls.append(command)
 
     monkeypatch.setattr(bert.subprocess, "run", run)
-    monkeypatch.setattr(bert, 'verify_preinstalled_hook', lambda: {'sha256': 'hook'})
-    monkeypatch.setattr(
-        bert, 'install_hook', lambda *args: pytest.fail('No runtime hook installation')
-    )
-    monkeypatch.setattr(
-        bert,
-        'isolate_historical_environment',
-        lambda *args: pytest.fail('No historical environment restoration'),
-    )
+    monkeypatch.setattr(bert, "install_hook", lambda *args: {"sha256": "hook"})
+    monkeypatch.setattr(bert, "isolate_historical_environment", lambda *args: None)
 
     def execute(path, command, env):
         assert path == "/bin/bash" and command[2] == bert.SETUP_SCRIPT
@@ -225,14 +211,7 @@ def test_pod_verifies_copy_before_unpacking(
     monkeypatch.setattr(bert.os, "execve", execute)
     with pytest.raises(RuntimeError, match="exec boundary"):
         bert.execute(work, output)
-    assert calls == [
-        ['tar', '-xzf', str(work / 'bundle/source.tar.gz'), '-C', str(work / 'source')]
-    ]
-    assert (destination / 'bin/python').read_bytes() == b'baked'
-    stages = [json.loads(line) for line in (output / 'stages.jsonl').read_text().splitlines()]
-    current = next(row for row in stages if row['stage'] == 'unified_environment_verified')
-    assert current['task_image'] == current_task_image
-    assert current['historical_environment_reproduced'] is False
+    assert len(calls) == 2 and all(command[0] == "tar" for command in calls)
     assert (output / "bundle-integrity.json").read_bytes() == (
         bundle / "bundle-integrity.json"
     ).read_bytes()
@@ -258,20 +237,13 @@ def test_corruption_during_copy_prevents_extraction(historical_bundle, tmp_path,
 
 
 @pytest.fixture
-def hooked_venv(tmp_path, monkeypatch):
+def hooked_venv(tmp_path):
     destination = tmp_path / "venv"
     venv.EnvBuilder(with_pip=False).create(destination)
     python = destination / "bin/python"
     hook = SCRIPTS / "ppu_diagnostic_sitecustomize.py"
-    site = next((destination / 'lib').glob('python*/site-packages'))
-    (site / 'ppu_bert_stack_hook.py').write_bytes(hook.read_bytes())
-    (site / 'ppu_bert_stack_hook.pth').write_text(
-        'import os; os.environ.get("PPU_DIAGNOSTIC_STACK_DIR") and __import__("ppu_bert_stack_hook")\n'
-    )
-    assert (
-        hashlib.sha256((site / 'ppu_bert_stack_hook.py').read_bytes()).hexdigest()
-        == hashlib.sha256(hook.read_bytes()).hexdigest()
-    )
+    report = bert.install_hook(python, destination, hook)
+    assert report["sha256"] == hashlib.sha256(hook.read_bytes()).hexdigest()
     return destination, python
 
 
@@ -295,52 +267,6 @@ def test_real_venv_hook_covers_isolated_and_forked_children(hooked_venv, tmp_pat
     assert len(logs) == (1 if mode == "isolated" else 2)
     assert any("Current thread" in path.read_text() for path in logs)
     assert all(path.with_suffix(".ready").is_file() for path in logs)
-
-
-@pytest.mark.parametrize(
-    'damage',
-    ['none', 'module', 'pth', 'missing-module', 'missing-pth', 'linked-module', 'linked-site'],
-)
-def test_preinstalled_hook_identity_is_checked_without_writing(tmp_path, monkeypatch, damage):
-    destination = tmp_path / 'venv'
-    site = destination / 'lib/python3.12/site-packages'
-    site.mkdir(parents=True)
-    hook = SCRIPTS / 'ppu_diagnostic_sitecustomize.py'
-    module = site / bert.HOOK_MODULE
-    module = module.with_suffix('.py')
-    module.write_bytes(hook.read_bytes())
-    pth = site / bert.HOOK_PTH
-    pth.write_text(
-        'import os; os.environ.get("PPU_DIAGNOSTIC_STACK_DIR") and __import__("ppu_bert_stack_hook")\n'
-    )
-    monkeypatch.setattr(bert, 'VENV', destination)
-    if damage == 'module':
-        module.write_bytes(b'changed')
-    elif damage == 'pth':
-        pth.write_text('import ppu_bert_stack_hook\n')
-    elif damage == 'missing-module':
-        module.unlink()
-    elif damage == 'missing-pth':
-        pth.unlink()
-    elif damage == 'linked-module':
-        module.unlink()
-        module.symlink_to(hook)
-    elif damage == 'linked-site':
-        original = site.with_name('original-site')
-        site.rename(original)
-        site.symlink_to(original, target_is_directory=True)
-    before = {str(path): path.read_bytes() for path in destination.rglob('*') if path.is_file()}
-    if damage == 'none':
-        assert (
-            bert.verify_preinstalled_hook()['sha256']
-            == hashlib.sha256(hook.read_bytes()).hexdigest()
-        )
-    else:
-        with pytest.raises(ValueError, match='build-time diagnostic hook'):
-            bert.verify_preinstalled_hook()
-    assert {
-        str(path): path.read_bytes() for path in destination.rglob('*') if path.is_file()
-    } == before
 
 
 def test_hook_is_inert_without_diagnostic_environment(hooked_venv, tmp_path):
@@ -406,9 +332,8 @@ def test_train_uses_original_model_and_shell_exactly_once(
 
 
 @pytest.mark.parametrize("mode", ["success", "failure", "timeout", "cancel", "exception"])
-def test_single_orchestration_never_retries(tmp_path, monkeypatch, mode, current_task_image):
+def test_single_orchestration_never_retries(tmp_path, monkeypatch, mode):
     authorized, _ = authorize_bert(monkeypatch)
-    monkeypatch.setattr(bert.diagnostic, 'current_image_identity', lambda: current_task_image)
     monkeypatch.setattr(
         bert.subprocess,
         "check_output",
@@ -418,7 +343,7 @@ def test_single_orchestration_never_retries(tmp_path, monkeypatch, mode, current
 
     def run(self, command, env, output, deadline):
         calls.append(command)
-        assert command[1:5] == ['-I', '-B', str(bert.SCRIPT), 'execute']
+        assert command[1:4] == ["-I", str(bert.SCRIPT), "execute"]
         assert 0 < deadline - time.monotonic() <= 490
         if mode == "exception":
             raise RuntimeError("controller failed")
@@ -440,9 +365,6 @@ def test_single_orchestration_never_retries(tmp_path, monkeypatch, mode, current
     assert len(calls) == 1 and report["numerical_validation"] is False
     assert report["authorization"]["control_sha"] != report["historical_sha"]
     assert report["completed"] is (mode == "success")
-    assert report['task_image'] == current_task_image
-    assert report['environment_mode'] == 'unified-image'
-    assert report['historical_environment_reproduced'] is False
 
 
 @pytest.mark.parametrize("cancelled", [False, True])
@@ -541,14 +463,10 @@ def test_dispatch_wires_bound_context_before_only_ppu_action():
     inputs = entry.get("on", entry.get(True))["workflow_dispatch"]["inputs"]
     assert inputs["compiler_diagnostic_context"]["default"] == "bda"
     assert inputs["compiler_diagnostic_context"]["options"] == ["bda", "bert"]
-    execution = yaml.safe_load((ROOT / '.github/workflows/ppu-execute.yml').read_text())
-    branch = execution['jobs']['compiler-diagnostic']
     assert (
-        'fromJSON(inputs.request_inputs).compiler_diagnostic_context'
-        in branch['with']['diagnostic_context']
+        "inputs.compiler_diagnostic_context"
+        in entry["jobs"]["compiler-diagnostic"]["with"]["diagnostic_context"]
     )
-    assert branch['needs'] == 'runtime-environment'
-    assert entry['jobs']['execute']['with']['request_inputs'] == '${{ toJSON(inputs) }}'
     workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-compiler-diagnostic.yml").read_text())
     steps = workflow["jobs"]["diagnose"]["steps"]
     preflight = next(

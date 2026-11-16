@@ -1274,11 +1274,6 @@ def test_ut_workflow_restores_same_run_bundle_before_execution(sealed_bundle, tm
         action["with"]["command"]
         .replace("cd /opt/megatron-lm", 'cd "$TEST_WORKSPACE"')
         .replace("${{ matrix.id }}", "dev-023")
-        .replace('/opt/ppu-ci-control-venv/bin/python', sys.executable)
-        .replace(
-            'bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" restore-source',
-            sys.executable + ' -I -B "$PPU_CONTROL_DIR/ppu_ci_container.py" restore-source',
-        )
     )
     env = {
         **os.environ,
@@ -1315,7 +1310,7 @@ def test_bundle_workflow_digest_and_run_scoping():
         for step in ut["jobs"]["test"]["steps"]
         if step.get("uses") == "actions/download-artifact@v4"
     ]
-    assert downloads == ['ppu-plan', 'ppu-runtime-environment']
+    assert downloads == ["ppu-control-environment", "ppu-plan", "ppu-runtime-environment"]
     action = next(step for step in ut["jobs"]["test"]["steps"] if step.get("id") == "ppu")
     assert (
         "PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build"

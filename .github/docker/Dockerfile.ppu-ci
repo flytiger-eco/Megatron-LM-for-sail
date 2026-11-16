@@ -1,5 +1,26 @@
 # syntax=docker/dockerfile:1.7
+ARG CONTROL_IMAGE=python:3.12-slim-bookworm
 ARG PPU_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+
+FROM ${CONTROL_IMAGE} AS control
+USER root
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+ENV PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
+    PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL="" PIP_FIND_LINKS="" \
+    PIP_NO_INPUT=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive
+COPY docker/control-requirements.txt /build/control-requirements.txt
+COPY docker/export_environment.py /build/export_environment.py
+# The slim base retains _tkinter but excludes its Tcl/Tk runtime dependency closure.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libtk8.6 \
+    && python -c 'import _tkinter' \
+    && python -m pip install --index-url "$PIP_INDEX_URL" --report /build/control-install.json \
+        -r /build/control-requirements.txt \
+    && python -m pip check \
+    && python /build/export_environment.py control
+FROM scratch AS control-export
+COPY --from=control /exports/ /
 
 FROM ${PPU_IMAGE} AS dependencies
 USER root
@@ -8,16 +29,12 @@ ENV PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/s
     PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL="" PIP_FIND_LINKS="" \
     PIP_NO_INPUT=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
     DEBIAN_FRONTEND=noninteractive TORCH_CPP_LOG_LEVEL=ERROR MAX_JOBS=16
-COPY docker/export_environment.py docker/control-requirements.txt /build/
+COPY docker/export_environment.py /build/export_environment.py
 COPY pyproject.toml /build/pyproject.toml
 RUN <<'PPU_DEPENDENCIES'
 set -euo pipefail
 apt-get update
-apt-get install -y --no-install-recommends bash git tar gzip coreutils curl jq file ca-certificates wget gettext-base make
-python3 -I -B -m venv --copies /opt/ppu-ci-control-venv
-/opt/ppu-ci-control-venv/bin/python -I -B -m pip install --index-url "$PIP_INDEX_URL" \
-    --report /build/control-install.json -r /build/control-requirements.txt
-/opt/ppu-ci-control-venv/bin/python -I -B -m pip check
+apt-get install -y --no-install-recommends git ca-certificates wget gettext-base make
 python3 -m pip uninstall --yes megatron-core cloud-tpu-client protobuf
 python3 /build/export_environment.py isolate
 [[ -f /build/export_environment.py && -f /build/pyproject.toml ]]
@@ -183,7 +200,6 @@ RUN --network=none test "${#TARGET_SHA}" = 40 && test "${#CONTROL_SHA}" = 40 \
     && python -m pip install --no-index --no-deps --ignore-installed \
         --report /build/source-package-install.json /build/wheels/*.whl \
     && python -m pip check \
-    && python /build/export_environment.py task-control \
     && if [[ "$EXPORT_FORMAT" == image ]]; then python /build/export_environment.py runtime-image; \
        elif [[ "$EXPORT_FORMAT" == archive ]]; then python /build/export_environment.py runtime; \
        else exit 1; fi
@@ -199,8 +215,6 @@ LABEL org.opencontainers.image.source="https://github.com/flytiger-eco/Megatron-
     org.opencontainers.image.base.name="${PPU_IMAGE}" \
     io.flytiger.ppu-ci.control="${CONTROL_SHA}"
 COPY release/docker-build.json /opt/ppu-ci-image/docker-build.json
-COPY --from=runtime /build/control/ /opt/ppu-ci-control-scripts/
-COPY --from=runtime /exports/task-image-capabilities.json /exports/control-installed-packages.json /exports/control-package-install.json /opt/ppu-ci-image/
 # The original training driver hardcodes this path; copy the digest-verified tool at build time only.
 RUN --network=none install -m 0755 /opt/ppu-ci-venv/bin/yq /usr/local/bin/yq \
     && cmp /opt/ppu-ci-venv/bin/yq /usr/local/bin/yq \

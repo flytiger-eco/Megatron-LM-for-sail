@@ -11,6 +11,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 from pathlib import Path
@@ -32,12 +33,7 @@ HOOK_PTH = "ppu_bert_stack_hook.pth"
 def load_module(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
-    previous = sys.dont_write_bytecode
-    try:
-        sys.dont_write_bytecode = True
-        spec.loader.exec_module(module)
-    finally:
-        sys.dont_write_bytecode = previous
+    spec.loader.exec_module(module)
     return module
 
 
@@ -185,26 +181,7 @@ def isolate_historical_environment(venv: Path, base: Path) -> None:
     )
 
 
-def verify_preinstalled_hook() -> dict:
-    """Verify the build-time hook; never write to the unified training venv."""
-    site = VENV / "lib/python3.12/site-packages"
-    hook = SCRIPT.with_name("ppu_diagnostic_sitecustomize.py").read_bytes()
-    destination = site / f"{HOOK_MODULE}.py"
-    expected = 'import os; os.environ.get("PPU_DIAGNOSTIC_STACK_DIR") and __import__("ppu_bert_stack_hook")\n'
-    if (
-        any(path.is_symlink() for path in (VENV, VENV / 'lib', site.parent, site))
-        or not destination.is_file()
-        or destination.is_symlink()
-        or destination.read_bytes() != hook
-        or not (site / HOOK_PTH).is_file()
-        or (site / HOOK_PTH).is_symlink()
-        or (site / HOOK_PTH).read_text() != expected
-    ):
-        raise ValueError("Missing or corrupted build-time diagnostic hook")
-    return {"module": str(destination), "sha256": hashlib.sha256(hook).hexdigest()}
-
-
-# Use current unified software with historical source; no install, Build or retry.
+# Check the restored historical environment; no install, uninstall, Build or retry.
 SETUP_SCRIPT = r'''
 set -euo pipefail
 root="$1"; bundle="$2"; output="$3"; script="$4"
@@ -218,7 +195,8 @@ export PIP_NO_INPUT=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 unset WORLD_SIZE RANK LOCAL_RANK
 python -m pip check
 make -q -C megatron/core/datasets
-exec python -I -B "$script" train --work "$root" --bundle "$bundle" --output "$output"
+python -I "$bundle/control/ppu_functional_environment.py" check --bundle "$bundle" --output "$output"
+exec python -I "$script" train --work "$root" --bundle "$bundle" --output "$output"
 '''
 
 
@@ -237,20 +215,15 @@ def execute(work: Path, output: Path) -> None:
     stage(output, "bundle_copy_verified", historical_identity=manifest["identity"])
     root = work / "source"
     root.mkdir()
-    identity = diagnostic.current_image_identity()
-    if not (VENV / "bin/python").is_file() or VENV.is_symlink():
-        raise ValueError("Missing unified diagnostic training venv")
-    hook = verify_preinstalled_hook()
+    if VENV.exists() or VENV.is_symlink():
+        raise ValueError("Refusing to overwrite an existing diagnostic venv")
     subprocess.run(["tar", "-xzf", str(bundle / "source.tar.gz"), "-C", str(root)], check=True)
-    stage(
-        output,
-        "unified_environment_verified",
-        hook=hook,
-        environment_mode="unified-image",
-        task_image=identity,
-        historical_identity=manifest["identity"],
-        historical_environment_reproduced=False,
+    subprocess.run(["tar", "-xzf", str(bundle / "environment.tar.gz"), "-C", "/opt"], check=True)
+    isolate_historical_environment(VENV, Path(sysconfig.get_path("purelib")))
+    hook = install_hook(
+        VENV / "bin/python", VENV, SCRIPT.with_name("ppu_diagnostic_sitecustomize.py")
     )
+    stage(output, "environment_restored", hook=hook)
     env = {**os.environ, "PPU_DIAGNOSTIC_STACK_DIR": str(output / "stacks")}
     os.execve(
         "/bin/bash",
@@ -335,11 +308,6 @@ def run_diagnostic(root: Path, output: Path, authorization: dict) -> int:
     runner = diagnostic.DiagnosticRunner()
     handlers = {sig: signal.signal(sig, runner.cancel) for sig in (signal.SIGTERM, signal.SIGINT)}
     try:
-        report.update(
-            environment_mode="unified-image",
-            task_image=diagnostic.current_image_identity(),
-            historical_environment_reproduced=False,
-        )
         for name in (
             SCRIPT.name,
             "ppu_compiler_diagnostic.py",
@@ -367,7 +335,6 @@ def run_diagnostic(root: Path, output: Path, authorization: dict) -> int:
             command = [
                 sys.executable,
                 "-I",
-                "-B",
                 str(SCRIPT),
                 "execute",
                 "--work",

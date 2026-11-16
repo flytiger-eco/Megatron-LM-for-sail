@@ -805,8 +805,6 @@ def bundle_inventory(directory: Path) -> dict:
         )
         if image_schema:
             record = json.loads((directory / "runtime-image.json").read_text())
-            if manifest.get("task_image") != record:
-                raise ValueError("Plan and bundle unified image identity mismatch")
             image = (directory / "image.txt").read_text().strip()
             environment.verify_image(
                 SimpleNamespace(

@@ -195,48 +195,24 @@ def isolate():
     Path('/build/base-packages.json').write_text(json.dumps(packages, sort_keys=True))
 
 
-def task_control():
-    """Export evidence only; the isolated control venv stays in the task image."""
+def control():
     verify_reports(['/build/control-install.json'])
-    EXPORT.mkdir(exist_ok=True)
-    interpreter = '/opt/ppu-ci-control-venv/bin/python'
-    result = subprocess.run(
-        [
-            interpreter,
-            '-I',
-            '-B',
-            '-c',
-            'import importlib.metadata as md, json; '
-            'print(json.dumps(sorted([{"name": d.metadata["Name"], "version": d.version} '
-            'for d in md.distributions()], key=lambda d: d["name"].lower()), sort_keys=True))',
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    (EXPORT / 'control-installed-packages.json').write_text(result.stdout)
+    root = Path('/build/control-runtime')
+    copy('/usr/local', root)
+    lib = root / 'lib/ppu-system'
+    libraries([root / 'bin/python3.12', *root.rglob('*.so'), *root.rglob('*.so.*')], lib)
+    launcher = root / 'bin/python'
+    if launcher.exists():
+        launcher.unlink()
+    launcher.write_text('''#!/bin/bash
+set -euo pipefail
+prefix="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+export LD_LIBRARY_PATH="$prefix/lib/ppu-system:$prefix/lib"
+exec "$prefix/lib/ppu-system/ld-linux-x86-64.so.2" --library-path "$LD_LIBRARY_PATH" "$prefix/bin/python3.12" "$@"
+''')
+    launcher.chmod(0o755)
+    archive(root, 'control-runtime.tar.gz', list(root.iterdir()))
     copy('/build/control-install.json', EXPORT / 'control-package-install.json')
-    (EXPORT / 'task-image-capabilities.json').write_text(
-        json.dumps(
-            {
-                'schema_version': 1,
-                'capability_version': 1,
-                'training_venv': str(VENV),
-                'control_venv': '/opt/ppu-ci-control-venv',
-                'control_system_site_packages': False,
-                'runtime_installation': False,
-                'diagnostic_hook': 'opt-in',
-                'kubectl': 'platform-mount-required',
-            },
-            sort_keys=True,
-        )
-        + '\n'
-    )
-    site = VENV / 'lib/python3.12/site-packages'
-    copy('/build/control/ppu_diagnostic_sitecustomize.py', site / 'ppu_bert_stack_hook.py')
-    (site / 'ppu_bert_stack_hook.pth').write_text(
-        'import os; os.environ.get("PPU_DIAGNOSTIC_STACK_DIR") and __import__("ppu_bert_stack_hook")\n'
-    )
 
 
 def runtime(*, image=False):
@@ -309,7 +285,7 @@ def runtime(*, image=False):
 if __name__ == '__main__':
     {
         'isolate': isolate,
-        'task-control': task_control,
+        'control': control,
         'runtime': runtime,
         'runtime-image': lambda: runtime(image=True),
     }[sys.argv[1]]()

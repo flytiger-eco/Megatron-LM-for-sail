@@ -87,25 +87,6 @@ def runtime_export(root, *, schema=1):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b'{}')
-    if schema == 2:
-        (root / 'task-image-capabilities.json').write_text(json.dumps(container.TASK_CAPABILITIES))
-        (root / 'control-installed-packages.json').write_text(
-            json.dumps(
-                [
-                    {'name': name, 'version': '1'}
-                    for name in (
-                        'click',
-                        'numpy',
-                        'pyyaml',
-                        'pydantic',
-                        'pytest',
-                        'tensorboard',
-                        'google-crc32c',
-                    )
-                ]
-            )
-        )
-        (root / 'control-package-install.json').write_text('{}')
     return seal(root, schema=schema)
 
 
@@ -121,11 +102,6 @@ def seal(root, *, schema=1):
         inputs_sha256='d' * 64,
         files=container.inventory(root, exclude=('docker-build.json', 'runtime-image.json')),
     )
-    if schema == 2:
-        metadata['task_image_capability_version'] = 1
-        metadata['control_files'] = {
-            'ppu_ci_container.py': container.digest(SCRIPTS / 'ppu_ci_container.py')
-        }
     (root / 'docker-build.json').write_text(json.dumps(metadata))
     return container.digest(root / 'docker-build.json')
 
@@ -612,15 +588,6 @@ def test_build_source_archiver_uses_trusted_helper_and_environment_identity():
     assert '--exclude' not in pack
 
 
-def inline_dependency_script():
-    dockerfile = (ROOT / '.github/docker/Dockerfile.ppu-ci').read_text()
-    blocks = re.findall(
-        r"^RUN <<'PPU_DEPENDENCIES'\n(.*?)\nPPU_DEPENDENCIES$", dockerfile, re.M | re.S
-    )
-    assert len(blocks) == 1
-    return blocks[0] + '\n'
-
-
 def test_dependency_installation_is_inline_with_valid_shell_and_python():
     docker = ROOT / '.github/docker'
     assert set(container.DOCKER_FILES) == {
@@ -634,101 +601,21 @@ def test_dependency_installation_is_inline_with_valid_shell_and_python():
     assert dockerfile.startswith('# syntax=docker/dockerfile:1.7\n')
     dependencies = dockerfile.split('AS dependencies\n', 1)[1].split('FROM dependencies', 1)[0]
     assert 'SHELL ["/bin/bash", "-euo", "pipefail", "-c"]' in dependencies
-    assert (
-        'COPY docker/export_environment.py docker/control-requirements.txt /build/' in dependencies
-    )
+    assert 'COPY docker/export_environment.py /build/export_environment.py' in dependencies
     assert 'COPY pyproject.toml /build/pyproject.toml' in dependencies
-    script = inline_dependency_script()
+    blocks = re.findall(
+        r"^RUN <<'PPU_DEPENDENCIES'\n(.*?)\nPPU_DEPENDENCIES$", dockerfile, re.M | re.S
+    )
+    assert len(blocks) == 1
+    script = blocks[0] + '\n'
     result = subprocess.run(
         ['bash', '-n'], input=script, text=True, capture_output=True, timeout=10
     )
     assert result.returncode == 0, result.stderr
-    blocks = re.findall(r"python (?:-I )?- <<'PY'\n(.*?)\nPY", script, re.S)
-    assert len(blocks) == 3
-    for block in blocks:
+    python_blocks = re.findall(r"python (?:-I )?- <<'PY'\n(.*?)\nPY", script, re.S)
+    assert len(python_blocks) == 3
+    for block in python_blocks:
         compile(block, 'inline-dependencies', 'exec')
-
-
-@pytest.mark.parametrize('failure', [None, *range(1, 15)])
-def test_inline_installation_preserves_order_environment_and_fail_fast(tmp_path, failure):
-    script = inline_dependency_script()
-    build, start, venv = tmp_path / 'build', tmp_path / 'start', tmp_path / 'venv'
-    build.mkdir()
-    start.mkdir()
-    (build / 'export_environment.py').touch()
-    (build / 'pyproject.toml').touch()
-    script = (
-        script.replace('/build/', f'{build}/')
-        .replace('cd /build\n', f'cd "{build}"\n')
-        .replace('/opt/ppu-ci-venv', str(venv))
-        .replace('/opt/ppu-ci-control-venv/bin/python', 'control_python')
-        .replace('/opt/ppu-ci-control-venv', str(tmp_path / 'control-venv'))
-    )
-    setup = '''calls=0
-mock_command() {
-    calls=$((calls + 1))
-    printf '%s|%s|%s|%s|%s|%s\\n' "$1" "$PWD" "${VIRTUAL_ENV:-}" "${PATH%%:*}" "${PIP_CONSTRAINT:-}" "$*" >> "$CALL_LOG"
-    if [[ "$calls" == "$FAIL_AT" ]]; then return 17; fi
-}
-apt-get() { mock_command apt-get "$@"; }
-python3() { mock_command python3 "$@"; }
-control_python() { mock_command control_python "$@"; }
-python() { mock_command python "$@"; }
-'''
-    environment = dict(os.environ)
-    environment.update(
-        CALL_LOG=str(tmp_path / 'calls'),
-        FAIL_AT=str(failure or 0),
-        PIP_INDEX_URL='https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple',
-        VIRTUAL_ENV='',
-        PIP_CONSTRAINT='',
-    )
-    result = subprocess.run(
-        ['bash', '-euo', 'pipefail', '-c', setup + script],
-        cwd=start,
-        env=environment,
-        text=True,
-        capture_output=True,
-        timeout=10,
-    )
-    assert result.returncode == (17 if failure else 0), result.stderr
-    rows = [line.split('|', 5) for line in (tmp_path / 'calls').read_text().splitlines()]
-    assert len(rows) == (failure or 14)
-    expected = [
-        'apt-get update',
-        'apt-get install -y --no-install-recommends bash git tar gzip coreutils curl jq file ca-certificates wget gettext-base make',
-        f'python3 -I -B -m venv --copies {tmp_path}/control-venv',
-        'control_python -I -B -m pip install',
-        'control_python -I -B -m pip check',
-        'python3 -m pip uninstall --yes megatron-core cloud-tpu-client protobuf',
-        f'python3 {build}/export_environment.py isolate',
-        'python -',
-        'python -m pip install',
-        'python -m pip install',
-        'python -m pip install',
-        'python -I -',
-        'python -m pip check',
-        'python -',
-    ]
-    for index, row in enumerate(rows):
-        name, cwd, virtual_env, first_path, constraint, command = row
-        assert command.startswith(expected[index])
-        assert name == expected[index].split()[0]
-        assert cwd == str(start if index < 7 else build)
-        if index >= 7:
-            assert virtual_env == str(venv) and first_path == str(venv / 'bin')
-        assert constraint == (str(build / 'constraints.txt') if index >= 8 else '')
-    if not failure:
-        for row, report in zip(
-            rows[8:11],
-            (
-                'packaging-install.json',
-                'build-tools-install.json',
-                'functional-package-install.json',
-            ),
-        ):
-            assert f'--report {build}/{report}' in row[-1]
-            assert f'--index-url {environment["PIP_INDEX_URL"]}' in row[-1]
 
 
 @pytest.fixture
@@ -930,16 +817,7 @@ def test_materialized_source_handles_actual_git_tracked_checkout_aliases(tmp_pat
     names = subprocess.run(
         ['git', '-C', str(ROOT), 'ls-files', '-z'], check=True, capture_output=True, text=True
     ).stdout.split('\0')
-    deleted = set(
-        subprocess.run(
-            ['git', '-C', str(ROOT), 'ls-files', '--deleted', '-z'],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.split('\0')
-    )
-    # Model the live tracked checkout without staging intentional file removals.
-    names = [name for name in names if name and name not in deleted]
+    names = [name for name in names if name]
     aliases = [name for name in names if (ROOT / name).is_symlink()]
     assert {
         '.agents/skills',
@@ -1004,8 +882,8 @@ def test_probe_export_is_readable_without_changing_private_evidence(tmp_path):
 
 def assert_build_arguments(argv, args):
     expected = [
-        f'PPU_IMAGE={args.image_digest}',
-        f'TARGET_SHA={args.target_sha}',
+        f'{"PPU_IMAGE" if args.kind == "runtime" else "CONTROL_IMAGE"}={args.image_digest}',
+        f'TARGET_SHA={args.target_sha or ""}',
         f'CONTROL_SHA={args.control_sha}',
     ]
     if getattr(args, 'mode', '') == 'build-image':
@@ -1089,6 +967,7 @@ def test_image_handoff_checks_all_identities_without_restoring_software(
         (root / 'constraints.txt').write_text('corrupt')
     elif damage == 'legacy':
         args.digest = seal(root)
+        write_image_record(root, args.digest)
     elif damage == 'archive':
         archive(root / 'compiled-source.tar.gz', [('evil.py', b'exec', tarfile.REGTYPE)])
         args.digest = seal(root, schema=2)
@@ -1294,12 +1173,10 @@ def test_baked_image_checks_metadata_before_overlay_and_never_restores_venv(
         return original_no_links(mapping.get(str(path), path))
 
     monkeypatch.setattr(container, 'no_links', no_links)
-    control_checks = []
     monkeypatch.setattr(
-        container, 'verify_control_environment', lambda *args: control_checks.append(args)
-    )
-    monkeypatch.setattr(
-        container, 'command', lambda *a, **k: pytest.fail('Activation must never install software')
+        container,
+        'command',
+        lambda *a, **k: pytest.fail('Activation must never install or run software'),
     )
     if damage == 'embedded':
         baked.write_text('corrupt')
@@ -1319,7 +1196,6 @@ def test_baked_image_checks_metadata_before_overlay_and_never_restores_venv(
         assert next(args.source_root.rglob('*.so')).read_bytes() == b'extension'
         assert (venv / 'bin/python').read_bytes() == b'baked interpreter'
         assert len(list(venv.rglob('*'))) == 2
-        assert len(control_checks) == 1
     else:
         with pytest.raises(container.ValidationError):
             container.verify_image(args)
@@ -1372,7 +1248,6 @@ def test_schema_two_bundle_is_sealed_without_environment_archive(image_exported,
         json.dumps(
             {
                 'environment_build_schema': 1 if damage == 'legacy' else 2,
-                'task_image': json.loads((root / 'runtime-image.json').read_text()),
                 'identity': {'control_sha': CONTROL, 'target_sha': TARGET},
             }
         )
@@ -1415,9 +1290,6 @@ def subprocess_bundle(tmp_path):
     root = tmp_path / 'bundle'
     trusted = runtime_export(root, schema=2)
     write_image_record(root, trusted)
-    manifest = json.loads((plan / 'manifest.json').read_text())
-    manifest['task_image'] = json.loads((root / 'runtime-image.json').read_text())
-    (plan / 'manifest.json').write_text(json.dumps(manifest))
     shutil.copytree(control, root / 'control')
     shutil.copyfile(plan / 'manifest.json', root / 'manifest.json')
     archive(root / 'source.tar.gz', [('source.py', b'VALUE = 1\n', tarfile.REGTYPE)])
@@ -1526,10 +1398,7 @@ def test_bundle_entrypoints_disable_bytecode_without_weakening_integrity():
             for step in job.get('steps', [])
         ]
         verify = next(command for command in commands if 'verify-bundle' in command)
-        assert (
-            '/opt/ppu-ci-control-venv/bin/python -I -B "$PPU_CONTROL_DIR/ppu_ci.py" verify-bundle'
-            in verify
-        )
+        assert 'python3 -I -B "$PPU_CONTROL_DIR/ppu_ci.py" verify-bundle' in verify
         assert '--bundle-digest "$PPU_BUNDLE_DIGEST"' in verify
     execute = (ROOT / '.github/workflows/ppu-execute.yml').read_text()
     assert 'diff -r .ppu-ci/control "$PPU_BUNDLE_DIR/control"' in execute
@@ -1646,17 +1515,15 @@ def test_cpu_jobs_declare_required_unprivileged_job_container(filename):
     ]
     assert cpu_jobs
     for job in cpu_jobs:
-        identity = (
-            'needs.runtime-environment.outputs.runtime_image_digest'
-            if filename == 'ppu-execute'
-            else 'inputs.runtime_image_digest'
-        )
-        assert job.get('container') == {'image': '${{ ' + identity + ' }}'}
-        assert job['defaults']['run']['shell'] == 'bash'
+        assert job.get('container') == {'image': 'ghcr.io/actions/actions-runner:latest'}
 
 
 @pytest.mark.parametrize(
-    'filename,job_name,kind', [('ppu-execute', 'runtime-environment', 'runtime')]
+    'filename,job_name,kind',
+    [
+        ('ppu-build', 'control-environment', 'control'),
+        ('ppu-execute', 'runtime-environment', 'runtime'),
+    ],
 )
 def test_docker_build_jobs_use_ubuntu_runner_after_authorization(filename, job_name, kind):
     workflow = yaml.safe_load((ROOT / f'.github/workflows/{filename}.yml').read_text())
@@ -1717,16 +1584,12 @@ def test_docker_build_jobs_use_ubuntu_runner_after_authorization(filename, job_n
 def test_runtime_handoff_preserves_flytiger_orchestration_and_trusted_job_outputs():
     jobs = yaml.safe_load((ROOT / '.github/workflows/ppu-execute.yml').read_text())['jobs']
     producer, consumer = jobs['runtime-environment'], jobs['build']
-    assert not producer.get('needs')
-    assert jobs['configure']['needs'] == 'runtime-environment'
-    assert 'inputs.allowed' in producer['if']
+    assert producer['needs'] == ['configure', 'admit-build']
     assert producer['environment'] == consumer['environment'] == 'ppu-ci'
     assert consumer['needs'] == ['configure', 'admit-build', 'runtime-environment']
     assert "needs.runtime-environment.result == 'success'" in consumer['if']
     assert consumer['runs-on'] == 'k8s-runner-group-cpu-flytiger'
-    assert consumer['container'] == {
-        'image': '${{ needs.runtime-environment.outputs.runtime_image_digest }}'
-    }
+    assert consumer['container'] == {'image': 'ghcr.io/actions/actions-runner:latest'}
     upload = next(
         step for step in producer['steps'] if step.get('uses') == 'actions/upload-artifact@v4'
     )
@@ -1794,9 +1657,7 @@ def test_runtime_handoff_shell_checks_before_copying_or_restoring(
     assert verify < ppu
     assert not steps[verify].get('continue-on-error', False)
     script = steps[verify]['run']
-    assert '--check-only' in script and '--task-container' in script
-    # This shell test authenticates the artifact; baked CPU execution is tested separately.
-    script = script.replace(' --task-container', '')
+    assert '--check-only' in script
     action = steps[ppu]['with']
     for field, variable in (
         ('environment_digest', 'PPU_ENVIRONMENT_DIGEST'),
@@ -1849,10 +1710,7 @@ def test_runtime_handoff_shell_checks_before_copying_or_restoring(
     control = tmp_path / 'control/.github/scripts'
     control.mkdir(parents=True)
     for name in ('ppu_ci_container.py', 'ppu_ci_container.sh'):
-        text = (SCRIPTS / name).read_text()
-        if name.endswith('.sh'):
-            text = text.replace('/opt/ppu-ci-control-venv/bin/python', sys.executable)
-        (control / name).write_text(text)
+        shutil.copyfile(SCRIPTS / name, control / name)
     (tmp_path / 'source').mkdir()
     destination = tmp_path / '.ppu-ci'
     destination.mkdir()
@@ -1898,16 +1756,16 @@ def test_runtime_helpers_never_install_or_compile(filename):
     assert 'urllib.request' not in text
 
 
-def test_control_venv_is_built_in_the_only_vendor_based_task_image():
+def test_control_dockerfile_completes_slim_tkinter_runtime():
     dockerfile = (ROOT / '.github/docker/Dockerfile.ppu-ci').read_text()
-    assert 'CONTROL_IMAGE' not in dockerfile and 'slim' not in dockerfile
-    assert 'control-export' not in dockerfile
+    control = dockerfile.split('FROM ${CONTROL_IMAGE} AS control', 1)[1].split(
+        'FROM scratch AS control-export', 1
+    )[0]
+    install = control.index('apt-get install -y --no-install-recommends libtk8.6')
+    probe = control.index("python -c 'import _tkinter'")
+    export = control.index('python /build/export_environment.py control')
+    assert install < probe < export
     assert 'FROM ${PPU_IMAGE} AS dependencies' in dockerfile
-    install = dockerfile.index('python3 -I -B -m venv --copies /opt/ppu-ci-control-venv')
-    check = dockerfile.index('/opt/ppu-ci-control-venv/bin/python -I -B -m pip check')
-    export = dockerfile.index('export_environment.py task-control')
-    assert install < check < export
-    assert 'COPY --from=runtime /build/control/ /opt/ppu-ci-control-scripts/' in dockerfile
 
 
 def test_restored_control_probes_tkinter_without_installing_dependencies(tmp_path, monkeypatch):
@@ -2310,7 +2168,7 @@ def test_builder_failures_identify_stage_without_raw_output(tmp_path, monkeypatc
             monkeypatch.setattr(container, 'checked_git', lambda *args: None)
             monkeypatch.setattr(container, 'preflight', lambda *args: None)
             container.build_identity(
-                SimpleNamespace(control_root=tmp_path, control_sha=CONTROL, kind='runtime')
+                SimpleNamespace(control_root=tmp_path, control_sha=CONTROL, kind='control')
             )
     assert str(error.value) == expected
 
@@ -2409,7 +2267,7 @@ def test_diagnostic_command_launch_failure_keeps_os_details_private(monkeypatch)
     assert error.value.__suppress_context__
 
 
-@pytest.mark.parametrize('kind', ['runtime'])
+@pytest.mark.parametrize('kind', ['control', 'runtime'])
 @pytest.mark.parametrize(
     'stage', ['dependency/cache build', 'environment export build', 'fresh-base offline probe']
 )
@@ -2418,6 +2276,9 @@ def test_build_stage_failures_stop_before_publishing_environment_digest(
 ):
     args = build_inputs
     args.kind = kind
+    if kind == 'control':
+        args.target_sha = None
+        args.image_digest = container.CONTROL_IMAGE.rsplit(':', 1)[0] + '@sha256:' + 'c' * 64
     output = tmp_path / 'github-output'
     monkeypatch.setenv('GITHUB_OUTPUT', str(output))
     calls = []
@@ -2436,7 +2297,15 @@ def test_build_stage_failures_stop_before_publishing_environment_digest(
         assert argv[:3] == ['docker', 'buildx', 'build']
         assert argv[argv.index('--progress') + 1] == 'plain'
         if '--output' in argv:
-            runtime_export(args.output)
+            if kind == 'runtime':
+                runtime_export(args.output)
+            else:
+                args.output.mkdir()
+                archive(
+                    args.output / 'control-runtime.tar.gz',
+                    [('bin/python', b'python', tarfile.REGTYPE)],
+                )
+                (args.output / 'control-package-install.json').write_text('{}')
         return ''
 
     monkeypatch.setattr(container, 'command', command)
@@ -2492,249 +2361,6 @@ def test_new_bundle_inventory_validates_environment_metadata(exported, damage):
         with pytest.raises(ValueError):
             ci.seal_bundle(root)
         assert not (root / 'bundle-integrity.json').exists()
-
-
-@pytest.mark.parametrize(
-    'damage',
-    [
-        'version',
-        'boolean',
-        'missing-controls',
-        'control-path',
-        'control-digest',
-        'capability',
-        'system-site',
-        'runtime-install',
-        'hook',
-        'missing-report',
-        'torch',
-        'triton',
-        'megatron-core',
-        'transformer-engine',
-        'duplicate-package',
-        'missing-package',
-        'control-archive',
-    ],
-)
-def test_unified_image_rejects_resealed_unsafe_capabilities(image_exported, damage):
-    root, _ = image_exported
-    metadata = json.loads((root / 'docker-build.json').read_text())
-    capabilities = json.loads((root / 'task-image-capabilities.json').read_text())
-    packages = json.loads((root / 'control-installed-packages.json').read_text())
-    if damage in ('version', 'boolean'):
-        metadata['task_image_capability_version'] = True if damage == 'boolean' else 2
-    elif damage == 'missing-controls':
-        metadata.pop('control_files')
-    elif damage == 'control-path':
-        metadata['control_files'] = {'../untrusted.py': 'a' * 64}
-    elif damage == 'control-digest':
-        metadata['control_files'] = {'ppu_ci.py': 'bad'}
-    elif damage in ('capability', 'system-site', 'runtime-install', 'hook'):
-        key, value = {
-            'capability': ('capability_version', 2),
-            'system-site': ('control_system_site_packages', True),
-            'runtime-install': ('runtime_installation', True),
-            'hook': ('diagnostic_hook', 'always'),
-        }[damage]
-        capabilities[key] = value
-        (root / 'task-image-capabilities.json').write_text(json.dumps(capabilities))
-    elif damage == 'missing-report':
-        (root / 'control-package-install.json').unlink()
-    elif damage == 'control-archive':
-        (root / 'control-runtime.tar.gz').write_bytes(b'legacy software')
-    else:
-        if damage == 'missing-package':
-            packages.pop()
-        else:
-            packages.append(
-                packages[0] if damage == 'duplicate-package' else {'name': damage, 'version': '1'}
-            )
-        (root / 'control-installed-packages.json').write_text(json.dumps(packages))
-    metadata['files'] = container.inventory(
-        root, exclude=('docker-build.json', 'runtime-image.json')
-    )
-    (root / 'docker-build.json').write_text(json.dumps(metadata))
-    trusted = container.digest(root / 'docker-build.json')
-    with pytest.raises(container.ValidationError):
-        container.verify_export(root, trusted, CONTROL, TARGET, schema=2)
-
-
-@pytest.mark.parametrize(
-    'damage', ['none', 'embedded', 'evidence', 'script', 'cold-start', 'tool', 'certificates']
-)
-def test_unified_control_executes_isolated_checks_before_task_handoff(
-    image_exported, tmp_path, monkeypatch, damage
-):
-    root, trusted = image_exported
-    args = image_args(root, trusted, tmp_path)
-    args.task_container = True
-    control = tmp_path / 'baked-control'
-    control.mkdir()
-    (control / 'ppu_ci_container.py').write_bytes((SCRIPTS / 'ppu_ci_container.py').read_bytes())
-    certificates = tmp_path / 'certificates.pem'
-    certificates.write_bytes(b'fixture certificates')
-    original = container.no_links
-
-    def no_links(path):
-        value = str(path)
-        if value.startswith('/opt/ppu-ci-image/'):
-            path = root / Path(value).name
-        elif value == '/opt/ppu-ci-control-scripts':
-            path = control
-        elif value == '/etc/ssl/certs/ca-certificates.crt':
-            path = certificates
-        return original(path)
-
-    calls = []
-
-    def execute(argv, **kwargs):
-        calls.append(argv)
-        assert kwargs['diagnostics'] is True
-        assert not any(value in argv for value in ('install', 'uninstall', 'curl -L'))
-        if damage == 'cold-start' and '-c' in argv:
-            raise container.ValidationError('Cold start rejected')
-        return ''
-
-    monkeypatch.setattr(container, 'no_links', no_links)
-    monkeypatch.setattr(container, 'command', execute)
-    monkeypatch.setattr(
-        container.shutil, 'which', lambda name: None if damage == 'tool' else '/usr/bin/' + name
-    )
-    if damage == 'embedded':
-        args.digest = 'f' * 64
-    elif damage == 'evidence':
-        (root / 'control-installed-packages.json').write_text('[]')
-    elif damage == 'script':
-        (control / 'ppu_ci_container.py').write_text('raise RuntimeError("untrusted")')
-    elif damage == 'certificates':
-        certificates.unlink()
-    if damage == 'none':
-        container.verify_image(args)
-        assert calls[0] == ['/opt/ppu-ci-control-venv/bin/python', '-I', '-B', '-m', 'pip', 'check']
-        cold_start = calls[1][4]
-        compile(cold_start, '<control-cold-start>', 'exec')
-        for guard in (
-            'sys.flags.isolated',
-            'sys.dont_write_bytecode',
-            'include-system-site-packages = false',
-            'is_relative_to(sys.prefix)',
-            'expected == actual',
-            'torch',
-            'transformer_engine',
-            'Event.FromString',
-        ):
-            assert guard in cold_start
-        assert all(
-            name in cold_start
-            for name in (
-                'ppu_ci',
-                'ppu_functional_results',
-                'ppu_pr_authorize',
-                'ppu_compiler_diagnostic',
-            )
-        )
-        assert all(
-            ['/usr/bin/' + tool, '--version'] in calls
-            for tool in (
-                'bash',
-                'git',
-                'tar',
-                'gzip',
-                'curl',
-                'jq',
-                'file',
-                'envsubst',
-                'sha256sum',
-                'timeout',
-            )
-        )
-        assert 'ssl.create_default_context' in calls[-1][4]
-    else:
-        with pytest.raises(container.ValidationError):
-            container.verify_image(args)
-    assert not args.source_root.exists()
-
-
-def test_unsupported_control_build_stops_before_git_or_docker(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        container, 'checked_git', lambda *args: pytest.fail('No Git on a rejected route')
-    )
-    monkeypatch.setattr(
-        container, 'preflight', lambda *args: pytest.fail('No Docker on a rejected route')
-    )
-    with pytest.raises(container.ValidationError, match='Only unified runtime'):
-        container.build_identity(SimpleNamespace(kind='control', control_root=tmp_path))
-
-
-def test_unified_workflow_graph_and_all_consumers_use_one_producer():
-    parent = yaml.safe_load((ROOT / '.github/workflows/ppu-build.yml').read_text())
-    assert 'control-environment' not in parent['jobs']
-    for filename in (
-        'ppu-build',
-        'ppu-execute',
-        'ppu-ut',
-        'ppu-functional',
-        'ppu-compiler-diagnostic',
-    ):
-        workflow = yaml.safe_load((ROOT / f'.github/workflows/{filename}.yml').read_text())
-        jobs = workflow['jobs']
-        visited, active = set(), set()
-
-        def visit(name):
-            assert name not in active, 'Cyclic task workflow'
-            if name in visited:
-                return
-            active.add(name)
-            needs = jobs[name].get('needs', [])
-            for dependency in [needs] if isinstance(needs, str) else needs:
-                assert dependency in jobs
-                visit(dependency)
-            active.remove(name)
-            visited.add(name)
-
-        for name, job in jobs.items():
-            visit(name)
-            if job.get('container'):
-                assert 'runtime_image_digest' in job['container']['image']
-                assert job['defaults']['run']['shell'] == 'bash'
-            for step in job.get('steps', []):
-                assert step.get('with', {}).get('name') != 'ppu-control-environment'
-                assert 'restore-control' not in step.get('run', '')
-                if 'cluster-task' in step.get('uses', ''):
-                    assert job['container']['image'] == step['with']['image']
-                    assert 'runtime_image_digest' in step['with']['image']
-        text = json.dumps(workflow)
-        assert 'actions-runner:latest' not in text and 'python:3.12-slim' not in text
-
-
-@pytest.mark.parametrize('damage', ['none', 'control', 'target', 'base', 'digest', 'image'])
-def test_plan_binds_current_image_and_rejects_different_source(image_exported, tmp_path, damage):
-    root, trusted = image_exported
-    plan = tmp_path / 'plan'
-    plan.mkdir()
-    (plan / 'manifest.json').write_text(
-        json.dumps({'identity': {'control_sha': CONTROL, 'target_sha': TARGET}})
-    )
-    args = image_args(root, trusted, tmp_path)
-    args.artifact = plan
-    if damage in ('control', 'target'):
-        setattr(args, damage + '_sha', 'f' * 40)
-    elif damage == 'base':
-        args.base_image_digest = PUBLISHED
-    elif damage == 'digest':
-        args.digest = 'invalid'
-    elif damage == 'image':
-        args.image_digest = PINNED
-    before = (plan / 'manifest.json').read_bytes()
-    if damage == 'none':
-        container.mark_plan(args)
-        manifest = json.loads((plan / 'manifest.json').read_text())
-        assert manifest['environment_build_schema'] == 2
-        assert manifest['task_image'] == json.loads((root / 'runtime-image.json').read_text())
-    else:
-        with pytest.raises(container.ValidationError):
-            container.mark_plan(args)
-        assert (plan / 'manifest.json').read_bytes() == before
 
 
 def test_untracked_control_helpers_do_not_enter_build_inputs(build_inputs):
