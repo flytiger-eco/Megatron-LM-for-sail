@@ -464,7 +464,7 @@ def fingerprint(args):
 
 
 def materialize_tracked_source(source, destination, names):
-    """仅将仓库内指向已跟踪普通文件的单层别名实体化到空构建目录。"""
+    """Materialize tracked files and single-level internal aliases into an empty build directory."""
     source, destination = no_links(source), no_links(destination)
     require(
         destination.is_dir() and not any(destination.iterdir()),
@@ -977,7 +977,7 @@ def portable_checks(source, *, execution_image=False):
         ['/opt/ppu-ci-venv/bin/make', '-q', '-C', str(source / 'megatron/core/datasets')],
     ]
     if execution_image:
-        # 检查原训练驱动的绝对路径，不能只验证 PATH 中的 venv 工具。
+        # Verify the original training driver's absolute path, not just the venv tool in PATH.
         checks.extend(
             [
                 ['/usr/local/bin/yq', '--version'],

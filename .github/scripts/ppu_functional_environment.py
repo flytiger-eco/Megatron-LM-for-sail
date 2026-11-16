@@ -301,7 +301,7 @@ def prepare(bundle: Path, manifest: dict):
         ):
             raise ValueError("Restored functional tool does not match the Dockerfile export")
     if manifest["environment_build_schema"] == 2:
-        # 只验证构建期副本，不在 PPU 运行期修补或安装工具。
+        # Verify the build-time copy; never patch or install tools during PPU execution.
         upstream_yq = Path("/usr/local/bin") / "yq"
         if (
             upstream_yq.is_symlink()
