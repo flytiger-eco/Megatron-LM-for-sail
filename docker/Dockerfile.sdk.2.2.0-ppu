@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# Build from the repository root with docker build -f docker/Dockerfile.ppu .
+# Build from the repository root with docker build -f docker/Dockerfile.sdk.2.2.0-ppu .
 ARG PPU_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch@sha256:cfecb7a38dd83afc6a302f72ad05423863bb892e0ab7b1cc6173ca3b871a133c
 FROM ${PPU_IMAGE} AS dependencies
 USER root
