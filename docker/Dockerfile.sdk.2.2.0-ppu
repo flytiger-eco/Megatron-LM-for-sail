@@ -1,4 +1,6 @@
 # syntax=docker/dockerfile:1.7
+# Self-contained PPU training image: entry scripts live in /opt/megatron-lm and
+# Megatron is installed from a wheel built out of the same checkout.
 # Build from the repository root with docker build -f docker/Dockerfile.sdk.2.2.0-ppu .
 ARG PPU_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch@sha256:cfecb7a38dd83afc6a302f72ad05423863bb892e0ab7b1cc6173ca3b871a133c
 FROM ${PPU_IMAGE} AS dependencies
@@ -152,10 +154,62 @@ RUN --network=none --mount=type=bind,source=.,target=/src,rw \
     python3 -m pip wheel --no-build-isolation --no-deps --wheel-dir /wheels /src
 
 FROM dependencies AS runtime
-RUN --network=none --mount=from=wheel,source=/wheels,target=/wheels \
-    python3 -m pip install --no-index --no-deps /wheels/*.whl \
-    && python3 -m pip check \
-    && python3 -I -c 'import torch, triton; from megatron.core.datasets import helpers_cpp'
+COPY pretrain_gpt.py pretrain_hybrid.py pretrain_mamba.py pretrain_vlm.py \
+    gpt_builders.py hybrid_builders.py mamba_builders.py model_provider.py \
+    /opt/megatron-lm/
+RUN --network=none --mount=from=wheel,source=/wheels,target=/wheels <<'PPU_RUNTIME'
+python3 -m pip install --no-index --no-deps /wheels/*.whl
+python3 -m pip check
+
+# The wheel ships a prebuilt helpers_cpp extension but not the datasets Makefile,
+# so only fall back to building it when the extension is missing.
+python3 -I - <<'PY'
+import importlib.metadata as md
+import sysconfig
+from pathlib import Path
+
+site = Path(sysconfig.get_path('purelib')).resolve()
+
+def patch(package, relative_path, original, replacement):
+    path = Path(md.distribution(package).locate_file(relative_path)).resolve()
+    if not path.is_relative_to(site):
+        raise RuntimeError(f'Patch target is outside the Python installation: {path}')
+    source = path.read_text()
+    if source.count(original) != 1:
+        raise RuntimeError(f'Unexpected content in PPU patch target: {path}')
+    patched = source.replace(original, replacement)
+    compile(patched, str(path), 'exec')
+    path.write_text(patched)
+
+patch(
+    'megatron-core', 'megatron/core/datasets/utils.py',
+    '''def compile_helpers():
+    """Compile C++ helper functions at runtime. Make sure this is invoked on a single process."""
+    import os
+    import subprocess
+
+    command = ["make", "-C", os.path.abspath(os.path.dirname(__file__))]''',
+    '''def compile_helpers():
+    """Compile C++ helper functions at runtime. Make sure this is invoked on a single process."""
+    import os
+    import subprocess
+
+    try:
+        from . import helpers_cpp  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        return
+
+    command = ["make", "-C", os.path.abspath(os.path.dirname(__file__))]''',
+)
+PY
+
+python3 -I -c 'import torch; from megatron.core.datasets.utils import compile_helpers; compile_helpers(); from megatron.core.datasets import helpers_cpp'
+cd /opt/megatron-lm
+python3 -c 'import gpt_builders, hybrid_builders, mamba_builders, model_provider'
+python3 pretrain_gpt.py --help > /dev/null
+PPU_RUNTIME
 WORKDIR /opt/megatron-lm
 ENTRYPOINT []
 CMD ["/bin/bash"]
