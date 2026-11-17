@@ -1,0 +1,58 @@
+name: Copilot upstream sync (main and dev)
+
+on:
+  push:
+    branches: ['ci/copilot-upstream-main-dev']
+    paths:
+      - '.github/workflows/copilot-upstream-sync.yml'
+      - '.github/workflows/copilot-upstream-sync-worker.yml'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Branch to synchronize
+        type: choice
+        options: [all, main, dev]
+        default: all
+      publish:
+        description: Publish results (only permitted when dispatched from main)
+        type: boolean
+        default: false
+  schedule:
+    # 16:00 UTC = 00:00 Asia/Shanghai. Active after merging into main.
+    - cron: '0 16 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: copilot-upstream-sync-main-dev
+  cancel-in-progress: false
+
+jobs:
+  main:
+    if: github.repository == 'flytiger-eco/Megatron-LM-for-sail' && (github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == 'main')
+    uses: ./.github/workflows/copilot-upstream-sync-worker.yml
+    permissions:
+      contents: write
+      pull-requests: write
+      copilot-requests: write
+    with:
+      sync_branch: main
+      upstream_branch: main
+      tracking_issue: '17'
+      publish: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish)) }}
+    secrets:
+      SYNC_PR_TOKEN: ${{ secrets.SYNC_PR_TOKEN }}
+
+  dev:
+    if: github.repository == 'flytiger-eco/Megatron-LM-for-sail' && (github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == 'dev')
+    uses: ./.github/workflows/copilot-upstream-sync-worker.yml
+    permissions:
+      contents: write
+      pull-requests: write
+      copilot-requests: write
+    with:
+      sync_branch: dev
+      upstream_branch: dev
+      tracking_issue: '17'
+      publish: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish)) }}

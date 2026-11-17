@@ -1,0 +1,341 @@
+name: Copilot upstream sync worker
+
+on:
+  workflow_call:
+    inputs:
+      sync_branch:
+        type: string
+        required: true
+      upstream_branch:
+        type: string
+        required: true
+      tracking_issue:
+        type: string
+        required: true
+      publish:
+        type: boolean
+        default: false
+    secrets:
+      SYNC_PR_TOKEN:
+        description: Optional repo-scoped Contents and Pull requests write token for main PR events
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  SYNC_BRANCH: ${{ inputs.sync_branch }}
+  UPSTREAM_REPOSITORY: NVIDIA/Megatron-LM
+  UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+  TRACKING_ISSUE: ${{ inputs.tracking_issue }}
+
+jobs:
+  merge:
+    if: github.repository == 'flytiger-eco/Megatron-LM-for-sail'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      copilot-requests: write
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SYNC_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare a merge on the corresponding target branch
+        id: merge
+        run: |
+          set -euo pipefail
+          [[ "$SYNC_BRANCH:$UPSTREAM_BRANCH" == 'main:main' || "$SYNC_BRANCH:$UPSTREAM_BRANCH" == 'dev:dev' ]] || exit 1
+          [[ "$(git branch --show-current)" == "$SYNC_BRANCH" ]] || exit 1
+          [[ -z "$(git status --porcelain)" ]] || exit 1
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git config merge.conflictStyle diff3
+          # The Copilot job has neither push credentials nor contents-write permission.
+          git remote set-url --push origin DISABLED
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream \
+            "refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          BASE_SHA=$(git rev-parse HEAD)
+          UPSTREAM_SHA=$(git rev-parse "upstream/$UPSTREAM_BRANCH")
+          printf 'base_sha=%s\nupstream_sha=%s\n' "$BASE_SHA" "$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" "$BASE_SHA"; then
+            printf 'changed=false\n' >> "$GITHUB_OUTPUT"
+            printf '社区 `%s:%s` 已包含在 `%s` 中，无需合并。\n' \
+              "$UPSTREAM_REPOSITORY" "$UPSTREAM_BRANCH" "$SYNC_BRANCH" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          printf 'changed=true\n' >> "$GITHUB_OUTPUT"
+          merge_status=0
+          git merge --no-ff --no-commit "$UPSTREAM_SHA" || merge_status=$?
+          git diff --name-only --diff-filter=U -z > "$RUNNER_TEMP/sync-conflicts"
+          if [[ "$merge_status" -ne 0 ]] && \
+             { [[ "$merge_status" -ne 1 ]] || [[ ! -s "$RUNNER_TEMP/sync-conflicts" ]]; }; then
+            echo '::error::Merge failed for a reason other than resolvable conflicts.'
+            exit "$merge_status"
+          fi
+          [[ "$(git rev-parse MERGE_HEAD)" == "$UPSTREAM_SHA" ]] || exit 1
+          # Preserve the entire target branch workflow subtree in the candidate index.
+          # Disposable runner files are not committed or executed by publishing.
+          git restore --source="$BASE_SHA" --staged -- .github/workflows
+          git diff --cached --quiet "$BASE_SHA" -- .github/workflows || {
+            echo '::error::Protected workflow files differ from our branch.'
+            exit 1
+          }
+          git diff --name-only --diff-filter=U -z > "$RUNNER_TEMP/sync-conflicts"
+          git ls-files --stage -z > "$RUNNER_TEMP/sync-index"
+
+      - uses: actions/setup-node@v7
+        if: steps.merge.outputs.changed == 'true'
+        with:
+          node-version: '24'
+
+      - name: Install Copilot CLI
+        if: steps.merge.outputs.changed == 'true'
+        run: npm install -g @github/copilot
+
+      - name: Resolve conflict hunks and review PPU adaptation with Copilot
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ steps.merge.outputs.base_sha }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          PROMPT=$(cat <<EOF
+          将社区 ${UPSTREAM_REPOSITORY}:${UPSTREAM_BRANCH} merge 到我方 ${SYNC_BRANCH}。
+          git merge --no-ff --no-commit 已由工作流执行。当前 HEAD（ours/local_branch）
+          为 ${BASE_SHA}，MERGE_HEAD（theirs/baseline_branch）为 ${UPSTREAM_SHA}。
+          你只负责逐 hunk 解决已有冲突，并审阅 PPU 适配的完整性。
+
+          冲突原则（优先于仓库中的其他同步规则）：
+          1. 纯上游内容取上游侧 theirs，即 baseline_branch。
+          2. 我方 PPU 适配完整保留 ours，即 local_branch 一侧。
+          3. 混合内容以上游新结构为骨架，重新嵌入我方 PPU 适配意图；
+             保住功能意图而非字面文本，检查调用方和被调用方 API 是否一致。
+          必须查看冲突的 base/ours/theirs 与相关提交历史，不能只按文件名或
+          关键字判断归属。禁止全局 -X ours/theirs，禁止整文件批量覆盖，
+          不采用 skills/nightly-sync 的上游整文件覆盖清单。
+
+          使用 git status、git diff、git ls-files -u、git show :1:path、
+          git show :2:path、git show :3:path 和 git log 读取证据。
+          只修改仍有冲突的路径；没有冲突时仅审阅，不改动任何文件。
+          整个 .github/workflows/ 已在索引中恢复目标分支的我方版本，禁止修改该目录。
+          工作树中残留的上游 workflow 不属于合并候选，忽略它们。
+          用 git diff --cached 审阅候选内容，不要把残留文件暂存或提交。
+          不手工编辑 uv.lock；无法可靠处理的冲突应保留并报告。
+          不运行 git add/commit/merge/rebase/reset/checkout/push，不修改任何
+          Git 引用或配置，不创建 PR，不调用远程写 API，不读取或输出凭据。
+          无法可靠解决时明确报告并保留冲突标记，后续检查会阻止发布。
+          输出中文摘要：同步范围、逐个冲突 hunk 的归属和处理依据、PPU
+          功能保留及 API 适配情况、未验证事项。不要声称完成了 PPU 硬件测试。
+          EOF
+          )
+          timeout 30m copilot -p "$PROMPT" -s \
+            --no-ask-user --no-custom-instructions --disable-builtin-mcps \
+            --disallow-temp-dir --secret-env-vars=GITHUB_TOKEN,GH_TOKEN \
+            --allow-tool='write' \
+            --allow-tool='shell(git status:*)' \
+            --allow-tool='shell(git diff:*)' \
+            --allow-tool='shell(git show:*)' \
+            --allow-tool='shell(git log:*)' \
+            --allow-tool='shell(git ls-files:*)' \
+            | tee "$RUNNER_TEMP/copilot-sync-summary.md"
+          cat "$RUNNER_TEMP/copilot-sync-summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate resolution and create a two-parent merge candidate
+        id: validate
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          BASE_SHA: ${{ steps.merge.outputs.base_sha }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SYNC_BRANCH:$UPSTREAM_BRANCH" == 'main:main' || "$SYNC_BRANCH:$UPSTREAM_BRANCH" == 'dev:dev' ]] || exit 1
+          [[ "$(git branch --show-current)" == "$SYNC_BRANCH" ]] || exit 1
+          [[ "$(git rev-parse HEAD)" == "$BASE_SHA" ]] || exit 1
+          [[ "$(git rev-parse MERGE_HEAD)" == "$UPSTREAM_SHA" ]] || exit 1
+          python3 -I - <<'PY'
+          import os
+          import subprocess
+          from pathlib import Path
+
+          def paths(*args):
+              return set(subprocess.check_output(["git", *args]).split(b"\0")) - {b""}
+
+          conflicts = set((Path(os.environ["RUNNER_TEMP"]) / "sync-conflicts").read_bytes().split(b"\0")) - {b""}
+          scope = ["--", ".", ":(exclude).github/workflows"]
+          modified = paths("diff", "--name-only", "-z", *scope) | paths("ls-files", "--others", "--exclude-standard", "-z", *scope)
+          if not modified <= conflicts:
+              raise SystemExit(f"Copilot modified non-conflict paths: {modified - conflicts!r}")
+
+          def non_conflict_entries(raw):
+              return {entry for entry in raw.split(b"\0") if entry and entry.split(b"\t", 1)[1] not in conflicts}
+
+          original_index = (Path(os.environ["RUNNER_TEMP"]) / "sync-index").read_bytes()
+          current_index = subprocess.check_output(["git", "ls-files", "--stage", "-z"])
+          if non_conflict_entries(original_index) != non_conflict_entries(current_index):
+              raise SystemExit("Copilot changed non-conflict index entries")
+          PY
+          while IFS= read -r -d '' conflict; do
+            git add --all -- "$conflict"
+          done < "$RUNNER_TEMP/sync-conflicts"
+          [[ -z "$(git ls-files -u)" ]] || exit 1
+          # Preserve upstream whitespace verbatim, but reject leftover conflict markers.
+          git -c core.whitespace=-trailing-space,-space-before-tab diff --cached --check
+          git diff --cached --quiet "$BASE_SHA" -- .github/workflows || {
+            echo '::error::Protected workflow files differ from our branch.'
+            exit 1
+          }
+          python3 -I - <<'PY'
+          import ast
+          import subprocess
+          from pathlib import Path
+
+          names = subprocess.check_output([
+              "git", "diff", "--cached", "--name-only", "--diff-filter=ACMRT", "-z"
+          ]).split(b"\0")
+          for name in names:
+              if name.endswith(b".py"):
+                  path = Path(name.decode("utf-8"))
+                  if not path.is_symlink():
+                      ast.parse(path.read_bytes(), filename=str(path))
+          PY
+          git commit --signoff -m "Merge ${UPSTREAM_REPOSITORY}:${UPSTREAM_BRANCH} into ${SYNC_BRANCH}"
+          [[ "$(git rev-parse HEAD^1)" == "$BASE_SHA" ]] || exit 1
+          [[ "$(git rev-parse HEAD^2)" == "$UPSTREAM_SHA" ]] || exit 1
+          mkdir -p "$RUNNER_TEMP/sync-candidate"
+          git bundle create "$RUNNER_TEMP/sync-candidate/candidate.bundle" \
+            "refs/heads/$SYNC_BRANCH" "^$BASE_SHA"
+          CANDIDATE_SHA=$(git rev-parse HEAD)
+          jq -n --arg target "$SYNC_BRANCH" --arg source "$UPSTREAM_BRANCH" \
+            --arg base "$BASE_SHA" --arg upstream "$UPSTREAM_SHA" --arg candidate "$CANDIDATE_SHA" \
+            '{target: $target, source: $source, base: $base, upstream: $upstream, candidate: $candidate}' \
+            > "$RUNNER_TEMP/sync-candidate/metadata.json"
+          printf '\n候选已通过范围、索引、冲突标记、Python 语法及双亲检查；未执行 PPU 硬件测试。\n' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.merge.outputs.changed == 'true'
+        with:
+          name: copilot-sync-candidate-${{ inputs.sync_branch }}
+          path: ${{ runner.temp }}/sync-candidate/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Report dry-run mode
+        if: steps.merge.outputs.changed == 'true' && !inputs.publish
+        run: |
+          printf '\n本次为 dry-run：只上传 `%s` 的候选，不推送分支、不创建同步 PR。\n' \
+            "$SYNC_BRANCH" >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: merge
+    if: needs.merge.outputs.changed == 'true' && inputs.publish && github.ref == 'refs/heads/main' && github.repository == 'flytiger-eco/Megatron-LM-for-sail'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SYNC_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: copilot-sync-candidate-${{ inputs.sync_branch }}
+          path: ${{ runner.temp }}/sync-candidate
+
+      - name: Publish dev or open a main PR without force push
+        id: publish
+        shell: bash
+        env:
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          GITHUB_TOKEN: ${{ github.token }}
+          # This secret is never available to the Copilot job; dev ignores it.
+          GH_TOKEN: ${{ inputs.sync_branch == 'main' && secrets.SYNC_PR_TOKEN || github.token }}
+          CUSTOM_PR_TOKEN_CONFIGURED: ${{ secrets.SYNC_PR_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          [[ "$PUBLISH_REQUESTED" == 'true' && "$GITHUB_REF" == 'refs/heads/main' ]] || exit 1
+          [[ "$SYNC_BRANCH:$UPSTREAM_BRANCH" == 'main:main' || "$SYNC_BRANCH:$UPSTREAM_BRANCH" == 'dev:dev' ]] || exit 1
+          [[ "$(git branch --show-current)" == "$SYNC_BRANCH" ]] || exit 1
+          [[ "$(git remote get-url origin)" == 'https://github.com/flytiger-eco/Megatron-LM-for-sail' || \
+             "$(git remote get-url origin)" == 'https://github.com/flytiger-eco/Megatron-LM-for-sail.git' ]] || exit 1
+          [[ "$GITHUB_REPOSITORY" == 'flytiger-eco/Megatron-LM-for-sail' ]] || exit 1
+          [[ "$TRACKING_ISSUE" =~ ^[1-9][0-9]*$ ]] || exit 1
+          metadata="$RUNNER_TEMP/sync-candidate/metadata.json"
+          [[ "$(jq -er .target "$metadata")" == "$SYNC_BRANCH" ]] || exit 1
+          [[ "$(jq -er .source "$metadata")" == "$UPSTREAM_BRANCH" ]] || exit 1
+          BASE_SHA=$(jq -er '.base | select(test("^[0-9a-f]{40}$"))' "$metadata")
+          UPSTREAM_SHA=$(jq -er '.upstream | select(test("^[0-9a-f]{40}$"))' "$metadata")
+          CANDIDATE_SHA=$(jq -er '.candidate | select(test("^[0-9a-f]{40}$"))' "$metadata")
+          git fetch --no-tags origin "refs/heads/$SYNC_BRANCH:refs/remotes/origin/$SYNC_BRANCH"
+          [[ "$(git rev-parse "origin/$SYNC_BRANCH")" == "$BASE_SHA" ]] || {
+            echo '::error::Target branch changed during the merge; aborting without overwriting it.'
+            exit 1
+          }
+          git fetch "$RUNNER_TEMP/sync-candidate/candidate.bundle" \
+            "refs/heads/$SYNC_BRANCH:refs/remotes/candidate/sync"
+          [[ "$(git rev-parse refs/remotes/candidate/sync)" == "$CANDIDATE_SHA" ]] || exit 1
+          read -r -a parents <<< "$(git rev-list --parents -n 1 "$CANDIDATE_SHA")"
+          [[ ${#parents[@]} -eq 3 && "${parents[1]}" == "$BASE_SHA" && "${parents[2]}" == "$UPSTREAM_SHA" ]] || exit 1
+          git diff --quiet "$BASE_SHA" "$CANDIDATE_SHA" -- .github/workflows || {
+            echo '::error::Candidate changed protected workflow files; publishing is forbidden.'
+            exit 1
+          }
+          # Never execute any scripts from the candidate in this contents-write job.
+          if [[ "$SYNC_BRANCH" == 'dev' ]]; then
+            git -c credential.helper= \
+              -c 'credential.helper=!f() { printf "username=x-access-token\npassword=%s\n" "$GITHUB_TOKEN"; }; f' \
+              push origin "$CANDIDATE_SHA:refs/heads/dev"
+            printf '社区 `dev` 已 merge 并发布到本仓库 `dev`：`%s`。保留我方 workflow 目录。\n' \
+              "$CANDIDATE_SHA" >> "$GITHUB_STEP_SUMMARY"
+          else
+            PR_BRANCH="sync/upstream-main/$UPSTREAM_SHA"
+            EXISTING_PR=$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --head "$PR_BRANCH" \
+              --state open --json url --jq '.[0].url // empty')
+            if [[ -n "$EXISTING_PR" ]]; then
+              printf '社区 main 的此版本已有待人工合并 PR：%s；未覆盖其分支。\n' \
+                "$EXISTING_PR" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            git -c credential.helper= \
+              -c 'credential.helper=!f() { printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f' \
+              push origin "$CANDIDATE_SHA:refs/heads/$PR_BRANCH"
+            BODY=$(cat <<EOF
+          Refs #${TRACKING_ISSUE}
+
+          ## 同步范围
+          - 社区 ${UPSTREAM_REPOSITORY}:${UPSTREAM_BRANCH} → 本仓库 main。
+          - 本仓库基线：${BASE_SHA}
+          - 社区版本：${UPSTREAM_SHA}
+          - 双亲 merge 候选：${CANDIDATE_SHA}
+          - 整个 .github/workflows/ 保留我方版本。
+
+          ## 验证及合并方式
+          已检查改动范围、索引、冲突标记、Python 语法及 merge 双亲。
+          未执行 PPU 硬件测试；静态检查不能替代功能验证。
+          详细冲突处理依据见本次 Actions 的 Copilot 中文摘要。
+          本 PR 为 draft，由人工检查、审批和合并；不启用自动合并。
+          EOF
+            )
+            PR_URL=$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$PR_BRANCH" \
+              --draft --title "sync: merge upstream main (${UPSTREAM_SHA:0:12})" --body "$BODY")
+            printf '已创建 main 同步 PR，等待人工处理：%s。main 未直接作为 push 目标。\n' \
+              "$PR_URL" >> "$GITHUB_STEP_SUMMARY"
+            if [[ "$CUSTOM_PR_TOKEN_CONFIGURED" != 'true' ]]; then
+              echo '::warning::The built-in token does not trigger other GitHub Actions on PR creation. Manually trigger checks or configure optional SYNC_PR_TOKEN.'
+            fi
+          fi
