@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+from test_ppu_ci_container import PUBLISHED, container, runtime_export, write_image_record
 from test_ppu_quick import (
     BASE_SHA,
     BRANCH,
@@ -1133,27 +1134,41 @@ def test_diagnostic_runner_selects_only_requested_group(tmp_path, monkeypatch, c
     ]
 
 
+def refresh_environment_evidence(bundle):
+    metadata = json.loads((bundle / "docker-build.json").read_text())
+    metadata.update(schema_version=2, control_sha=CONTROL_SHA, target_sha=SHA)
+    metadata["files"] = {
+        name: {"size": (bundle / name).stat().st_size, "sha256": container.digest(bundle / name)}
+        for name in metadata["files"]
+    }
+    (bundle / "docker-build.json").write_text(json.dumps(metadata))
+    write_image_record(bundle, container.digest(bundle / "docker-build.json"))
+
+
 @pytest.fixture
 def sealed_bundle(tmp_path):
     plan = tmp_path / "plan"
     control = plan / "control"
     control.mkdir(parents=True)
-    (plan / "manifest.json").write_text(json.dumps({"identity": IDENTITY}))
+    (plan / "manifest.json").write_text(
+        json.dumps({"identity": IDENTITY, "environment_build_schema": 2})
+    )
     shutil.copyfile(ROOT / ".github/scripts/ppu_ci.py", control / "ppu_ci.py")
     for name in ("ppu_ci_container.py", "ppu_ci_container.sh"):
         shutil.copyfile(ROOT / ".github/scripts" / name, control / name)
     (control / "ppu_ci_run.sh").write_text('printf "UT_STARTED:%s\\n" "$1"\n')
     (control / "ppu_pytest_policy.py").write_text("POLICY = True\n")
     bundle = tmp_path / "nas" / "run-1" / "build"
-    shutil.copytree(plan, bundle)
+    runtime_export(bundle)
+    shutil.copytree(plan, bundle, dirs_exist_ok=True)
     payload = tmp_path / "source.py"
     payload.write_text("VALUE = 1\n")
     with tarfile.open(bundle / "source.tar.gz", "w:gz") as archive:
         archive.add(payload, arcname="source.py")
-    (bundle / "environment.tar.gz").write_bytes(b"environment archive")
+    refresh_environment_evidence(bundle)
     (bundle / "commit.txt").write_text(SHA + "\n")
     (bundle / "control.txt").write_text(CONTROL_SHA + "\n")
-    (bundle / "image.txt").write_text("fixed-image\n")
+    (bundle / "image.txt").write_text(PUBLISHED + "\n")
     (bundle / "build-timing.json").write_text('{"elapsed_seconds":1}')
     (bundle / "data").mkdir()
     (bundle / "data/blob").write_bytes(b"tokenizer data")
@@ -1166,6 +1181,32 @@ def sealed_bundle(tmp_path):
 
 def bundle_digest(bundle):
     return hashlib.sha256((bundle / "bundle-integrity.json").read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("schema", ["absent", None, 1, True, "2", 2.0, 3])
+def test_training_bundle_rejects_environment_protocol_downgrade(sealed_bundle, schema):
+    plan, bundle = sealed_bundle
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    if schema == "absent":
+        manifest.pop("environment_build_schema")
+    else:
+        manifest["environment_build_schema"] = schema
+    (bundle / "manifest.json").write_text(json.dumps(manifest))
+    original = (bundle / "bundle-integrity.json").read_bytes()
+    with pytest.raises(ValueError, match="Unsupported Dockerfile environment schema"):
+        ci.seal_bundle(bundle)
+    with pytest.raises(ValueError, match="Unsupported Dockerfile environment schema"):
+        ci.verify_bundle(bundle, plan, bundle_digest(bundle))
+    assert (bundle / "bundle-integrity.json").read_bytes() == original
+
+
+def test_training_bundle_rejects_extra_software_archive_even_after_resealing(sealed_bundle):
+    _, bundle = sealed_bundle
+    (bundle / "environment.tar.gz").write_bytes(b"Old software payload")
+    original = (bundle / "bundle-integrity.json").read_bytes()
+    with pytest.raises(ValueError, match="must not contain a software environment archive"):
+        ci.seal_bundle(bundle)
+    assert (bundle / "bundle-integrity.json").read_bytes() == original
 
 
 def test_bundle_seal_and_verify_preserve_all_payloads(sealed_bundle, capsys):
@@ -1212,7 +1253,7 @@ def test_bundle_verify_rejects_partial_or_untrusted_payload(sealed_bundle, tmp_p
         }[damage]
         (bundle / name).rename(tmp_path / "missing")
     elif damage == "truncated_environment":
-        (bundle / "environment.tar.gz").write_bytes(b"part")
+        (bundle / "compiled-source.tar.gz").write_bytes(b"part")
     elif damage in ("changed_control", "sealed_control"):
         (bundle / "control/ppu_ci_run.sh").write_text("exit 0\n")
     elif damage in ("extra_control", "sealed_extra_control"):
@@ -1223,9 +1264,14 @@ def test_bundle_verify_rejects_partial_or_untrusted_payload(sealed_bundle, tmp_p
         (bundle / ".complete").write_text(CONTROL_SHA)
     elif damage in ("changed_plan", "sealed_manifest"):
         root = plan if damage == "changed_plan" else bundle
-        (root / "manifest.json").write_text(
-            json.dumps({"identity": {**IDENTITY, "target_sha": CONTROL_SHA}})
-        )
+        manifest = json.loads((root / "manifest.json").read_text())
+        manifest["identity"]["target_sha"] = CONTROL_SHA
+        (root / "manifest.json").write_text(json.dumps(manifest))
+        if damage == "sealed_manifest":
+            metadata = json.loads((bundle / "docker-build.json").read_text())
+            metadata["target_sha"] = CONTROL_SHA
+            (bundle / "docker-build.json").write_text(json.dumps(metadata))
+            write_image_record(bundle, container.digest(bundle / "docker-build.json"))
     elif damage == "external_symlink":
         (bundle / "external").symlink_to(tmp_path / "source.py")
     elif damage == "symlink_directory":
@@ -1247,7 +1293,7 @@ def test_bundle_verify_rejects_partial_or_untrusted_payload(sealed_bundle, tmp_p
         ci.verify_bundle(bundle, plan, digest)
 
 
-@pytest.mark.parametrize("name", ["source.tar.gz", "environment.tar.gz", "control/ppu_ci.py"])
+@pytest.mark.parametrize("name", ["source.tar.gz", "runtime-image.json", "control/ppu_ci.py"])
 def test_bundle_seal_rejects_empty_required_payload(sealed_bundle, name):
     _, bundle = sealed_bundle
     (bundle / name).write_bytes(b"")

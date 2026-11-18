@@ -110,7 +110,6 @@ jobs:
           if [[ "$(python3 -c 'import json,os; print(json.loads(os.environ["PPU_INPUTS"]).get("test_kind", "unit"))')" == functional ]]; then
             "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I control/.github/scripts/ppu_functional.py configure
             cp control/.github/scripts/ppu_functional*.py .ppu-ci/control/
-            cp control/.github/scripts/ppu_compiler_diagnostic.py .ppu-ci/control/
             cp control/.github/scripts/ppu_functional_run.sh .ppu-ci/control/
           else
             "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I control/.github/scripts/ppu_ci.py configure

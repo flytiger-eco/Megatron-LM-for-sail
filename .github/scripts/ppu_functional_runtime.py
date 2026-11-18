@@ -21,9 +21,62 @@ _spec = importlib.util.spec_from_file_location(
 results = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(results)
 control = results.control
-process_control = control.module_from_path(
-    "ppu_functional_process_control", Path(__file__).with_name("ppu_compiler_diagnostic.py")
-)
+
+
+def proc_text(path: Path) -> str:
+    """Read bounded /proc fields only; record permission or exit races as they are."""
+    try:
+        with path.open(errors="replace") as stream:
+            return stream.read(16384)
+    except OSError as error:
+        return f"unavailable: {error}"
+
+
+def process_family(root_pid: int, known: dict) -> dict:
+    """Track descendants across setsid; keep session ownership to reap orphaned compiler workers."""
+    table = {}
+    for path in Path("/proc").glob("[0-9]*"):
+        fields = proc_text(path / "stat").rsplit(")", 1)[-1].split()
+        try:
+            table[int(path.name)] = {
+                "ppid": int(fields[1]),
+                "pgid": int(fields[2]),
+                "sid": int(fields[3]),
+                "start": int(fields[19]),
+            }
+        except (ValueError, IndexError):
+            continue
+    sessions = {root_pid, *(row["sid"] for row in known.values())}
+    selected = {
+        pid: row
+        for pid, row in table.items()
+        if row["sid"] in sessions or (pid in known and known[pid]["start"] == row["start"])
+    }
+    while True:
+        children = {
+            pid: row
+            for pid, row in table.items()
+            if pid not in selected and row["ppid"] in selected
+        }
+        if not children:
+            break
+        selected.update(children)
+    known.update(selected)
+    return selected
+
+
+def signal_family(root_pid: int, known: dict, sig: int) -> None:
+    """Forward termination signals only to process groups of this
+    launcher and its descendant sessions.
+    """
+    groups = {root_pid, *(row["pgid"] for row in process_family(root_pid, known).values())}
+    for group in groups:
+        if group <= 1 or group == os.getpgrp():
+            raise ValueError("Refusing to signal the controller process group")
+        try:
+            os.killpg(group, sig)
+        except ProcessLookupError:
+            pass
 
 
 class ProcessRunner:
@@ -44,7 +97,7 @@ class ProcessRunner:
 
     def terminate(self):
         if self.process is not None:
-            process_control.signal_family(self.process.pid, self.known_processes, signal.SIGTERM)
+            signal_family(self.process.pid, self.known_processes, signal.SIGTERM)
 
     def run(self, command, *, cwd, env, log, deadline):
         remaining = deadline - time.monotonic()
@@ -65,7 +118,7 @@ class ProcessRunner:
             self.known_processes = {}
             try:
                 while self.process.poll() is None:
-                    process_control.process_family(self.process.pid, self.known_processes)
+                    process_family(self.process.pid, self.known_processes)
                     if self.cancelled or time.monotonic() >= deadline:
                         self.timed_out = not self.cancelled
                         return 143 if self.cancelled else 124
@@ -81,9 +134,7 @@ class ProcessRunner:
                     except subprocess.TimeoutExpired:
                         pass
                     finally:
-                        process_control.signal_family(
-                            self.process.pid, self.known_processes, signal.SIGKILL
-                        )
+                        signal_family(self.process.pid, self.known_processes, signal.SIGKILL)
                     self.process.wait(timeout=10)
                 finally:
                     self.process = None

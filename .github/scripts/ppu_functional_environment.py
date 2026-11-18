@@ -284,10 +284,11 @@ print(json.dumps({{
 
 def prepare(bundle: Path, manifest: dict):
     """Attest the existing Dockerfile environment; never acquire software here."""
-    if type(manifest.get("environment_build_schema")) is not int or manifest[
-        "environment_build_schema"
-    ] not in (1, 2):
-        raise ValueError("Functional preparation requires a Dockerfile environment export")
+    if (
+        type(manifest.get("environment_build_schema")) is not int
+        or manifest["environment_build_schema"] != 2
+    ):
+        raise ValueError("Functional preparation requires a schema2 execution image")
     metadata = json.loads((bundle / "docker-build.json").read_text())
     for name in ("yq", "envsubst"):
         path = bundle / "functional-tools" / name
@@ -300,16 +301,14 @@ def prepare(bundle: Path, manifest: dict):
             or installed.read_bytes() != path.read_bytes()
         ):
             raise ValueError("Restored functional tool does not match the Dockerfile export")
-    if manifest["environment_build_schema"] == 2:
-        # 只验证构建期副本，不在 PPU 运行期修补或安装工具。
-        upstream_yq = Path("/usr/local/bin") / "yq"
-        if (
-            upstream_yq.is_symlink()
-            or not upstream_yq.is_file()
-            or not os.access(upstream_yq, os.X_OK)
-            or upstream_yq.read_bytes() != (bundle / "functional-tools/yq").read_bytes()
-        ):
-            raise ValueError("Upstream yq path does not match the Dockerfile export")
+    upstream_yq = Path("/usr/local/bin") / "yq"
+    if (
+        upstream_yq.is_symlink()
+        or not upstream_yq.is_file()
+        or not os.access(upstream_yq, os.X_OK)
+        or upstream_yq.read_bytes() != (bundle / "functional-tools/yq").read_bytes()
+    ):
+        raise ValueError("Upstream yq path does not match the Dockerfile export")
     site = Path(
         command_output(
             [sys.executable, "-c", 'import sysconfig; print(sysconfig.get_path("purelib"))']
@@ -377,38 +376,31 @@ def check_compiler(manifest: dict) -> dict:
 
 
 def check(bundle: Path, manifest: dict, output: Path):
+    if (
+        type(manifest.get("environment_build_schema")) is not int
+        or manifest["environment_build_schema"] != 2
+    ):
+        raise ValueError("Unsupported functional Dockerfile environment schema")
     compiler = check_compiler(manifest)
     tools = bundle / "functional-tools"
     arch, expected = YQ[platform.machine()]
     if hashlib.sha256((tools / "yq").read_bytes()).hexdigest() != expected:
         raise ValueError("Functional yq binary digest mismatch")
-    schema = manifest.get("environment_build_schema")
-    if schema is not None and (type(schema) is not int or schema not in (1, 2)):
-        raise ValueError("Unsupported functional Dockerfile environment schema")
-    current = schema in (1, 2)
     delivery = {}
-    if schema == 2:
-        record = json.loads((bundle / "runtime-image.json").read_text())
-        for field, variable in (
-            ("runtime_image_digest", "PPU_IMAGE_DIGEST"),
-            ("base_image_digest", "PPU_BASE_IMAGE_DIGEST"),
-            ("environment_digest", "PPU_ENVIRONMENT_DIGEST"),
-        ):
-            if not os.environ.get(variable) or record[field] != os.environ[variable]:
-                raise ValueError("Functional execution image handoff mismatch")
-            delivery[field] = record[field]
-    if current:
-        prepare(bundle, manifest)
-    else:
-        # Offline attestation of legacy sealed bundles retains its original tool path.
-        for name in ("yq", "envsubst"):
-            shutil.copy2(tools / name, Path("/usr/local/bin") / name)
+    record = json.loads((bundle / "runtime-image.json").read_text())
+    for field, variable in (
+        ("runtime_image_digest", "PPU_IMAGE_DIGEST"),
+        ("base_image_digest", "PPU_BASE_IMAGE_DIGEST"),
+        ("environment_digest", "PPU_ENVIRONMENT_DIGEST"),
+    ):
+        if not os.environ.get(variable) or record[field] != os.environ[variable]:
+            raise ValueError("Functional execution image handoff mismatch")
+        delivery[field] = record[field]
+    prepare(bundle, manifest)
     bash = command_output(["bash", "--version"])
     if "GNU bash, version" not in bash or int(bash.split("version ")[1].split(".")[0]) < 4:
         raise ValueError("Functional tests require GNU Bash >=4")
-    yq = command_output(
-        [str(Path(sys.prefix) / "bin/yq") if schema == 1 else "/usr/local/bin/yq", "--version"]
-    )
+    yq = command_output(["/usr/local/bin/yq", "--version"])
     if "mikefarah/yq" not in yq or f"v{YQ_VERSION}" not in yq:
         raise ValueError("Functional tests require the attested Mike Farah yq v4")
     envsubst = command_output(["envsubst", "--version"])
@@ -480,8 +472,6 @@ def main():
     manifest = json.loads((args.bundle / "manifest.json").read_text())
     if manifest.get("test_kind") != "functional" or not manifest["config"]["build"]:
         raise ValueError("Functional environment setup requires a regression build")
-    if args.command == "prepare":
-        prepare(args.bundle, manifest)
     check(args.bundle, manifest, args.output or args.bundle)
 
 

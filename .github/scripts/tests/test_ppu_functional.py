@@ -55,6 +55,19 @@ def upstream(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("key", ["compiler_diagnostic", "compiler_diagnostic_context"])
+@pytest.mark.parametrize("value", [False, True, "false", "bda", "", None])
+@pytest.mark.parametrize("kind", ["unit", "functional"])
+def test_removed_diagnostic_inputs_fail_before_selection(key, value, kind):
+    inputs = {"test_kind": kind, key: value}
+    with pytest.raises(ValueError, match="no longer supported"):
+        functional.validate_route("workflow_dispatch", functional.BRANCH, inputs)
+    with pytest.raises(ValueError, match="no longer supported"):
+        functional.select_config(inputs)
+    with pytest.raises(ValueError, match="no longer supported"):
+        functional.validate_route("push", functional.BRANCH, inputs)
+
+
 @pytest.mark.parametrize("kind", ["unit", "functional"])
 def test_route_defaults(kind):
     assert (

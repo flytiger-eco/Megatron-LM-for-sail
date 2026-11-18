@@ -93,8 +93,8 @@ def verify_export(
     require(
         type(metadata.get('schema_version')) is int
         and metadata['schema_version'] == schema
-        and schema in (1, 2)
-        and (schema == 1 or kind == 'runtime')
+        and type(schema) is int
+        and (kind, schema) in (('control', 1), ('runtime', 2))
         and metadata.get('kind') == kind,
         'Unsupported environment build metadata',
     )
@@ -138,7 +138,6 @@ def verify_export(
         )
     required = (
         (
-            'environment.tar.gz',
             'compiled-source.tar.gz',
             'functional-package-install.json',
             'constraints.txt',
@@ -159,11 +158,7 @@ def verify_export(
         else ('control-runtime.tar.gz', 'control-package-install.json')
     )
     require(
-        all(
-            files.get(name, {}).get('size', 0) > 0
-            for name in required
-            if schema == 1 or name != 'environment.tar.gz'
-        ),
+        all(files.get(name, {}).get('size', 0) > 0 for name in required),
         'Incomplete Dockerfile environment export',
     )
     require(DIGEST.fullmatch(metadata.get('inputs_sha256', '')), 'Missing build inputs digest')
@@ -531,6 +526,12 @@ def readable_probe_export(output, context):
 
 def build(args):
     image_mode = getattr(args, 'mode', '') == 'build-image'
+    require(
+        args.kind == ('runtime' if image_mode else 'control'), 'Unsupported environment build kind'
+    )
+    require(
+        image_mode or args.target_sha is None, 'Control builds cannot contain a target identity'
+    )
     root = no_links(args.control_root)
     image, pinned, _, inputs = build_identity(args)
     output = no_links(args.output)
@@ -584,7 +585,6 @@ def build(args):
                 re.fullmatch(r'ppu-ci-runtime:run-[0-9]+-[0-9]+', args.local_image),
                 'Invalid local execution image tag',
             )
-            common += ['--build-arg', 'EXPORT_FORMAT=image']
         if cache and (cache / 'index.json').is_file():
             common += ['--cache-from', f'type=local,src={cache}']
         if cache:
@@ -693,8 +693,6 @@ def build(args):
             '--mount',
             f'type=bind,source={root / ".github/scripts"},target=/trusted,readonly',
         ]
-        if args.kind == 'runtime':
-            mounts += ['--mount', f'type=bind,source={context / "source"},target=/source,readonly']
         probe = [
             'python3',
             '-I',
@@ -709,10 +707,8 @@ def build(args):
             '--destination',
             '/tmp/ppu-control-runtime',
         ]
-        if args.kind == 'runtime':
-            probe += ['--target-sha', args.target_sha, '--image-digest', pinned]
         started = time.monotonic()
-        probe_output = command(
+        command(
             [
                 'docker',
                 'run',
@@ -735,8 +731,6 @@ def build(args):
             'device_validation': False,
             'elapsed_seconds': round(time.monotonic() - started, 3),
         }
-        if args.kind == 'runtime':
-            metadata['offline_verification'].update(json.loads(probe_output.splitlines()[-1]))
         (output / 'docker-build.json').write_text(json.dumps(metadata, sort_keys=True) + '\n')
         sha = digest(output / 'docker-build.json')
         print(
@@ -884,7 +878,7 @@ def image_probe(args):
     shutil.copytree('/source', source)
     args.source_root = source
     verify_installed_image(args, metadata)
-    portable_checks(source, execution_image=True)
+    portable_checks(source)
 
 
 def restore_control(args):
@@ -908,44 +902,20 @@ def restore_control(args):
     )
 
 
-def restore_runtime(args):
-    metadata_path = Path(args.artifact) / 'docker-build.json'
-    require(metadata_path.is_file(), 'Missing Dockerfile environment metadata')
-    metadata = verify_export(
-        args.artifact, args.digest, args.control_sha, args.target_sha, subset=True
-    )
-    require(
-        args.image_digest == metadata['image_digest'], 'Restored environment base image mismatch'
-    )
-    destination = no_links(args.destination)
-    require(not (destination / 'ppu-ci-venv').exists(), 'Refusing to overwrite the PPU environment')
-    environment = Path(args.artifact) / 'environment.tar.gz'
-    compiled = Path(args.artifact) / 'compiled-source.tar.gz'
-    extract_archive(environment, destination, prefix='ppu-ci-venv', check_only=True)
-    if args.source_root:
-        extract_archive(compiled, args.source_root, overlay=True, check_only=True, compiled=True)
-    if getattr(args, 'check_only', False):
-        return
-    started = time.monotonic()
-    extract_archive(environment, destination, prefix='ppu-ci-venv')
-    if args.source_root:
-        extract_archive(compiled, args.source_root, overlay=True, compiled=True)
-    print(json.dumps({'environment_restore_seconds': round(time.monotonic() - started, 3)}))
-
-
 def offline_probe(args):
-    """Fresh-base, network-disabled portability checks; never claim device acceptance."""
-    if args.target_sha is None:
-        restore_control(args)
-        return
-    source = Path('/tmp/ppu-offline-source')
-    shutil.copytree('/source', source)
-    args.source_root, args.destination = source, Path('/opt')
-    restore_runtime(args)
-    portable_checks(source)
+    """Fresh-base, network-disabled control checks; never claim device acceptance."""
+    require(
+        all(
+            getattr(args, name, None) is None
+            for name in ('target_sha', 'source_root', 'image_digest')
+        )
+        and not getattr(args, 'check_only', False),
+        'Offline probe only supports the control environment',
+    )
+    restore_control(args)
 
 
-def portable_checks(source, *, execution_image=False):
+def portable_checks(source):
     environment = client_env()
     environment.update(
         {
@@ -975,23 +945,21 @@ def portable_checks(source, *, execution_image=False):
         ['/opt/ppu-ci-venv/bin/yq', '--version'],
         ['/opt/ppu-ci-venv/bin/make', '-q', '-C', str(source / 'megatron/core/datasets')],
     ]
-    if execution_image:
-        # Verify the original training driver's absolute path, not just the venv tool in PATH.
-        checks.extend(
+    checks.extend(
+        [
+            ['/usr/local/bin/yq', '--version'],
             [
-                ['/usr/local/bin/yq', '--version'],
-                [
-                    '/opt/ppu-ci-venv/bin/python',
-                    '-I',
-                    '-c',
-                    'import os, pathlib, subprocess; tool = pathlib.Path("/usr/local/bin/yq"); '
-                    'assert tool.is_file() and not tool.is_symlink() and os.access(tool, os.X_OK); '
-                    'assert tool.read_bytes() == pathlib.Path("/opt/ppu-ci-venv/bin/yq").read_bytes(); '
-                    'assert subprocess.check_output([str(tool), ".TEST_TYPE"], '
-                    'input="TEST_TYPE: regular\\n", text=True, timeout=30).strip() == "regular"',
-                ],
-            ]
-        )
+                '/opt/ppu-ci-venv/bin/python',
+                '-I',
+                '-c',
+                'import os, pathlib, subprocess; tool = pathlib.Path("/usr/local/bin/yq"); '
+                'assert tool.is_file() and not tool.is_symlink() and os.access(tool, os.X_OK); '
+                'assert tool.read_bytes() == pathlib.Path("/opt/ppu-ci-venv/bin/yq").read_bytes(); '
+                'assert subprocess.check_output([str(tool), ".TEST_TYPE"], '
+                'input="TEST_TYPE: regular\\n", text=True, timeout=30).strip() == "regular"',
+            ],
+        ]
+    )
     for check in checks:
         result = subprocess.run(check, env=environment, capture_output=True, text=True)
         require(
@@ -1070,7 +1038,11 @@ def main():
             create.set_defaults(kind='runtime')
             create.add_argument('--local-image', required=True)
         else:
-            create.add_argument('--kind', choices=('control', 'runtime'), required=True)
+            create.add_argument(
+                '--kind',
+                choices=('control', 'runtime') if mode == 'fingerprint' else ('control',),
+                required=True,
+            )
         create.add_argument('--control-root', type=Path, required=True)
         create.add_argument('--control-sha', required=True)
         create.add_argument('--source-root', type=Path)
@@ -1079,17 +1051,12 @@ def main():
         if mode in ('build', 'build-image'):
             create.add_argument('--output', type=Path, required=True)
             create.add_argument('--cache-root', type=Path)
-    for mode in ('restore-control', 'restore-runtime', 'offline-probe'):
+    for mode in ('restore-control', 'offline-probe'):
         restore = sub.add_parser(mode)
         restore.add_argument('--artifact', type=Path, required=True)
         restore.add_argument('--digest', required=True)
         restore.add_argument('--control-sha', required=True)
-        restore.add_argument('--target-sha')
-        restore.add_argument('--source-root', type=Path)
         restore.add_argument('--destination', type=Path, required=True)
-        if mode in ('restore-runtime', 'offline-probe'):
-            restore.add_argument('--image-digest', required=mode == 'restore-runtime')
-            restore.add_argument('--check-only', action='store_true')
     for mode in ('publish-image', 'verify-image', 'image-probe'):
         image = sub.add_parser(mode)
         image.add_argument('--artifact', type=Path, required=True)
@@ -1126,7 +1093,6 @@ def main():
         'image-probe': image_probe,
         'fingerprint': fingerprint,
         'restore-control': restore_control,
-        'restore-runtime': restore_runtime,
         'restore-source': restore_source,
         'archive-source': archive_source,
         'offline-probe': offline_probe,

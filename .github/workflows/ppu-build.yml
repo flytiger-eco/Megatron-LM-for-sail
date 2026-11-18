@@ -16,15 +16,6 @@ on:
         type: choice
         options: [unit, functional]
         default: unit
-      compiler_diagnostic:
-        description: Standalone compiler diagnostic (single 8-card Pod, at most 10 minutes; no Build, UT or formal regression)
-        type: boolean
-        default: false
-      compiler_diagnostic_context:
-        description: bda isolates compute; bert only reuses the original 41070324511 artifacts for one original 50-step context capture
-        type: choice
-        options: [bda, bert]
-        default: bda
       functional_mode:
         description: Read-only CPU asset preflight or explicitly requested PPU regression
         type: choice
@@ -238,32 +229,10 @@ jobs:
           path: ${{ runner.temp }}/ppu-control-export/
           if-no-files-found: error
           retention-days: 7
-  compiler-diagnostic:
-    needs: [authorize, control-environment]
-    if: >-
-      github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/ci/ppu-validation' &&
-      github.run_attempt == 1 && needs.authorize.outputs.allowed == 'true' &&
-      needs.authorize.outputs.test_kind == 'compiler_diagnostic'
-    permissions:
-      contents: read
-    uses: ./.github/workflows/ppu-compiler-diagnostic.yml
-    secrets:
-      PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
-      PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
-      PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
-      PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
-      PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
-      PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
-    with:
-      target_sha: ${{ needs.authorize.outputs.target_sha }}
-      control_sha: ${{ needs.authorize.outputs.control_sha }}
-      diagnostic_context: ${{ inputs.compiler_diagnostic_context || 'bda' }}
-      control_digest: ${{ needs.control-environment.outputs.control_digest }}
   execute:
     needs: [authorize, pr-pending, control-environment]
     if: >-
       always() && !cancelled() && needs.authorize.result == 'success' &&
-      needs.authorize.outputs.test_kind != 'compiler_diagnostic' &&
       (needs.authorize.outputs.allowed != 'true' || needs.control-environment.result == 'success') &&
       (needs.authorize.outputs.pr_number == '0' ||
        (needs.pr-pending.result == 'success' && needs.pr-pending.outputs.status_result == 'published'))

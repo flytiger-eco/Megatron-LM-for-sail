@@ -1,5 +1,6 @@
 """CPU-only regression gates for Dockerfile construction and authenticated restoration."""
 
+import ast
 import importlib.util
 import io
 import json
@@ -28,7 +29,6 @@ def load(name, path):
 
 container = load('ppu_container_test', SCRIPTS / 'ppu_ci_container.py')
 exporter = load('ppu_exporter_test', ROOT / '.github/docker/export_environment.py')
-bert = load('ppu_legacy_restore_test', SCRIPTS / 'ppu_bert_diagnostic.py')
 ci = load('ppu_container_bundle_test', SCRIPTS / 'ppu_ci.py')
 CONTROL = 'a' * 40
 TARGET = 'b' * 40
@@ -51,8 +51,8 @@ def archive(path, rows):
                 stream.addfile(member)
 
 
-def runtime_export(root, *, schema=1):
-    root.mkdir(exist_ok=True)
+def runtime_export(root, *, schema=2):
+    root.mkdir(parents=True, exist_ok=True)
     if schema == 1:
         archive(
             root / 'environment.tar.gz', [('ppu-ci-venv/bin/python', b'python', tarfile.REGTYPE)]
@@ -90,7 +90,7 @@ def runtime_export(root, *, schema=1):
     return seal(root, schema=schema)
 
 
-def seal(root, *, schema=1):
+def seal(root, *, schema=2):
     metadata = dict(
         schema_version=schema,
         kind='runtime',
@@ -134,23 +134,346 @@ def image_args(root, trusted, tmp_path):
     )
 
 
+def control_export(root):
+    root.mkdir(parents=True, exist_ok=True)
+    archive(
+        root / 'control-runtime.tar.gz', [('bin/python', b'#!/bin/sh\nexit 0\n', tarfile.REGTYPE)]
+    )
+    (root / 'control-package-install.json').write_text('{"version":"1","install":[]}')
+    metadata = {
+        'schema_version': 1,
+        'kind': 'control',
+        'platform': 'linux/amd64',
+        'control_sha': CONTROL,
+        'target_sha': None,
+        'image': container.CONTROL_IMAGE,
+        'image_digest': container.CONTROL_IMAGE.rsplit(':', 1)[0] + '@sha256:' + 'c' * 64,
+        'inputs_sha256': 'd' * 64,
+        'files': container.inventory(root),
+    }
+    (root / 'docker-build.json').write_text(json.dumps(metadata))
+    return container.digest(root / 'docker-build.json')
+
+
+@pytest.mark.parametrize(
+    'kind,schema',
+    [
+        ('control', 1),
+        ('control', 2),
+        ('control', True),
+        ('control', '1'),
+        ('runtime', 2),
+        ('runtime', 1),
+        ('runtime', True),
+        ('runtime', '2'),
+    ],
+)
+def test_export_only_accepts_current_kind_schema_combinations(tmp_path, kind, schema):
+    root = tmp_path / 'export'
+    trusted = control_export(root) if kind == 'control' else runtime_export(root)
+    metadata = json.loads((root / 'docker-build.json').read_text())
+    metadata['schema_version'] = schema
+    (root / 'docker-build.json').write_text(json.dumps(metadata))
+    trusted = container.digest(root / 'docker-build.json')
+    target = None if kind == 'control' else TARGET
+    if (kind, schema) in [('control', 1), ('runtime', 2)] and type(schema) is int:
+        container.verify_export(root, trusted, CONTROL, target, schema=schema)
+    else:
+        with pytest.raises(
+            container.ValidationError, match='Unsupported environment build metadata'
+        ):
+            container.verify_export(root, trusted, CONTROL, target, schema=schema)
+
+
+@pytest.mark.parametrize('mode', ['build', ''])
+def test_direct_runtime_software_build_fails_before_any_command(build_inputs, monkeypatch, mode):
+    args = build_inputs
+    args.mode = mode
+    monkeypatch.setattr(
+        container, 'command', lambda *a, **k: pytest.fail('Old runtime build must not start')
+    )
+    with pytest.raises(container.ValidationError, match='Unsupported environment build kind'):
+        container.build(args)
+    assert not args.output.exists()
+
+
+@pytest.mark.parametrize(
+    'field,value',
+    [
+        ('target_sha', TARGET),
+        ('source_root', Path('/fixture/source')),
+        ('image_digest', PINNED),
+        ('check_only', True),
+    ],
+)
+def test_direct_offline_probe_rejects_runtime_fields_before_restore(
+    tmp_path, monkeypatch, field, value
+):
+    args = SimpleNamespace(
+        artifact=tmp_path,
+        digest='a' * 64,
+        control_sha=CONTROL,
+        destination=tmp_path / 'restored',
+        **{field: value},
+    )
+    monkeypatch.setattr(
+        container, 'command', lambda *a, **k: pytest.fail('Old runtime probe must not start')
+    )
+    with pytest.raises(container.ValidationError, match='only supports the control'):
+        container.offline_probe(args)
+    assert not args.destination.exists()
+
+
+@pytest.mark.parametrize(
+    'arguments',
+    [
+        ['restore-runtime'],
+        ['build', '--kind', 'runtime'],
+        ['offline-probe', '--target-sha', TARGET],
+        ['offline-probe', '--source-root', '/fixture/source'],
+        ['offline-probe', '--image-digest', PINNED],
+        ['offline-probe', '--check-only'],
+        ['build-image', '--kind', 'control'],
+    ],
+)
+def test_removed_runtime_cli_is_rejected_before_dispatch(tmp_path, monkeypatch, arguments):
+    if arguments[0] == 'offline-probe':
+        arguments = arguments + [
+            '--artifact',
+            str(tmp_path),
+            '--digest',
+            'a' * 64,
+            '--control-sha',
+            CONTROL,
+            '--destination',
+            str(tmp_path / 'restore'),
+        ]
+    monkeypatch.setattr(sys, 'argv', ['container', *arguments])
+    monkeypatch.setattr(container, 'build', lambda *a: pytest.fail('Old build route must not run'))
+    monkeypatch.setattr(
+        container, 'offline_probe', lambda *a: pytest.fail('Old probe route must not run')
+    )
+    with pytest.raises(SystemExit) as error:
+        container.main()
+    assert error.value.code == 2
+    assert not hasattr(container, 'restore_runtime')
+
+
+@pytest.mark.parametrize('kind', ['control', 'runtime'])
+def test_fingerprint_preserves_both_current_cache_paths(build_inputs, monkeypatch, capsys, kind):
+    args = build_inputs
+    args.kind = kind
+    if kind == 'control':
+        args.target_sha = None
+        args.image_digest = container.CONTROL_IMAGE.rsplit(':', 1)[0] + '@sha256:' + 'c' * 64
+    monkeypatch.delenv('GITHUB_OUTPUT', raising=False)
+    container.fingerprint(args)
+    record = json.loads(capsys.readouterr().out)
+    assert record['image_digest'] == args.image_digest
+    assert re.fullmatch('[0-9a-f]{64}', record['cache_key'])
+
+
+@pytest.mark.parametrize('damage', ['none', 'digest', 'member', 'schema'])
+def test_control_schema_one_build_probe_and_restore_remain_authenticated(
+    build_inputs, monkeypatch, damage
+):
+    args = build_inputs
+    args.kind, args.mode, args.target_sha = 'control', 'build', None
+    args.image_digest = container.CONTROL_IMAGE.rsplit(':', 1)[0] + '@sha256:' + 'c' * 64
+    calls = []
+
+    def command(argv, **kwargs):
+        calls.append(argv)
+        if argv[0] == 'git':
+            return '.github/scripts/ppu_ci_container.py\0'
+        if argv[:3] == ['docker', 'buildx', 'build']:
+            assert_build_arguments(argv, args)
+            if '--output' in argv:
+                control_export(args.output)
+        elif argv[:2] == ['docker', 'run']:
+            assert 'offline-probe' in argv and 'image-probe' not in argv
+            assert '--network=none' in argv and '--cap-drop=ALL' in argv
+            assert '--target-sha' not in argv and '--source-root' not in argv
+        else:
+            assert argv[0].endswith('/bin/python') and '_tkinter' in argv[-1]
+        return ''
+
+    monkeypatch.setattr(container, 'command', command)
+    container.build(args)
+    metadata = json.loads((args.output / 'docker-build.json').read_text())
+    assert metadata['schema_version'] == 1 and metadata['offline_verification']['passed']
+    restore = SimpleNamespace(
+        artifact=args.output,
+        digest=container.digest(args.output / 'docker-build.json'),
+        control_sha=CONTROL,
+        destination=args.output.parent / 'restored',
+    )
+    if damage == 'digest':
+        restore.digest = 'e' * 64
+    elif damage == 'member':
+        (args.output / 'control-runtime.tar.gz').write_bytes(b'corrupt')
+    elif damage == 'schema':
+        metadata['schema_version'] = 2
+        (args.output / 'docker-build.json').write_text(json.dumps(metadata))
+        restore.digest = container.digest(args.output / 'docker-build.json')
+    before = len(calls)
+    if damage == 'none':
+        container.offline_probe(restore)
+        assert (restore.destination / 'bin/python').read_bytes() == b'#!/bin/sh\nexit 0\n'
+        assert (restore.destination / 'bin/python').stat().st_mode & 0o6000 == 0
+        assert len(calls) == before + 1
+    else:
+        with pytest.raises(container.ValidationError):
+            container.offline_probe(restore)
+        assert not restore.destination.exists() and len(calls) == before
+
+
+@pytest.mark.parametrize('damage', ['empty', 'count', 'negative', 'size', 'space'])
+def test_archive_capacity_checks_fail_before_destination_writes(tmp_path, monkeypatch, damage):
+    path, destination = tmp_path / 'source.tar.gz', tmp_path / 'restore'
+    archive(path, [('source.py', b'pass', tarfile.REGTYPE)])
+    if damage == 'space':
+        monkeypatch.setattr(container.shutil, 'disk_usage', lambda _: SimpleNamespace(free=0))
+    else:
+        member = tarfile.TarInfo('source.py')
+        member.size = -1 if damage == 'negative' else 65 * 1024**3 if damage == 'size' else 1
+        rows = [] if damage == 'empty' else [member] * 500001 if damage == 'count' else [member]
+        monkeypatch.setattr(container.tarfile.TarFile, 'getmembers', lambda _: rows)
+    with pytest.raises(container.ValidationError):
+        container.extract_archive(path, destination)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    'damage',
+    ['none', 'vendor', 'missing-helper', 'duplicate-helper', 'missing-tool', 'external-report'],
+)
+def test_real_runtime_image_export_keeps_evidence_without_software_archive(
+    tmp_path, monkeypatch, damage
+):
+    build, venv, site, output = (tmp_path / name for name in ('build', 'venv', 'site', 'exports'))
+    for path in (build, venv / 'bin', site / 'torch', site / 'triton', build / 'wheels'):
+        path.mkdir(parents=True, exist_ok=True)
+    for name in ('torch', 'triton'):
+        (site / name / '__init__.py').write_bytes(b'vendor bytes')
+    (build / 'vendor-bytes.json').write_text(json.dumps(exporter.vendor_bytes(site)))
+    for name in (
+        'constraints.txt',
+        'ppu-requirements.txt',
+        'test-requirements.txt',
+        'compatibility-patches.json',
+        'base-packages.json',
+        'source-package-install.json',
+    ):
+        (build / name).write_text('{}')
+    for name in (
+        'packaging-install.json',
+        'build-tools-install.json',
+        'functional-package-install.json',
+    ):
+        (build / name).write_text('{"version":"1","install":[]}')
+    (build / 'wheels/megatron.whl').write_bytes(b'wheel')
+    native = build / 'source/megatron/core/datasets'
+    native.mkdir(parents=True)
+    (native / 'helpers_cpp.so').write_bytes(b'extension')
+    tools = tmp_path / 'tools'
+    tools.mkdir()
+    for name in ('git', 'wget', 'envsubst', 'make', 'yq'):
+        (tools / name).write_bytes(b'#!/bin/sh\nexit 0\n')
+    shutil.copy2(tools / 'yq', venv / 'bin/yq')
+    git_core = tmp_path / 'git-core'
+    git_core.mkdir()
+    (git_core / 'git-helper').write_bytes(b'#!/bin/sh\nexit 0\n')
+    cert = tmp_path / 'certificate'
+    cert.write_bytes(b'certificate')
+
+    def path(value):
+        value = Path(value)
+        if value.is_relative_to('/build'):
+            return build / value.relative_to('/build')
+        return {'/usr/lib/git-core': git_core, '/etc/ssl/certs/ca-certificates.crt': cert}.get(
+            str(value), value
+        )
+
+    monkeypatch.setattr(exporter, 'Path', path)
+    monkeypatch.setattr(exporter, 'VENV', venv)
+    monkeypatch.setattr(exporter, 'EXPORT', output)
+    monkeypatch.setattr(exporter.sysconfig, 'get_path', lambda _: str(site))
+    monkeypatch.setattr(
+        exporter.shutil,
+        'which',
+        lambda name: None if damage == 'missing-tool' and name == 'git' else str(tools / name),
+    )
+    monkeypatch.setattr(exporter.md, 'distributions', lambda: [])
+    if damage == 'vendor':
+        (site / 'torch/__init__.py').write_bytes(b'changed')
+    elif damage == 'missing-helper':
+        (native / 'helpers_cpp.so').rename(native / 'old-helper')
+    elif damage == 'duplicate-helper':
+        (native / 'helpers_cpp.extra.so').write_bytes(b'extra')
+    elif damage == 'external-report':
+        (build / 'packaging-install.json').write_text(
+            json.dumps(
+                {
+                    'version': '1',
+                    'install': [
+                        {
+                            'is_direct': False,
+                            'metadata': {},
+                            'download_info': {'url': 'https://example.com/pkg.whl'},
+                        }
+                    ],
+                }
+            )
+        )
+    if damage != 'none':
+        with pytest.raises(RuntimeError):
+            exporter.runtime()
+        assert not (output / 'docker-build.json').exists()
+        return
+    exporter.runtime()
+    assert not (output / 'environment.tar.gz').exists()
+    assert json.loads((output / 'export-files.json').read_text()) == container.inventory(
+        output, exclude=('export-files.json',)
+    )
+    trusted = seal(output)
+    container.verify_export(output, trusted, CONTROL, TARGET, schema=2)
+    with tarfile.open(output / 'compiled-source.tar.gz') as stream:
+        assert [member.name for member in stream.getmembers()] == [
+            'megatron/core/datasets/helpers_cpp.so'
+        ]
+    assert (output / 'functional-tools/yq').read_bytes() == (venv / 'bin/yq').read_bytes()
+
+
+def test_runtime_export_has_only_image_entrypoint_and_no_archive_switch(tmp_path):
+    assert exporter.runtime.__code__.co_argcount == 0
+    tree = ast.parse((ROOT / '.github/docker/export_environment.py').read_text())
+    entry = tree.body[-1].body[0].value.func.value
+    assert {key.value for key in entry.keys} == {'isolate', 'control', 'runtime-image'}
+    assert not hasattr(exporter, 'restore_runtime')
+    dockerfile = (ROOT / '.github/docker/Dockerfile.ppu-ci').read_text()
+    assert 'EXPORT_FORMAT' not in dockerfile
+    assert 'AS runtime-export' in dockerfile
+    assert 'export_environment.py runtime-image' in dockerfile
+    result = subprocess.run(
+        [sys.executable, '-I', '-B', str(ROOT / '.github/docker/export_environment.py'), 'runtime'],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0 and "KeyError: 'runtime'" in result.stderr
+    with pytest.raises(TypeError):
+        exporter.runtime(image=False)
+    with pytest.raises(TypeError):
+        container.portable_checks(tmp_path, execution_image=False)
+
+
 @pytest.fixture
 def exported(tmp_path):
     root = tmp_path / 'export'
-    return root, runtime_export(root)
-
-
-def restore_args(root, digest, tmp_path):
-    return SimpleNamespace(
-        artifact=root,
-        digest=digest,
-        control_sha=CONTROL,
-        target_sha=TARGET,
-        image_digest=PINNED,
-        destination=tmp_path / 'opt',
-        source_root=tmp_path / 'source',
-        check_only=False,
-    )
+    trusted = runtime_export(root)
+    write_image_record(root, trusted)
+    return root, trusted
 
 
 @pytest.mark.parametrize(
@@ -183,7 +506,7 @@ def test_authenticated_export_rejects_mutations(exported, mutation):
     else:
         (root / 'linked').symlink_to(root / 'constraints.txt')
     with pytest.raises(container.ValidationError):
-        container.verify_export(root, trusted, control, target)
+        container.verify_export(root, trusted, control, target, schema=2)
 
 
 @pytest.mark.parametrize(
@@ -235,47 +558,6 @@ def test_archive_refuses_linked_destination_and_existing_file(tmp_path):
     with pytest.raises(container.ValidationError):
         container.extract_archive(path, other)
     assert (other / 'a').read_bytes() == b'original'
-
-
-def test_runtime_restore_checks_image_and_both_archives_before_writes(exported, tmp_path):
-    root, digest = exported
-    args = restore_args(root, digest, tmp_path)
-    args.image_digest = PINNED[:-1] + 'e'
-    with pytest.raises(container.ValidationError, match='base image mismatch'):
-        container.restore_runtime(args)
-    args.image_digest = PINNED
-    archive(root / 'compiled-source.tar.gz', [('evil.py', b'exec', tarfile.REGTYPE)])
-    args.digest = seal(root)
-    with pytest.raises(container.ValidationError, match='compiled source'):
-        container.restore_runtime(args)
-    assert not args.destination.exists()
-
-
-def test_runtime_restores_without_installer_and_removes_privilege_bits(
-    exported, tmp_path, monkeypatch
-):
-    root, digest = exported
-    monkeypatch.setattr(
-        container,
-        'command',
-        lambda *args, **kwargs: pytest.fail('Restore must not install software'),
-    )
-    args = restore_args(root, digest, tmp_path)
-    container.restore_runtime(args)
-    python = args.destination / 'ppu-ci-venv/bin/python'
-    assert python.read_bytes() == b'python' and python.stat().st_mode & 0o6000 == 0
-    extension = next(args.source_root.rglob('*.so'))
-    assert extension.read_bytes() == b'extension' and extension.stat().st_mtime > 1
-    with pytest.raises(container.ValidationError, match='overwrite'):
-        container.restore_runtime(args)
-
-
-def test_check_only_does_not_extract(exported, tmp_path):
-    root, digest = exported
-    args = restore_args(root, digest, tmp_path)
-    args.check_only = True
-    container.restore_runtime(args)
-    assert not args.destination.exists() and not args.source_root.exists()
 
 
 def test_source_restore_requires_sealed_archive_identity(tmp_path):
@@ -817,7 +1099,22 @@ def test_materialized_source_handles_actual_git_tracked_checkout_aliases(tmp_pat
     names = subprocess.run(
         ['git', '-C', str(ROOT), 'ls-files', '-z'], check=True, capture_output=True, text=True
     ).stdout.split('\0')
-    names = [name for name in names if name]
+    deleted = subprocess.run(
+        ['git', '-C', str(ROOT), 'ls-files', '--deleted', '-z'],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split('\0')
+    approved_deletions = {
+        '.github/workflows/ppu-compiler-diagnostic.yml',
+        '.github/scripts/ppu_compiler_diagnostic.py',
+        '.github/scripts/ppu_bert_diagnostic.py',
+        '.github/scripts/ppu_diagnostic_sitecustomize.py',
+        '.github/scripts/tests/test_ppu_compiler_diagnostic.py',
+        '.github/scripts/tests/test_ppu_bert_diagnostic.py',
+    }
+    assert set(deleted) - {''} <= approved_deletions
+    names = [name for name in names if name and name not in deleted]
     aliases = [name for name in names if (ROOT / name).is_symlink()]
     assert {
         '.agents/skills',
@@ -886,8 +1183,6 @@ def assert_build_arguments(argv, args):
         f'TARGET_SHA={args.target_sha or ""}',
         f'CONTROL_SHA={args.control_sha}',
     ]
-    if getattr(args, 'mode', '') == 'build-image':
-        expected.append('EXPORT_FORMAT=image')
     actual = [argv[index + 1] for index, value in enumerate(argv) if value == '--build-arg']
     assert actual == expected
     assert not any(value.endswith('--build-arg') for value in argv if value != '--build-arg')
@@ -897,6 +1192,7 @@ def test_build_uses_only_trusted_dockerfile_and_offline_unprivileged_probe(
     build_inputs, monkeypatch
 ):
     args = build_inputs
+    args.mode, args.local_image = 'build-image', 'ppu-ci-runtime:run-12-1'
     malicious = args.source_root / 'Dockerfile'
     malicious.write_text('RUN steal-credentials')
     (args.source_root / 'Dockerfile-alias').symlink_to('Dockerfile')
@@ -916,7 +1212,10 @@ def test_build_uses_only_trusted_dockerfile_and_offline_unprivileged_probe(
             assert exports.endswith('/probe-exports,target=/exports,readonly')
             assert str(args.output) not in exports
             assert all('docker.sock' not in item and 'secret' not in item for item in argv)
-            return '{"environment_restore_seconds": 0.1}'
+            assert LOCAL_ID in argv and args.local_image not in argv
+            assert '--security-opt=no-new-privileges' in argv
+        if argv[:3] == ['docker', 'image', 'inspect']:
+            return LOCAL_ID
         if argv[:3] == ['docker', 'buildx', 'build']:
             assert_build_arguments(argv, args)
             context = Path(argv[-1])
@@ -939,10 +1238,8 @@ def test_build_uses_only_trusted_dockerfile_and_offline_unprivileged_probe(
         and 'PPU_POD_RUN_ROOT' not in container.client_env()
     )
     metadata = json.loads((args.output / 'docker-build.json').read_text())
-    assert (
-        metadata['offline_verification']['passed']
-        and metadata['offline_verification']['device_validation'] is False
-    )
+    assert metadata['schema_version'] == 2
+    assert any(call[:2] == ['docker', 'run'] and 'image-probe' in call for call in calls)
     assert any('--cache-to' in call and 'dependencies' in call for call in calls)
     assert not any('--cache-to' in call and 'runtime-export' in call for call in calls)
 
@@ -966,7 +1263,7 @@ def test_image_handoff_checks_all_identities_without_restoring_software(
     elif damage == 'file':
         (root / 'constraints.txt').write_text('corrupt')
     elif damage == 'legacy':
-        args.digest = seal(root)
+        args.digest = seal(root, schema=1)
         write_image_record(root, args.digest)
     elif damage == 'archive':
         archive(root / 'compiled-source.tar.gz', [('evil.py', b'exec', tarfile.REGTYPE)])
@@ -981,8 +1278,7 @@ def test_image_handoff_checks_all_identities_without_restoring_software(
             container.verify_image(args)
     assert not args.source_root.exists()
     assert not (tmp_path / 'opt').exists()
-    with pytest.raises(container.ValidationError):
-        container.restore_runtime(restore_args(root, trusted, tmp_path))
+    assert not hasattr(container, 'restore_runtime')
 
 
 def test_image_check_only_without_source_does_not_create_paths(
@@ -1028,7 +1324,9 @@ def test_complete_image_build_loads_and_probes_exact_id_without_publication(
                 raise container.ValidationError('export failed')
             runtime_export(args.output, schema=2)
         if '--load' in argv:
-            assert '--push' not in argv and 'EXPORT_FORMAT=image' in argv
+            assert '--push' not in argv and '--target' in argv
+            assert argv[argv.index('--target') + 1] == 'execution'
+            assert not any('EXPORT_FORMAT' in item for item in argv)
             metadata = Path(argv[-1]) / 'release/docker-build.json'
             assert metadata.read_bytes() == (args.output / 'docker-build.json').read_bytes()
             if stage == 'load':
@@ -1437,13 +1735,7 @@ def test_real_bundle_verification_still_rejects_added_bytecode(subprocess_bundle
 
 
 def test_only_guarded_runtime_job_receives_package_publication_permission():
-    for filename in (
-        'ppu-build',
-        'ppu-execute',
-        'ppu-ut',
-        'ppu-functional',
-        'ppu-compiler-diagnostic',
-    ):
+    for filename in ('ppu-build', 'ppu-execute', 'ppu-ut', 'ppu-functional'):
         jobs = yaml.safe_load((ROOT / f'.github/workflows/{filename}.yml').read_text())['jobs']
         allowed_job = {'ppu-build': 'execute', 'ppu-execute': 'runtime-environment'}.get(filename)
         for name, job in jobs.items():
@@ -1458,38 +1750,7 @@ def test_only_guarded_runtime_job_receives_package_publication_permission():
         assert 'PPU_BASE_IMAGE_DIGEST' in text and 'PPU_IMAGE_DIGEST' in text
 
 
-def test_namespace_legacy_restore_keeps_historical_bytes_and_does_not_run_base_hooks(tmp_path):
-    venv, base = tmp_path / 'venv', tmp_path / 'base'
-    site = venv / 'lib/python3.12/site-packages'
-    (site / 'google/protobuf').mkdir(parents=True)
-    (site / 'google/protobuf/current.py').write_text('current')
-    (venv / 'pyvenv.cfg').write_text('include-system-site-packages = true\n')
-    (base / 'google/protobuf').mkdir(parents=True)
-    (base / 'google/protobuf/old.py').write_text('old')
-    (base / 'google/auth').mkdir()
-    (base / 'torch').mkdir()
-    for name in ('protobuf-1.dist-info', 'cloud_tpu_client-1.dist-info'):
-        (base / name).mkdir()
-    (base / 'startup.pth').write_text('raise RuntimeError("must not execute")')
-    before = {
-        p.relative_to(base).as_posix(): p.read_bytes() for p in base.rglob('*') if p.is_file()
-    }
-    bert.isolate_historical_environment(venv, base)
-    assert 'include-system-site-packages = false' in (venv / 'pyvenv.cfg').read_text()
-    assert not (site / 'startup.pth').exists() and not (site / 'protobuf-1.dist-info').exists()
-    assert not (site / 'cloud_tpu_client-1.dist-info').exists()
-    assert (site / 'torch').resolve() == base / 'torch'
-    assert (site / 'google/auth').resolve() == base / 'google/auth'
-    assert (site / 'google/protobuf/current.py').read_text() == 'current'
-    assert not (site / 'google/protobuf/old.py').exists()
-    assert before == {
-        p.relative_to(base).as_posix(): p.read_bytes() for p in base.rglob('*') if p.is_file()
-    }
-
-
-@pytest.mark.parametrize(
-    'filename', ['ppu-build', 'ppu-execute', 'ppu-ut', 'ppu-functional', 'ppu-compiler-diagnostic']
-)
+@pytest.mark.parametrize('filename', ['ppu-build', 'ppu-execute', 'ppu-ut', 'ppu-functional'])
 def test_workflows_never_install_software(filename):
     text = (ROOT / f'.github/workflows/{filename}.yml').read_text()
     assert not re.search(
@@ -1503,9 +1764,7 @@ def test_workflows_never_install_software(filename):
                 assert '--digest' in step['run'] and '--control-sha' in step['run']
 
 
-@pytest.mark.parametrize(
-    'filename', ['ppu-execute', 'ppu-ut', 'ppu-functional', 'ppu-compiler-diagnostic']
-)
+@pytest.mark.parametrize('filename', ['ppu-execute', 'ppu-ut', 'ppu-functional'])
 def test_cpu_jobs_declare_required_unprivileged_job_container(filename):
     workflow = yaml.safe_load((ROOT / f'.github/workflows/{filename}.yml').read_text())
     cpu_jobs = [
@@ -1739,13 +1998,7 @@ def test_runtime_handoff_shell_checks_before_copying_or_restoring(
 
 @pytest.mark.parametrize(
     'filename',
-    [
-        'ppu_ci_build.sh',
-        'ppu_ci_run.sh',
-        'ppu_functional_run.sh',
-        'ppu_functional_environment.py',
-        'ppu_bert_diagnostic.py',
-    ],
+    ['ppu_ci_build.sh', 'ppu_ci_run.sh', 'ppu_functional_run.sh', 'ppu_functional_environment.py'],
 )
 def test_runtime_helpers_never_install_or_compile(filename):
     text = (SCRIPTS / filename).read_text()
@@ -1784,10 +2037,7 @@ def test_restored_control_probes_tkinter_without_installing_dependencies(tmp_pat
     assert 'import sys, _tkinter,' in calls[0][3]
 
 
-@pytest.mark.parametrize('execution_image', [False, True])
-def test_portable_checks_probe_upstream_yq_only_for_execution_images(
-    tmp_path, monkeypatch, execution_image
-):
+def test_portable_checks_always_probe_upstream_yq(tmp_path, monkeypatch):
     calls = []
 
     def run(argv, **kwargs):
@@ -1796,9 +2046,9 @@ def test_portable_checks_probe_upstream_yq_only_for_execution_images(
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(container.subprocess, 'run', run)
-    container.portable_checks(tmp_path, execution_image=execution_image)
-    assert (['/usr/local/bin/yq', '--version'] in calls) == execution_image
-    assert any('input="TEST_TYPE: regular' in argv[-1] for argv in calls) == execution_image
+    container.portable_checks(tmp_path)
+    assert ['/usr/local/bin/yq', '--version'] in calls
+    assert any('input="TEST_TYPE: regular' in argv[-1] for argv in calls)
 
 
 @pytest.mark.parametrize(
@@ -1812,7 +2062,7 @@ def test_execution_yq_probe_executes_parse_and_rejects_invalid_copy(tmp_path, mo
         'run',
         lambda argv, **kwargs: calls.append(argv) or SimpleNamespace(returncode=0),
     )
-    container.portable_checks(tmp_path, execution_image=True)
+    container.portable_checks(tmp_path)
     code = next(argv[-1] for argv in calls if 'input="TEST_TYPE: regular' in argv[-1])
     local, baked = tmp_path / 'yq', tmp_path / 'baked-yq'
     payload = '#!/bin/sh\ncat >/dev/null\nprintf "regular\\n"\n'
@@ -1846,7 +2096,7 @@ def test_image_probe_enforces_upstream_tool_contract(tmp_path, monkeypatch):
     container.image_probe(
         SimpleNamespace(artifact=tmp_path, digest='a' * 64, control_sha=CONTROL, target_sha=TARGET)
     )
-    assert calls == [{'execution_image': True}]
+    assert calls == [{}]
 
 
 def test_execution_dockerfile_installs_upstream_yq_offline_before_cleanup(tmp_path):
@@ -2267,9 +2517,17 @@ def test_diagnostic_command_launch_failure_keeps_os_details_private(monkeypatch)
     assert error.value.__suppress_context__
 
 
-@pytest.mark.parametrize('kind', ['control', 'runtime'])
 @pytest.mark.parametrize(
-    'stage', ['dependency/cache build', 'environment export build', 'fresh-base offline probe']
+    'kind,stage',
+    [
+        ('control', 'dependency/cache build'),
+        ('control', 'environment export build'),
+        ('control', 'fresh-base offline probe'),
+        ('runtime', 'dependency/cache build'),
+        ('runtime', 'environment export build'),
+        ('runtime', 'execution image build'),
+        ('runtime', 'execution image offline probe'),
+    ],
 )
 def test_build_stage_failures_stop_before_publishing_environment_digest(
     build_inputs, monkeypatch, tmp_path, kind, stage
@@ -2279,6 +2537,11 @@ def test_build_stage_failures_stop_before_publishing_environment_digest(
     if kind == 'control':
         args.target_sha = None
         args.image_digest = container.CONTROL_IMAGE.rsplit(':', 1)[0] + '@sha256:' + 'c' * 64
+    else:
+        args.mode, args.local_image = 'build-image', 'ppu-ci-runtime:run-12-1'
+    expected = f'Dockerfile {kind} {stage} failed'
+    if stage.startswith('execution'):
+        expected = f'Dockerfile {stage} failed'
     output = tmp_path / 'github-output'
     monkeypatch.setenv('GITHUB_OUTPUT', str(output))
     calls = []
@@ -2290,11 +2553,14 @@ def test_build_stage_failures_stop_before_publishing_environment_digest(
                 if argv[2] == str(args.control_root)
                 else 'pyproject.toml\0'
             )
+        if argv[:3] == ['docker', 'image', 'inspect']:
+            return LOCAL_ID
         calls.append(kwargs['failure'])
         assert kwargs['diagnostics'] is True
-        if kwargs['failure'] == f'Dockerfile {kind} {stage} failed':
+        if kwargs['failure'] == expected:
             raise container.ValidationError(kwargs['failure'])
         assert argv[:3] == ['docker', 'buildx', 'build']
+        assert_build_arguments(argv, args)
         assert argv[argv.index('--progress') + 1] == 'plain'
         if '--output' in argv:
             if kind == 'runtime':
@@ -2311,7 +2577,7 @@ def test_build_stage_failures_stop_before_publishing_environment_digest(
     monkeypatch.setattr(container, 'command', command)
     with pytest.raises(container.ValidationError) as error:
         container.build(args)
-    assert str(error.value) == f'Dockerfile {kind} {stage} failed'
+    assert str(error.value) == expected
     assert calls[-1] == str(error.value)
     assert not output.exists()
     if (args.output / 'docker-build.json').exists():
@@ -2341,11 +2607,12 @@ def test_new_bundle_inventory_validates_environment_metadata(exported, damage):
     (root / 'manifest.json').write_text(
         json.dumps(
             {
-                'environment_build_schema': 1,
+                'environment_build_schema': 2,
                 'identity': {'control_sha': CONTROL, 'target_sha': TARGET},
             }
         )
     )
+    (root / 'image.txt').write_text(PUBLISHED + '\n')
     if damage == 'target':
         metadata = json.loads((root / 'docker-build.json').read_text())
         metadata['target_sha'] = 'f' * 40

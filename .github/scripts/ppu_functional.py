@@ -90,16 +90,8 @@ def validate_route(event_name: str, ref: str, inputs: dict) -> str:
     kind = inputs.get("test_kind", "unit")
     if kind not in ("unit", "functional"):
         raise ValueError("test_kind must be unit or functional")
-    diagnostic = str(inputs.get("compiler_diagnostic", False)).lower()
-    if diagnostic not in ("true", "false"):
-        raise ValueError("compiler_diagnostic must be a boolean")
-    diagnostic_context = inputs.get("compiler_diagnostic_context", "bda")
-    if diagnostic_context not in ("bda", "bert"):
-        raise ValueError("compiler_diagnostic_context must be bda or bert")
-    if diagnostic_context != "bda" and diagnostic != "true":
-        raise ValueError("BERT context requires explicit compiler diagnostics")
-    if diagnostic == "true" and kind != "functional":
-        raise ValueError("Compiler diagnostics require test_kind=functional")
+    if any(key in inputs for key in ("compiler_diagnostic", "compiler_diagnostic_context")):
+        raise ValueError("Compiler diagnostic inputs are no longer supported")
     if kind == "unit":
         if any(str(inputs.get(key, default)) != default for key, default in DEFAULTS.items()):
             raise ValueError("Functional inputs require test_kind=functional")
@@ -120,19 +112,12 @@ def validate_route(event_name: str, ref: str, inputs: dict) -> str:
     for key in ("build", "unit_test"):
         if key in inputs and str(inputs[key]).lower() not in ("true", "yes"):
             raise ValueError("Functional mode controls Build and UT; do not set UT switches")
-    if diagnostic == "true":
-        if any(str(inputs.get(key, default)) != default for key, default in DEFAULTS.items()):
-            raise ValueError("Compiler diagnostics cannot contain functional selection inputs")
-        return "compiler_diagnostic"
     return kind
 
 
 def select_config(inputs: dict) -> dict:
-    if (
-        str(inputs.get("compiler_diagnostic", False)).lower() != "false"
-        or inputs.get("compiler_diagnostic_context", "bda") != "bda"
-    ):
-        raise ValueError("Compiler diagnostics must not enter the functional execution chain")
+    if any(key in inputs for key in ("compiler_diagnostic", "compiler_diagnostic_context")):
+        raise ValueError("Compiler diagnostic inputs are no longer supported")
     mode = inputs.get("functional_mode", "assets")
     scope = inputs.get("functional_scope", "all")
     if mode not in ("assets", "regression") or scope not in ("all", *TIERS):

@@ -75,6 +75,31 @@ def api_for(pull=None, permission="write"):
     return api
 
 
+@pytest.mark.parametrize("key", ["compiler_diagnostic", "compiler_diagnostic_context"])
+@pytest.mark.parametrize("value", [False, True, "false", "bda", "", None])
+@pytest.mark.parametrize("kind", ["unit", "functional"])
+def test_removed_diagnostic_inputs_fail_before_authorization_api(key, value, kind):
+    def api(*args):
+        pytest.fail("Removed inputs must fail before authorization or resource access")
+
+    with pytest.raises(ValueError, match="no longer supported"):
+        auth.authorize({}, {"test_kind": kind, key: value}, context(), api)
+
+
+def test_authorization_and_workflow_no_longer_publish_diagnostic_fields():
+    result = auth.authorize({}, {"test_kind": "functional"}, context(), api_for())
+    assert result["test_kind"] == "functional" and result["allowed"]
+    assert not {"compiler_diagnostic", "compiler_diagnostic_context"} & result.keys()
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
+    event = workflow.get("on", workflow.get(True))
+    assert (
+        not {"compiler_diagnostic", "compiler_diagnostic_context"}
+        & event["workflow_dispatch"]["inputs"].keys()
+    )
+    assert "compiler-diagnostic" not in workflow["jobs"]
+    assert "diagnostic" not in workflow["jobs"]["execute"]["if"]
+
+
 @pytest.mark.parametrize("ref", [BRANCH, "refs/tags/v1.2.3"])
 @pytest.mark.parametrize("requested_scope", ["quick", "full"])
 def test_automatic_scope_cannot_be_downgraded(ref, requested_scope):

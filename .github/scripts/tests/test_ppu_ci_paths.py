@@ -156,9 +156,7 @@ def test_masks_cover_all_configured_roots_and_mount_components(path_env, capsys)
     assert "ppu://assets/cpu" in public and "ppu://runs/pod" in public
 
 
-@pytest.mark.parametrize(
-    "filename", ["ppu-build", "ppu-execute", "ppu-ut", "ppu-functional", "ppu-compiler-diagnostic"]
-)
+@pytest.mark.parametrize("filename", ["ppu-build", "ppu-execute", "ppu-ut", "ppu-functional"])
 def test_all_parent_child_secret_boundaries_are_explicit(filename):
     workflow = yaml.safe_load((ROOT / f".github/workflows/{filename}.yml").read_text())
     event = workflow.get("on", workflow.get(True))
@@ -206,13 +204,7 @@ def test_all_parent_child_secret_boundaries_are_explicit(filename):
 
 
 def test_workflow_steps_receive_only_their_runtime_route_secrets(path_env):
-    for filename in (
-        "ppu-build",
-        "ppu-execute",
-        "ppu-ut",
-        "ppu-functional",
-        "ppu-compiler-diagnostic",
-    ):
+    for filename in ("ppu-build", "ppu-execute", "ppu-ut", "ppu-functional"):
         workflow = yaml.safe_load((ROOT / f".github/workflows/{filename}.yml").read_text())
         for job in workflow["jobs"].values():
             for step in job.get("steps", []):

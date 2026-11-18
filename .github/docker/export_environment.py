@@ -215,7 +215,7 @@ exec "$prefix/lib/ppu-system/ld-linux-x86-64.so.2" --library-path "$LD_LIBRARY_P
     copy('/build/control-install.json', EXPORT / 'control-package-install.json')
 
 
-def runtime(*, image=False):
+def runtime():
     verify_reports(
         Path('/build') / name
         for name in (
@@ -239,8 +239,6 @@ def runtime(*, image=False):
         + list((VENV / 'libexec/git-core').iterdir()),
         VENV / 'lib/ppu-system',
     )
-    if not image:
-        archive(Path('/opt'), 'environment.tar.gz', [VENV])
     source = Path('/build/source')
     extension = list((source / 'megatron/core/datasets').glob('helpers_cpp*.so'))
     if len(extension) != 1:
@@ -283,9 +281,4 @@ def runtime(*, image=False):
 
 
 if __name__ == '__main__':
-    {
-        'isolate': isolate,
-        'control': control,
-        'runtime': runtime,
-        'runtime-image': lambda: runtime(image=True),
-    }[sys.argv[1]]()
+    {'isolate': isolate, 'control': control, 'runtime-image': runtime}[sys.argv[1]]()

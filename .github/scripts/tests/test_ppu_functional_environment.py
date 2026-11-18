@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 from test_ppu_functional import ROOT, SCRIPTS, functional
-from test_ppu_upstream import bundle_digest, ci, sealed_bundle
+from test_ppu_upstream import bundle_digest, ci, refresh_environment_evidence, sealed_bundle
 
 environment = functional.module_from_path(
     "ppu_functional_environment", SCRIPTS / "ppu_functional_environment.py"
@@ -48,6 +48,7 @@ def functional_bundle(sealed_bundle):
         path.write_text("Functional payload fixture\n")
         if name.startswith("control/"):
             shutil.copy2(path, plan / name)
+    refresh_environment_evidence(bundle)
     ci.seal_bundle(bundle)
     return plan, bundle
 
@@ -70,7 +71,12 @@ def test_functional_bundle_rejects_incomplete_or_changed_payload(functional_bund
     with pytest.raises(ValueError):
         ci.verify_bundle(bundle, plan, digest)
     if damage != "modified":
-        with pytest.raises(ValueError, match="Missing or empty functional"):
+        expected = "Missing or empty functional"
+        if name in ("functional-tools/yq", "functional-tools/envsubst"):
+            expected = "Missing or corrupted environment member"
+        elif name in ("functional-package-install.json", "installed-packages.json"):
+            expected = "Missing Dockerfile environment build artifact"
+        with pytest.raises(ValueError, match=expected):
             ci.seal_bundle(bundle)
 
 
@@ -241,11 +247,23 @@ def tool_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("PPU_SOURCE_ROOT", str(ROOT))
     monkeypatch.setattr(environment, "check_postprocessing", lambda root: {"event_roundtrip": True})
     manifest = {
-        "environment_build_schema": 1,
+        "environment_build_schema": 2,
         "functional": {"case": {"launcher": "torchrun", "nvrx_checkpoint": []}},
         "identity": {"run_id": "123"},
         "config": {"image": "fixed"},
     }
+    record = {
+        "runtime_image_digest": "fixture-image",
+        "base_image_digest": "fixture-base",
+        "environment_digest": "fixture-environment",
+    }
+    (bundle / "runtime-image.json").write_text(json.dumps(record))
+    for field, variable in (
+        ("runtime_image_digest", "PPU_IMAGE_DIGEST"),
+        ("base_image_digest", "PPU_BASE_IMAGE_DIGEST"),
+        ("environment_digest", "PPU_ENVIRONMENT_DIGEST"),
+    ):
+        monkeypatch.setenv(variable, record[field])
     return bundle, site, manifest, calls, versions, cuda
 
 
@@ -504,26 +522,24 @@ def checkpoint_api(tool_environment, monkeypatch):
 
 @pytest.mark.parametrize("launcher", ["torchrun", "ft_launcher"])
 @pytest.mark.parametrize("checkpoint", [False, True])
-@pytest.mark.parametrize("schema", [1, 2])
 def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
-    tool_environment, checkpoint_api, launcher, checkpoint, schema, monkeypatch
+    tool_environment, checkpoint_api, launcher, checkpoint, monkeypatch
 ):
     bundle, site, manifest, calls, _, _ = tool_environment
-    manifest["environment_build_schema"] = schema
+    manifest["environment_build_schema"] = 2
     delivery = {
         "runtime_image_digest": "ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci@sha256:"
         + "e" * 64,
         "base_image_digest": functional.IMAGE.rsplit(":", 1)[0] + "@sha256:" + "f" * 64,
         "environment_digest": "a" * 64,
     }
-    if schema == 2:
-        (bundle / "runtime-image.json").write_text(json.dumps(delivery))
-        for name, field in (
-            ("PPU_IMAGE_DIGEST", "runtime_image_digest"),
-            ("PPU_BASE_IMAGE_DIGEST", "base_image_digest"),
-            ("PPU_ENVIRONMENT_DIGEST", "environment_digest"),
-        ):
-            monkeypatch.setenv(name, delivery[field])
+    (bundle / "runtime-image.json").write_text(json.dumps(delivery))
+    for name, field in (
+        ("PPU_IMAGE_DIGEST", "runtime_image_digest"),
+        ("PPU_BASE_IMAGE_DIGEST", "base_image_digest"),
+        ("PPU_ENVIRONMENT_DIGEST", "environment_digest"),
+    ):
+        monkeypatch.setenv(name, delivery[field])
     manifest["functional"]["case"]["launcher"] = launcher
     if checkpoint:
         manifest["functional"]["case"]["nvrx_checkpoint"] = [
@@ -540,10 +556,7 @@ def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
     assert report["postprocessing"] == {"event_roundtrip": True}
     assert "protobuf" in report["packages"]
     assert report["identity"] == manifest["identity"] and report["devices"] == 8
-    if schema == 2:
-        assert {field: report[field] for field in delivery} == delivery
-    else:
-        assert not any(field in report for field in delivery)
+    assert {field: report[field] for field in delivery} == delivery
     assert report["training_dependencies"]["packages"] == environment.TRAINING_PACKAGES
     assert environment.TRAINING_PACKAGES.items() <= report["packages"].items()
     assert report["training_dependencies"]["emerging_optimizers_enabled"]
@@ -561,6 +574,81 @@ def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
             == manifest["functional"]["case"]["nvrx_checkpoint"]
         )
         assert "mp_mode" in report["nvrx"]["signatures"]["get_write_results_queue"]
+
+
+@pytest.mark.parametrize("schema", ["absent", None, 1, True, "2", 2.0, 3])
+@pytest.mark.parametrize("operation", ["prepare", "check"])
+def test_environment_rejects_old_protocol_before_process_or_tool_changes(
+    tool_environment, monkeypatch, schema, operation
+):
+    bundle, _, manifest, calls, _, _ = tool_environment
+    if schema == "absent":
+        manifest.pop("environment_build_schema")
+    else:
+        manifest["environment_build_schema"] = schema
+    before = {
+        path.relative_to(bundle): path.read_bytes() for path in bundle.rglob("*") if path.is_file()
+    }
+    monkeypatch.setattr(
+        environment,
+        "command_output",
+        lambda *a: pytest.fail("Old protocol must not start a process"),
+    )
+    monkeypatch.setattr(
+        environment,
+        "check_compiler",
+        lambda *a: pytest.fail("Old protocol must not run compiler checks"),
+    )
+    with pytest.raises(ValueError, match="schema"):
+        if operation == "prepare":
+            environment.prepare(bundle, manifest)
+        else:
+            environment.check(bundle, manifest, bundle / "reports")
+    assert calls == [] and not (bundle / "reports").exists()
+    assert before == {
+        path.relative_to(bundle): path.read_bytes() for path in bundle.rglob("*") if path.is_file()
+    }
+
+
+@pytest.mark.parametrize("command", ["direct", "prepare", "check"])
+def test_environment_check_authenticates_preparation_exactly_once(
+    tool_environment, monkeypatch, command
+):
+    bundle, _, manifest, calls, _, _ = tool_environment
+    original = environment.prepare
+    preparations = []
+
+    def prepare(*args):
+        preparations.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(environment, "prepare", prepare)
+    if command == "direct":
+        environment.check(bundle, manifest, bundle / "reports")
+    else:
+        manifest["test_kind"] = "functional"
+        manifest["config"].update(build=True, **compiler_manifest()["config"])
+        (bundle / "manifest.json").write_text(json.dumps(manifest))
+        monkeypatch.delenv("TORCHINDUCTOR_COMPILE_THREADS", raising=False)
+        monkeypatch.setattr(
+            environment.subprocess, "check_output", lambda *a, **k: json.dumps(compiler_report())
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "ppu_functional_environment.py",
+                command,
+                "--bundle",
+                str(bundle),
+                "--output",
+                str(bundle / "reports"),
+            ],
+        )
+        environment.main()
+    assert preparations == [(bundle, manifest)]
+    assert calls == []
+    assert (bundle / "reports/functional-environment.json").is_file()
 
 
 @pytest.mark.parametrize("damage", ["missing", "modified", "not_executable", "symlink"])
@@ -1163,9 +1251,7 @@ def test_invalid_runtime_environment_fails_before_training(tool_environment, mon
     bundle, _, manifest, _, versions, cuda = tool_environment
     environment.prepare(bundle, manifest)
     if damage in ("bash", "yq", "envsubst"):
-        versions[str(Path(environment.sys.prefix) / "bin/yq") if damage == "yq" else damage] = (
-            "Unsupported version"
-        )
+        versions["/usr/local/bin/yq" if damage == "yq" else damage] = "Unsupported version"
     elif damage == "devices":
         cuda.device_count = lambda: 4
     elif damage == "nodes":

@@ -287,7 +287,7 @@ def test_process_runner_reaps_real_detached_worker(tmp_path, monkeypatch, mode):
         f"time.sleep({0.8 if mode in ('success', 'failure') else 60}); "
         f"raise SystemExit({23 if mode == 'failure' else 0})"
     )
-    original_family = runtime.process_control.process_family
+    original_family = runtime.process_family
     observed = set()
     raised = False
 
@@ -317,7 +317,7 @@ def test_process_runner_reaps_real_detached_worker(tmp_path, monkeypatch, mode):
                 raise RuntimeError("controller failed after tracking worker")
         return selected
 
-    monkeypatch.setattr(runtime.process_control, "process_family", family)
+    monkeypatch.setattr(runtime, "process_family", family)
     kwargs = {
         "cwd": tmp_path,
         "env": os.environ.copy(),
@@ -737,9 +737,11 @@ def test_configure_archives_complete_standalone_runtime_dependencies(tmp_path):
         timeout=30,
     )
     assert run.returncode == 0, run.stderr
-    assert (plan / "control/ppu_compiler_diagnostic.py").read_bytes() == (
-        SCRIPTS / "ppu_compiler_diagnostic.py"
+    assert (plan / "control/ppu_functional_runtime.py").read_bytes() == (
+        SCRIPTS / "ppu_functional_runtime.py"
     ).read_bytes()
+    assert not (plan / "control/ppu_compiler_diagnostic.py").exists()
+    assert not any("diagnostic" in path.name for path in (plan / "control").iterdir())
     cold_start = subprocess.run(
         [sys.executable, "-I", str(plan / "control/ppu_functional_runtime.py"), "--help"],
         cwd=tmp_path,
@@ -749,6 +751,47 @@ def test_configure_archives_complete_standalone_runtime_dependencies(tmp_path):
     )
     assert cold_start.returncode == 0, cold_start.stderr
     assert "--manifest" in cold_start.stdout
+
+
+def test_cross_session_discovery_orphans_and_pid_reuse(tmp_path, monkeypatch):
+    def process(pid, ppid, pgid, sid, start=100):
+        directory = tmp_path / str(pid)
+        directory.mkdir(exist_ok=True)
+        fields = ["S", str(ppid), str(pgid), str(sid)] + ["0"] * 15 + [str(start)]
+        (directory / "stat").write_text(f"{pid} (python worker) " + " ".join(fields))
+
+    monkeypatch.setattr(runtime, "Path", lambda _: tmp_path)
+    process(10, 1, 10, 10)
+    process(20, 10, 20, 20)
+    process(30, 20, 20, 20)
+    process(40, 1, 40, 40)
+    known = {}
+    assert set(runtime.process_family(10, known)) == {10, 20, 30}
+    process(20, 1, 20, 20)
+    process(31, 1, 20, 20)
+    process(30, 1, 40, 40, start=200)
+    assert set(runtime.process_family(10, known)) == {10, 20, 31}
+    assert known[30]["start"] == 100
+    signals = []
+    monkeypatch.setattr(runtime.os, "killpg", lambda group, sig: signals.append((group, sig)))
+    monkeypatch.setattr(runtime.os, "getpgrp", lambda: 999)
+    runtime.signal_family(10, known, signal.SIGTERM)
+    assert set(signals) == {(10, signal.SIGTERM), (20, signal.SIGTERM)}
+
+
+def test_kernel_stack_unavailability_is_recorded(tmp_path):
+    assert runtime.proc_text(tmp_path / "not-present").startswith("unavailable:")
+
+
+@pytest.mark.parametrize("group", [0, 1, 999])
+def test_signal_family_refuses_controller_group(monkeypatch, group):
+    monkeypatch.setattr(runtime, "process_family", lambda *_: {})
+    monkeypatch.setattr(runtime.os, "getpgrp", lambda: 999)
+    monkeypatch.setattr(
+        runtime.os, "killpg", lambda *_: pytest.fail("Controller must not be signalled")
+    )
+    with pytest.raises(ValueError, match="controller process group"):
+        runtime.signal_family(group, {}, signal.SIGTERM)
 
 
 def test_workflow_functional_route_is_manual_only_and_preserves_ut():
