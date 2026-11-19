@@ -63,6 +63,8 @@ def api_for(pull=None, permission="write"):
     def api(path):
         if path.startswith("collaborators/"):
             return {"permission": permission}
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": (pull or pr())["base"]["sha"]}}
         if path.startswith("pulls/7/files?"):
             return [{"filename": "megatron/core/utils.py", "status": "modified"}]
         if path == f"git/commits/{MERGE_SHA}":
@@ -343,7 +345,13 @@ def test_configure_cli_separates_control_and_source(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     manifest = json.loads((output / "manifest.json").read_text())
-    assert manifest["identity"] == {**IDENTITY, "pr_head_sha": "", "base_sha": ""}
+    assert manifest["identity"] == {
+        **IDENTITY,
+        "pr_head_sha": "",
+        "base_sha": "",
+        "run_id": "",
+        "run_attempt": "",
+    }
     expected_scope = ci.load_policy()["daily_scope"]
     assert manifest["config"]["scope"] == expected_scope
     assert len(manifest["unit"]) == (6 if expected_scope == "quick" else 37)
@@ -360,6 +368,7 @@ def test_commit_status_uses_pr_head_sha(tmp_path, monkeypatch, state):
                 "decision": "run",
                 "run_id": "123",
                 **IDENTITY,
+                "target_sha": MERGE_SHA,
             }
         )
     )
@@ -373,10 +382,16 @@ def test_commit_status_uses_pr_head_sha(tmp_path, monkeypatch, state):
             return pr()
         if path == "actions/runs/123":
             return {"status": "in_progress", "run_attempt": 1}
+        if path == f"git/commits/{MERGE_SHA}":
+            return {"parents": [{"sha": BASE_SHA}, {"sha": SHA}]}
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": BASE_SHA}}
         return [
             {
                 "context": auth.STATUS_CONTEXT,
                 "target_url": f"https://github.com/{REPOSITORY}/actions/runs/123",
+                "state": "pending",
+                "description": f"Awaiting tests attempt=1 base={BASE_SHA}",
             }
         ]
 
@@ -805,40 +820,41 @@ def test_real_pytest_plugin_reports(tmp_path, source, complete, extra):
 
 def test_workflow_trust_and_resource_boundaries():
     build = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
+    execute = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())
     ut = yaml.safe_load((ROOT / ".github/workflows/ppu-ut.yml").read_text())
     events = build.get("on", build.get(True))
     assert set(events) == {"push", "pull_request_target", "workflow_dispatch", "merge_group"}
     assert events["push"]["tags"] == ["v*"]
     assert auth.BRANCH == BRANCH == "refs/heads/main"
-    for event_name in ("push", "pull_request_target", "merge_group"):
-        assert events[event_name]["branches"] == ["main"]
+    assert events["push"]["branches"] == ["main", "dev"]
+    for event_name in ("pull_request_target", "merge_group"):
+        assert events[event_name]["branches"] == list(auth.policy.BRANCHES)
     authorize_if = build["jobs"]["authorize"]["if"]
-    assert "github.ref == 'refs/heads/main'" in authorize_if
-    assert "github.event.merge_group.base_ref == 'refs/heads/main'" in authorize_if
-    assert build["jobs"]["invalidate-base"]["if"] == (
-        "github.event_name == 'push' && github.ref == 'refs/heads/main'"
-    )
+    for ref in auth.policy.REFS:
+        assert ref in authorize_if
+    assert 'github.event.merge_group.base_ref)' in authorize_if
+    assert "github.event_name == 'push'" in build["jobs"]["invalidate-base"]["if"]
     assert "ci/ppu-validation" not in (ROOT / ".github/workflows/ppu-build.yml").read_text()
     assert build["jobs"]["authorize"]["runs-on"] == "ubuntu-latest"
-    assert "allowed == 'true'" in build["jobs"]["configure"]["if"]
+    assert execute["jobs"]["configure"]["if"] == "inputs.allowed"
     for name in ("build", "unit-tests"):
-        assert "github.run_attempt == 1" in build["jobs"][name]["if"]
+        assert "github.run_attempt == 1" in execute["jobs"][name]["if"]
     assert "github.run_attempt == 1" in ut["jobs"]["test"]["if"]
     assert ut["jobs"]["test"]["strategy"]["max-parallel"] == 1
     assert "inputs.threshold_percent" in ut["jobs"]["result"]["name"]
     for field in ("scope", "threshold_percent"):
-        assert build["jobs"]["configure"]["outputs"][field] == (
+        assert execute["jobs"]["configure"]["outputs"][field] == (
             "${{ steps.config.outputs." + field + " }}"
         )
-        assert build["jobs"]["unit-tests"]["with"][field] == (
+        assert execute["jobs"]["unit-tests"]["with"][field] == (
             "${{ needs.configure.outputs." + field + " }}"
         )
         assert (
-            "needs.configure.outputs." + field
+            "needs.execute.outputs." + field
             in build["jobs"]["pr-result"]["steps"][-1]["env"]["DESCRIPTION"]
         )
-    assert "GH_TOKEN" not in build["jobs"]["build"].get("env", {})
-    for workflow in (build, ut):
+    assert "GH_TOKEN" not in execute["jobs"]["build"].get("env", {})
+    for workflow in (build, execute, ut):
         for job in workflow["jobs"].values():
             if job.get("permissions", {}).get("statuses") == "write":
                 assert job["runs-on"] == "ubuntu-latest"
@@ -847,14 +863,19 @@ def test_workflow_trust_and_resource_boundaries():
                     assert step["with"]["persist-credentials"] is False
     text = (ROOT / ".github/workflows/ppu-ut.yml").read_text()
     assert 'bash "$PPU_CONTROL_DIR/ppu_ci_run.sh"' in text
-    assert "python3 -I .ppu-ci/control/ppu_ci.py summarize" in text
+    assert (
+        '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci.py summarize'
+        in text
+    )
     build_script = (SCRIPTS / "ppu_ci_build.sh").read_text()
-    assert 'install -m 0644 "$PPU_CONTROL_DIR/ppu_pytest_policy.py"' in build_script
+    dockerfile = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
+    assert 'install -m 0644 /build/control/ppu_pytest_policy.py' in dockerfile
     assert "install -m 0644 .github/scripts/ppu_pytest_policy.py" not in build_script
     assert "secrets: inherit" not in (ROOT / ".github/workflows/ppu-build.yml").read_text()
     assert "release-{0}" in build["concurrency"]["group"]
     assert "full-{0}" in build["concurrency"]["group"]
-    assert "inputs.pr_number == ''" in build["concurrency"]["cancel-in-progress"]
+    assert "workflow_dispatch" not in build["concurrency"]["cancel-in-progress"]
+    assert "pull_request_target" not in build["concurrency"]["cancel-in-progress"]
 
 
 TOOL_STUB = r'''
@@ -941,6 +962,9 @@ def test_suite_runner_with_fake_hardware(tmp_path, failure):
         "PPU_CONTROL_DIR": str(SCRIPTS),
         "PPU_TARGET_SHA": SHA,
         "PPU_CONTROL_SHA": CONTROL_SHA,
+        "PPU_ENVIRONMENT_DIGEST": "d" * 64,
+        "PPU_IMAGE_DIGEST": "ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci@sha256:" + "e" * 64,
+        "PPU_BASE_IMAGE_DIGEST": "pkg.flytiger-eco.com/docker_release/pytorch@sha256:" + "f" * 64,
         "NPROC_PER_NODE": "8",
         "NNODES": "1",
     }
@@ -949,10 +973,16 @@ def test_suite_runner_with_fake_hardware(tmp_path, failure):
     )
     assert run.returncode == (0 if failure == "none" else 1), run.stdout + run.stderr
     commands = [json.loads(line) for line in (tmp_path / "commands.jsonl").read_text().splitlines()]
-    restores = [
-        c for c in commands if c['name'] == 'tar' and 'environment.tar.gz' in ' '.join(c['args'])
-    ]
-    assert len(restores) == 1
+    verifications = [c for c in commands if c['name'] == 'python3' and 'verify-image' in c['args']]
+    assert len(verifications) == 1
+    for flag, variable in (
+        ('--digest', 'PPU_ENVIRONMENT_DIGEST'),
+        ('--image-digest', 'PPU_IMAGE_DIGEST'),
+        ('--base-image-digest', 'PPU_BASE_IMAGE_DIGEST'),
+    ):
+        args = verifications[0]['args']
+        assert args[args.index(flag) + 1] == env[variable]
+    assert not any('restore-runtime' in c['args'] for c in commands)
     calls = [
         c
         for c in commands

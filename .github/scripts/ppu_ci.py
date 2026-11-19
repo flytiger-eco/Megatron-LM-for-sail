@@ -9,7 +9,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 CONTROL_ROOT = Path(os.environ.get("PPU_CONTROL_ROOT", Path(__file__).resolve().parents[2]))
 ROOT = Path(os.environ.get("PPU_SOURCE_ROOT", CONTROL_ROOT)).resolve()
@@ -17,6 +17,13 @@ ENVIRONMENTS = ("dev", "lts")
 OUTCOME_ORDER = {"skipped": 0, "passed": 1, "failed": 2}
 RECIPE_PATH = "tests/test_utils/recipes/h100/unit-tests.yaml"
 POLICY_PATH = ".github/ppu-pr-tests.json"
+
+
+_policy_spec = importlib.util.spec_from_file_location(
+    "ppu_policy", Path(__file__).with_name("ppu_policy.py")
+)
+policy = importlib.util.module_from_spec(_policy_spec)
+exec(compile(Path(_policy_spec.origin).read_bytes(), _policy_spec.origin, "exec"), policy.__dict__)
 
 
 def load_policy() -> dict:
@@ -52,6 +59,18 @@ def positive(value: object, name: str, maximum: int = 10000) -> int:
 def select_config(event: dict, event_name: str, inputs: dict) -> dict:
     if event_name not in {"pull_request_target", "push", "workflow_dispatch", "merge_group"}:
         raise ValueError(f"Unsupported trigger event: {event_name}")
+    if inputs.get("test_kind") == "smoke":
+        if event_name != "workflow_dispatch" or event.get("ref") != policy.SANDBOX_REF:
+            raise ValueError("Smoke diagnostics require a manual sandbox dispatch")
+        inputs = {
+            **inputs,
+            "scope": "full",
+            "suite_family": "nvidia-dev",
+            "repeat": 1,
+            "unit_bucket": policy.SMOKE_UNIT_BUCKET,
+            "build": True,
+            "unit_test": True,
+        }
     config = {"build": inputs.get("build", True), "unit_test": inputs.get("unit_test", True)}
     for key, value in config.items():
         text = str(value).lower()
@@ -61,7 +80,7 @@ def select_config(event: dict, event_name: str, inputs: dict) -> dict:
     repeat = inputs.get("repeat", 1)
     config["repeat"] = 0 if str(repeat) == "0" else positive(repeat, "repeat", 10)
     config["timeout"] = positive(inputs.get("timeout", 30), "timeout", 1380)
-    policy = load_policy()
+    unit_policy = load_policy()
     scope = inputs.get("scope", "auto")
     family = inputs.get("suite_family", "nvidia-dev")
     if scope not in ("auto", "quick", "full") or family not in ("nvidia-dev", "release-dev-lts"):
@@ -72,20 +91,20 @@ def select_config(event: dict, event_name: str, inputs: dict) -> dict:
         if ref.startswith("refs/tags/v"):
             scope, family, trigger = "full", "release-dev-lts", "release"
             config.update(build=True, unit_test=True, repeat=1)
-        elif ref == "refs/heads/main":
+        elif ref in policy.REFS:
             scope, family, trigger = "auto", "nvidia-dev", "push"
             config.update(build=True, unit_test=True, repeat=1)
         else:
             raise ValueError("Unsupported push ref")
     if event_name == "merge_group":
-        if event["merge_group"]["base_ref"] != "refs/heads/main":
+        if event["merge_group"]["base_ref"] not in policy.REFS:
             raise ValueError("The merge queue base must be main")
         scope, family, trigger = "full", "nvidia-dev", "merge_group"
         config.update(build=True, unit_test=True, repeat=1)
     if event_name == "pull_request_target":
         scope, family, trigger = "auto", "nvidia-dev", "pr"
         pr = event["pull_request"]
-        if pr["base"]["ref"] != "main":
+        if pr["base"]["ref"] not in policy.BRANCHES:
             raise ValueError("The PR base must be main")
         config.update(build=True, unit_test=True, repeat=1)
         if not pr["head"].get("repo") or (
@@ -93,7 +112,7 @@ def select_config(event: dict, event_name: str, inputs: dict) -> dict:
         ):
             config["build"] = False
     if event_name == "workflow_dispatch":
-        if ref != "refs/heads/main":
+        if ref not in policy.REFS:
             raise ValueError("Manual dispatch is only allowed on main")
         number, sha, base = (inputs.get(key, "") for key in ("pr_number", "pr_sha", "pr_base_sha"))
         if any((number, sha, base)) and not all((number, sha, base)):
@@ -105,11 +124,11 @@ def select_config(event: dict, event_name: str, inputs: dict) -> dict:
             family, trigger = "nvidia-dev", "pr"
             config.update(build=True, unit_test=True, repeat=1)
     if scope == "auto":
-        scope = "full" if family == "release-dev-lts" else policy["daily_scope"]
+        scope = "full" if family == "release-dev-lts" else unit_policy["daily_scope"]
     if scope == "quick":
-        if family != "nvidia-dev" or policy["quick_state"] == "unavailable":
+        if family != "nvidia-dev" or unit_policy["quick_state"] == "unavailable":
             raise ValueError("Quick is unavailable for this suite or policy state")
-        if policy["quick_state"] == "candidate" and trigger != "manual":
+        if unit_policy["quick_state"] == "candidate" and trigger != "manual":
             raise ValueError("Candidate quick is limited to non-PR manual validation")
         config["repeat"] = 1
     config.update(scope=scope, suite_family=family, trigger_kind=trigger)
@@ -385,6 +404,7 @@ def generate(config: dict, output: Path, identity: dict | None = None) -> dict:
     }
     manifest = {
         "schema_version": 3,
+        "runtime_path_schema": 1,
         "config": config,
         "identity": identity or {},
         "provenance": provenance,
@@ -598,6 +618,16 @@ def summarize(manifest: dict, directory: Path) -> dict:
             require_timing=manifest.get("schema_version", 2) >= 3,
         )
         group_errors = result["errors"]
+        if manifest.get("runtime_path_schema") == 1:
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    "ppu_ci_public_export", Path(__file__).with_name("ppu_ci_export.py")
+                )
+                exporter = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(exporter)
+                exporter.verify_public(result_dir)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                group_errors.append(f"Public evidence inventory: {exc}")
         timing_path = result_dir / "timing.json"
         timing = (
             read_timing(timing_path, group_errors)
@@ -735,9 +765,11 @@ def bundle_inventory(directory: Path) -> dict:
         with path.open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
         inventory[name] = {"size": path.stat().st_size, "sha256": digest}
+    manifest = json.loads((directory / "manifest.json").read_text())
+    image_schema = manifest.get("environment_build_schema") == 2
     for name in (
+        "runtime-image.json" if image_schema else "environment.tar.gz",
         "source.tar.gz",
-        "environment.tar.gz",
         "manifest.json",
         "commit.txt",
         "control.txt",
@@ -749,6 +781,98 @@ def bundle_inventory(directory: Path) -> dict:
     ):
         if name not in inventory or inventory[name]["size"] == 0:
             raise ValueError(f"Missing or empty build artifact: {name}")
+    current_paths = manifest.get("runtime_path_schema") == 1 or (
+        manifest.get("test_kind") == "functional" and manifest.get("schema_version") == 2
+    )
+    if manifest.get("test_kind") == "combined":
+        sidecar = directory / "functional-manifest.json"
+        if sidecar.is_file():
+            current_paths = (
+                current_paths or json.loads(sidecar.read_text()).get("schema_version") == 2
+            )
+    if "environment_build_schema" in manifest:
+        if type(manifest["environment_build_schema"]) is not int or manifest[
+            "environment_build_schema"
+        ] not in (1, 2):
+            raise ValueError("Unsupported Dockerfile environment schema")
+        for name in (
+            "docker-build.json",
+            "compiled-source.tar.gz",
+            "compatibility-patches.json",
+            "base-packages.json",
+            "vendor-bytes.json",
+            "installed-packages.json",
+            "constraints.txt",
+            "functional-package-install.json",
+            "control/ppu_ci_container.py",
+            "control/ppu_ci_container.sh",
+        ):
+            if inventory.get(name, {}).get("size", 0) == 0:
+                raise ValueError("Missing Dockerfile environment build artifact")
+        spec = importlib.util.spec_from_file_location(
+            "ppu_container_inventory", Path(__file__).with_name("ppu_ci_container.py")
+        )
+        environment = importlib.util.module_from_spec(spec)
+        # Inventory validation must not add bytecode to the trusted control tree.
+        previous_dont_write_bytecode = sys.dont_write_bytecode
+        try:
+            sys.dont_write_bytecode = True
+            spec.loader.exec_module(environment)
+        finally:
+            sys.dont_write_bytecode = previous_dont_write_bytecode
+        environment.verify_export(
+            directory,
+            inventory["docker-build.json"]["sha256"],
+            manifest["identity"]["control_sha"],
+            manifest["identity"]["target_sha"],
+            subset=True,
+            schema=2 if image_schema else 1,
+        )
+        if image_schema:
+            record = json.loads((directory / "runtime-image.json").read_text())
+            image = (directory / "image.txt").read_text().strip()
+            environment.verify_image(
+                SimpleNamespace(
+                    artifact=directory,
+                    digest=inventory["docker-build.json"]["sha256"],
+                    control_sha=manifest["identity"]["control_sha"],
+                    target_sha=manifest["identity"]["target_sha"],
+                    base_image_digest=record["base_image_digest"],
+                    image_digest=image,
+                    source_root=None,
+                    check_only=True,
+                )
+            )
+    if current_paths:
+        for name in ("control/ppu_ci_paths.py", "control/ppu_ci_export.py"):
+            if name not in inventory or inventory[name]["size"] == 0:
+                raise ValueError("Missing or empty trusted path control helper")
+    if manifest.get("test_kind") in ("functional", "combined"):
+        required = [
+            "functional-tools/yq",
+            "functional-tools/envsubst",
+            "functional-environment.json",
+            "functional-package-install.json",
+            "installed-packages.json",
+            "control/ppu_functional_run.sh",
+        ]
+        required += [
+            f"control/ppu_functional{suffix}.py"
+            for suffix in (
+                "",
+                "_results",
+                "_runtime",
+                "_environment",
+                "_pytest",
+                "_snapshot",
+                "_hf",
+            )
+        ]
+        if manifest["test_kind"] == "combined":
+            required.append("functional-manifest.json")
+        for name in required:
+            if name not in inventory or inventory[name]["size"] == 0:
+                raise ValueError(f"Missing or empty functional build artifact: {name}")
     return inventory
 
 
@@ -770,6 +894,12 @@ def verify_bundle(directory: Path, plan: Path, digest: str) -> None:
         raise ValueError("Build artifacts are missing, truncated, or failed content verification")
     if (directory / "manifest.json").read_bytes() != (plan / "manifest.json").read_bytes():
         raise ValueError("Build artifacts do not match the trusted test plan")
+    combined = json.loads((plan / "manifest.json").read_text()).get("test_kind") == "combined"
+    if combined and (
+        (directory / "functional-manifest.json").read_bytes()
+        != (plan / "functional-manifest.json").read_bytes()
+    ):
+        raise ValueError("Build artifacts do not match the trusted functional plan")
     identity = json.loads((plan / "manifest.json").read_text())["identity"]
     for filename, key in (
         (".complete", "target_sha"),
@@ -830,7 +960,14 @@ def main() -> None:
             config.update(build=False, unit_test=False)
         identity = {
             key: authorization.get(key, "")
-            for key in ("target_sha", "control_sha", "pr_head_sha", "base_sha")
+            for key in (
+                "target_sha",
+                "control_sha",
+                "pr_head_sha",
+                "base_sha",
+                "run_id",
+                "run_attempt",
+            )
         }
         emit("config", json.dumps(config))
         emit("build", config["build"])

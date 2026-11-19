@@ -28,10 +28,20 @@ trap 'prepare_results_for_upload "$?"' EXIT
 umask 022
 mkdir -p "$PPU_RESULTS_DIR" /opt/data /workspace/data/cache /tmp/checkpoints
 export PPU_REPORT_DIR="$PPU_RESULTS_DIR"
-python3 -m pip uninstall --yes cloud-tpu-client protobuf
-tar -xzf .ppu-ci/environment.tar.gz -C /opt
+: "${PPU_ENVIRONMENT_DIGEST:?Missing trusted Dockerfile build digest}"
+bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" verify-image \
+    --artifact "$PPU_ARTIFACT_DIR" --digest "$PPU_ENVIRONMENT_DIGEST" \
+    --control-sha "$PPU_CONTROL_SHA" --target-sha "$PPU_TARGET_SHA" \
+    --source-root "$PPU_SOURCE_ROOT" \
+    --base-image-digest "${PPU_BASE_IMAGE_DIGEST:?Missing trusted base image digest}" \
+    --image-digest "${PPU_IMAGE_DIGEST:?Missing trusted execution image digest}"
 export PATH="/opt/ppu-ci-venv/bin:$PATH"
 export VIRTUAL_ENV=/opt/ppu-ci-venv UV_PROJECT_ENVIRONMENT=/opt/ppu-ci-venv
+export PYTHONNOUSERSITE=1 UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never
+export LD_LIBRARY_PATH="/opt/ppu-ci-venv/lib/ppu-system:${LD_LIBRARY_PATH:-}"
+export GIT_EXEC_PATH=/opt/ppu-ci-venv/libexec/git-core
+export SSL_CERT_FILE=/opt/ppu-ci-venv/etc/ssl/certs/ca-certificates.crt
+export GIT_SSL_CAINFO="$SSL_CERT_FILE"
 python -m pip check
 python -I - <<'PY'
 import importlib

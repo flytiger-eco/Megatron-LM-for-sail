@@ -134,6 +134,8 @@ def test_docs_only_pr_skips_without_merge_or_source(fork):
     def api(path):
         if "/files?" in path:
             return [{"filename": "README.md"}]
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": BASE_SHA}}
         assert path == "pulls/7"
         return pull
 
@@ -148,6 +150,8 @@ def test_snapshot_drift_during_docs_check():
         nonlocal calls
         if "/files?" in path:
             return [{"filename": "README.md"}]
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": BASE_SHA}}
         calls += 1
         pull = pr()
         if calls > 1:
@@ -479,7 +483,18 @@ def test_final_status_cannot_overwrite_new_snapshot(monkeypatch, mutation):
                 "status": "completed" if mutation == "cancelled" else "in_progress",
                 "run_attempt": 2 if mutation == "rerun" else 1,
             }
-        return [{"context": auth.STATUS_CONTEXT, "target_url": url}]
+        if path == f"git/commits/{MERGE_SHA}":
+            return {"parents": [{"sha": BASE_SHA}, {"sha": SHA}]}
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": pull["base"]["sha"]}}
+        return [
+            {
+                "context": auth.STATUS_CONTEXT,
+                "target_url": url,
+                "state": "pending",
+                "description": f"attempt=1 base={BASE_SHA}",
+            }
+        ]
 
     auth.publish_status(
         {
@@ -622,7 +637,18 @@ def test_status_snapshot_is_rechecked_before_write(monkeypatch, decision):
             return pull
         if path == "actions/runs/123":
             return {"status": "in_progress", "run_attempt": 1}
-        return [{"context": auth.STATUS_CONTEXT, "target_url": auth.run_url("123")}]
+        if path == f"git/commits/{MERGE_SHA}":
+            return {"parents": [{"sha": BASE_SHA}, {"sha": SHA}]}
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": BASE_SHA}}
+        return [
+            {
+                "context": auth.STATUS_CONTEXT,
+                "target_url": auth.run_url("123"),
+                "state": "pending",
+                "description": f"attempt=1 base={BASE_SHA}",
+            }
+        ]
 
     auth.publish_status(
         {
@@ -631,6 +657,7 @@ def test_status_snapshot_is_rechecked_before_write(monkeypatch, decision):
             "base_sha": BASE_SHA,
             "run_id": "123",
             "decision": decision,
+            "target_sha": MERGE_SHA,
         },
         "success",
         "completed",
@@ -661,12 +688,11 @@ def test_merge_snapshot_rechecked_after_parent_lookup(mutation):
         auth.authorize(pr_event(), {}, context("pull_request_target"), api)
 
 
-def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch):
-    script = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
+@pytest.mark.parametrize("test_kind", [None, "unit", "functional"])
+def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch, test_kind):
+    script = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
     block = next(
-        block
-        for block in re.findall(r"<<'PY'\n(.*?)\nPY", script, re.S)
-        if "native_requirements =" in block
+        block for block in re.findall(r"<<'PY'\n(.*?)\nPY", script, re.S) if "native =" in block
     )
     runtimes = {
         "torch": "2.13.0",
@@ -679,27 +705,34 @@ def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch):
     monkeypatch.setattr(metadata, "version", runtimes.__getitem__)
     artifact = tmp_path / ".ppu-ci"
     artifact.mkdir()
+    (artifact / "manifest.json").write_text(json.dumps({"test_kind": test_kind}))
+    (tmp_path / "pyproject.toml").write_bytes((ROOT / "pyproject.toml").read_bytes())
     exec(compile(block, "ppu-native-requirements", "exec"), {})
-    requirements = (artifact / "ppu-requirements.txt").read_text().splitlines()
-    constraints = (artifact / "constraints.txt").read_text().splitlines()
+    requirements = (tmp_path / "ppu-requirements.txt").read_text().splitlines()
+    constraints = (tmp_path / "constraints.txt").read_text().splitlines()
     assert requirements.count("pla==1.0.0+v0.1.0.ppu2.2.0") == 1
     assert requirements.count("fla-core==0.4.1+v0.1.0.ppu2.2.0") == 1
     assert set(requirements) <= set(constraints)
     assert {f"{name}=={version}" for name, version in runtimes.items()} <= set(constraints)
     assert {"numpy==1.26.4", "pyarrow==21.0.0"} <= set(constraints)
-    assert not any(line.startswith(("fla==", "flash-linear-attention==")) for line in requirements)
+    assert not any(line.startswith("fla==") for line in requirements)
+    for requirement in (
+        "flash-linear-attention==0.4.1+v0.1.0.ppu2.2.0",
+        "emerging-optimizers==0.3.0",
+    ):
+        assert requirement in requirements
+    dockerfile = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
     assert (
-        "export PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"
-        in script
+        "PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"
+        in dockerfile
     )
-    assert "PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL='' PIP_FIND_LINKS=''" in script
-    install = script.index("-r .ppu-ci/test-requirements.txt -r .ppu-ci/ppu-requirements.txt")
+    assert 'PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL="" PIP_FIND_LINKS=""' in dockerfile
+    install = script.index("-r /build/test-requirements.txt -r /build/ppu-requirements.txt")
     assert script.index("export PIP_CONSTRAINT=") < install
-    assert (
-        install
-        < script.index("PLA import check passed:")
-        < script.index("tar -czf .ppu-ci/environment.tar.gz")
-    )
+    assert install < script.index("distribution = md.distribution('fla-core')")
+    build = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
+    assert build.index("verify-image") < build.index("PLA import check passed:")
+    assert "pip install" not in build
 
 
 @pytest.mark.parametrize("script_name", ["ppu_ci_build.sh", "ppu_ci_run.sh"])
@@ -722,7 +755,7 @@ def test_pla_probe_checks_version_origin_and_native_imports(monkeypatch, script_
         if "md.version('pla')" in block
     )
     if script_name == "ppu_ci_run.sh":
-        assert script.index("tar -xzf .ppu-ci/environment.tar.gz") < script.index(probe)
+        assert script.index("verify-image") < script.index(probe)
         assert "pip install" not in script
     modules = ("pla", "pla.decode", "pla.prefill.flashqla", "pla.prefill.flashkdapro")
     imported = []
@@ -780,12 +813,12 @@ l2_norm = l2norm
     ],
 )
 def test_fla_l2norm_dependency_patch_is_restricted(tmp_path, monkeypatch, mode):
-    script = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
+    script = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
     block = next(
         block
         for block in re.findall(r"python -I - <<'PY'\n(.*?)\nPY", script, re.S)
         if "distribution = md.distribution('fla-core')" in block
-    )
+    ).split("\ndistribution = md.distribution('transformer-engine')", 1)[0]
     prefix = tmp_path / "venv"
     target = prefix / "fla/modules/l2norm.py"
     target.parent.mkdir(parents=True)
@@ -920,14 +953,14 @@ def test_fla_patch_and_probes_preserve_ut_and_restore_contract():
     build = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
     run = (ROOT / ".github/scripts/ppu_ci_run.sh").read_text()
     assert (
-        build.index("python -m pip check")
-        < build.index("FLA Core l2norm last dimension argument adaptation:")
+        build.index("verify-image")
+        < build.index("python -m pip check")
         < build.index("FLA Core import check passed:")
         < build.index("assert gated_delta_net.HAVE_FLA")
-        < build.index("tar -czf .ppu-ci/environment.tar.gz")
+        < build.index("seal-bundle")
     )
     assert (
-        run.index("tar -xzf .ppu-ci/environment.tar.gz")
+        run.index("verify-image")
         < run.index("FLA Core import check passed:")
         < run.index("export PYTHONPATH=")
         < run.index("assert gated_delta_net.HAVE_FLA")
@@ -994,7 +1027,7 @@ def test_diagnostic_generates_one_unchanged_upstream_bucket(tmp_path, capsys):
     workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
     events = workflow.get("on", workflow.get(True))
     assert events["workflow_dispatch"]["inputs"]["unit_bucket"]["default"] == ""
-    assert len(events["workflow_dispatch"]["inputs"]) <= 10
+    assert len(events["workflow_dispatch"]["inputs"]) <= 25
 
 
 @pytest.mark.parametrize(
@@ -1065,7 +1098,14 @@ def test_diagnostic_results_never_count_as_full_baseline(tmp_path, capsys, state
         (directory / "prod-1-rank-7.json").rename(directory / "missing-rank")
     if state == "missing_timing":
         (directory / "suite-timing.json").rename(directory / "missing-timing")
-    result = ci.summarize(manifest, tmp_path)
+    spec = importlib.util.spec_from_file_location(
+        "diagnostic_export_fixture", ROOT / ".github/scripts/ppu_ci_export.py"
+    )
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    public = tmp_path / "public-results" / directory.name
+    exporter.export(directory, public, env={})
+    result = ci.summarize(manifest, public.parent)
     assert result["success"] is (state == "passed")
     assert not result["baseline_complete"]
     assert result["scope"] == "diagnostic"
@@ -1100,6 +1140,8 @@ def sealed_bundle(tmp_path):
     control.mkdir(parents=True)
     (plan / "manifest.json").write_text(json.dumps({"identity": IDENTITY}))
     shutil.copyfile(ROOT / ".github/scripts/ppu_ci.py", control / "ppu_ci.py")
+    for name in ("ppu_ci_container.py", "ppu_ci_container.sh", "ppu_policy.py"):
+        shutil.copyfile(ROOT / ".github/scripts" / name, control / name)
     (control / "ppu_ci_run.sh").write_text('printf "UT_STARTED:%s\\n" "$1"\n')
     (control / "ppu_pytest_policy.py").write_text("POLICY = True\n")
     bundle = tmp_path / "nas" / "run-1" / "build"
@@ -1253,7 +1295,7 @@ def test_ut_workflow_restores_same_run_bundle_before_execution(sealed_bundle, tm
 
 
 def test_bundle_workflow_digest_and_run_scoping():
-    build = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
+    build = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())
     ut = yaml.safe_load((ROOT / ".github/workflows/ppu-ut.yml").read_text())
     assert (
         build["jobs"]["build"]["outputs"]["bundle_digest"]
@@ -1268,16 +1310,19 @@ def test_bundle_workflow_digest_and_run_scoping():
         for step in ut["jobs"]["test"]["steps"]
         if step.get("uses") == "actions/download-artifact@v4"
     ]
-    assert downloads == ["ppu-plan"]
+    assert downloads == ["ppu-control-environment", "ppu-plan", "ppu-runtime-environment"]
     action = next(step for step in ut["jobs"]["test"]["steps"] if step.get("id") == "ppu")
     assert (
-        "PPU_BUNDLE_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build"
+        "PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build"
         in action["with"]["extra_env"]
     )
     assert "PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }}" in action["with"]["extra_env"]
     command = action["with"]["command"]
     assert (
-        command.index("verify-bundle") < command.index("tar -xzf") < command.index("ppu_ci_run.sh")
+        command.index("verify-bundle")
+        < command.index("restore-source")
+        < command.index("ppu_ci_run.sh")
     )
     script = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
-    assert script.index("seal-bundle") > script.index("tar -czf .ppu-ci/environment.tar.gz")
+    assert script.index("seal-bundle") > script.index("verify-image")
+    assert "tar -czf .ppu-ci/environment.tar.gz" not in script
