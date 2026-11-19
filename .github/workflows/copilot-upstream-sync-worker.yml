@@ -111,32 +111,39 @@ jobs:
         run: |
           set -euo pipefail
           PROMPT=$(cat <<EOF
-          将社区 ${UPSTREAM_REPOSITORY}:${UPSTREAM_BRANCH} merge 到我方 ${SYNC_BRANCH}。
-          git merge --no-ff --no-commit 已由工作流执行。当前 HEAD（ours/local_branch）
-          为 ${BASE_SHA}，MERGE_HEAD（theirs/baseline_branch）为 ${UPSTREAM_SHA}。
-          你只负责逐 hunk 解决已有冲突，并审阅 PPU 适配的完整性。
+          Merge upstream ${UPSTREAM_REPOSITORY}:${UPSTREAM_BRANCH} into our ${SYNC_BRANCH}.
+          The workflow has already executed git merge --no-ff --no-commit.
+          Current HEAD (ours/local_branch) is ${BASE_SHA};
+          MERGE_HEAD (theirs/baseline_branch) is ${UPSTREAM_SHA}.
+          Resolve existing conflicts hunk by hunk and review the completeness of our PPU adaptations.
 
-          冲突原则（优先于仓库中的其他同步规则）：
-          1. 纯上游内容取上游侧 theirs，即 baseline_branch。
-          2. 我方 PPU 适配完整保留 ours，即 local_branch 一侧。
-          3. 混合内容以上游新结构为骨架，重新嵌入我方 PPU 适配意图；
-             保住功能意图而非字面文本，检查调用方和被调用方 API 是否一致。
-          必须查看冲突的 base/ours/theirs 与相关提交历史，不能只按文件名或
-          关键字判断归属。禁止全局 -X ours/theirs，禁止整文件批量覆盖，
-          不采用 skills/nightly-sync 的上游整文件覆盖清单。
+          Conflict resolution principles (take precedence over other repository synchronization rules):
+          1. For upstream-only content, take theirs, the baseline_branch side.
+          2. Fully preserve our PPU adaptations from ours, the local_branch side.
+          3. For mixed content, use the new upstream structure as the skeleton and reapply our PPU
+             adaptation intent. Preserve functional intent rather than literal text, and verify
+             that caller and callee APIs remain consistent.
+          Inspect the base/ours/theirs versions and relevant commit history for each conflict.
+          Do not determine ownership solely from filenames or keywords. Do not use global
+          -X ours/theirs, bulk whole-file replacement, or the upstream whole-file overwrite list
+          from skills/nightly-sync.
 
-          使用 git status、git diff、git ls-files -u、git show :1:path、
-          git show :2:path、git show :3:path 和 git log 读取证据。
-          只修改仍有冲突的路径；没有冲突时仅审阅，不改动任何文件。
-          整个 .github/workflows/ 已在索引中恢复目标分支的我方版本，禁止修改该目录。
-          工作树中残留的上游 workflow 不属于合并候选，忽略它们。
-          用 git diff --cached 审阅候选内容，不要把残留文件暂存或提交。
-          不手工编辑 uv.lock；无法可靠处理的冲突应保留并报告。
-          不运行 git add/commit/merge/rebase/reset/checkout/push，不修改任何
-          Git 引用或配置，不创建 PR，不调用远程写 API，不读取或输出凭据。
-          无法可靠解决时明确报告并保留冲突标记，后续检查会阻止发布。
-          输出中文摘要：同步范围、逐个冲突 hunk 的归属和处理依据、PPU
-          功能保留及 API 适配情况、未验证事项。不要声称完成了 PPU 硬件测试。
+          Read evidence using git status, git diff, git ls-files -u, git show :1:path,
+          git show :2:path, git show :3:path, and git log.
+          Modify only paths that still have conflicts. If there are no conflicts, review only;
+          do not modify any files.
+          The entire .github/workflows/ directory has been restored in the index to our target
+          branch version. Do not modify this directory. Ignore leftover upstream workflow files
+          in the worktree; they are not part of the merge candidate.
+          Review the candidate with git diff --cached. Do not stage or commit leftover files.
+          Do not edit uv.lock manually; preserve and report conflicts you cannot handle reliably.
+          Do not run git add/commit/merge/rebase/reset/checkout/push, change Git refs or configuration,
+          create PRs, call remote write APIs, or read or output credentials.
+          If you cannot resolve a conflict reliably, explicitly report it and leave the conflict
+          markers in place so subsequent checks prevent publication.
+          Produce a Chinese summary covering the synchronization scope, ownership and rationale
+          for each conflict hunk, PPU functionality preservation and API adaptation, and unverified
+          items. Do not claim that PPU hardware tests were performed.
           EOF
           )
           timeout 30m copilot -p "$PROMPT" -s \
