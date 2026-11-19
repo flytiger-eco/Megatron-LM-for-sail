@@ -585,7 +585,8 @@ def describe_case(root: Path, name: str, specs: list, config: dict) -> dict:
         "upstream_nodes": spec.get("nodes"),
         "upstream_gpus": spec.get("gpus"),
         "recipe_path": spec["recipe_path"],
-        "recipe_sha256": spec["recipe_sha256"],
+        # Selection uses trusted control recipes; execution attests the target checkout.
+        "recipe_sha256": sha256(safe_file(root, spec["recipe_path"])),
         "scopes": sorted({row["scope"] for row in specs}),
         "cadence": sorted({cadence for row in specs for cadence in row["cadence"]}),
         "training_script": entries[0],
@@ -779,6 +780,7 @@ def build_manifest(root: Path, control: Path, config: dict, identity: dict) -> d
             "test_pretraining_resume_checkpoint_pipeline.py",
         )
     ]
+    protected += sorted({case["recipe_path"] for case in manifest["functional"].values()})
     manifest["source_files"] = {name: sha256(safe_file(root, name)) for name in protected}
     manifest["control_files"] = {name: sha256(safe_file(control, name)) for name in protected}
     return manifest

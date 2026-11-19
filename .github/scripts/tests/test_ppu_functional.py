@@ -446,6 +446,55 @@ def test_conflicting_recipe_fails(monkeypatch):
         functional.catalogue(ROOT, ROOT, functional.select_config({}))
 
 
+@pytest.mark.parametrize("damage", ["none", "changed_after_plan", "missing", "symlink"])
+def test_different_control_and_target_recipes_keep_selection_and_integrity(tmp_path, damage):
+    config = functional.select_config(
+        {
+            "functional_mode": "regression",
+            "functional_cases": "gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files",
+        }
+    )
+    identity = {"target_sha": "a" * 40, "control_sha": "b" * 40, "run_id": "123", "run_attempt": 1}
+    original = functional.build_manifest(ROOT, ROOT, config, identity)
+    original_case = next(iter(original["functional"].values()))
+    source = tmp_path / "source"
+    files = set(original["source_files"]) | {original_case["training_script"]}
+    files.update(
+        path.relative_to(ROOT).as_posix()
+        for path in (ROOT / functional.BASELINES).rglob("*")
+        if path.is_file()
+    )
+    for name in files:
+        target = source / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((ROOT / name).read_bytes())
+    recipe_name = original_case["recipe_path"]
+    recipe = source / recipe_name
+    recipe.write_text("# The target branch has a different recipe revision.\n" + recipe.read_text())
+    expected_digest = functional.sha256(recipe)
+    if damage in ("missing", "symlink"):
+        recipe.unlink()
+        if damage == "symlink":
+            recipe.symlink_to(ROOT / recipe_name)
+        with pytest.raises(ValueError, match="Missing or unsafe source file"):
+            functional.build_manifest(source, ROOT, config, identity)
+        return
+    manifest = functional.build_manifest(source, ROOT, config, identity)
+    case = next(iter(manifest["functional"].values()))
+    assert case == {**original_case, "recipe_sha256": expected_digest}
+    assert manifest["source_files"][recipe_name] == expected_digest
+    assert manifest["control_files"][recipe_name] == original_case["recipe_sha256"]
+    assert expected_digest != original_case["recipe_sha256"]
+    results = functional.module_from_path(
+        "ppu_recipe_results", SCRIPTS / "ppu_functional_results.py"
+    )
+    results.verify_source(manifest, source, case)
+    if damage == "changed_after_plan":
+        recipe.write_text(recipe.read_text() + "# Unreviewed change after planning.\n")
+        with pytest.raises(ValueError, match="Functional source digest mismatch"):
+            results.verify_source(manifest, source, case)
+
+
 def test_recipe_entrypoint_is_not_guessed(catalogue):
     case = next(row for row in catalogue["functional"].values() if row["model"] == "bert")
     spec = next(row for row in functional.load_recipes(ROOT) if row["test_case"] == case["case"])
