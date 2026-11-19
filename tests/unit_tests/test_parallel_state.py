@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from math import log2
+from datetime import timedelta
 
 import pytest
 import torch
@@ -12,6 +12,46 @@ from tests.unit_tests.test_utilities import Utils
 rank = Utils.rank
 world_size = Utils.world_size
 test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
+
+
+@pytest.mark.parametrize(
+    "accessor, kwargs, group_name",
+    [
+        (ps.get_data_parallel_group_gloo, {}, '_DATA_PARALLEL_GROUP_GLOO'),
+        (
+            ps.get_data_parallel_group_gloo,
+            {'with_context_parallel': True},
+            '_DATA_PARALLEL_GROUP_WITH_CP_GLOO',
+        ),
+        (
+            ps.get_data_parallel_group_gloo,
+            {'with_context_parallel': True, 'partial_data_parallel': True},
+            '_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO',
+        ),
+        (ps.get_expert_data_parallel_group_gloo, {}, '_EXPERT_DATA_PARALLEL_GROUP_GLOO'),
+        (
+            ps.get_expert_data_parallel_group_gloo,
+            {'partial_expert_data_parallel': True},
+            '_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO',
+        ),
+    ],
+)
+def test_optional_gloo_group_accessors(monkeypatch, accessor, kwargs, group_name):
+    """Absent Gloo groups are optional only when initialization checks are disabled."""
+    monkeypatch.setattr(ps, group_name, None)
+    with pytest.raises(AssertionError, match='not initialized'):
+        accessor(**kwargs)
+    assert accessor(**kwargs, check_initialized=False) is None
+
+    group = object()
+    monkeypatch.setattr(ps, group_name, group)
+    assert accessor(**kwargs) is group
+    assert accessor(**kwargs, check_initialized=False) is group
+
+
+def test_optional_gloo_group_still_requires_cp_for_partial_dp():
+    with pytest.raises(AssertionError, match='needs to include CP'):
+        ps.get_data_parallel_group_gloo(partial_data_parallel=True, check_initialized=False)
 
 
 def test_inject_gtp_remat_axis():
@@ -592,12 +632,12 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
 
 
 @pytest.mark.parametrize(
-    "world_size, tp_size, cp_size, dp_size",
-    [(8, 1, 2, 4), (8, 1, 1, 8)],  # 8 GPUs, 1 TP, 2 CP, 4 DP  # 8 GPUs, 1 TP, 1 CP, 8 DP
+    "world_size, tp_size, cp_size, dp_size", [(8, 1, 2, 4), (8, 1, 1, 8), (8, 2, 2, 2)]
 )
-def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
+def test_dynamic_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     """
-    Test that hybrid DPxCP groups are created correctly.
+    Test that every valid dynamic DPxCP group, including CP1, is created with the
+    configured timeout.
     """
     Utils.destroy_model_parallel()
 
@@ -608,16 +648,42 @@ def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
         context_parallel_size=cp_size,
-        hybrid_context_parallel=True,
+        dynamic_context_parallel=True,
+        distributed_timeout_minutes=45,
     )
 
-    dp_cp_size = ps.get_data_parallel_world_size(with_context_parallel=True)
-    group_sizes = [2**i for i in range(int(log2(dp_cp_size)))][1:]
+    dp_cp_size = ps.get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False)
+    group_sizes = ps.get_valid_dynamic_context_parallel_group_sizes(dp_cp_size)
     for group_size in group_sizes:
-        group = ps.get_hybrid_data_context_parallel_groups(group_size=group_size)
+        group = ps.get_dynamic_data_context_parallel_groups(group_size=group_size)
         assert group.size() == group_size
+        # distributed_timeout_minutes, not torch's default NCCL timeout (10 minutes)
+        assert group._get_backend(torch.device("cuda")).options._timeout == timedelta(minutes=45)
+        tp_dp_cp_group = ps.get_dynamic_tensor_data_context_parallel_group(group_size=group_size)
+        assert tp_dp_cp_group.size() == tp_size * group_size
 
     Utils.destroy_model_parallel()
+
+
+def test_expert_data_parallel_gloo_group_timeout():
+    """
+    Test that the expert data parallel gloo group is created with the configured timeout.
+    """
+    Utils.initialize_model_parallel(distributed_timeout_minutes=45)
+
+    group = ps.get_expert_data_parallel_group_gloo()
+    assert group._get_backend(torch.device("cpu")).options._timeout == timedelta(minutes=45)
+
+    Utils.destroy_model_parallel()
+
+
+def test_valid_dynamic_cp_group_sizes():
+    assert ps.get_valid_dynamic_context_parallel_group_sizes(8) == [1, 2, 4, 8]
+    assert ps.get_valid_dynamic_context_parallel_group_sizes(6) == [1, 2, 6]
+    assert ps.get_valid_dynamic_context_parallel_group_sizes(3) == [1, 3]
+
+    with pytest.raises(ValueError, match="must be positive"):
+        ps.get_valid_dynamic_context_parallel_group_sizes(0)
 
 
 def test_separate_all_gather_group():
