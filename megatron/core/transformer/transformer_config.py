@@ -1062,7 +1062,7 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_megakernel_backend: Optional[str] = None
     """Optional backend that replaces MoE dispatch, expert computation, and combine.
-    Supported values: None and "mok".
+    Supported values: None, "mok", and "te_ppu_rtc" (BF16 shape-only prototype).
     """
 
     moe_megakernel_backend_config: Optional[dict] = None
@@ -3421,15 +3421,57 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_router_load_balancing_type = "quantile_balancing"
             self.moe_aux_loss_coeff = self.moe_aux_loss_coeff[0]
 
-        if self.moe_megakernel_backend not in (None, "mok"):
+        if self.moe_megakernel_backend not in (None, "mok", "te_ppu_rtc"):
             raise ValueError(
-                "moe_megakernel_backend must be None or 'mok', got "
+                "moe_megakernel_backend must be None, 'mok', or 'te_ppu_rtc', got "
                 f"{self.moe_megakernel_backend!r}"
             )
         if self.moe_megakernel_backend is None and self.moe_megakernel_backend_config:
             raise ValueError(
                 "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
             )
+
+        if self.moe_megakernel_backend == "te_ppu_rtc":
+            if (
+                not self.bf16
+                or self.fp16
+                or self.fp8
+                or self.fp4
+                or self.fp8_param
+                or self.fp4_param
+            ):
+                raise ValueError("te_ppu_rtc requires BF16 activations and BF16 weights")
+            if not self.gated_linear_unit or self.activation_func != F.silu or self.add_bias_linear:
+                raise ValueError("te_ppu_rtc requires bias-free SwiGLU experts")
+            if not self.moe_grouped_gemm or self.moe_single_grouped_weight:
+                raise ValueError(
+                    "te_ppu_rtc requires grouped experts with per-expert weight parameters"
+                )
+            if self.moe_router_dtype == "fp64" or self.moe_pad_expert_input_to_capacity:
+                raise ValueError("te_ppu_rtc requires at most K routes and FP32-compatible scores")
+            if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
+                raise ValueError("te_ppu_rtc requires TP=1 and expert TP=1")
+            if (
+                self.transformer_impl != "transformer_engine"
+                or self.moe_latent_size
+                or self.moe_shortcut_connection
+                or self.moe_shared_expert_overlap
+                or self.overlap_moe_expert_parallel_comm
+                or self.moe_virtual_expert_load_balance
+            ):
+                raise ValueError("te_ppu_rtc requires ordinary TE experts without dispatch overlap")
+            if (
+                self.moe_apply_probs_on_input
+                or self.moe_mlp_glu_interleave_size is not None
+                or self.glu_linear_offset
+                or self.activation_func_clamp_value is not None
+                or self.activation_func_tanh_clamp_scale is not None
+            ):
+                raise ValueError(
+                    "te_ppu_rtc expects gate-then-up SwiGLU with router weights before FC2"
+                )
+            if self.moe_megakernel_backend_config:
+                raise ValueError("te_ppu_rtc does not take kernel tuning options")
 
         if self.moe_megakernel_backend == "mok":
             # TODO: Add a materialized-wgrad adapter for non-fused accumulation.

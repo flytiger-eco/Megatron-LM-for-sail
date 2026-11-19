@@ -591,6 +591,27 @@ FP8 training provides benefits across all three performance walls:
 
 ### MoE Megakernel Backends
 
+#### BF16 PPU RTC interface prototype
+
+Select `--moe-megakernel-backend te_ppu_rtc` with a matching PPU TE checkout,
+`--bf16 --swiglu --disable-bias-linear --moe-grouped-gemm` and TP/expert TP of 1.
+The router selects global expert IDs. The adapter passes the compact routes, FP32
+scores, original per-expert BF16 parameters and EP group to
+`transformer_engine.pytorch.bf16_mega_moe`. Shared experts execute in Megatron.
+The proposed operator multiplies the SwiGLU output by its route weight before FC2.
+
+The prototype supports forward/backward shape inspection on PyTorch meta tensors.
+Concrete execution raises `NotImplementedError` at the RTC operator boundary.
+The backward API describes ordinary autograd gradients for the input, router scores
+and each FC1/FC2 parameter. Device kernels, EP communication and DDP gradient
+buffer integration are future implementation work.
+
+With both checkouts on the Python path, run the cross-repository shape demo from Megatron:
+
+```bash
+python -m pytest --noconftest -q tests/unit_tests/transformer/moe/test_te_ppu_megamoe.py
+```
+
 #### MOK
 
 A megakernel backend replaces the native post-router dispatch, expert-compute, and combine path.

@@ -620,7 +620,8 @@ class MoELayer(BaseMoELayer):
         input_ids = self._align_batch_first_to_sequence_parallel(input_ids, hidden_states)
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
-        hidden_states = self.token_dispatcher.wrap_layer_input(hidden_states)
+        if self.token_dispatcher is not None:
+            hidden_states = self.token_dispatcher.wrap_layer_input(hidden_states)
         probs, routing_map = apply_module(self.router)(
             hidden_states, padding_mask, input_ids=input_ids, packed_seq_params=packed_seq_params
         )
@@ -894,7 +895,11 @@ class MoELayer(BaseMoELayer):
                 probs, routing_map = self.route(
                     hidden_states, padding_mask, input_ids, packed_seq_params
                 )
-                return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+                output = apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+                # The TE PPU interface computes routed experts only.
+                if self.config.moe_megakernel_backend == "te_ppu_rtc" and self.use_shared_expert:
+                    output = output + self.shared_experts_compute(hidden_states)
+                return output
 
             if self.moe_layer_recompute and self.training:
                 output = precision_aware_checkpoint(

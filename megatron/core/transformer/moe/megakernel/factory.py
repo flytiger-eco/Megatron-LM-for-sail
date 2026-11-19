@@ -29,6 +29,10 @@ def build_megakernel_backend(
     do not acquire optional megakernel dependencies.
     """
     backend = config.moe_megakernel_backend
+    if backend == "te_ppu_rtc":
+        from megatron.core.transformer.moe.megakernel.te_ppu import TEPPUMegaMoE
+
+        return TEPPUMegaMoE(config, ep_group, routed_experts, num_local_experts)
     if backend == "mok":
         from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
 
@@ -45,7 +49,7 @@ def build_megakernel_backend(
 def prepare_megakernel_shared_expert_config(config: TransformerConfig) -> TransformerConfig:
     """Return the config used to construct backend-compatible shared experts."""
     backend = config.moe_megakernel_backend
-    if backend is None:
+    if backend in (None, "te_ppu_rtc"):
         return config
     if backend == "mok":
         from megatron.core.transformer.moe.megakernel.mok.weights import (
@@ -59,7 +63,7 @@ def prepare_megakernel_shared_expert_config(config: TransformerConfig) -> Transf
 def megakernel_shared_expert_init_context(config: TransformerConfig):
     """Return the backend-specific context used to construct shared experts."""
     backend = config.moe_megakernel_backend
-    if backend is None:
+    if backend in (None, "te_ppu_rtc"):
         return nullcontext()
     if backend == "mok":
         from megatron.core.fp8_utils import get_fp8_disabled_context
