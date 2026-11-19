@@ -69,7 +69,7 @@ jobs:
           printf 'base_sha=%s\nupstream_sha=%s\n' "$BASE_SHA" "$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
           if git merge-base --is-ancestor "$UPSTREAM_SHA" "$BASE_SHA"; then
             printf 'changed=false\n' >> "$GITHUB_OUTPUT"
-            printf '社区 `%s:%s` 已包含在 `%s` 中，无需合并。\n' \
+            printf 'Upstream `%s:%s` is already included in `%s`; no merge is needed.\n' \
               "$UPSTREAM_REPOSITORY" "$UPSTREAM_BRANCH" "$SYNC_BRANCH" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
@@ -141,7 +141,7 @@ jobs:
           create PRs, call remote write APIs, or read or output credentials.
           If you cannot resolve a conflict reliably, explicitly report it and leave the conflict
           markers in place so subsequent checks prevent publication.
-          Produce a Chinese summary covering the synchronization scope, ownership and rationale
+          Produce an English summary covering the synchronization scope, ownership and rationale
           for each conflict hunk, PPU functionality preservation and API adaptation, and unverified
           items. Do not claim that PPU hardware tests were performed.
           EOF
@@ -227,7 +227,7 @@ jobs:
             --arg base "$BASE_SHA" --arg upstream "$UPSTREAM_SHA" --arg candidate "$CANDIDATE_SHA" \
             '{target: $target, source: $source, base: $base, upstream: $upstream, candidate: $candidate}' \
             > "$RUNNER_TEMP/sync-candidate/metadata.json"
-          printf '\n候选已通过范围、索引、冲突标记、Python 语法及双亲检查；未执行 PPU 硬件测试。\n' \
+          printf '\nThe candidate passed modification-scope, index, conflict-marker, Python syntax, and two-parent checks; no PPU hardware tests were run.\n' \
             >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
@@ -241,7 +241,7 @@ jobs:
       - name: Report dry-run mode
         if: steps.merge.outputs.changed == 'true' && !inputs.publish
         run: |
-          printf '\n本次为 dry-run：只上传 `%s` 的候选，不推送分支、不创建同步 PR。\n' \
+          printf '\nDry-run: only upload the candidate for `%s`; do not push branches or create a synchronization PR.\n' \
             "$SYNC_BRANCH" >> "$GITHUB_STEP_SUMMARY"
 
   publish:
@@ -307,14 +307,14 @@ jobs:
             git -c credential.helper= \
               -c 'credential.helper=!f() { printf "username=x-access-token\npassword=%s\n" "$GITHUB_TOKEN"; }; f' \
               push origin "$CANDIDATE_SHA:refs/heads/dev"
-            printf '社区 `dev` 已 merge 并发布到本仓库 `dev`：`%s`。保留我方 workflow 目录。\n' \
+            printf 'Upstream `dev` has been merged and published to repository `dev`: `%s`. Our workflow directory is preserved.\n' \
               "$CANDIDATE_SHA" >> "$GITHUB_STEP_SUMMARY"
           else
             PR_BRANCH="sync/upstream-main/$UPSTREAM_SHA"
             EXISTING_PR=$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --head "$PR_BRANCH" \
               --state open --json url --jq '.[0].url // empty')
             if [[ -n "$EXISTING_PR" ]]; then
-              printf '社区 main 的此版本已有待人工合并 PR：%s；未覆盖其分支。\n' \
+              printf 'This upstream main revision already has a PR awaiting manual merge: %s; its branch was not overwritten.\n' \
                 "$EXISTING_PR" >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
@@ -324,23 +324,23 @@ jobs:
             BODY=$(cat <<EOF
           Refs #${TRACKING_ISSUE}
 
-          ## 同步范围
-          - 社区 ${UPSTREAM_REPOSITORY}:${UPSTREAM_BRANCH} → 本仓库 main。
-          - 本仓库基线：${BASE_SHA}
-          - 社区版本：${UPSTREAM_SHA}
-          - 双亲 merge 候选：${CANDIDATE_SHA}
-          - 整个 .github/workflows/ 保留我方版本。
+          ## Summary
+          - Upstream ${UPSTREAM_REPOSITORY}:${UPSTREAM_BRANCH} to repository main.
+          - Repository baseline: ${BASE_SHA}
+          - Upstream revision: ${UPSTREAM_SHA}
+          - Two-parent merge candidate: ${CANDIDATE_SHA}
+          - Preserve our version of the entire .github/workflows/ directory.
 
-          ## 验证及合并方式
-          已检查改动范围、索引、冲突标记、Python 语法及 merge 双亲。
-          未执行 PPU 硬件测试；静态检查不能替代功能验证。
-          详细冲突处理依据见本次 Actions 的 Copilot 中文摘要。
-          本 PR 为 draft，由人工检查、审批和合并；不启用自动合并。
+          ## Validation and merging
+          Modification scope, index integrity, conflict markers, Python syntax, and merge parents were checked.
+          No PPU hardware tests were run; static checks cannot replace functional validation.
+          See the Copilot English summary for this Actions run for detailed conflict-resolution rationale.
+          This is a draft PR for manual review, approval, and merging; auto-merge is not enabled.
           EOF
             )
             PR_URL=$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$PR_BRANCH" \
               --draft --title "sync: merge upstream main (${UPSTREAM_SHA:0:12})" --body "$BODY")
-            printf '已创建 main 同步 PR，等待人工处理：%s。main 未直接作为 push 目标。\n' \
+            printf 'Created a main synchronization PR for manual review: %s. main was not a direct push target.\n' \
               "$PR_URL" >> "$GITHUB_STEP_SUMMARY"
             if [[ "$CUSTOM_PR_TOKEN_CONFIGURED" != 'true' ]]; then
               echo '::warning::The built-in token does not trigger other GitHub Actions on PR creation. Manually trigger checks or configure optional SYNC_PR_TOKEN.'
