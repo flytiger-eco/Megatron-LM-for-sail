@@ -1201,6 +1201,48 @@ def test_baked_image_checks_metadata_before_overlay_and_never_restores_venv(
         assert not args.source_root.exists()
 
 
+@pytest.mark.parametrize('test_kind', ['unit', 'functional', 'combined'])
+def test_workflow_configuration_delivers_shared_build_checks(tmp_path, test_kind):
+    workflow = yaml.safe_load((ROOT / '.github/workflows/ppu-execute.yml').read_text())
+    configure = next(
+        step for step in workflow['jobs']['configure']['steps'] if step.get('id') == 'config'
+    )
+    # Exercise the real shell branches and copies. Stub planning/sealing, which have
+    # their own tests, so this check needs neither a source checkout nor hardware.
+    control = tmp_path / 'control/.github/scripts'
+    control.mkdir(parents=True)
+    for source in SCRIPTS.glob('ppu*'):
+        if source.is_file():
+            shutil.copyfile(source, control / source.name)
+    (control / 'ppu_ci_container.sh').write_text('exit 0\n')
+    bundle = tmp_path / '.ppu-ci'
+    (bundle / 'control').mkdir(parents=True)
+    (bundle / 'authorization.json').write_text(json.dumps({'test_kind': test_kind}))
+    (bundle / 'manifest.json').write_text(json.dumps({'config': {'build': True}}))
+    interpreter = tmp_path / 'ppu-control-runtime/bin/python'
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text('#!/bin/sh\nexit 0\n')
+    interpreter.chmod(0o755)
+    result = subprocess.run(
+        ['bash', '-euo', 'pipefail', '-c', configure['run']],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            'RUNNER_TEMP': str(tmp_path),
+            'GITHUB_OUTPUT': str(tmp_path / 'outputs'),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    helper = bundle / 'control/ppu_functional_environment.py'
+    assert helper.read_bytes() == (SCRIPTS / helper.name).read_bytes()
+    namespace = {'__name__': 'ppu_build_environment'}
+    exec(compile(helper.read_bytes(), str(helper), 'exec'), namespace)
+    assert callable(namespace['check_inference_dependencies'])
+
+
 def test_ghcr_publication_retains_authenticated_login_and_authorization_guard():
     workflow = yaml.safe_load((ROOT / '.github/workflows/ppu-execute.yml').read_text())
     job = workflow['jobs']['runtime-environment']

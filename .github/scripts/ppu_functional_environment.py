@@ -1,4 +1,4 @@
-"""Prepare and attest functional-only tools without changing the fixed PPU image."""
+"""Check shared PPU dependencies and attest functional tools in the fixed image."""
 
 import argparse
 import hashlib

@@ -131,7 +131,7 @@ jobs:
               echo 'test_kind=unit' >> "$GITHUB_OUTPUT"
             fi
           fi
-          cp control/.github/scripts/{ppu_ci.py,ppu_policy.py,ppu_ci_build.sh,ppu_ci_run.sh,ppu_pytest_policy.py,ppu_ci_paths.py,ppu_ci_export.py,ppu_ci_container.py,ppu_ci_container.sh} .ppu-ci/control/
+          cp control/.github/scripts/{ppu_ci.py,ppu_policy.py,ppu_ci_build.sh,ppu_ci_run.sh,ppu_pytest_policy.py,ppu_ci_paths.py,ppu_ci_export.py,ppu_ci_container.py,ppu_ci_container.sh,ppu_functional_environment.py} .ppu-ci/control/
           bash control/.github/scripts/ppu_ci_container.sh mark-plan --artifact .ppu-ci
       - name: Export checked public evidence
         id: public-configure-131
