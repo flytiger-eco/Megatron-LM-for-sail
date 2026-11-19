@@ -349,6 +349,48 @@ def compiler_report():
     }
 
 
+@pytest.mark.parametrize("layout", ["legacy", "split"])
+@pytest.mark.parametrize("capability", ["available", "HAVE_ZMQ", "HAVE_MSGPACK", "missing"])
+def test_inference_check_follows_actual_engine_and_rejects_missing_dependencies(
+    monkeypatch, layout, capability
+):
+    public_name = "megatron.core.inference.engines.dynamic_engine"
+    engine_name = (
+        public_name if layout == "legacy" else "megatron.core.inference.engines.dynamic.engine"
+    )
+    communication_name = (
+        public_name if layout == "legacy" else "megatron.core.inference.engines.dynamic.coordinator"
+    )
+
+    class Engine:
+        def __init__(self):
+            pytest.fail("Dependency checks must not start the engine")
+
+    Engine.__module__ = engine_name
+    public = SimpleNamespace(DynamicInferenceEngine=Engine)
+    communication = public if layout == "legacy" else SimpleNamespace()
+    if capability != "missing":
+        communication.HAVE_ZMQ = capability != "HAVE_ZMQ"
+        communication.HAVE_MSGPACK = capability != "HAVE_MSGPACK"
+    modules = {public_name: public, communication_name: communication}
+    monkeypatch.setattr(environment.importlib, "import_module", modules.__getitem__)
+    if capability == "available":
+        report = environment.check_inference_dependencies()
+        assert report["engine_module"] == engine_name
+        assert report["communication_module"] == communication_name
+        assert report["zmq_enabled"] and report["msgpack_enabled"]
+    else:
+        with pytest.raises(ValueError, match="communication dependency is unavailable"):
+            environment.check_inference_dependencies()
+
+
+def test_inference_check_rejects_unrecognized_engine_layout(monkeypatch):
+    public = SimpleNamespace(DynamicInferenceEngine=SimpleNamespace(__module__="unknown.engine"))
+    monkeypatch.setattr(environment.importlib, "import_module", lambda name: public)
+    with pytest.raises(ValueError, match="Unsupported upstream dynamic inference engine"):
+        environment.check_inference_dependencies()
+
+
 @pytest.mark.parametrize("kind", [None, "unit", "functional"])
 def test_historical_environment_does_not_probe_or_change_compiler(monkeypatch, kind):
     manifest = {"test_kind": kind, "config": {"functional_mode": "regression"}}

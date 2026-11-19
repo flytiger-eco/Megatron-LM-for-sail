@@ -155,6 +155,34 @@ def check_nvrx(requirements: dict) -> dict:
     }
 
 
+def check_inference_dependencies() -> dict:
+    """Check the communication backend used by the public engine without starting it."""
+    public = importlib.import_module("megatron.core.inference.engines.dynamic_engine")
+    engine_module = public.DynamicInferenceEngine.__module__
+    communication_modules = {
+        "megatron.core.inference.engines.dynamic_engine": (
+            "megatron.core.inference.engines.dynamic_engine"
+        ),
+        "megatron.core.inference.engines.dynamic.engine": (
+            "megatron.core.inference.engines.dynamic.coordinator"
+        ),
+    }
+    if engine_module not in communication_modules:
+        raise ValueError(f"Unsupported upstream dynamic inference engine: {engine_module}")
+    communication = importlib.import_module(communication_modules[engine_module])
+    for capability in ("HAVE_ZMQ", "HAVE_MSGPACK"):
+        if getattr(communication, capability, False) is not True:
+            raise ValueError(
+                f"Inference engine communication dependency is unavailable: {capability}"
+            )
+    return {
+        "engine_module": engine_module,
+        "communication_module": communication_modules[engine_module],
+        "zmq_enabled": True,
+        "msgpack_enabled": True,
+    }
+
+
 def check_apex_layer_norm() -> dict:
     """Verify the original LayerNorm call interface and backend selection
     without running training kernels.
