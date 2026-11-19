@@ -1,4 +1,5 @@
 name: PPU control tests
+# Temporary CI-only routing probe; this comment does not alter execution.
 on:
   push:
     branches: [davidsophus/ppu-ci-integration]
