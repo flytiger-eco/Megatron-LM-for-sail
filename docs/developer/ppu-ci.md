@@ -39,6 +39,10 @@ GitHub 自 2025-12-08 起从默认分支加载 `pull_request_target`，即使 PR
 当前 main/dev 基线与当前控制 SHA，再调用同一流水线的最小诊断模式；不发布到 main/dev，不创建同步 PR。
 此模式验证发布后的接线和 SHA 隔离，不代表实际上游合并或完整测试集通过。
 
+dev 的 UT recipe 目前还包含 `examples/multimodal_dev/tests` 和 2/4 卡分组。
+选择器直接读取 recipe 的 `gpus`，GTP bucket 按上游脚本显式设置的 `GPUS_PER_NODE=4` 执行；
+这条例外集中在 `ppu_policy.py`。新增测试根目录、超出单机 1/2/4/8 卡的拓扑会在 CPU 选例阶段报错。
+
 ## 执行路径
 
 ```mermaid

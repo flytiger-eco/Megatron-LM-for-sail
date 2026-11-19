@@ -38,3 +38,8 @@ def artifact_prefix() -> str:
     if prefix not in ("", "sync-main-", "sync-dev-"):
         raise ValueError("Invalid sync artifact namespace")
     return prefix
+
+
+# Upstream DEV's UT recipe requests eight cards for this bucket, but its script
+# explicitly sets GPUS_PER_NODE=4. Match that test world size on SAIL.
+UT_PROCESS_OVERRIDES = {"tests/unit_tests/generalized_tensor_parallel/**/*.py": 4}

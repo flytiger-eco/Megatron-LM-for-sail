@@ -183,7 +183,8 @@ def unit_cases(config: dict) -> dict:
         raise ValueError("Duplicate UT bucket")
     for bucket in buckets:
         if not re.fullmatch(
-            r"tests/unit_tests/(?:[A-Za-z0-9_]+/)*(?:[A-Za-z0-9_]+\.py|\*\*/\*\.py)", bucket
+            r"(?:tests/unit_tests|examples/multimodal_dev/tests)/(?:[A-Za-z0-9_]+/)*(?:[A-Za-z0-9_]+\.py|\*\*/\*\.py)",
+            bucket,
         ):
             raise ValueError(f"Unsupported UT bucket; refusing to skip silently: {bucket}")
     excluded = policy_exclusions()
@@ -218,12 +219,23 @@ def unit_cases(config: dict) -> dict:
         for index, spec in enumerate(sorted(specs, key=lambda row: row["test_case"])):
             bucket = spec["test_case"]
             target = helper.get_base_path(bucket)
+            test_root = ROOT / (
+                "examples/multimodal_dev/tests"
+                if bucket.startswith("examples/multimodal_dev/tests/")
+                else "tests/unit_tests"
+            )
             if not (ROOT / target).exists() or not (ROOT / target).resolve().is_relative_to(
-                ROOT / "tests/unit_tests"
+                test_root
             ):
                 raise ValueError(f"UT path does not exist: {target}")
-            if positive(spec["nodes"], "nodes") != 1 or positive(spec["gpus"], "gpus") != 8:
+            cards = positive(spec["gpus"], "gpus")
+            if positive(spec["nodes"], "nodes") != 1 or cards not in (1, 2, 4, 8):
                 raise ValueError(f"UT topology requires explicit adaptation: {bucket}")
+            if bucket in policy.UT_PROCESS_OVERRIDES:
+                processes = policy.UT_PROCESS_OVERRIDES[bucket]
+                if cards not in (processes, 8):
+                    raise ValueError(f"Upstream UT process override requires adaptation: {bucket}")
+                cards = processes
             files = {
                 path.relative_to(ROOT).as_posix() for path in ROOT.glob(bucket) if path.is_file()
             }
@@ -235,10 +247,7 @@ def unit_cases(config: dict) -> dict:
                         for path in ROOT.glob(child)
                         if path.is_file()
                     )
-            if any(
-                not (ROOT / path).resolve().is_relative_to(ROOT / "tests/unit_tests")
-                for path in files
-            ):
+            if any(not (ROOT / path).resolve().is_relative_to(test_root) for path in files):
                 raise ValueError("UT file path escapes the unit test root")
             if not files - ignored:
                 raise ValueError(f"Empty UT bucket: {bucket}")
@@ -249,7 +258,7 @@ def unit_cases(config: dict) -> dict:
                 "id": case_id,
                 "bucket": bucket,
                 "environment": environment,
-                "cards": 8,
+                "cards": cards,
                 "minutes": minutes,
                 "action_minutes": minutes + 15,
                 "job_minutes": minutes + 30,

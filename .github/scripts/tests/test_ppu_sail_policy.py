@@ -230,3 +230,82 @@ def test_pr_target_never_uses_dev_as_the_workflow_source():
     event = {"number": 7, "action": "opened", "pull_request": copy.deepcopy(github.pull)}
     with pytest.raises(ValueError, match="default main"):
         auth.authorize(event, {}, context("pull_request_target", "refs/heads/dev"), github)
+
+
+@pytest.mark.parametrize("cards", [1, 2, 4, 8])
+@pytest.mark.parametrize("escape", [False, True])
+def test_upstream_dev_multimodal_bucket_keeps_its_directory_boundary(
+    tmp_path, monkeypatch, escape, cards
+):
+    recipe = yaml.safe_load((ROOT / ci.RECIPE_PATH).read_text())
+    recipe["spec"]["gpus"] = cards
+    recipe["products"] = [
+        {
+            "test_case": ["examples/multimodal_dev/tests/**/*.py"],
+            "products": [
+                {
+                    "environment": ["dev"],
+                    "tag": ["latest"],
+                    "scope": ["unit-tests"],
+                    "n_repeat": [1],
+                }
+            ],
+        }
+    ]
+    recipe_path = tmp_path / ci.RECIPE_PATH
+    recipe_path.parent.mkdir(parents=True)
+    recipe_path.write_text(yaml.safe_dump(recipe))
+    case = tmp_path / "examples/multimodal_dev/tests/test_example.py"
+    case.parent.mkdir(parents=True)
+    if escape:
+        outside = tmp_path / "not_a_test.py"
+        outside.write_text("def test_wrong_directory(): pass\n")
+        case.symlink_to(outside)
+    else:
+        case.write_text("def test_supported_bucket(): pass\n")
+    monkeypatch.setattr(ci, "ROOT", tmp_path)
+    monkeypatch.setattr(ci, "policy_exclusions", lambda: {})
+    config = {"suite_family": "nvidia-dev", "repeat": 1, "timeout": 30}
+    if escape:
+        with pytest.raises(ValueError, match="escapes"):
+            ci.unit_cases(config)
+    else:
+        cases = ci.unit_cases(config)
+        assert len(cases) == 1
+        assert next(iter(cases.values()))["cards"] == cards
+        assert next(iter(cases.values()))["files"] == [
+            "examples/multimodal_dev/tests/test_example.py"
+        ]
+
+
+@pytest.mark.parametrize("cards", [2, 4, 8])
+def test_gtp_world_size_matches_upstream_script(tmp_path, monkeypatch, cards):
+    recipe = yaml.safe_load((ROOT / ci.RECIPE_PATH).read_text())
+    recipe["spec"]["gpus"] = cards
+    recipe["products"] = [
+        {
+            "test_case": ["tests/unit_tests/generalized_tensor_parallel/**/*.py"],
+            "products": [
+                {
+                    "environment": ["dev"],
+                    "tag": ["latest"],
+                    "scope": ["unit-tests"],
+                    "n_repeat": [1],
+                }
+            ],
+        }
+    ]
+    recipe_path = tmp_path / ci.RECIPE_PATH
+    recipe_path.parent.mkdir(parents=True)
+    recipe_path.write_text(yaml.safe_dump(recipe))
+    case = tmp_path / "tests/unit_tests/generalized_tensor_parallel/test_gtp.py"
+    case.parent.mkdir(parents=True)
+    case.write_text("def test_world_size(): pass\n")
+    monkeypatch.setattr(ci, "ROOT", tmp_path)
+    monkeypatch.setattr(ci, "policy_exclusions", lambda: {})
+    config = {"suite_family": "nvidia-dev", "repeat": 1, "timeout": 30}
+    if cards == 2:
+        with pytest.raises(ValueError, match="override requires adaptation"):
+            ci.unit_cases(config)
+    else:
+        assert next(iter(ci.unit_cases(config).values()))["cards"] == 4
