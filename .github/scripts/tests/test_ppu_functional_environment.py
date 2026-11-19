@@ -837,6 +837,48 @@ def test_incompatible_checkpoint_api_fails_before_training(
     assert not (bundle / "reports/functional-environment.json").exists()
 
 
+@pytest.mark.parametrize("capability", ["available", "disabled", "missing", "signature_changed"])
+def test_current_dev_direct_nvrx_api_keeps_capability_and_signature_checks(
+    tool_environment, checkpoint_api, monkeypatch, capability
+):
+    modules, requested = checkpoint_api
+    original_import = environment.importlib.import_module
+    upstream = SimpleNamespace(
+        HAVE_NVRX=capability != "disabled", has_nvrx_async_support=lambda: capability != "missing"
+    )
+    monkeypatch.setattr(
+        environment.importlib,
+        "import_module",
+        lambda name: (
+            upstream
+            if name == "megatron.core.dist_checkpointing.strategies.torch"
+            else original_import(name)
+        ),
+    )
+    if capability == "signature_changed":
+        modules["filesystem_async"].get_write_results_queue = lambda: None
+    requirements = {
+        "case": {
+            "launcher": "torchrun",
+            "checkpoint": [{"persistent_worker": True, "cpu_shm": True}],
+        }
+    }
+    if capability == "available":
+        report = environment.check_nvrx(requirements)
+        assert report["source_api"] == "direct_nvrx"
+        assert "mp_mode" in report["signatures"]["get_write_results_queue"]
+        assert (
+            "use_cpu_shm_for_gpu_tensors" in report["signatures"]["FileSystemWriterAsync.__init__"]
+        )
+    elif capability == "signature_changed":
+        with pytest.raises(ValueError, match="mp_mode"):
+            environment.check_nvrx(requirements)
+    else:
+        with pytest.raises(ModuleNotFoundError, match="compatible nvidia-resiliency-ext"):
+            environment.check_nvrx(requirements)
+    assert requested == []  # DEV never calls the removed legacy getter.
+
+
 @pytest.mark.parametrize("kind", [None, "unit", "functional"])
 def test_training_packages_match_build_constraints(tmp_path, monkeypatch, kind):
     script = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()

@@ -85,11 +85,35 @@ def check_nvrx(requirements: dict) -> dict:
         raise ValueError(f"Functional NVRx version mismatch: {version} != {NVRX_VERSION}")
     stages = [stage for case in requirements.values() for stage in case["checkpoint"]]
     signatures = {}
+    source_api = "launcher_only"
     if stages:
         upstream = importlib.import_module("megatron.core.dist_checkpointing.strategies.torch")
-        strategy, modules = upstream.get_async_strategy("nvrx")
-        if strategy != "nvrx":
-            raise ValueError("Original async checkpoint strategy must remain nvrx")
+        get_strategy = getattr(upstream, "get_async_strategy", None)
+        if callable(get_strategy):
+            source_api = "get_async_strategy"
+            strategy, modules = get_strategy("nvrx")
+            if strategy != "nvrx":
+                raise ValueError("Original async checkpoint strategy must remain nvrx")
+        elif callable(getattr(upstream, "has_nvrx_async_support", None)):
+            # Current DEV uses NVRx directly and no longer exposes the strategy getter.
+            # Keep its capability check, then inspect the same original NVRx interfaces.
+            source_api = "direct_nvrx"
+            if not getattr(upstream, "HAVE_NVRX", False) or not upstream.has_nvrx_async_support():
+                raise ModuleNotFoundError("Upstream requires compatible nvidia-resiliency-ext")
+            core = importlib.import_module("nvidia_resiliency_ext.checkpointing.async_ckpt.core")
+            filesystem = importlib.import_module(
+                "nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async"
+            )
+            modules = {
+                "AsyncCallsQueue": core.AsyncCallsQueue,
+                "AsyncRequest": core.AsyncRequest,
+                "FileSystemWriterAsync": filesystem.FileSystemWriterAsync,
+                "get_write_results_queue": filesystem.get_write_results_queue,
+            }
+        else:
+            raise ValueError(
+                "Unsupported upstream NVRx checkpoint API; explicit adaptation required"
+            )
         queue = modules["AsyncCallsQueue"]
         request = inspect.signature(modules["AsyncRequest"])
         request.bind(None, (), [], async_fn_kwargs={}, preload_fn=None)
@@ -123,7 +147,12 @@ def check_nvrx(requirements: dict) -> dict:
         if not shutil.which("ft_launcher"):
             raise ValueError("Selected case requires the original ft_launcher")
         command_output(["ft_launcher", "--help"])
-    return {"version": version, "requirements": requirements, "signatures": signatures}
+    return {
+        "version": version,
+        "source_api": source_api,
+        "requirements": requirements,
+        "signatures": signatures,
+    }
 
 
 def check_apex_layer_norm() -> dict:
