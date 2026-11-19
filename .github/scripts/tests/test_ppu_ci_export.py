@@ -750,7 +750,8 @@ def test_arbitrary_exception_messages_are_never_public_diagnostics(path_env):
     assert private not in summary and "arbitrary-secret-filename" not in summary
 
 
-def test_required_export_failure_does_not_print_private_exception_paths(tmp_path, path_env):
+@pytest.mark.parametrize("github_actions", ["true", "false"])
+def test_required_export_failure_does_not_print_private_exception_paths(tmp_path, path_env, github_actions):
     source = tmp_path / "private"
     source.mkdir()
     (source / "unknown.bin").write_bytes(path_env["PPU_CPU_RUN_ROOT"].encode())
@@ -764,9 +765,16 @@ def test_required_export_failure_does_not_print_private_exception_paths(tmp_path
             "--destination",
             str(tmp_path / "public"),
         ],
-        env={**os.environ, **path_env},
+        env={**os.environ, **path_env, "GITHUB_ACTIONS": github_actions},
         capture_output=True,
         text=True,
     )
     assert process.returncode != 0 and "Public evidence export failed" in process.stderr
-    assert not any(value in process.stdout + process.stderr for value in path_env.values())
+    # Captured subprocess output contains the masking protocol before Actions processes it.
+    # Allow only exact registration commands; errors and all ordinary output must be redacted.
+    expected_masks = {
+        f"::add-mask::{value}"
+        for value in (path_env["PPU_HOST_VOLUMES"], *exporter.paths.replacements(path_env))
+    } if github_actions == "true" else set()
+    ordinary_output = "\n".join(line for line in process.stdout.splitlines() if line not in expected_masks)
+    assert not any(value in ordinary_output + process.stderr for value in path_env.values())
