@@ -170,7 +170,7 @@ def test_functional_config_does_not_inherit_unit_gate(mode):
     config = functional.select_config({"functional_mode": mode})
     assert config["build"] is (mode == "regression")
     assert config["unit_test"] is False
-    assert config["repeat"] == 5
+    assert config["repeat"] == 1
     assert config["timeout"] == 30
     assert config["threshold_percent"] == 100
     assert config["data_path"] == "ppu://assets/pod"
@@ -243,7 +243,7 @@ def test_catalogue_real_upstream_intersection(catalogue):
     assert len(catalogue["coverage"]["baseline_not_selected"]) == 10
     assert sum(not row["observation"] for row in cases) == 82
     assert {row["observation"] for row in cases if row["observation"]} == {"lightweight"}
-    assert all(row["repeat"] == (1 if row["observation"] else 5) for row in cases)
+    assert all(row["repeat"] == 1 for row in cases)
     assert not (set(functional.SKIPPED_CASES) & {row["name"] for row in cases})
     assert all(row["second_golden_role"] == "provenance_only_not_resume_reference" for row in cases)
     assert any(row["test_type"] == "regular" and "resume" in row["name"] for row in cases)
@@ -364,7 +364,7 @@ def test_real_torchrun_case_records_async_dependency_without_changing_baseline(c
     assert case["nvrx_checkpoint"] == [
         {"section": "MODEL_ARGS", "persistent_worker": True, "cpu_shm": False}
     ]
-    assert case["train_iters"] == 50 and case["repeat"] == 5
+    assert case["train_iters"] == 50 and case["repeat"] == 1
     for row in catalogue["functional"].values():
         path = ROOT / row["config_path"]
         assert functional.sha256(path) == row["config_sha256"]

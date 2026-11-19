@@ -15,6 +15,10 @@ on:
       publish:
         type: boolean
         default: false
+    outputs:
+      sync_request:
+        description: Exact published source commit for the shared UT and functional workflow
+        value: ${{ jobs.publish.outputs.sync_request }}
     secrets:
       SYNC_PR_TOKEN:
         description: Optional repo-scoped Contents and Pull requests write token for main PR events
@@ -246,6 +250,8 @@ jobs:
 
   publish:
     needs: merge
+    outputs:
+      sync_request: ${{ steps.publish.outputs.sync_request }}
     if: needs.merge.outputs.changed == 'true' && inputs.publish && github.ref == 'refs/heads/main' && github.repository == 'flytiger-eco/Megatron-LM-for-sail'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -303,6 +309,7 @@ jobs:
             exit 1
           }
           # Never execute any scripts from the candidate in this contents-write job.
+          PR_BRANCH="$SYNC_BRANCH"
           if [[ "$SYNC_BRANCH" == 'dev' ]]; then
             git -c credential.helper= \
               -c 'credential.helper=!f() { printf "username=x-access-token\npassword=%s\n" "$GITHUB_TOKEN"; }; f' \
@@ -346,3 +353,7 @@ jobs:
               echo '::warning::The built-in token does not trigger other GitHub Actions on PR creation. Manually trigger checks or configure optional SYNC_PR_TOKEN.'
             fi
           fi
+          SYNC_REQUEST=$(jq -nc --arg target_branch "$SYNC_BRANCH" --arg source_ref "$PR_BRANCH" \
+            --arg base_sha "$BASE_SHA" --arg upstream_sha "$UPSTREAM_SHA" --arg target_sha "$CANDIDATE_SHA" \
+            '{target_branch: $target_branch, source_ref: $source_ref, base_sha: $base_sha, upstream_sha: $upstream_sha, target_sha: $target_sha}')
+          printf 'sync_request=%s\n' "$SYNC_REQUEST" >> "$GITHUB_OUTPUT"

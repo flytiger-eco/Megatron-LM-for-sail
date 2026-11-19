@@ -17,12 +17,38 @@
 - 两者使用同一份构建产物；UT 失败则 FT 不启动。
 - 这是调试证据，不是完整 UT/FT 覆盖；此模式不能用于发布 PR 成功状态。
 
+## 同步与 PR 的统一入口
+
+main/dev 同步发布成功后，worker 输出 `sync_request`（被测 SHA、两个父提交、发布分支），
+父 workflow 直接调用 `ppu-build.yml` 的 `workflow_call`，再复用同一套 Build→UT→FT。
+不依赖 `GITHUB_TOKEN` 的 push 触发后续 Actions。main 和 dev 的 artifacts、NAS 目录分别使用
+`sync-main-` / `sync-dev-` 前缀，共享同一个硬件队列。
+
+普通分支更新、同步及无标签 PR 默认使用相同的上游 L0 数值测试、一次重复、30 分钟预算。
+`Run tests` 保留显式轻量观察模式，`Run functional tests` 可扩大到 L1；常规路径不需要标签。
+文档和纯 CI 编排变更仅走 CPU 检查；执行器、镜像/依赖、recipe、golden、被测代码变更仍运行硬件测试。
+改名同时检查原路径，变更列表不完整时不豁免。
+
+GitHub 自 2025-12-08 起从默认分支加载 `pull_request_target`，即使 PR 合入 dev，控制代码仍来自 main。
+因此入口用 PR 的 `base.ref` 判断目标分支，用默认分支 SHA 固定控制代码。
+独立分支通过真实 PR 的 full-SHA 手动授权验证执行和状态；自动 PR 事件入口必须在 main 上线后验收。
+参考：[GitHub 变更说明](https://github.blog/changelog/2025-11-07-actions-pull_request_target-and-environment-branch-protections-changes/)。
+
+测试同步接线时，在独立分支调度同步 workflow 并设置 `sandbox_handoff=true`。
+它只读取固定的 `davidsophus/ppu-sync-main` / `davidsophus/ppu-sync-dev` 测试引用，要求两个父提交分别是
+当前 main/dev 基线与当前控制 SHA，再调用同一流水线的最小诊断模式；不发布到 main/dev，不创建同步 PR。
+此模式验证发布后的接线和 SHA 隔离，不代表实际上游合并或完整测试集通过。
+
 ## 执行路径
 
 ```mermaid
 flowchart TD
-    A[ppu-build.yml 触发] --> B[pr_authorize 固定 control / target SHA]
-    B --> C[ppu-execute.yml 选例与 manifest]
+    S[同步成功：发布 SHA 与父提交] --> A[ppu-build.yml 共用入口]
+    P[main/dev PR 或分支更新] --> A
+    A --> B[pr_authorize 固定 control / target SHA]
+    B --> Q{文档或纯 CI 改动？}
+    Q -->|是| X[CPU 检查与硬件豁免状态]
+    Q -->|否| C[ppu-execute.yml 选例与 manifest]
     C --> D[CPU 资产预检查]
     C --> E[构建镜像与封装源码]
     E --> F[SAIL Pod: UT]
@@ -48,6 +74,7 @@ combined 流程仅在 UT 成功后启动 functional；最终组合结果要求 U
 
 | 文件 | 维护职责 |
 |---|---|
+| `ppu_policy.py` | 受信任分支、最小诊断 case、CPU 豁免路径和同步产物前缀 |
 | `ppu_pr_authorize.py` | 授权、SHA、过期状态与 PR 状态归属 |
 | `ppu_ci.py`、`ppu_pytest_policy.py` | UT 选例、manifest、排除策略、结果门槛和证据 |
 | `ppu_ci_build.sh`、`ppu_ci_run.sh` | 构建准备和 UT 执行 |
@@ -82,7 +109,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q \
   .github/scripts/tests/test_ppu_functional_results.py
 ```
 
-需要 NAS 或设备验证时，在正式 `ppu-build.yml` 的受信任 main 上手动选择下列输入。
+需要 NAS 或设备验证时，在 `ppu-build.yml` 的受信任分支上手动选择下列输入。
 功能测试控制 Build/UT，其他 UT 开关保持默认值；不要提交 `all` 个 case。
 
 | 输入 | 首先检查资产 | 确需训练时 |
@@ -99,7 +126,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q \
 现有执行器仍要求单机 **8 卡**。`repeat=1` 不关闭正式基础设施重试：最多 3 次 attempt
 共用预算；排队、构建、资产预检查和退出清理另有开销。冷编译可能耗尽预算，不能据此判精度失败。
 
-4 步、单 attempt 的本地调试入口保留在上述备份分支，不再给正式 PR 增加脚本或 workflow。
+最小集成调试使用本页的 `smoke` 入口；历史四步专项诊断不属于当前交付。
 需要时独立 checkout 使用，并记录实际 control/target SHA；其 smoke 结果不计作精度通过。
 
 已有正式产物直接在 CPU 复核，不重跑训练：

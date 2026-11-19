@@ -20,13 +20,13 @@ IMAGE = "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04
 TIERS = ("L0", "L1", "L2", "L3")
 FUNCTIONAL_MANIFEST = "functional-manifest.json"
 SCOPE_LABELS = ("Run tests", "Run functional tests")
-# Mirrors the upstream GitHub/GitLab functional triggers (scope, cadence, repeat, budget).
+# SAIL shares one numeric default across branch updates and PRs; upstream recipes remain authoritative.
 EVENT_POLICIES = {
-    "push": ("mr", "bypass", 5, 60, False),
-    "merge_group": ("L1", "mergegroup", 1, 30, False),
+    "push": ("L0", "bypass", 1, 30, False),
+    "merge_group": ("L0", "bypass", 1, 30, False),
     "Run tests": ("L1", "bypass", 1, 30, True),
-    "Run functional tests": ("L1", "bypass", 5, 30, False),
-    "pr": ("L0", "pr", 2, 30, False),
+    "Run functional tests": ("L1", "bypass", 1, 30, False),
+    "pr": ("L0", "bypass", 1, 30, False),
 }
 # Python 3.12.3 may inherit a locked shutdown lock when it forks again
 # after the compile pool quiesces.
@@ -44,7 +44,7 @@ DEFAULTS = {
     "functional_mode": "assets",
     "functional_scope": "all",
     "functional_cases": "all",
-    "functional_repeat": "5",
+    "functional_repeat": "1",
     "functional_timeout": "30",
 }
 ENTRYPOINTS = {
@@ -231,7 +231,7 @@ def select_config(inputs: dict, policy: dict | None = None) -> dict:
         "cadence": cadence,
         "lightweight": False,
         "requested_cases": names,
-        "repeat": positive(inputs.get("functional_repeat", 5), "functional_repeat", 10),
+        "repeat": positive(inputs.get("functional_repeat", 1), "functional_repeat", 10),
         "timeout": positive(inputs.get("functional_timeout", 30), "functional_timeout", 1380),
         "build": mode == "regression",
         "unit_test": False,

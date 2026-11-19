@@ -555,7 +555,9 @@ def summarize(manifest: dict, root: Path, directory: Path) -> dict:
     if not manifest.get("functional"):
         raise ValueError("Functional manifest has no cases")
     cases = [
-        verify_case(manifest, root, case, directory / case["id"])
+        verify_case(
+            manifest, root, case, directory / f"{control.policy.artifact_prefix()}{case['id']}"
+        )
         for case in manifest["functional"].values()
     ]
     numeric = [case for case in cases if not case["observation"]]

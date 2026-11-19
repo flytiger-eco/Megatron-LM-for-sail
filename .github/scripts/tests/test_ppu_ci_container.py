@@ -1556,9 +1556,9 @@ def test_runtime_handoff_preserves_flytiger_orchestration_and_trusted_job_output
     download = next(
         step
         for step in consumer['steps']
-        if step.get('with', {}).get('name') == 'ppu-runtime-environment'
+        if step.get('with', {}).get('name') == '${{ inputs.artifact_prefix }}ppu-runtime-environment'
     )
-    assert upload['with']['name'] == download['with']['name'] == 'ppu-runtime-environment'
+    assert upload['with']['name'] == download['with']['name'] == '${{ inputs.artifact_prefix }}ppu-runtime-environment'
     assert upload['with']['path'].rstrip('/') == download['with']['path']
     assert upload['with']['if-no-files-found'] == 'error'
     assert (

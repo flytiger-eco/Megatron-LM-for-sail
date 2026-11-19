@@ -43,16 +43,16 @@ def label(github, *names):
 @pytest.mark.parametrize(
     "trigger,labels,expected",
     [
-        ("push", (), ("push", "mr", "bypass", 5, 60, False)),
-        ("merge_group", (), ("merge_group", "L1", "mergegroup", 1, 30, False)),
-        ("pr", (), ("pr", "L0", "pr", 2, 30, False)),
+        ("push", (), ("push", "L0", "bypass", 1, 30, False)),
+        ("merge_group", (), ("merge_group", "L0", "bypass", 1, 30, False)),
+        ("pr", (), ("pr", "L0", "bypass", 1, 30, False)),
         ("pr", ("Run tests",), ("Run tests", "L1", "bypass", 1, 30, True)),
-        ("pr", ("Run functional tests",), ("Run functional tests", "L1", "bypass", 5, 30, False)),
+        ("pr", ("Run functional tests",), ("Run functional tests", "L1", "bypass", 1, 30, False)),
         ("pr", ("Run functional tests", "Run tests"), ("Run tests", "L1", "bypass", 1, 30, True)),
-        ("pr", ("bug",), ("pr", "L0", "pr", 2, 30, False)),
+        ("pr", ("bug",), ("pr", "L0", "bypass", 1, 30, False)),
     ],
 )
-def test_event_policy_mirrors_upstream_triggers(trigger, labels, expected):
+def test_event_policy_uses_shared_sail_defaults(trigger, labels, expected):
     policy = functional.event_policy(trigger, labels)
     keys = ("trigger", "functional_scope", "cadence", "repeat", "timeout", "lightweight")
     assert tuple(policy[key] for key in keys) == expected
@@ -71,13 +71,13 @@ def test_policy_config_is_not_overridable_by_manual_inputs():
     assert config["functional_mode"] == "regression" and config["build"] is True
     assert config["unit_test"] is False and config["threshold_percent"] == 100
     assert (config["scope"], config["cadence"], config["repeat"], config["timeout"]) == (
-        "mr",
+        "L0",
         "bypass",
-        5,
-        60,
+        1,
+        30,
     )
     assert config["trigger_kind"] == "push" and config["requested_cases"] == ["all"]
-    assert functional.functional_label(config) == "functional mr numeric x5"
+    assert functional.functional_label(config) == "functional L0 numeric x1"
 
 
 @pytest.mark.parametrize(
@@ -111,7 +111,8 @@ def test_automatic_selections_are_nonempty_and_follow_cadence(selections):
     assert all(case_names.values())
     assert case_names["merge_group"] <= case_names["L1"]
     assert case_names["Run tests"] == case_names["Run functional tests"] == case_names["L1"]
-    # `mr` is its own upstream tier and must not alias L1.
+    assert case_names["push"] == case_names["pr"] == case_names["merge_group"]
+    # Explicit labels may request the larger upstream L1 suite.
     assert case_names["push"] != case_names["L1"]
     assert all(row["observation"] for row in selections["Run tests"].values())
     assert not all(row["observation"] for row in selections["Run functional tests"].values())
@@ -216,7 +217,7 @@ def test_docker_mark_plan_preserves_combined_policy_and_sidecar_digest(tmp_path,
         ({"allowed": False}, "authorized combined"),
         ({"test_kind": "unit"}, "authorized combined"),
         ({"labels": ["Run tests"]}, "trusted trigger policy"),
-        ({"functional_policy": {**functional.event_policy("push"), "repeat": 1}}, "trusted"),
+        ({"functional_policy": {**functional.event_policy("push"), "repeat": 2}}, "trusted"),
         ({"event_name": "workflow_dispatch"}, "push, merge queue, or PR"),
         ({"control_sha": "e" * 40}, "different commit identities"),
     ],
@@ -354,8 +355,8 @@ class DocsGitHub(FakeGitHub):
         return super().__call__(path, payload)
 
 
-@pytest.mark.parametrize("labels,decision", [((), "docs_only"), (("Run tests",), "run")])
-def test_scope_label_overrides_docs_only_exemption(monkeypatch, labels, decision):
+@pytest.mark.parametrize("labels,decision", [((), "cpu_only"), (("Run tests",), "run")])
+def test_scope_label_overrides_cpu_only_exemption(monkeypatch, labels, decision):
     monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
     github = DocsGitHub()
     label(github, *labels)

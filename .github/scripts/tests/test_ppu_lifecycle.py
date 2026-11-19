@@ -99,7 +99,7 @@ def test_ready_events_acquire_current_pending(github, action):
         ("conflict", "failure"),
         ("merge_unavailable", "pending"),
         ("authorization_required", "pending"),
-        ("docs_only", "success"),
+        ("cpu_only", "success"),
         ("preflight_error", "error"),
     ],
 )
@@ -114,7 +114,7 @@ def test_blocked_states_do_not_execute(github, decision, state):
         github.pull["mergeable"] = None
     elif decision == "authorization_required":
         github.pull["head"]["repo"]["full_name"] = "other/fork"
-    if decision == "docs_only":
+    if decision == "cpu_only":
         original = github
 
         def api(path, payload=None):
@@ -488,7 +488,7 @@ def test_workflow_authorized_concurrency_and_cancellation_contract():
     assert call["needs"] == ["authorize", "pr-pending", "control-environment"]
     assert "needs.control-environment.result == 'success'" in call["if"]
     assert (
-        "needs.authorize.outputs.allowed != 'true' || needs.control-environment.result == 'success'"
+        "needs.authorize.outputs.allowed == 'true' && needs.control-environment.result == 'success'"
         in call["if"]
     )
     assert "status_result == 'published'" in call["if"]

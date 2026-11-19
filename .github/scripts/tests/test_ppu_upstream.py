@@ -83,7 +83,7 @@ def test_pr_preflight_decisions(change, decision):
         ([{"filename": "README.md"}], True),
         ([{"filename": "docs/conf.py"}], True),
         ([{"filename": "docs/a.md"}, {"filename": "pyproject.toml"}], False),
-        ([{"filename": ".github/workflows/ci.yml"}], False),
+        ([{"filename": ".github/workflows/ci.yml"}], True),
         (
             [
                 {
@@ -101,13 +101,13 @@ def test_pr_preflight_decisions(change, decision):
 def test_document_classification(files, expected):
     pull = pr()
     pull["changed_files"] = len(files)
-    assert auth.docs_only(7, pull, lambda path: files) is expected
+    assert auth.cpu_only(7, pull, lambda path: files) is expected
 
 
 @pytest.mark.parametrize("count", [0, 3000, 3001, None, True])
 def test_incomplete_document_count_never_skips(count):
     pull = {**pr(), "changed_files": count}
-    assert not auth.docs_only(7, pull, lambda path: pytest.fail("must not fetch"))
+    assert not auth.cpu_only(7, pull, lambda path: pytest.fail("must not fetch"))
 
 
 @pytest.mark.parametrize("mode", ["complete", "truncated", "duplicate", "error"])
@@ -123,12 +123,12 @@ def test_document_pagination(mode):
             return rows[:100]
         return [] if mode == "truncated" else rows[:1] if mode == "duplicate" else rows[100:]
 
-    assert auth.docs_only(7, {**pr(), "changed_files": 101}, api) is (mode == "complete")
+    assert auth.cpu_only(7, {**pr(), "changed_files": 101}, api) is (mode == "complete")
     assert len(paths) == (1 if mode == "error" else 2)
 
 
 @pytest.mark.parametrize("fork", [True, False])
-def test_docs_only_pr_skips_without_merge_or_source(fork):
+def test_cpu_only_pr_skips_without_merge_or_source(fork):
     pull = pr(fork)
 
     def api(path):
@@ -140,7 +140,7 @@ def test_docs_only_pr_skips_without_merge_or_source(fork):
         return pull
 
     result = auth.authorize(pr_event(pull), {}, context("pull_request_target"), api)
-    assert result["decision"] == "docs_only" and not result["allowed"]
+    assert result["decision"] == "cpu_only" and not result["allowed"]
 
 
 def test_snapshot_drift_during_docs_check():
@@ -621,7 +621,7 @@ def test_recipe_changes_cannot_silently_drop_workloads(tmp_path, monkeypatch, mu
         ci.unit_cases({"suite_family": "nvidia-dev", "repeat": 1, "timeout": 30})
 
 
-@pytest.mark.parametrize("decision", ["run", "docs_only"])
+@pytest.mark.parametrize("decision", ["run", "cpu_only"])
 def test_status_snapshot_is_rechecked_before_write(monkeypatch, decision):
     monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
     reads = 0
@@ -1310,10 +1310,10 @@ def test_bundle_workflow_digest_and_run_scoping():
         for step in ut["jobs"]["test"]["steps"]
         if step.get("uses") == "actions/download-artifact@v4"
     ]
-    assert downloads == ["ppu-control-environment", "ppu-plan", "ppu-runtime-environment"]
+    assert downloads == ["${{ inputs.artifact_prefix }}" + name for name in ["ppu-control-environment", "ppu-plan", "ppu-runtime-environment"]]
     action = next(step for step in ut["jobs"]["test"]["steps"] if step.get("id") == "ppu")
     assert (
-        "PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build"
+        "PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build"
         in action["with"]["extra_env"]
     )
     assert "PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }}" in action["with"]["extra_env"]

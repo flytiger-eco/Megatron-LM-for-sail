@@ -15,6 +15,10 @@ on:
       PPU_TOKENIZER_RECEIPTS_ROOT:
         required: false
     inputs:
+      artifact_prefix:
+        description: Isolate artifacts and NAS output for main and dev in one synchronization run
+        type: string
+        default: ''
       allowed:
         type: boolean
         required: true
@@ -81,7 +85,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-control-environment
+          name: ${{ inputs.artifact_prefix }}ppu-control-environment
           path: .ppu-control-export
       - name: Verify and restore isolated configuration environment
         run: >-
@@ -90,7 +94,7 @@ jobs:
           --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-authorization
+          name: ${{ inputs.artifact_prefix }}ppu-authorization
           path: .ppu-ci
       - name: Verify current PR ownership before configuration
         env:
@@ -137,7 +141,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-configure-131.outcome == 'success' }}
         with:
-          name: ppu-plan
+          name: ${{ inputs.artifact_prefix }}ppu-plan
           path: .ppu-public/configure-131/
           include-hidden-files: true
           if-no-files-found: error
@@ -153,7 +157,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-plan
+          name: ${{ inputs.artifact_prefix }}ppu-plan
           path: .ppu-ci
       - uses: actions/checkout@v4
         with:
@@ -162,7 +166,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-control-environment
+          name: ${{ inputs.artifact_prefix }}ppu-control-environment
           path: .ppu-control-export
       - name: Verify and restore trusted control interpreter
         run: >-
@@ -192,7 +196,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-functional-assets-166.outcome == 'success' }}
         with:
-          name: ppu-functional-assets
+          name: ${{ inputs.artifact_prefix }}ppu-functional-assets
           path: .ppu-public/functional-assets-166/
           if-no-files-found: error
           retention-days: 7
@@ -210,7 +214,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-authorization
+          name: ${{ inputs.artifact_prefix }}ppu-authorization
           path: .ppu-ci
       - name: Verify current PR ownership before requesting PPU
         env:
@@ -242,7 +246,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-authorization
+          name: ${{ inputs.artifact_prefix }}ppu-authorization
           path: .ppu-ci
       - name: Revalidate authorization before accessing build cache
         env:
@@ -319,7 +323,7 @@ jobs:
           key: ppu-runtime-linux-amd64-${{ steps.identity.outputs.cache_key }}
       - uses: actions/upload-artifact@v4
         with:
-          name: ppu-runtime-environment
+          name: ${{ inputs.artifact_prefix }}ppu-runtime-environment
           path: ${{ runner.temp }}/ppu-runtime-export/
           compression-level: 0
           if-no-files-found: error
@@ -352,7 +356,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-control-environment
+          name: ${{ inputs.artifact_prefix }}ppu-control-environment
           path: .ppu-control-export
       - name: Verify and restore trusted control interpreter
         run: >-
@@ -384,11 +388,11 @@ jobs:
           submodules: recursive
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-plan
+          name: ${{ inputs.artifact_prefix }}ppu-plan
           path: .ppu-ci
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-runtime-environment
+          name: ${{ inputs.artifact_prefix }}ppu-runtime-environment
           path: ${{ runner.temp }}/ppu-runtime-export
       - name: Verify Dockerfile environment handoff before requesting PPU
         run: |
@@ -423,7 +427,7 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ needs.configure.outputs.target_sha }},PPU_CONTROL_SHA=${{ needs.configure.outputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_ENVIRONMENT_DIGEST=${{ needs.runtime-environment.outputs.environment_digest }},PPU_IMAGE_DIGEST=${{ needs.runtime-environment.outputs.runtime_image_digest }},PPU_BASE_IMAGE_DIGEST=${{ needs.runtime-environment.outputs.base_image_digest }},PPU_IMAGE=${{ needs.runtime-environment.outputs.runtime_image_digest }},PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build
+          extra_env: PPU_TARGET_SHA=${{ needs.configure.outputs.target_sha }},PPU_CONTROL_SHA=${{ needs.configure.outputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_ENVIRONMENT_DIGEST=${{ needs.runtime-environment.outputs.environment_digest }},PPU_IMAGE_DIGEST=${{ needs.runtime-environment.outputs.runtime_image_digest }},PPU_BASE_IMAGE_DIGEST=${{ needs.runtime-environment.outputs.base_image_digest }},PPU_IMAGE=${{ needs.runtime-environment.outputs.runtime_image_digest }},PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build
           command: |
             set -euo pipefail
             umask 022
@@ -442,7 +446,7 @@ jobs:
         env:
           PPU_STATUS: ${{ steps.ppu-build.outputs.job_status }}
           PPU_OUTCOME: ${{ steps.ppu-build.outcome }}
-          PPU_BUNDLE_DIR: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build
+          PPU_BUNDLE_DIR: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build
           PPU_TARGET_SHA: ${{ needs.configure.outputs.target_sha }}
           PPU_CONTROL_SHA: ${{ needs.configure.outputs.control_sha }}
           PPU_ENVIRONMENT_DIGEST: ${{ needs.runtime-environment.outputs.environment_digest }}
@@ -474,12 +478,12 @@ jobs:
           PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
           PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
           PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
-          EXPORT_SOURCE: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build/
+          EXPORT_SOURCE: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build/
         run: '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/build-305 --kind bundle'
       - uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-build-305.outcome == 'success' }}
         with:
-          name: ppu-bundle
+          name: ${{ inputs.artifact_prefix }}ppu-bundle
           path: .ppu-public/build-305/
           include-hidden-files: true
           compression-level: 0
@@ -500,6 +504,7 @@ jobs:
       PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
       PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
     with:
+      artifact_prefix: ${{ inputs.artifact_prefix }}
       matrix: ${{ needs.configure.outputs.unit_matrix }}
       bundle_digest: ${{ needs.build.outputs.bundle_digest }}
       environment_digest: ${{ needs.build.outputs.environment_digest }}
@@ -531,6 +536,7 @@ jobs:
       PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
       PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
     with:
+      artifact_prefix: ${{ inputs.artifact_prefix }}
       matrix: ${{ needs.configure.outputs.functional_matrix }}
       bundle_digest: ${{ needs.build.outputs.bundle_digest }}
       environment_digest: ${{ needs.build.outputs.environment_digest }}

@@ -13,6 +13,10 @@ on:
         type: choice
         options: [all, main, dev]
         default: all
+      sandbox_handoff:
+        description: Validate already-published test fixtures on the isolated integration branch
+        type: boolean
+        default: false
       publish:
         description: Publish results (only permitted when dispatched from main)
         type: boolean
@@ -30,7 +34,7 @@ concurrency:
 
 jobs:
   main:
-    if: github.repository == 'flytiger-eco/Megatron-LM-for-sail' && (github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == 'main')
+    if: github.repository == 'flytiger-eco/Megatron-LM-for-sail' && (github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == 'main') && !inputs.sandbox_handoff
     uses: ./.github/workflows/copilot-upstream-sync-worker.yml
     permissions:
       contents: write
@@ -45,7 +49,7 @@ jobs:
       SYNC_PR_TOKEN: ${{ secrets.SYNC_PR_TOKEN }}
 
   dev:
-    if: github.repository == 'flytiger-eco/Megatron-LM-for-sail' && (github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == 'dev')
+    if: github.repository == 'flytiger-eco/Megatron-LM-for-sail' && (github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == 'dev') && !inputs.sandbox_handoff
     uses: ./.github/workflows/copilot-upstream-sync-worker.yml
     permissions:
       contents: write
@@ -56,3 +60,78 @@ jobs:
       upstream_branch: dev
       tracking_issue: '17'
       publish: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish)) }}
+
+  test-main:
+    needs: [main, sandbox-handoff]
+    if: always() && !cancelled() && (needs.main.outputs.sync_request != '' || needs.sandbox-handoff.outputs.main_request != '')
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      statuses: write
+      packages: write
+    uses: ./.github/workflows/ppu-build.yml
+    with:
+      artifact_prefix: sync-main-
+      sync_request: ${{ needs.main.outputs.sync_request || needs.sandbox-handoff.outputs.main_request }}
+    secrets:
+      PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+      PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+      PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+      PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+      PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
+      PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
+
+  test-dev:
+    needs: [dev, sandbox-handoff]
+    if: always() && !cancelled() && (needs.dev.outputs.sync_request != '' || needs.sandbox-handoff.outputs.dev_request != '')
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      statuses: write
+      packages: write
+    uses: ./.github/workflows/ppu-build.yml
+    with:
+      artifact_prefix: sync-dev-
+      sync_request: ${{ needs.dev.outputs.sync_request || needs.sandbox-handoff.outputs.dev_request }}
+    secrets:
+      PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+      PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+      PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+      PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+      PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
+      PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
+
+  sandbox-handoff:
+    if: github.repository == 'flytiger-eco/Megatron-LM-for-sail' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/davidsophus/ppu-ci-integration' && inputs.sandbox_handoff
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      main_request: ${{ steps.handoff.outputs.main_request }}
+      dev_request: ${{ steps.handoff.outputs.dev_request }}
+    steps:
+      - id: handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ inputs.target }}
+          CONTROL_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in all) targets='main dev' ;; main|dev) targets="$TARGET" ;; *) exit 1 ;; esac
+          for branch in $targets; do
+            source_ref="davidsophus/ppu-sync-$branch"
+            target_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$source_ref" --jq '.object.sha')
+            parents=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$target_sha" --jq '.parents')
+            base_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" --jq '.object.sha')
+            jq -e --arg base "$base_sha" --arg control "$CONTROL_SHA" \
+              'length == 2 and .[0].sha == $base and .[1].sha == $control' <<< "$parents" >/dev/null
+            upstream_sha=$(jq -er '.[1].sha' <<< "$parents")
+            request=$(jq -nc --arg target_branch "$branch" --arg source_ref "$source_ref" \
+              --arg base_sha "$base_sha" --arg upstream_sha "$upstream_sha" --arg target_sha "$target_sha" \
+              '{target_branch: $target_branch, source_ref: $source_ref, base_sha: $base_sha, upstream_sha: $upstream_sha, target_sha: $target_sha}')
+            printf '%s_request=%s\n' "$branch" "$request" >> "$GITHUB_OUTPUT"
+          done
+          echo 'Sandbox handoff checks only: fixed test refs, one UT bucket and one numeric FT case; no publication or production sync.' >> "$GITHUB_STEP_SUMMARY"

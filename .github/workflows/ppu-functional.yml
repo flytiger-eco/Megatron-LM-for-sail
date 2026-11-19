@@ -15,6 +15,10 @@ on:
       PPU_TOKENIZER_RECEIPTS_ROOT:
         required: false
     inputs:
+      artifact_prefix:
+        description: Isolate artifacts and NAS output for main and dev in one synchronization run
+        type: string
+        default: ''
       matrix:
         type: string
         required: true
@@ -65,7 +69,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-control-environment
+          name: ${{ inputs.artifact_prefix }}ppu-control-environment
           path: .ppu-control-export
       - name: Verify and restore isolated public evidence exporter
         run: >-
@@ -74,7 +78,7 @@ jobs:
           --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-plan
+          name: ${{ inputs.artifact_prefix }}ppu-plan
           path: .ppu-ci
       - name: Verify current PR ownership before requesting PPU for this case
         env:
@@ -86,7 +90,7 @@ jobs:
         run: printf 'requested_at=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-runtime-environment
+          name: ${{ inputs.artifact_prefix }}ppu-runtime-environment
           path: ${{ runner.temp }}/ppu-runtime-export
       - name: Verify execution image handoff before requesting PPU
         run: >-
@@ -121,7 +125,7 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_ENVIRONMENT_DIGEST=${{ inputs.environment_digest }},PPU_IMAGE_DIGEST=${{ inputs.runtime_image_digest }},PPU_BASE_IMAGE_DIGEST=${{ inputs.base_image_digest }},PPU_RESULTS_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }},PPU_POD_ASSETS_ROOT=${{ secrets.PPU_POD_ASSETS_ROOT }}
+          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_ENVIRONMENT_DIGEST=${{ inputs.environment_digest }},PPU_IMAGE_DIGEST=${{ inputs.runtime_image_digest }},PPU_BASE_IMAGE_DIGEST=${{ inputs.base_image_digest }},PPU_RESULTS_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }},PPU_POD_ASSETS_ROOT=${{ secrets.PPU_POD_ASSETS_ROOT }}
           command: |
             set -euo pipefail
             cd /opt/megatron-lm
@@ -153,7 +157,7 @@ jobs:
         if: always()
         shell: bash
         env:
-          RESULT_DIR: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
+          RESULT_DIR: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
         run: |
           # Advisory and read-only; unreadable checkpoint payloads do not change the case gate.
           "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --checkpoint-audit \
@@ -167,7 +171,7 @@ jobs:
           PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
           PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
           PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
-          EXPORT_SOURCE: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
+          EXPORT_SOURCE: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
         run: >-
           "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py
           --source "$EXPORT_SOURCE" --destination .ppu-public/test-152 --kind evidence --overlay .ppu-action
@@ -175,7 +179,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-test-152.outcome == 'success' }}
         with:
-          name: ${{ matrix.id }}
+          name: ${{ inputs.artifact_prefix }}${{ matrix.id }}
           path: .ppu-public/test-152/
           include-hidden-files: true
           if-no-files-found: error
@@ -201,7 +205,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-control-environment
+          name: ${{ inputs.artifact_prefix }}ppu-control-environment
           path: .ppu-control-export
       - name: Verify and restore isolated upstream comparison environment
         run: >-
@@ -215,13 +219,15 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-plan
+          name: ${{ inputs.artifact_prefix }}ppu-plan
           path: .ppu-ci
       - uses: actions/download-artifact@v4
         with:
-          pattern: functional-*
+          pattern: ${{ inputs.artifact_prefix }}functional-*
           path: results
       - name: Independently verify all required repetitions using original comparators
+        env:
+          PPU_ARTIFACT_PREFIX: ${{ inputs.artifact_prefix }}
         run: |
           "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_functional_results.py \
             --manifest .ppu-ci/manifest.json --root source --results results
@@ -239,7 +245,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-result-208.outcome == 'success' }}
         with:
-          name: ppu-functional-summary
+          name: ${{ inputs.artifact_prefix }}ppu-functional-summary
           path: .ppu-public/result-208/
           if-no-files-found: error
           retention-days: 7

@@ -572,8 +572,8 @@ def case_results(
 
 def result_directory(manifest: dict, directory: Path, case_id: str) -> Path:
     if manifest["config"].get("scope") == "quick":
-        return directory / "ppu-ut-quick" / case_id
-    return directory / f"ppu-ut-{case_id}"
+        return directory / f"{policy.artifact_prefix()}ppu-ut-quick" / case_id
+    return directory / f"{policy.artifact_prefix()}ppu-ut-{case_id}"
 
 
 def read_timing(path: Path, errors: list, suite: bool = False) -> dict:
@@ -673,7 +673,7 @@ def summarize(manifest: dict, directory: Path) -> dict:
     timings = {}
     if manifest["config"].get("scope") == "quick":
         for name in ("build", "suite"):
-            path = directory / "ppu-ut-quick" / f"{name}-timing.json"
+            path = directory / f"{policy.artifact_prefix()}ppu-ut-quick" / f"{name}-timing.json"
             timings[name] = read_timing(path, errors, suite=name == "suite")
     if scope in ("full", "diagnostic") and manifest.get("schema_version", 2) >= 3:
         first = next(iter(manifest["unit"]), None)
@@ -954,8 +954,11 @@ def main() -> None:
         event.setdefault("ref", os.environ["GITHUB_REF"])
         inputs = json.loads(os.environ.get("PPU_DEFAULTS", "{}"))
         inputs.update(json.loads(os.environ.get("PPU_INPUTS", "{}")))
-        config = select_config(event, event_name, inputs)
         authorization = json.loads((args.output / "authorization.json").read_text())
+        if authorization.get("sync_request"):
+            event, event_name = {"ref": authorization["base_ref"]}, authorization["event_name"]
+            inputs = {"test_kind": "smoke"} if authorization.get("diagnostic_smoke") else {}
+        config = select_config(event, event_name, inputs)
         if authorization["allowed"] is not True:
             config.update(build=False, unit_test=False)
         identity = {

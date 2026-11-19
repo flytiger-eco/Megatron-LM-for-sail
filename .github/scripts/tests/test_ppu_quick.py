@@ -823,7 +823,7 @@ def test_workflow_trust_and_resource_boundaries():
     execute = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())
     ut = yaml.safe_load((ROOT / ".github/workflows/ppu-ut.yml").read_text())
     events = build.get("on", build.get(True))
-    assert set(events) == {"push", "pull_request_target", "workflow_dispatch", "merge_group"}
+    assert set(events) == {"push", "pull_request_target", "workflow_dispatch", "merge_group", "workflow_call"}
     assert events["push"]["tags"] == ["v*"]
     assert auth.BRANCH == BRANCH == "refs/heads/main"
     assert events["push"]["branches"] == ["main", "dev"]

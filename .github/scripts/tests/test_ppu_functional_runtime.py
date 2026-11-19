@@ -810,7 +810,7 @@ def test_workflow_functional_route_is_manual_only_and_preserves_ut():
     inputs = events["workflow_dispatch"]["inputs"]
     assert inputs["test_kind"]["default"] == "unit"
     assert inputs["functional_mode"]["default"] == "assets"
-    assert inputs["functional_repeat"]["default"] == 5
+    assert inputs["functional_repeat"]["default"] == 1
     assert len(inputs) <= 25
     assert set(workflow.get("on", workflow.get(True))) == {"workflow_call"}
     assert execute["unit-tests"]["uses"] == "./.github/workflows/ppu-ut.yml"

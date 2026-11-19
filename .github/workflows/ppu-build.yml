@@ -1,5 +1,28 @@
 name: PPU Build
 on:
+  workflow_call:
+    inputs:
+      artifact_prefix:
+        description: Isolate artifacts and NAS output for main and dev in one synchronization run
+        type: string
+        default: ''
+      sync_request:
+        description: Published commit handoff from the trusted upstream sync workflow
+        type: string
+        required: true
+    secrets:
+      PPU_HOST_VOLUMES:
+        required: false
+      PPU_CPU_RUN_ROOT:
+        required: false
+      PPU_POD_RUN_ROOT:
+        required: false
+      PPU_CPU_ASSETS_ROOT:
+        required: false
+      PPU_POD_ASSETS_ROOT:
+        required: false
+      PPU_TOKENIZER_RECEIPTS_ROOT:
+        required: false
   push:
     branches: [main, dev]
     tags: ['v*']
@@ -33,7 +56,7 @@ on:
       functional_repeat:
         description: Independent repetitions per numeric case (1-10)
         type: number
-        default: 5
+        default: 1
       functional_timeout:
         description: Total training minutes per case including repeats and retries (1-1380)
         type: number
@@ -83,7 +106,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: ppu-build-${{ (github.event_name == 'pull_request_target' && format('preflight-{0}', github.run_id)) || (github.event_name == 'workflow_dispatch' && (inputs.pr_number != '' || inputs.pr_sha != '' || inputs.pr_base_sha != '') && format('preflight-{0}', github.run_id)) || (startsWith(github.ref, 'refs/tags/v') && format('release-{0}', github.ref)) || (github.event_name == 'workflow_dispatch' && format('full-{0}', github.run_id)) || format('daily-{0}', github.ref) }}
+  group: ppu-build-${{ inputs.artifact_prefix }}${{ (github.event_name == 'pull_request_target' && format('preflight-{0}', github.run_id)) || (github.event_name == 'workflow_dispatch' && (inputs.pr_number != '' || inputs.pr_sha != '' || inputs.pr_base_sha != '') && format('preflight-{0}', github.run_id)) || (startsWith(github.ref, 'refs/tags/v') && format('release-{0}', github.ref)) || (github.event_name == 'workflow_dispatch' && format('full-{0}', github.run_id)) || format('daily-{0}', github.ref) }}
   cancel-in-progress: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v') || github.event_name == 'merge_group' }}
 jobs:
   authorize:
@@ -118,6 +141,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PPU_INPUTS: ${{ toJSON(inputs) }}
+          PPU_ARTIFACT_PREFIX: ${{ inputs.artifact_prefix || '' }}
+          PPU_SYNC_REQUEST: ${{ inputs.sync_request || '' }}
           PPU_CONTROL_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.workflow_sha }}
           PPU_WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
@@ -132,7 +157,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-authorize-140.outcome == 'success' }}
         with:
-          name: ppu-authorization
+          name: ${{ inputs.artifact_prefix }}ppu-authorization
           path: .ppu-public/authorize-140/
           include-hidden-files: true
           if-no-files-found: error
@@ -152,7 +177,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-authorization
+          name: ${{ inputs.artifact_prefix }}ppu-authorization
           path: .ppu-ci
       - id: status
         env:
@@ -170,7 +195,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-authorization
+          name: ${{ inputs.artifact_prefix }}ppu-authorization
           path: .ppu-ci
       - env:
           GH_TOKEN: ${{ github.token }}
@@ -198,7 +223,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: ppu-authorization
+          name: ${{ inputs.artifact_prefix }}ppu-authorization
           path: .ppu-ci
       - name: Revalidate authorization before accessing build cache
         env:
@@ -228,7 +253,7 @@ jobs:
           key: ppu-control-linux-amd64-${{ steps.identity.outputs.cache_key }}
       - uses: actions/upload-artifact@v4
         with:
-          name: ppu-control-environment
+          name: ${{ inputs.artifact_prefix }}ppu-control-environment
           path: ${{ runner.temp }}/ppu-control-export/
           if-no-files-found: error
           retention-days: 7
@@ -236,7 +261,7 @@ jobs:
     needs: [authorize, pr-pending, control-environment]
     if: >-
       always() && !cancelled() && needs.authorize.result == 'success' &&
-      (needs.authorize.outputs.allowed != 'true' || needs.control-environment.result == 'success') &&
+      needs.authorize.outputs.allowed == 'true' && needs.control-environment.result == 'success' &&
       (needs.authorize.outputs.pr_number == '0' ||
        (needs.pr-pending.result == 'success' && needs.pr-pending.outputs.status_result == 'published'))
     concurrency:
@@ -257,6 +282,7 @@ jobs:
       PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
       PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
     with:
+      artifact_prefix: ${{ inputs.artifact_prefix || '' }}
       allowed: ${{ needs.authorize.outputs.allowed == 'true' }}
       target_sha: ${{ needs.authorize.outputs.target_sha }}
       control_sha: ${{ needs.authorize.outputs.control_sha }}
@@ -280,7 +306,7 @@ jobs:
       - uses: actions/download-artifact@v4
         if: always()
         with:
-          name: ppu-authorization
+          name: ${{ inputs.artifact_prefix }}ppu-authorization
           path: .ppu-ci
       - id: cancellation
         if: cancelled()

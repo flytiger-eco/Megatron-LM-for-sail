@@ -177,7 +177,7 @@ def test_all_parent_child_secret_boundaries_are_explicit(filename):
                 assert "github.token" not in json.dumps(step["with"])
                 assert "ppu_ci_paths.py" in job["steps"][index - 1]["run"]
             if step.get("uses") == "actions/upload-artifact@v4":
-                if step["with"].get("name") == "ppu-control-environment":
+                if step["with"].get("name") == "${{ inputs.artifact_prefix }}ppu-control-environment":
                     assert filename == "ppu-build"
                     assert job is workflow["jobs"]["control-environment"]
                     assert step["with"]["path"] == "${{ runner.temp }}/ppu-control-export/"
@@ -187,7 +187,7 @@ def test_all_parent_child_secret_boundaries_are_explicit(filename):
                     assert "outputs.allowed == 'true'" in job["if"]
                     assert "secrets." not in json.dumps(job)
                     continue
-                if step["with"].get("name") == "ppu-runtime-environment":
+                if step["with"].get("name") == "${{ inputs.artifact_prefix }}ppu-runtime-environment":
                     assert filename == "ppu-execute"
                     assert job is workflow["jobs"]["runtime-environment"]
                     assert step["with"]["path"] == "${{ runner.temp }}/ppu-runtime-export/"

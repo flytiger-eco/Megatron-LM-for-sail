@@ -43,7 +43,7 @@ def full_sha(value: str) -> str:
     return value.lower()
 
 
-def docs_only(number: int, pr: dict, api=github_api) -> bool:
+def cpu_only(number: int, pr: dict, api=github_api) -> bool:
     count = pr.get("changed_files")
     if type(count) is not int or not 0 < count < 3000:
         return False
@@ -60,7 +60,7 @@ def docs_only(number: int, pr: dict, api=github_api) -> bool:
             paths = [row["filename"]]
             if row.get("status") == "renamed":
                 paths.append(row["previous_filename"])
-            if any(not (p.startswith("docs/") or p.endswith(".md")) for p in paths):
+            if any(not policy.cpu_only_path(p) for p in paths):
                 return False
     except (OSError, ValueError, KeyError, TypeError):
         return False
@@ -118,8 +118,14 @@ def blocked(result: dict, decision: str, reason: str) -> dict:
 
 def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=time.sleep) -> dict:
     repository = context["repository"]
+    if context.get("artifact_prefix"):
+        raise ValueError("Artifact namespaces are reserved for the trusted sync handoff")
     event_name, ref = context["event_name"], context["ref"]
-    base_ref = event.get("merge_group", {}).get("base_ref", ref)
+    base_ref = (
+        f"refs/heads/{event['pull_request']['base']['ref']}"
+        if event_name == "pull_request_target"
+        else event.get("merge_group", {}).get("base_ref", ref)
+    )
     if not (event_name == "push" and ref.startswith("refs/tags/v")):
         policy.trusted_ref(base_ref)
     spec = importlib.util.spec_from_file_location(
@@ -159,8 +165,8 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
             diagnostic_smoke=True, labels=[], functional_policy=functional.event_policy("smoke")
         )
     if event_name == "workflow_dispatch":
-        expected_workflow = f"{repository}/.github/workflows/ppu-build.yml@{base_ref}"
-        if ref != base_ref or context["workflow_ref"] != expected_workflow:
+        expected_workflow = f"{repository}/.github/workflows/ppu-build.yml@{ref}"
+        if context["workflow_ref"] != expected_workflow:
             raise ValueError("Authorization must originate from the trusted workflow branch")
         for actor in {context["actor"], context["triggering_actor"]}:
             if not re.fullmatch(r"[A-Za-z0-9_\[\]-]+", actor):
@@ -175,8 +181,9 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
                 )
             requested_sha, requested_base = full_sha(requested_sha), full_sha(requested_base)
     elif event_name == "pull_request_target":
-        if ref != base_ref:
-            raise ValueError("Only PRs targeting trusted branches are allowed")
+        expected_workflow = f"{repository}/.github/workflows/ppu-build.yml@{BRANCH}"
+        if ref != BRANCH or context["workflow_ref"] != expected_workflow:
+            raise ValueError("PR events must use the trusted default main workflow")
         if str(context["run_attempt"]) != "1":
             raise ValueError("PR runs cannot be rerun; use a new event or full-SHA dispatch")
         number = str(event["number"])
@@ -210,6 +217,9 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
     if not re.fullmatch(r"[1-9][0-9]{0,8}", number):
         raise ValueError("Invalid PR number")
     pr = api(f"pulls/{number}")
+    if manual_pr:
+        base_ref = policy.trusted_ref(f"refs/heads/{pr['base']['ref']}")
+        result["base_ref"] = base_ref
     if pr["base"]["repo"]["full_name"] != repository or pr["base"]["ref"] != base_ref.removeprefix(
         "refs/heads/"
     ):
@@ -266,14 +276,14 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
 def resolve_pr(result: dict, pr: dict, inputs: dict, repository: str, api, sleep) -> dict:
     number = result["pr_number"]
     requested_sha, requested_base = result["pr_head_sha"], result["base_sha"]
-    only_docs = docs_only(number, pr, api)
+    only_docs = cpu_only(number, pr, api)
     checked = api(f"pulls/{number}")
     if pr_identity(checked) != pr_identity(pr) or not base_is_current(
         requested_base, api, result["base_ref"]
     ):
         raise StaleSnapshot("PR snapshot changed during preflight")
     if only_docs and inputs.get("scope", "auto") == "auto" and not result["labels"]:
-        return blocked(result, "docs_only", "Docs-only changes; UT exempt under policy")
+        return blocked(result, "cpu_only", "Docs/CI-only changes; UT and FT exempt under policy")
     if pr["head"]["repo"]["full_name"] != repository and not result["manual_pr"]:
         return blocked(
             result,
@@ -314,6 +324,90 @@ def resolve_pr(result: dict, pr: dict, inputs: dict, repository: str, api, sleep
     )
 
 
+def sync_is_current(request: dict, api=github_api) -> bool:
+    if (
+        full_sha(api(f"git/ref/heads/{request['source_ref']}")["object"]["sha"])
+        != request["target_sha"]
+    ):
+        return False
+    if request["source_ref"].startswith(("sync/upstream-main/", "davidsophus/ppu-sync-")):
+        return (
+            current_base_sha(api, f"refs/heads/{request['target_branch']}") == request["base_sha"]
+        )
+    return True
+
+
+def authorize_sync(request: dict, context: dict, api=github_api) -> dict:
+    """Accept only an explicit handoff from the trusted synchronization workflow."""
+    ref = context["ref"]
+    if ref not in (BRANCH, policy.SANDBOX_REF) or context["event_name"] not in (
+        "schedule",
+        "workflow_dispatch",
+    ):
+        raise ValueError("Sync handoff requires the trusted main or sandbox workflow")
+    expected = f"{context['repository']}/.github/workflows/copilot-upstream-sync.yml@{ref}"
+    if context["workflow_ref"] != expected or full_sha(context["sha"]) != full_sha(
+        context["control_sha"]
+    ):
+        raise ValueError("Sync handoff did not originate in the trusted synchronization workflow")
+    if set(request) != {"target_branch", "source_ref", "base_sha", "upstream_sha", "target_sha"}:
+        raise ValueError("Unexpected sync handoff fields")
+    branch = request["target_branch"]
+    if branch not in ("main", "dev"):
+        raise ValueError("Sync target must be main or dev")
+    request = dict(request)
+    for key in ("base_sha", "upstream_sha", "target_sha"):
+        request[key] = full_sha(request[key])
+    if context.get("artifact_prefix") != f"sync-{branch}-":
+        raise ValueError("Sync handoff requires an isolated artifact namespace")
+    sandbox = ref == policy.SANDBOX_REF
+    expected_source = (
+        f"davidsophus/ppu-sync-{branch}"
+        if sandbox
+        else "dev" if branch == "dev" else f"sync/upstream-main/{request['upstream_sha']}"
+    )
+    if (
+        request["source_ref"] != expected_source
+        or sandbox
+        and request["upstream_sha"] != context["control_sha"]
+    ):
+        raise ValueError("Sync source is outside the permitted publication destination")
+    commit = api(f"git/commits/{request['target_sha']}")
+    if [full_sha(row["sha"]) for row in commit["parents"]] != [
+        request["base_sha"],
+        request["upstream_sha"],
+    ]:
+        raise ValueError("Published sync commit does not match the two-parent handoff")
+    if not sync_is_current(request, api):
+        raise StaleSnapshot("Published sync ref or base changed; PPU not started")
+    spec = importlib.util.spec_from_file_location(
+        "ppu_functional_sync", Path(__file__).with_name("ppu_functional.py")
+    )
+    functional = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(functional)
+    return {
+        "allowed": True,
+        "decision": "run",
+        "reason": "Published synchronization commit; awaiting UT and FT",
+        "target_sha": request["target_sha"],
+        "control_sha": full_sha(context["control_sha"]),
+        "pr_head_sha": "",
+        "base_sha": request["base_sha"],
+        "pr_number": 0,
+        "manual_pr": False,
+        "base_ref": policy.SANDBOX_REF if sandbox else f"refs/heads/{branch}",
+        "actor": context["actor"],
+        "run_id": context["run_id"],
+        "run_attempt": int(context["run_attempt"]),
+        "event_name": "workflow_dispatch" if sandbox else "push",
+        "test_kind": "combined",
+        "labels": [],
+        "diagnostic_smoke": sandbox,
+        "sync_request": request,
+        "functional_policy": functional.event_policy("smoke" if sandbox else "push"),
+    }
+
+
 def run_url(run_id: str) -> str:
     return f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run_id}"
 
@@ -340,7 +434,7 @@ def status_description(reason: str, authorization: dict) -> str:
 def initial_state(decision: str) -> str:
     return {
         "run": "pending",
-        "docs_only": "success",
+        "cpu_only": "success",
         "draft": "pending",
         "closed": "error",
         "authorization_required": "pending",
@@ -391,7 +485,7 @@ def publish_status(
         return "rejected"
     if not number or decision not in (
         "run",
-        "docs_only",
+        "cpu_only",
         "draft",
         "closed",
         "authorization_required",
@@ -471,7 +565,9 @@ def execution_guard(authorization: dict, api=github_api) -> bool:
     if not authorization.get("allowed"):
         return False
     if not authorization["pr_number"]:
-        return True
+        return not authorization.get("sync_request") or sync_is_current(
+            authorization["sync_request"], api
+        )
     if (
         int(os.environ["GITHUB_RUN_ID"]) != int(authorization["run_id"])
         or int(os.environ["GITHUB_RUN_ATTEMPT"]) != authorization["run_attempt"]
@@ -595,11 +691,16 @@ def main() -> None:
         "run_attempt": "GITHUB_RUN_ATTEMPT",
     }
     context = {key: os.environ[value] for key, value in env_keys.items()}
-    result = authorize(
-        json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text()),
-        json.loads(os.environ.get("PPU_INPUTS", "{}")),
-        context,
-    )
+    context["artifact_prefix"] = os.environ.get("PPU_ARTIFACT_PREFIX", "")
+    sync_request = os.environ.get("PPU_SYNC_REQUEST", "")
+    if sync_request:
+        result = authorize_sync(json.loads(sync_request), context)
+    else:
+        result = authorize(
+            json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text()),
+            json.loads(os.environ.get("PPU_INPUTS", "{}")),
+            context,
+        )
     args.output.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     if os.environ.get("GITHUB_OUTPUT"):
