@@ -30,8 +30,10 @@ def _expert_parameters(num_local_experts, config, **kwargs):
     return experts
 
 
-@pytest.mark.parametrize("shared", [False, True])
-def test_meta_training_call(monkeypatch, shared):
+@pytest.mark.parametrize(
+    "shared,mode", [(False, None), (True, None), (True, "auto"), (True, "native")]
+)
+def test_meta_training_call(monkeypatch, shared, mode):
     pytest.importorskip("transformer_engine.pytorch.mega_moe")
     # Use the router's PyTorch GEMM fallback; TE cuBLAS requires a live device.
     monkeypatch.setattr(moe_utils, "te_general_gemm", None)
@@ -58,6 +60,7 @@ def test_meta_training_call(monkeypatch, shared):
         perform_initialization=False,
         moe_router_load_balancing_type="none",
         moe_megakernel_backend="te_ppu_rtc",
+        moe_megakernel_backend_config={"shared_expert_mode": mode} if mode else None,
         moe_shared_expert_intermediate_size=8 if shared else None,
     )
     submodules = MoESubmodules(
@@ -69,6 +72,7 @@ def test_meta_training_call(monkeypatch, shared):
         shared_forward = Mock(wraps=model.shared_experts.forward)
         monkeypatch.setattr(model.shared_experts, "forward", shared_forward)
     assert model.token_dispatcher is None
+    assert not model.megakernel_fuses_shared_expert
     assert not list(model.megakernel_experts.parameters())
     x = torch.empty(4, 2, 16, device="meta", dtype=torch.bfloat16, requires_grad=True)
     y, bias = model(x)

@@ -34,9 +34,9 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from megatron.core.fusions.fused_mla_yarn_rope_apply import (
-    mla_rope_apply_raw_,
-    mla_rope_unapply_raw,
+from megatron.core.ops.attention.csa.output_rope import (
+    OutputRopeParams,
+    undo_output_rope_for_backward,
 )
 from megatron.core.quantization.indexer_quantization import (
     HAVE_TE_MXFP8,
@@ -64,98 +64,8 @@ from ..dsa_cudnn_kernels import (
     _pad_sparse_backward_topk,
 )
 from . import csa_indexer_loss_kernels, thd_indexer_kernels, thd_layout_kernels
+from .aligned_hca import aligned_hca_backward
 from .csa_teacher_lse import csa_teacher_lse_unsupported_reason, fused_csa_teacher_lse
-
-# ---------------------------------------------------------------------------
-# Output inverse-RoPE fused into the sparse-attention Functions
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class OutputRopeParams:
-    """Inverse-RoPE applied to the attention output inside the fused Functions.
-
-    DSv4 undoes the query-side RoPE on the attention output.  Folding that into
-    the sparse-attention ``Function`` lets the rotation happen in place on the
-    tensor the Function already saves for backward, instead of on a private
-    clone, which removes one full ``(rows, heads, v_head_dim)`` buffer per layer
-    from the forward-to-backward live set.
-
-    The rotation is orthogonal only when the cos/sin were built with
-    ``mscale=1.0`` (DSv4's "pure rotation" contract).  That is what makes
-    :meth:`undo` an exact inverse rather than just a transpose, so the backward
-    can recover the pre-RoPE output and gradient.
-
-    ``sbhd_batch_size`` is required for the sbhd layout, where the flat
-    ``(sq * b, ...)`` rows are sq-major and the kernel derives the token index
-    as ``row // batch_size``.  For thd it must be None and ``cu_seqlens_q``
-    supplies the segment boundaries instead.
-    """
-
-    cos: Tensor
-    sin: Tensor
-    nope_dim: int
-    pos_dim: int
-    cu_seqlens_q: Optional[Tensor] = None
-    cp_rank: int = 0
-    cp_size: int = 1
-    position_ids: Optional[Tensor] = None
-    sbhd_batch_size: Optional[int] = None
-
-    def _kernel_view(self, out_flat: Tensor) -> Tensor:
-        """View a flat ``(rows, heads, head_dim)`` output the way the kernel wants it."""
-        if out_flat.shape[-1] != self.nope_dim + self.pos_dim:
-            raise ValueError(
-                "Output inverse-RoPE expects head_dim == nope_dim + pos_dim, got "
-                f"{out_flat.shape[-1]} != {self.nope_dim} + {self.pos_dim}."
-            )
-        if self.cu_seqlens_q is not None:
-            return out_flat
-        if self.sbhd_batch_size is None:
-            raise ValueError("sbhd_batch_size is required when cu_seqlens_q is None.")
-        rows, nheads, head_dim = out_flat.shape
-        return out_flat.view(rows // self.sbhd_batch_size, self.sbhd_batch_size, nheads, head_dim)
-
-    def _kernel_kwargs(self) -> dict:
-        return dict(
-            cu_seqlens_q=self.cu_seqlens_q,
-            cp_rank=self.cp_rank,
-            cp_size=self.cp_size,
-            inverse=True,
-            remove_interleaving=True,
-            position_ids=self.position_ids,
-        )
-
-    def apply_(self, out_flat: Tensor) -> Tensor:
-        """Inverse-RoPE a ``(rows, heads, head_dim)`` attention output in place."""
-        mla_rope_apply_raw_(
-            self._kernel_view(out_flat),
-            self.cos,
-            self.sin,
-            self.nope_dim,
-            self.pos_dim,
-            **self._kernel_kwargs(),
-        )
-        return out_flat
-
-    def undo(self, t: Tensor, out: Optional[Tensor] = None) -> Tensor:
-        """Recover the pre-RoPE values of ``t``, in place or into ``out``.
-
-        Pass ``out`` whenever ``t`` is aliased by a tensor that another autograd
-        node still expects to hold the rotated values, which is the case for the
-        saved attention output.
-        """
-        mla_rope_unapply_raw(
-            self._kernel_view(t),
-            self.cos,
-            self.sin,
-            self.nope_dim,
-            self.pos_dim,
-            out=None if out is None else self._kernel_view(out),
-            **self._kernel_kwargs(),
-        )
-        return t if out is None else out
-
 
 # ---------------------------------------------------------------------------
 # Lazy kernel imports
@@ -856,7 +766,8 @@ def _csa_fwd_flash_mla(
             lse_indexer = None
 
     if padded_num_heads != actual_num_heads:
-        out = out[:, :actual_num_heads, :]
+        # Reconstruction uses the same strides for saved output and its private destination.
+        out = out[:, :actual_num_heads, :].contiguous()
         lse = lse[:, :actual_num_heads]
         if lse_indexer is not None:
             lse_indexer = lse_indexer[:, :actual_num_heads]
@@ -868,36 +779,6 @@ def _csa_fwd_flash_mla(
             return out, lse, lse.clone()
         return out, lse, lse_indexer
     return out, lse, None
-
-
-def _undo_output_rope_for_backward(
-    out_rope: Optional[OutputRopeParams], out_flat: Tensor, dO_flat: Tensor
-) -> Tuple[Tensor, Tensor]:
-    """Recover the pre-RoPE ``(O, dO)`` pair that the cuDNN backward expects.
-
-    ``dO`` is un-rotated in place; the gradient buffer is exclusively ours.
-    ``O`` is un-rotated in a fresh contiguous clone because the saved output aliases the
-    tensor the downstream output projection saved for its own backward, and a
-    triton in-place write would corrupt it without tripping autograd's version
-    counter.
-
-    #TODO:
-    Two follow-ups can remove work here. The only thing ``O`` feeds is cuDNN's
-    internal ``delta = rowsum(dO * O)``, which the rotation leaves unchanged, so
-    a ``sparse_attention_backward_wrapper`` that accepts a precomputed delta
-    would let the ``O`` un-rotation be dropped entirely. Short of that, one
-    triton kernel could un-rotate ``O`` and ``dO`` in a single launch.
-    """
-    if out_rope is None:
-        return out_flat, dO_flat
-    # Head-padding removal can leave a view with a padded row stride. The RoPE
-    # kernel shares input/output strides, so clone into one owned dense buffer
-    # and undo in place there without changing the saved module output.
-    o_unrot = out_flat.clone(memory_format=torch.contiguous_format)
-    out_rope.undo(o_unrot)
-    dO_flat = dO_flat.contiguous()
-    out_rope.undo(dO_flat)
-    return o_unrot, dO_flat
 
 
 def _ensure_dsa_namespace():
@@ -1578,11 +1459,6 @@ _DETERMINISTIC_SPARSE_BWD_RETIRED_WORKSPACES: list[Tensor] = []
 _DETERMINISTIC_SPARSE_BWD_LOCK = threading.Lock()
 
 
-def _deterministic_requested(flag: bool = False) -> bool:
-    """Deterministic execution was asked for, via the config flag or torch's global switch."""
-    return bool(flag) or torch.are_deterministic_algorithms_enabled()
-
-
 def _canonicalize_compact_topk(
     topk_indices: Tensor, compact_logits: Tensor, compact_softmax: Optional[Tensor]
 ) -> Tuple[Tensor, Optional[Tensor]]:
@@ -1680,27 +1556,32 @@ def _get_deterministic_sparse_attention_workspace(
 
 def _deterministic_sparse_bwd_kwargs(
     q_flat: Tensor,
-    kv_flat: Tensor,
-    out_flat: Tensor,
-    lse: Tensor,
-    attn_sink: Tensor,
-    topk_idxs: Tensor,
-    topk_length: Optional[Tensor],
-    softmax_scale: float,
+    kv_flat: Optional[Tensor] = None,
+    out_flat: Optional[Tensor] = None,
+    lse: Optional[Tensor] = None,
+    attn_sink: Optional[Tensor] = None,
+    topk_idxs: Optional[Tensor] = None,
+    topk_length: Optional[Tensor] = None,
+    softmax_scale: Optional[float] = None,
     requested: bool = False,
     cuda_graph: bool = False,
 ) -> dict:
     """Extra kwargs that switch ``sparse_attention_backward_wrapper`` to its deterministic kernel.
 
-    ``cuda_graph`` mirrors ``TransformerConfig.cuda_graph_impl != "none"`` and marks the
-    workspace as graph-owned from the eager warmup on (see the ownership notes above
-    ``_DeterministicSparseBwdWorkspace``).
-
-    Returns ``{}`` unless deterministic execution was requested. When it was requested but the
-    installed cuDNN frontend / GPU / head count cannot provide the kernel, raise instead of
+    Returns ``{}`` unless deterministic execution was requested. Only ``requested`` (sourced
+    from ``TransformerConfig.deterministic_mode``) selects this kernel;
+    ``torch.use_deterministic_algorithms`` alone keeps the default one. When it was requested but
+    the installed cuDNN frontend / GPU / head count cannot provide the kernel, raise instead of
     silently running the atomic version, so a deterministic run never degrades unnoticed.
+
+    With only ``q_flat``, the wrapper allocates the kernel's scratch workspace for each call from
+    PyTorch's caching allocator. When ``kv_flat`` and the other backward operands are supplied,
+    the kwargs also carry the retained per-device workspace sized for them. ``cuda_graph``
+    mirrors ``TransformerConfig.cuda_graph_impl != "none"`` and marks that workspace as
+    graph-owned from the eager warmup on (see the ownership notes above
+    ``_DeterministicSparseBwdWorkspace``).
     """
-    if not _deterministic_requested(requested):
+    if not requested:
         return {}
     _ensure_dsa_namespace()
     wrapper = getattr(_DSA, "sparse_attention_backward_wrapper", None)
@@ -1708,14 +1589,18 @@ def _deterministic_sparse_bwd_kwargs(
         parameters = inspect.signature(wrapper).parameters if wrapper is not None else {}
     except (TypeError, ValueError):
         parameters = {}
-    if (
-        "deterministic" not in parameters
-        or "workspace" not in parameters
-        or getattr(_DSA, "SparseAttentionBackward", None) is None
-    ):
+    retained_workspace = kv_flat is not None
+    supported = "deterministic" in parameters
+    if retained_workspace:
+        supported = (
+            supported
+            and "workspace" in parameters
+            and getattr(_DSA, "SparseAttentionBackward", None) is not None
+        )
+    if not supported:
         raise RuntimeError(
             "deterministic mode: the installed cudnn-frontend has no deterministic DSA "
-            "sparse-attention backward (needs nvidia-cudnn-frontend >= 1.28)."
+            "sparse-attention backward (needs nvidia-cudnn-frontend >= 1.29)."
         )
     num_heads = q_flat.shape[-2]
     capability = torch.cuda.get_device_capability(q_flat.device)[0] if q_flat.is_cuda else None
@@ -1724,6 +1609,18 @@ def _deterministic_sparse_bwd_kwargs(
             "deterministic mode: cuDNN's deterministic DSA sparse-attention backward needs an "
             f"SM100 GPU and a query-head count in {sorted(_DETERMINISTIC_SPARSE_BWD_HEAD_COUNTS)}; "
             f"got sm{capability}0 with {num_heads} heads."
+        )
+    if not retained_workspace:
+        return {"deterministic": True}
+    # NOTE(nightly-sync 2026-11-12): ``_csa_sparse_attention_backward`` hands cuDNN head-padded
+    # operands (FlashMLA pads e.g. 16 query heads to 64 on SM100, exercised by main's #7708
+    # test_non_cp_sparse_attention_backward_reference_and_replay), so size the retained scratch
+    # for that padded problem. The unpadded LSE can also be a strided view of the forward's
+    # padded LSE, which cuDNN's SparseAttentionBackward rejects.
+    padded_num_heads = _get_head_padding(num_heads) if q_flat.is_cuda else num_heads
+    if padded_num_heads != num_heads:
+        q_flat, out_flat, lse, attn_sink = _pad_sparse_attention_heads(
+            padded_num_heads, q_flat, out_flat, lse, attn_sink
         )
     return {
         "deterministic": True,
@@ -1803,85 +1700,93 @@ def _deterministic_sparse_indexer_grads_wk(
     if total_keys == 0 or batch * sq == 0 or topk == 0:
         grad_w = torch.zeros_like(w_bsh) if compute_grad_w else None
         return grad_w, torch.zeros_like(k_idx_bsd)
-    rows = batch * sq
-    device = k_idx_bsd.device
-    q_flat = q_idx_bshd.reshape(rows, indexer_heads, indexer_dim)
-    w_flat = w_bsh.reshape(rows, indexer_heads)
-    k_flat = k_idx_bsd.reshape(total_keys, indexer_dim)
-    attn_flat = attn_score.reshape(rows, topk)
-    index_flat = index_score.reshape(rows, topk)
-    topk_flat = topk_indices.reshape(rows, topk)
-    grad_scale = grad_loss.to(dtype=torch.float32) * (loss_coeff / rows) * sm_scale
-    use_index_add = torch.are_deterministic_algorithms_enabled()
-    chunk_rows = _deterministic_indexer_dk_chunk_rows(indexer_heads, indexer_dim, topk)
-    # Dummy rows that absorb the (zero) contributions of padding slots.
-    pad_rows = min(4096, chunk_rows * topk)
-    grad_k_ext = torch.zeros(
-        (total_keys + pad_rows, indexer_dim), device=device, dtype=torch.float32
-    )
-    grad_w_flat = (
-        torch.empty(w_flat.shape, device=w_flat.device, dtype=torch.float32)
-        if compute_grad_w
-        else None
-    )
-    pad_ids = (
-        total_keys + torch.arange(chunk_rows * topk, device=device, dtype=torch.int64) % pad_rows
-    )
-    key_ids = None
-    for row_start in range(0, rows, chunk_rows):
-        row_end = min(row_start + chunk_rows, rows)
-        n_rows = row_end - row_start
-        q_chunk = q_flat[row_start:row_end].float()
-        w_chunk = w_flat[row_start:row_end].float()
-        indices_chunk = topk_flat[row_start:row_end].long()
-        valid = (indices_chunk >= 0) & (indices_chunk < keys_per_batch)
-        if batch > 1:
-            # SBHD Top-K ids are local to each sample, whereas k_flat and grad_k_ext
-            # concatenate samples. Chunk boundaries need not align with sample boundaries.
-            batch_offsets = (
-                torch.arange(row_start, row_end, device=device, dtype=torch.int64) // sq
-            ) * keys_per_batch
-            indices_chunk = indices_chunk + batch_offsets.unsqueeze(-1)
-        flat_idx = torch.where(
-            valid.reshape(-1), indices_chunk.reshape(-1), pad_ids[: n_rows * topk]
+    # Training runs this under BF16 autocast, which would still run the bmm calls below in BF16
+    # despite their FP32 inputs; index_add_ then rejects BF16 contributions for the FP32 buffer.
+    with torch.autocast(device_type=k_idx_bsd.device.type, enabled=False):
+        rows = batch * sq
+        device = k_idx_bsd.device
+        q_flat = q_idx_bshd.reshape(rows, indexer_heads, indexer_dim)
+        w_flat = w_bsh.reshape(rows, indexer_heads)
+        k_flat = k_idx_bsd.reshape(total_keys, indexer_dim)
+        attn_flat = attn_score.reshape(rows, topk)
+        index_flat = index_score.reshape(rows, topk)
+        topk_flat = topk_indices.reshape(rows, topk)
+        grad_scale = grad_loss.to(dtype=torch.float32) * (loss_coeff / rows) * sm_scale
+        use_index_add = torch.are_deterministic_algorithms_enabled()
+        chunk_rows = _deterministic_indexer_dk_chunk_rows(indexer_heads, indexer_dim, topk)
+        # Dummy rows that absorb the (zero) contributions of padding slots.
+        pad_rows = min(4096, chunk_rows * topk)
+        grad_k_ext = torch.zeros(
+            (total_keys + pad_rows, indexer_dim), device=device, dtype=torch.float32
         )
-        gather_idx = indices_chunk.masked_fill(~valid, 0).reshape(-1)
-        selected_k = k_flat.index_select(0, gather_idx).reshape(n_rows, topk, indexer_dim).float()
-        dot = torch.bmm(q_chunk, selected_k.transpose(1, 2))  # (rows, heads, topk)
-        predict = index_flat[row_start:row_end].float()
-        kept = valid & (predict >= _CUDNN_INDEXER_CLIP_PROB_MIN)
-        kept_target = torch.where(
-            kept, attn_flat[row_start:row_end].float().clamp_min(_CUDNN_INDEXER_CLIP_PROB_MIN), 0.0
+        grad_w_flat = (
+            torch.empty(w_flat.shape, device=w_flat.device, dtype=torch.float32)
+            if compute_grad_w
+            else None
         )
-        score_grad = predict * kept_target.sum(dim=-1, keepdim=True) - kept_target
-        score_grad = (score_grad * grad_scale).masked_fill(~valid, 0.0)
-        head_coeff = (dot > 0).to(dtype=torch.float32)
-        if grad_w_flat is not None:
-            dot.relu_()
-            dot.mul_(score_grad.unsqueeze(1))
-            grad_w_flat[row_start:row_end].copy_(dot.sum(dim=-1))
-        head_coeff.mul_(w_chunk.unsqueeze(-1))
-        head_coeff.mul_(score_grad.unsqueeze(1))
-        contributions = torch.bmm(head_coeff.transpose(1, 2), q_chunk)  # (rows, topk, dim)
-        flat_contrib = contributions.reshape(-1, indexer_dim)
-        if use_index_add:
-            grad_k_ext.index_add_(0, flat_idx, flat_contrib)
-        else:
-            if key_ids is None:
-                key_ids = torch.arange(grad_k_ext.size(0), device=device, dtype=torch.int64)
-            sorted_keys, order = torch.sort(flat_idx, stable=True)
-            sorted_contributions = flat_contrib.index_select(0, order)
-            prefix = torch.nn.functional.pad(
-                torch.cumsum(sorted_contributions, dim=0), (0, 0, 1, 0)
+        pad_ids = (
+            total_keys
+            + torch.arange(chunk_rows * topk, device=device, dtype=torch.int64) % pad_rows
+        )
+        key_ids = None
+        for row_start in range(0, rows, chunk_rows):
+            row_end = min(row_start + chunk_rows, rows)
+            n_rows = row_end - row_start
+            q_chunk = q_flat[row_start:row_end].float()
+            w_chunk = w_flat[row_start:row_end].float()
+            indices_chunk = topk_flat[row_start:row_end].long()
+            valid = (indices_chunk >= 0) & (indices_chunk < keys_per_batch)
+            if batch > 1:
+                # SBHD Top-K ids are local to each sample, whereas k_flat and grad_k_ext
+                # concatenate samples. Chunk boundaries need not align with sample boundaries.
+                batch_offsets = (
+                    torch.arange(row_start, row_end, device=device, dtype=torch.int64) // sq
+                ) * keys_per_batch
+                indices_chunk = indices_chunk + batch_offsets.unsqueeze(-1)
+            flat_idx = torch.where(
+                valid.reshape(-1), indices_chunk.reshape(-1), pad_ids[: n_rows * topk]
             )
-            left = torch.searchsorted(sorted_keys, key_ids, right=False)
-            right = torch.searchsorted(sorted_keys, key_ids, right=True)
-            grad_k_ext.add_(prefix.index_select(0, right) - prefix.index_select(0, left))
-    grad_k = grad_k_ext[:total_keys].reshape_as(k_idx_bsd).to(dtype=k_idx_bsd.dtype)
-    grad_w = (
-        grad_w_flat.reshape_as(w_bsh).to(dtype=w_bsh.dtype) if grad_w_flat is not None else None
-    )
-    return grad_w, grad_k
+            gather_idx = indices_chunk.masked_fill(~valid, 0).reshape(-1)
+            selected_k = (
+                k_flat.index_select(0, gather_idx).reshape(n_rows, topk, indexer_dim).float()
+            )
+            dot = torch.bmm(q_chunk, selected_k.transpose(1, 2))  # (rows, heads, topk)
+            predict = index_flat[row_start:row_end].float()
+            kept = valid & (predict >= _CUDNN_INDEXER_CLIP_PROB_MIN)
+            kept_target = torch.where(
+                kept,
+                attn_flat[row_start:row_end].float().clamp_min(_CUDNN_INDEXER_CLIP_PROB_MIN),
+                0.0,
+            )
+            score_grad = predict * kept_target.sum(dim=-1, keepdim=True) - kept_target
+            score_grad = (score_grad * grad_scale).masked_fill(~valid, 0.0)
+            head_coeff = (dot > 0).to(dtype=torch.float32)
+            if grad_w_flat is not None:
+                dot.relu_()
+                dot.mul_(score_grad.unsqueeze(1))
+                grad_w_flat[row_start:row_end].copy_(dot.sum(dim=-1))
+            head_coeff.mul_(w_chunk.unsqueeze(-1))
+            head_coeff.mul_(score_grad.unsqueeze(1))
+            contributions = torch.bmm(head_coeff.transpose(1, 2), q_chunk)  # (rows, topk, dim)
+            flat_contrib = contributions.reshape(-1, indexer_dim)
+            if use_index_add:
+                grad_k_ext.index_add_(0, flat_idx, flat_contrib)
+            else:
+                if key_ids is None:
+                    key_ids = torch.arange(grad_k_ext.size(0), device=device, dtype=torch.int64)
+                sorted_keys, order = torch.sort(flat_idx, stable=True)
+                sorted_contributions = flat_contrib.index_select(0, order)
+                prefix = torch.nn.functional.pad(
+                    torch.cumsum(sorted_contributions, dim=0), (0, 0, 1, 0)
+                )
+                left = torch.searchsorted(sorted_keys, key_ids, right=False)
+                right = torch.searchsorted(sorted_keys, key_ids, right=True)
+                grad_k_ext.add_(prefix.index_select(0, right) - prefix.index_select(0, left))
+        grad_k = grad_k_ext[:total_keys].reshape_as(k_idx_bsd).to(dtype=k_idx_bsd.dtype)
+        grad_w = (
+            grad_w_flat.reshape_as(w_bsh).to(dtype=w_bsh.dtype) if grad_w_flat is not None else None
+        )
+        return grad_w, grad_k
 
 
 def _override_indexer_grads(ig: dict, det_w: Optional[Tensor], det_k: Optional[Tensor]) -> dict:
@@ -1915,6 +1820,8 @@ class CSASparseAttnFunc(torch.autograd.Function):
         out_rope: Optional[OutputRopeParams] = None,
         deterministic: bool = False,
         cuda_graph: bool = False,
+        hca_cp_rank: Optional[int] = None,
+        hca_cp_size: Optional[int] = None,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
         # cuDNN backward keys its compile cache on the saved top-k width. Align
@@ -1935,18 +1842,22 @@ class CSASparseAttnFunc(torch.autograd.Function):
         # buffer. Mutating after the save would trip the version counter.
         if out_rope is not None:
             out_rope.apply_(out)
+        ctx.num_forward_inputs = len(ctx.needs_input_grad)
 
+        saved_topk_idxs = None if hca_cp_rank is not None else topk_idxs
         ctx.reconstruct_kv_for_backward = kv_reconstruction_parts is not None
         if ctx.reconstruct_kv_for_backward:
             _validate_kv_reconstruction_parts(kv, kv_reconstruction_parts)
-            ctx.save_for_backward(q, *kv_reconstruction_parts, attn_sink, topk_idxs, out, lse)
+            ctx.save_for_backward(q, *kv_reconstruction_parts, attn_sink, saved_topk_idxs, out, lse)
         else:
-            ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse)
+            ctx.save_for_backward(q, kv, attn_sink, saved_topk_idxs, out, lse)
         ctx.softmax_scale = softmax_scale
-        ctx.topk_length = topk_length
+        ctx.topk_length = None if hca_cp_rank is not None else topk_length
         ctx.out_rope = out_rope
         ctx.deterministic = deterministic
         ctx.cuda_graph = cuda_graph
+        ctx.hca_cp_rank = hca_cp_rank
+        ctx.hca_cp_size = hca_cp_size
         return out, lse, lse_indexer
 
     @staticmethod
@@ -1962,32 +1873,47 @@ class CSASparseAttnFunc(torch.autograd.Function):
         else:
             q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
 
-        out, dO = _undo_output_rope_for_backward(ctx.out_rope, out, dO)
+        out, dO = undo_output_rope_for_backward(ctx.out_rope, out, dO)
 
-        dq, dkv, d_sink = _csa_sparse_attention_backward(
-            q,
-            kv,
-            out,
-            dO,
-            lse,
-            attn_sink,
-            topk_idxs,
-            softmax_scale=ctx.softmax_scale,
-            topk_length=ctx.topk_length,
-            **_deterministic_sparse_bwd_kwargs(
+        if ctx.hca_cp_rank is not None:
+            result = aligned_hca_backward(
                 q,
                 kv,
                 out,
+                dO,
+                lse,
+                attn_sink,
+                cp_rank=ctx.hca_cp_rank,
+                cp_size=ctx.hca_cp_size,
+                softmax_scale=ctx.softmax_scale,
+            )
+            dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
+        else:
+            dq, dkv, d_sink = _csa_sparse_attention_backward(
+                q,
+                kv,
+                out,
+                dO,
                 lse,
                 attn_sink,
                 topk_idxs,
-                ctx.topk_length,
-                ctx.softmax_scale,
-                requested=getattr(ctx, "deterministic", False),
-                cuda_graph=getattr(ctx, "cuda_graph", False),
-            ),
-        )
-        return dq, dkv, d_sink, None, None, None, None, None, None, None, None
+                softmax_scale=ctx.softmax_scale,
+                topk_length=ctx.topk_length,
+                **_deterministic_sparse_bwd_kwargs(
+                    q,
+                    kv,
+                    out,
+                    lse,
+                    attn_sink,
+                    topk_idxs,
+                    ctx.topk_length,
+                    ctx.softmax_scale,
+                    requested=getattr(ctx, "deterministic", False),
+                    cuda_graph=getattr(ctx, "cuda_graph", False),
+                ),
+            )
+        gradients = (dq, dkv, d_sink, None, None, None, None, None, None, None, None, None, None)
+        return gradients[: ctx.num_forward_inputs]
 
 
 def csa_sparse_attn(
@@ -2003,6 +1929,8 @@ def csa_sparse_attn(
     out_rope: Optional[OutputRopeParams] = None,
     deterministic: bool = False,
     cuda_graph: bool = False,
+    hca_cp_rank: Optional[int] = None,
+    hca_cp_size: Optional[int] = None,
 ) -> Tensor:
     """Sparse attention (Path A / Path C step 2).
 
@@ -2040,11 +1968,16 @@ def csa_sparse_attn(
             the Function, in place on the tensor it saves for backward, and
             undone there before the cuDNN backward. Saves one full O buffer
             per layer against rotating the returned tensor out of place.
+        hca_cp_rank: CP rank for an aligned HCA layout validated by the caller.
+        hca_cp_size: Required CP size when ``hca_cp_rank`` is set.
 
     Returns:
         SBHD ``(sq, b, np * d_v)`` or THD ``(total_sq, np * d_v)`` bf16,
         inverse-RoPE'd when ``out_rope`` is given.
     """
+    if hca_cp_rank is not None and hca_cp_size is None:
+        raise ValueError("hca_cp_size is required when hca_cp_rank is set")
+
     # Layout-specific input pre-reshape — the kernel always consumes a
     # flat ``(rows, np, d)`` query and ``(n_kv, d)`` KV; only the rows
     # axis interpretation differs (rows = ``total_sq`` for THD, rows =
@@ -2081,6 +2014,8 @@ def csa_sparse_attn(
         out_rope,
         deterministic,
         cuda_graph,
+        hca_cp_rank,
+        hca_cp_size,
     )  # (rows, np, d_v)
 
     # Layout-specific output reshape: collapse (np, d_v) → (np * d_v),
@@ -2528,6 +2463,27 @@ def _indexer_topk_core(
     )
 
 
+def _indexer_topk_bshd(
+    q_bshd: Tensor,
+    k_bsd: Tensor,
+    w_bsh: Tensor,
+    topk: int,
+    ratio: int = 4,
+    deterministic: bool = False,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Dense BSHD score + Top-K, returning ``(topk_indices, topk_length, scores)``.
+
+    Thin wrapper over the dense fallback of :func:`_indexer_topk_core` (no compact dispatch).
+    ``w_bsh`` must already be ``indexer_softmax_scale``-scaled. ``deterministic`` selects a
+    stable Top-K with score ties resolved toward the smallest key id;
+    ``torch.use_deterministic_algorithms`` alone does not select it.
+    """
+    topk_indices, topk_length, scores, _ = _indexer_topk_core(
+        q_bshd, k_bsd, w_bsh, topk, ratio, deterministic=deterministic
+    )
+    return topk_indices, topk_length, scores
+
+
 def _indexer_score_chunk_rows(total_rows: int, max_seqlen_kv: int) -> int:
     """Query rows whose fp32 score block fits ``_CSA_INDEXER_SCORE_CHUNK_MAX_BYTES``."""
     bytes_per_row = max(1, max_seqlen_kv) * torch.finfo(torch.float32).bits // 8
@@ -2728,7 +2684,8 @@ def indexer_topk(
         deterministic: resolve exact-value ties at the K-th boundary toward
             the smallest local KV indices. Compact dispatch leaves the output
             slot order unspecified; the standalone Top-K fallback returns ids in
-            descending-score order.
+            descending-score order. ``torch.use_deterministic_algorithms`` alone does not
+            select it.
         return_softmax: also return the compact kernel's Top-K softmax. The
             third return is ``None`` when compact dispatch is unavailable.
 
@@ -3186,6 +3143,19 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
 
+        # The dense cuDNN indexer backward has no deterministic kernel. It only produces the
+        # indexer gradients, so reject it only when those gradients are consumed.
+        if (
+            deterministic
+            and loss_coeff > 0
+            and not sparse_loss
+            and any(ctx.needs_input_grad[index] for index in (4, 5, 6))
+        ):
+            raise RuntimeError(
+                "deterministic CSA indexer backward requires dsa_indexer_use_sparse_loss=True; "
+                "the dense cuDNN indexer backward is not supported in deterministic mode."
+            )
+
         is_thd = cu_seqlens_q is not None
         total_q = q_indexer.shape[0] if is_thd else q_indexer.shape[0] * q_indexer.shape[1]
 
@@ -3355,7 +3325,9 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         out_flat, lse, _ = _csa_fwd_flash_mla(
             q_flat,
             kv_flat,
-            global_idxs,
+            # Same aligned width as CSASparseAttnFunc: forward-only and training
+            # passes must hand FlashMLA the identical id tensor.
+            _align_topk_width(global_idxs),
             softmax_scale,
             attn_sink=attn_sink,
             topk_length=topk_length,
@@ -3590,9 +3562,9 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
                     bwd_topk = topk_indices_cmp
 
                 det_w = det_k = None
-                # Skip in passes whose autograd graph is never used (the no_grad pass of an
-                # activation checkpoint): the query activation does not require grad there.
-                if _deterministic_requested(deterministic) and ctx.needs_input_grad[0]:
+                # Skip when no indexer input (q_indexer, k_indexer, weights) requires grad, e.g.
+                # in the no_grad pass of an activation checkpoint, whose graph is never used.
+                if deterministic and any(ctx.needs_input_grad[index] for index in (4, 5, 6)):
                     # cuDNN accumulates dK (and dW on SM90) with atomics; compute the
                     # deterministic replacements first because the cuDNN kernel overwrites
                     # its score operands.
@@ -3691,6 +3663,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         # mutating a saved tensor afterwards trips the version counter.
         if out_rope is not None:
             out_rope.apply_(out_flat)
+        ctx.num_forward_inputs = len(ctx.needs_input_grad)
 
         # ---- 8. Save context (only sparse-attn bwd tensors + indexer grads). -
         ctx.save_for_backward(
@@ -3759,7 +3732,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             dO_flat = dO_flat.masked_fill(ctx.padding_row_mask[:, None, None], 0)
             lse = lse.masked_fill(ctx.padding_row_mask[:, None], 0)
 
-        out_flat, dO_flat = _undo_output_rope_for_backward(ctx.out_rope, out_flat, dO_flat)
+        out_flat, dO_flat = undo_output_rope_for_backward(ctx.out_rope, out_flat, dO_flat)
 
         dq, dkv, d_sink = _csa_sparse_attention_backward(
             q_flat,
@@ -3839,7 +3812,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             None,
             None,
             None,
-        )
+        )[: ctx.num_forward_inputs]
 
 
 class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
@@ -3972,7 +3945,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                 bwd_idx = predict.view(1, total_q, indexer_topk)
                 bwd_topk = indexer_topk_idxs_for_loss.view(1, total_q, indexer_topk)
                 det_w = det_k = None
-                if _deterministic_requested(deterministic) and ctx.needs_input_grad[0]:
+                if deterministic and any(ctx.needs_input_grad[index] for index in (4, 5, 6)):
                     # See FusedCSAIndexerSparseAttnFunc: atomic-free dK/dW before the cuDNN call.
                     det_w, det_k = _deterministic_sparse_indexer_grads_wk(
                         bwd_q,
@@ -4218,7 +4191,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             dO_flat = dO_flat.masked_fill(ctx.q_padding_mask[:, None, None], 0)
             lse = lse.masked_fill(ctx.q_padding_mask[:, None], 0)
 
-        out_flat, dO_flat = _undo_output_rope_for_backward(ctx.out_rope, out_flat, dO_flat)
+        out_flat, dO_flat = undo_output_rope_for_backward(ctx.out_rope, out_flat, dO_flat)
 
         nvtx_range_push("dsv4_cp_sparse_attention_backward")
         dq, dkv, d_sink = _csa_sparse_attention_backward(
@@ -4454,9 +4427,11 @@ def fused_csa_indexer_sparse_attn(
             metadata and MXFP8 storage. A matching workspace is required during
             compact CUDA-graph capture; prepare it outside capture with the
             matching ``prepare_*_compact_indexer_workspace`` helper.
-        deterministic: resolve exact-value compact Top-K ties toward the
-            smallest local KV indices. This is normally sourced from
-            ``TransformerConfig.deterministic_mode``.
+        deterministic: use stable Top-K (exact-value ties resolve toward the smallest local KV
+            indices), cuDNN's deterministic sparse-attention backward and fixed-order sparse
+            indexer dK/dW. Requires sparse loss when indexer loss is enabled. This is normally
+            sourced from ``TransformerConfig.deterministic_mode``;
+            ``torch.use_deterministic_algorithms`` alone does not select these.
         thd_window_size: THD raw-layout sliding-window width. Required when
             ``thd_compressed_is_sequence_major=True``.
         thd_compressed_is_sequence_major: lower logical compressed ids directly
@@ -4540,6 +4515,27 @@ __all__ = [
 ]
 
 
+def _pad_sparse_attention_heads(
+    padded_num_heads: int, q: Tensor, out: Tensor, lse: Tensor, attn_sink: Tensor
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Pad sparse-attention backward operands to ``padded_num_heads`` query heads.
+
+    Padded query/output rows and LSE entries are zero and padded sinks are ``-inf``, so the extra
+    heads contribute nothing. ``_csa_sparse_attention_backward`` and the retained deterministic
+    workspace sizing share this, so cuDNN sizes its scratch for the operands it actually receives.
+    """
+    actual_num_heads = q.size(1)
+    q_padded = q.new_zeros((q.size(0), padded_num_heads, q.size(2)))
+    q_padded[:, :actual_num_heads, :] = q
+    out_padded = out.new_zeros((out.size(0), padded_num_heads, out.size(2)))
+    out_padded[:, :actual_num_heads, :] = out
+    lse_padded = lse.new_zeros((lse.size(0), padded_num_heads))
+    lse_padded[:, :actual_num_heads] = lse
+    attn_sink_padded = attn_sink.new_full((padded_num_heads,), float("-inf"))
+    attn_sink_padded[:actual_num_heads] = attn_sink
+    return q_padded, out_padded, lse_padded, attn_sink_padded
+
+
 def _csa_sparse_attention_backward(
     q: Tensor,
     kv: Tensor,
@@ -4552,31 +4548,23 @@ def _csa_sparse_attention_backward(
     topk_length: Optional[Tensor],
     **backward_kwargs,
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    """Run cuDNN sparse-attention backward with FlashMLA-compatible head padding."""
+    """Run cuDNN sparse-attention backward with FlashMLA-compatible head padding.
+
+    Deterministic execution travels in ``backward_kwargs``: callers pass the
+    ``_deterministic_sparse_bwd_kwargs`` result (with or without a retained workspace), or a bare
+    ``deterministic=True`` for cuDNN's deterministic kernel with a per-call scratch workspace.
+    """
     _ensure_dsa_namespace()
 
     actual_num_heads = q.size(1)
     padded_num_heads = _get_head_padding(actual_num_heads) if q.is_cuda else actual_num_heads
     if padded_num_heads != actual_num_heads:
-        q_padded = q.new_zeros((q.size(0), padded_num_heads, q.size(2)))
-        q_padded[:, :actual_num_heads, :] = q
-        q = q_padded
-
-        out_padded = out.new_zeros((out.size(0), padded_num_heads, out.size(2)))
-        out_padded[:, :actual_num_heads, :] = out
-        out = out_padded
-
+        q, out, lse, attn_sink = _pad_sparse_attention_heads(
+            padded_num_heads, q, out, lse, attn_sink
+        )
         d_out_padded = d_out.new_zeros((d_out.size(0), padded_num_heads, d_out.size(2)))
         d_out_padded[:, :actual_num_heads, :] = d_out
         d_out = d_out_padded
-
-        lse_padded = lse.new_zeros((lse.size(0), padded_num_heads))
-        lse_padded[:, :actual_num_heads] = lse
-        lse = lse_padded
-
-        attn_sink_padded = attn_sink.new_full((padded_num_heads,), float("-inf"))
-        attn_sink_padded[:actual_num_heads] = attn_sink
-        attn_sink = attn_sink_padded
 
     result = _DSA.sparse_attention_backward_wrapper(
         q,

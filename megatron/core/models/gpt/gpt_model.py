@@ -452,15 +452,19 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 # Flash decoding uses precomputed cos and sin for RoPE
                 if self.config.flash_decode:
                     rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
-                        inference_context.max_sequence_length,
-                        self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
+                        inference_context.max_sequence_length_for_model,
+                        self.rotary_pos_emb.get_cos_sin(
+                            inference_context.max_sequence_length_for_model
+                        ),
                     )
                 elif use_flash_infer_fused_rope:
                     assert not self.mtp_process, "MTP not tested with flashinfer_fused_rope"
                     rotary_pos_cos_sin = self.rotary_pos_emb_cache.setdefault(
-                        inference_context.max_sequence_length,
+                        inference_context.max_sequence_length_for_model,
                         torch.cat(
-                            self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
+                            self.rotary_pos_emb.get_cos_sin(
+                                inference_context.max_sequence_length_for_model
+                            ),
                             -1,
                         ),
                     )
@@ -586,6 +590,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             delta_offload_bytes_across_pp_ranks=self.config.delta_offload_bytes_across_pp_ranks,
             activation_offload_fraction=self.config.activation_offload_fraction,
             max_inflight_offloads=self.config.fine_grained_offloading_max_inflight_offloads,
+            buffer_size_gib=self.config.fine_grained_offloading_buffer_size_gib,
         )
         if self.disable_param_offloading:
             for param in self.decoder.parameters():
@@ -734,13 +739,21 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 **decoder_extra_block_kwargs,
             )
 
+        # When mHC + MTP, the decoder returns (contracted, multi-stream); when
+        # AttnRes + MTP, it returns (aggregated, depth-source tuple). MTP needs
+        # the extra stream; lm_head needs the first element. mHC and AttnRes are
+        # mutually exclusive, so the config disambiguates the second slot.
+        mhc_multistream = None
+        attn_res_sources = None
         if isinstance(decoder_output, tuple):
-            # With mHC + MTP, preserve the pre-contraction streams for MTP on
-            # the final decoder stage, including pipeline-parallel models.
-            hidden_states, mhc_multistream = decoder_output
+            if self.config.enable_attention_residuals:
+                hidden_states, attn_res_sources = decoder_output
+            else:
+                # With mHC + MTP, preserve the pre-contraction streams for MTP on
+                # the final decoder stage, including pipeline-parallel models.
+                hidden_states, mhc_multistream = decoder_output
         else:
             hidden_states = decoder_output
-            mhc_multistream = None
 
         return self._postprocess(
             hidden_states=hidden_states,
@@ -763,6 +776,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
             mhc_multistream=mhc_multistream,
+            attn_res_sources=attn_res_sources,
             output_processor=output_processor,
             output_processor_context=output_processor_context,
         )
@@ -789,6 +803,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         extra_block_kwargs=None,
         inference_context=None,
         mhc_multistream=None,
+        attn_res_sources=None,
         output_processor=None,
         output_processor_context=None,
     ):
@@ -867,6 +882,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 mhc_multistream=mhc_multistream,
+                attn_res_sources=attn_res_sources,
                 attention_mask=attention_mask,
                 inference_params=None,  # MTP layers don't use KV cache
                 rotary_pos_emb=rotary_pos_emb,
@@ -971,8 +987,13 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             or labels is None
             or is_observing_tensor("output_logits")
         ):
+            # Inference consumes logits in fp32: emit them so when the head can, upcast otherwise.
+            emit_fp32 = in_inference_mode and self.lm_head_can_emit_fp32
             logits, _ = self.output_layer(
-                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+                hidden_states,
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                output_dtype=torch.float32 if emit_fp32 else None,
             )
         else:
             # Training with labels: the logits are produced (and muP-scaled) below, either by
@@ -982,6 +1003,15 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         if logits is not None:
             # Apply MuP output scaling to logits
             logits = self._scale_logits(logits)
+            if in_inference_mode:
+                logits = logits.float()
+            # Dynamic inference under CUDA graphs: write the logits into the controller's
+            # persistent buffer and return a view of it, so no graph pins its own copy.
+            logits_buffer = getattr(inference_context, "logits_output_buffer", None)
+            if logits_buffer is not None:
+                buffer_rows = logits_buffer[0, : logits.shape[0]]
+                buffer_rows.copy_(logits.squeeze(1))
+                logits = buffer_rows.unsqueeze(1)
             gather_output = (
                 self.output_layer.gather_output
                 if runtime_gather_output is None

@@ -20,9 +20,12 @@
 """
 
 import contextlib
+from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from megatron.core import config as mcore_config
 from megatron.core.fusions import fused_mhc_kernels
@@ -33,8 +36,12 @@ from megatron.core.fusions.fused_row_copy import contiguous_rows
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
     fused_csa_teacher_lse,
 )
-from megatron.core.transformer.hyper_connection import native_h_aggregate_into
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    native_h_aggregate_into,
+)
 from megatron.core.transformer.moe.moe_utils import pad_routing_map
+from megatron.core.utils import PARAM_READY_CALLBACK_ATTR
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
     bytes_equal,
@@ -180,6 +187,71 @@ def test_dsa_kpool_chunked_selection_replays(monkeypatch):
         backward=False,
         contention=True,
         what="DSA KPool chunked selection",
+    )
+
+
+@pytest.mark.parametrize("with_attention_mask", [False, True])
+def test_dsa_index_share_support_replays_across_forward_scopes(with_attention_mask):
+    """Interleaved forwards must replay their own indices and optional lengths bit for bit."""
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.experimental_attention_variant import dsa
+
+    seeded()
+    config = SimpleNamespace(
+        dsa_indexer_topk=8, dsa_indexer_topk_freq=4, dsa_indexer_skip_topk_offset=1, kv_channels=16
+    )
+    attention = dsa.DSAttention(
+        config=config,
+        submodules=dsa.DSAttentionSubmodules(indexer=object()),
+        layer_number=2,
+        attn_mask_type=AttnMaskType.causal,
+        attention_type="self",
+        softmax_scale=1.0,
+        pg_collection=SimpleNamespace(),
+    )
+    attention_mask = torch.empty(1, device="cuda") if with_attention_mask else None
+    # Distinct candidate sets and lengths make cross-forward contamination visible.
+    supports = (
+        torch.arange(8, device="cuda", dtype=torch.int64).reshape(1, 2, 4),
+        torch.arange(8, 16, device="cuda", dtype=torch.int64).reshape(1, 2, 4),
+    )
+    lengths = (
+        torch.tensor([[1, 3]], device="cuda", dtype=torch.int32),
+        torch.tensor([[2, 4]], device="cuda", dtype=torch.int32),
+    )
+
+    def run():
+        carriers = (dsa._DSAIndexShareCarrier(), dsa._DSAIndexShareCarrier())
+        # F1 -> F2 -> replay F1 -> replay F2, sharing the same mask/config fallback.
+        for carrier, indices, valid_length in zip(carriers, supports, lengths):
+            with dsa._dsa_index_share_carrier_scope(carrier):
+                attention._get_index_share_topk_holder(None, attention_mask)[1] = indices
+                attention._get_index_share_topk_length_holder(None, attention_mask)[
+                    1
+                ] = valid_length
+
+        replayed = []
+        for carrier, indices, valid_length in zip(carriers, supports, lengths):
+            with dsa._dsa_index_share_carrier_scope(carrier):
+                actual_indices = attention._get_index_share_topk_holder(None, attention_mask)[1]
+                actual_length = attention._get_index_share_topk_length_holder(None, attention_mask)[
+                    1
+                ]
+                assert bytes_equal(actual_indices, indices)
+                assert bytes_equal(actual_length, valid_length)
+                replayed.extend((actual_indices.clone(), actual_length.clone()))
+
+        # Leaving the scope must restore the fallback without attaching holders to it.
+        fallback = attention_mask if attention_mask is not None else config
+        assert attention._get_index_share_carrier(None, attention_mask) is fallback
+        for owner in (config, attention_mask):
+            if owner is not None:
+                assert not hasattr(owner, dsa.DSAttention._HOLDER_ATTR)
+                assert not hasattr(owner, dsa.DSAttention._LENGTH_HOLDER_ATTR)
+        return tuple(replayed)
+
+    assert_replays_bit_exact(
+        run, (), backward=False, contention=True, what="DSA per-forward index-share support"
     )
 
 
@@ -497,6 +569,35 @@ def test_mhc_sinkhorn_replays_fwd_bwd(backend):
     )
 
 
+@pytest.mark.parametrize("compile_cache_limit", [1, 8])
+def test_native_mhc_sinkhorn_checkpoint_replays_with_limited_compile_cache(compile_cache_limit):
+    """Checkpointing must reuse the forward arithmetic even after compiler fallback."""
+    from megatron.core.transformer.hyper_connection import native_sinkhorn
+
+    torch._dynamo.reset()
+    try:
+        with torch._dynamo.config.patch(cache_size_limit=compile_cache_limit):
+            seeded()
+            logits = _mhc_rand(8, 2, 4, 4, dtype=torch.float32)
+            grad_output = torch.randn_like(logits)
+
+            def run(x):
+                # Mapping operations produce logits with requires_grad=False in the
+                # checkpoint's no-grad forward, unlike the original forward.
+                return native_sinkhorn(x * 1.0, 20, 1e-6)
+
+            expected = run(logits)
+            # At limit=1, this backward hits the recompile limit for a new grad-mode guard.
+            expected.backward(grad_output)
+            replay_logits = logits.detach().clone().requires_grad_(True)
+            actual = checkpoint(run, replay_logits, use_reentrant=True)
+            assert bytes_equal(actual, expected)
+            actual.backward(grad_output)
+            assert bytes_equal(replay_logits.grad, logits.grad)
+    finally:
+        torch._dynamo.reset()
+
+
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)
 def test_mhc_h_aggregate_replays_fwd_bwd(backend):
     if backend == "triton" and not fused_mhc_kernels.is_triton_available():
@@ -575,6 +676,43 @@ def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend):
         what=f"mhc proj_rms_compute_h[{backend}]",
     )
 
+    def run_mapping(x, weight, alpha_pre, alpha_post, alpha_res, bias):
+        ready = False
+
+        def publish_weight():
+            nonlocal ready
+            ready = True
+
+        def projection(*args):
+            assert ready, "mapping projection must wait before reading the weight"
+            return fused_mhc_kernels.fused_proj_rms_compute_h(*args, backend=backend)
+
+        setattr(weight, PARAM_READY_CALLBACK_ATTR, publish_weight)
+        module = SimpleNamespace(
+            n=n,
+            hidden_size=C,
+            mapping_proj=SimpleNamespace(weight=weight),
+            alpha_pre=alpha_pre,
+            alpha_post=alpha_post,
+            alpha_res=alpha_res,
+            bias=bias,
+            norm_eps=1e-6,
+            compute_h_eps=1e-6,
+            sinkhorn_iterations=20,
+            sinkhorn_eps=1e-6,
+            _proj_rms_compute_h_op=projection,
+            _sinkhorn_op=partial(fused_mhc_kernels.fused_sinkhorn, backend=backend),
+            config=SimpleNamespace(mhc_keep_mappings_in_fp32=False),
+        )
+        return HyperConnectionModule.compute_mappings(module, x.view(S, B, n * C))
+
+    assert_replays_bit_exact(
+        run_mapping,
+        (x, weight, alpha_pre, alpha_post, alpha_res, bias),
+        contention=True,
+        what=f"mhc mappings with parameter readiness[{backend}]",
+    )
+
 
 def test_contiguous_thd_rope_and_teacher_replay():
     """Replay explicit packed positions and the packed streaming teacher LSE."""
@@ -629,3 +767,114 @@ def test_contiguous_thd_rope_and_teacher_replay():
         contention=True,
         what="packed CSA teacher",
     )
+
+
+@pytest.mark.parametrize("eps_inside_sqrt", [False, True])
+def test_native_mhc_dtype_casts_replay_fwd_bwd(eps_inside_sqrt):
+    """Native mHC reductions and FP32 mapping projections replay bit-exactly."""
+    from megatron.core.transformer.hyper_connection import (
+        _proj_rms_impl,
+        native_h_aggregate,
+        native_h_post_bda,
+        native_proj_rms,
+    )
+
+    seeded()
+    s, b, n, c = 128, 2, 4, 128
+    x = _mhc_rand(s, b, n, c)
+    h_pre = _mhc_rand(s, b, n)
+    assert_replays_bit_exact(
+        native_h_aggregate, (x, h_pre), replays=3, what="native mHC h_aggregate"
+    )
+
+    h_res = _mhc_rand(s, b, n, n)
+    original_residual = _mhc_rand(s, b, n, c)
+    h_post = _mhc_rand(s, b, n)
+    x_single = _mhc_rand(s, b, c)
+    bias = _mhc_rand(c)
+    assert_replays_bit_exact(
+        lambda h_res, residual, h_post, x, bias: native_h_post_bda(
+            h_res, residual, h_post, x, bias
+        ),
+        (h_res, original_residual, h_post, x_single, bias),
+        replays=3,
+        what="native mHC h_post_bda",
+    )
+
+    projection_input = _mhc_rand(s * b, n * c, dtype=torch.float32)
+    projection_weight = _mhc_rand(n * n + 2 * n, n * c, dtype=torch.float32)
+    assert_replays_bit_exact(
+        lambda x, weight: native_proj_rms(x, weight, eps_inside_sqrt=eps_inside_sqrt),
+        (projection_input, projection_weight),
+        replays=3,
+        what="native mHC proj_rms",
+    )
+    # The module uses eager FP32 projection for both the no-grad forward and replay.
+    assert_replays_bit_exact(
+        lambda x, weight: _proj_rms_impl(x, weight, eps_inside_sqrt=eps_inside_sqrt),
+        (projection_input.to(torch.bfloat16).detach().requires_grad_(True), projection_weight),
+        replays=3,
+        what="eager mHC proj_rms with BF16 saved input",
+    )
+
+
+@pytest.mark.parametrize("attention", ["ordinary", "absorbed"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+def test_mla_elementwise_output_gate_dispatch_replays(attention, dtype):
+    """MLA's elementwise output-gate dispatch reaches the fused Triton kernels and replays.
+
+    ``attention_output_gate_fusion`` routes ``_apply_mla_output_gate`` of both MLA variants
+    through ``fused_elementwise_attention_output_gate_before_cast``; the result and both
+    input gradients must be byte-identical across replays and to the eager composition.
+    """
+    from types import SimpleNamespace
+
+    from megatron.core.fusions.fused_attention_output_gate import HAVE_TRITON
+    from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+        AbsorbedMLASelfAttention,
+    )
+    from megatron.core.transformer.multi_latent_attention import MultiLatentAttention
+    from tests.unit_tests.determinism.kernels.harness import (
+        assert_replays_bit_exact,
+        bytes_equal,
+        seeded,
+    )
+
+    if not torch.cuda.is_available() or not HAVE_TRITON:
+        pytest.skip("needs a GPU and Triton")
+    attention_class = MultiLatentAttention if attention == "ordinary" else AbsorbedMLASelfAttention
+
+    def build(fusion):
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                gated_attention_proj_granularity="elementwise", attention_output_gate_fusion=fusion
+            )
+        )
+
+    seeded()
+    core_attn_out = (torch.randn(6, 3, 1001, device="cuda") * 3).to(dtype).requires_grad_()
+    gate = (torch.randn(6, 3, 1001, device="cuda") * 4).float().requires_grad_()
+    grad_output = (torch.randn(6, 3, 1001, device="cuda") * 2).to(dtype)
+
+    def fused(core_attn_out, gate):
+        output = attention_class._apply_mla_output_gate(build(True), core_attn_out, gate)
+        assert type(output.grad_fn).__name__ == "_FusedElementwiseGateBeforeCastBackward"
+        return output
+
+    outputs, grads = assert_replays_bit_exact(
+        fused,
+        {"core_attn_out": core_attn_out, "gate": gate},
+        grad_outputs={"out": grad_output},
+        replays=3,
+        contention=True,
+        what=f"{attention_class.__name__} fused elementwise output gate",
+    )
+
+    x = core_attn_out.detach().clone().requires_grad_()
+    g = gate.detach().clone().requires_grad_()
+    eager = attention_class._apply_mla_output_gate(build(False), x, g)
+    assert type(eager.grad_fn).__name__ == "MulBackward0"
+    eager.backward(grad_output)
+    assert bytes_equal(outputs["out"], eager.detach())
+    assert bytes_equal(grads["in.core_attn_out"], x.grad)
+    assert bytes_equal(grads["in.gate"], g.grad)
