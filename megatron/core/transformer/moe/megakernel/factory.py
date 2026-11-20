@@ -26,7 +26,7 @@ def split_megakernel_backend_config(config: TransformerConfig) -> tuple[str, dic
 
 def megakernel_fuses_shared_expert(config: TransformerConfig) -> bool:
     """Resolve shared execution from structural compatibility, independently of activation."""
-    if config.moe_megakernel_backend is None:
+    if config.moe_megakernel_backend in (None, "te_ppu_rtc"):
         return False
     if config.moe_megakernel_backend != "mok":
         raise ValueError(f"Unsupported MoE megakernel backend: {config.moe_megakernel_backend!r}")
@@ -61,6 +61,10 @@ def build_megakernel_backend(
     do not acquire optional megakernel dependencies.
     """
     backend = config.moe_megakernel_backend
+    if backend == "te_ppu_rtc":
+        from megatron.core.transformer.moe.megakernel.te_ppu import TEPPUMegaMoE
+
+        return TEPPUMegaMoE(config, ep_group, routed_experts, num_local_experts)
     if backend == "mok":
         from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
 
