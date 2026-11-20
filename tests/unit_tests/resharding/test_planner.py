@@ -742,6 +742,50 @@ def _recv_sig(plan):
 class TestBuildPlanFromRosters:
     """Local plan building replayed independently per rank."""
 
+    @pytest.mark.parametrize("destination_ranks", [(2,), (3,), (2, 3)])
+    def test_partial_destination_mesh_keeps_generic_plan(self, destination_ranks):
+        """A subset of a TP mesh can receive weights through the generic schedule."""
+        sources = _tp_metadata(shape=(2, 4), partition_dim=0, tp_ranks=[0, 1])
+        destinations = _tp_metadata(shape=(2, 4), partition_dim=0, tp_ranks=[2, 3])
+        gathered = [([sources[0]], []), ([sources[1]], [])] + [
+            ([], [metadata] if metadata.owner_rank in destination_ranks else [])
+            for metadata in destinations
+        ]
+
+        plans = _build_all(gathered)
+
+        sends, receives = _plan_edges(plans)
+        assert sends == receives
+        assert {destination for _, _, destination in sends} == set(destination_ranks)
+        for plan in plans.values():
+            if len(destination_ranks) == 2:
+                assert plan.tensor_reshard_specs is not None
+                assert plan.tensor_reshard_error is None
+            else:
+                assert plan.tensor_reshard_specs is None
+                assert (
+                    "destination TP metadata does not cover its mesh" in plan.tensor_reshard_error
+                )
+
+        full_weight = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        source_shards = full_weight.chunk(2)
+        for rank in destination_ranks:
+            received = torch.full((2, 4), float("nan"))
+            for receive in plans[rank].recv_ops:
+                send = next(
+                    op for op in plans[receive.peer_rank].send_ops if op.task_id == receive.task_id
+                )
+                received[receive.my_slice].copy_(source_shards[receive.peer_rank][send.my_slice])
+            torch.testing.assert_close(received, source_shards[rank - 2], rtol=0, atol=0)
+
+    def test_send_ops_defer_wire_dtype_to_executor(self):
+        """The executor negotiates from the actual receive buffer, not metadata."""
+        dst = _meta(owner_rank=1, tp_ranks=[1], dp_ranks=[1])
+        dst.dtype, dst.element_size = torch.bfloat16, 2
+        plans = _build_all([([_meta(owner_rank=0, tp_ranks=[0], dp_ranks=[0])], []), ([], [dst])])
+
+        assert [op.wire_dtype for op in plans[0].send_ops] == [None]
+
     def test_gtp_schedule_matches_across_ranks(self):
         """Every GTP shard send has the matching deterministic receive."""
         src = [
@@ -1145,3 +1189,62 @@ class TestTensorReshardSpecs:
 
         assert error is None
         assert [(spec.src_ranks, spec.dst_ranks) for spec in specs] == [((0,), (2,)), ((1,), (3,))]
+
+
+class TestDefaultParameterCap:
+    """Execution batches are on by default, capped by logical parameters per batch."""
+
+    @staticmethod
+    def _rosters(num_params):
+        names = [f"p{i}" for i in range(num_params)]
+        return [
+            (
+                [
+                    _meta(name=n, shape=(8,), owner_rank=0, tp_ranks=[0], dp_ranks=[0])
+                    for n in names
+                ],
+                [],
+            ),
+            (
+                [],
+                [
+                    _meta(name=n, shape=(8,), owner_rank=1, tp_ranks=[1], dp_ranks=[1])
+                    for n in names
+                ],
+            ),
+        ]
+
+    def test_default_cap_splits_large_plans_consistently(self, monkeypatch):
+        monkeypatch.delenv("MEGATRON_REFIT_MAX_PARAMS_PER_BATCH", raising=False)
+        monkeypatch.setattr(planner, "DEFAULT_MAX_PARAMS_PER_BATCH", 32)
+        plans = _build_all(self._rosters(70))
+        assert {plan.num_batches for plan in plans.values()} == {3}
+        assert {plan.total_tasks for plan in plans.values()} == {70}
+        send_batches = {op.task_id: op.batch_id for op in plans[0].send_ops}
+        recv_batches = {op.task_id: op.batch_id for op in plans[1].recv_ops}
+        assert send_batches == recv_batches
+        assert max(send_batches.values()) == 2
+        # Exactly the cap in every full batch.
+        from collections import Counter
+
+        assert sorted(Counter(send_batches.values()).values()) == [6, 32, 32]
+
+    def test_small_plans_stay_in_one_batch(self, monkeypatch):
+        monkeypatch.delenv("MEGATRON_REFIT_MAX_PARAMS_PER_BATCH", raising=False)
+        plans = _build_all(self._rosters(5))
+        assert {plan.num_batches for plan in plans.values()} == {1}
+
+    def test_env_override_and_disable(self, monkeypatch):
+        monkeypatch.setenv("MEGATRON_REFIT_MAX_PARAMS_PER_BATCH", "10")
+        plans = _build_all(self._rosters(25))
+        assert {plan.num_batches for plan in plans.values()} == {3}
+        monkeypatch.setenv("MEGATRON_REFIT_MAX_PARAMS_PER_BATCH", "0")
+        plans = _build_all(self._rosters(70))
+        assert {plan.num_batches for plan in plans.values()} == {1}
+
+    def test_byte_limit_and_parameter_cap_compose(self, monkeypatch):
+        monkeypatch.setenv("MEGATRON_REFIT_MAX_PARAMS_PER_BATCH", "1000")
+        plans = _build_all(
+            self._rosters(4), execution_batch_bytes=64
+        )  # two 32-byte params per batch
+        assert {plan.num_batches for plan in plans.values()} == {2}
