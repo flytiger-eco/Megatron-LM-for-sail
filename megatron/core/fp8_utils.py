@@ -30,6 +30,7 @@ except (ImportError, ModuleNotFoundError):
     # Transformer Engine not found
     pass
 
+
 try:
     from packaging.version import Version as PkgVersion
 
@@ -178,16 +179,33 @@ def get_grouped_quantized_members(
     if not is_grouped_tensor_with_quantized_storage(grouped_tensor):
         raise ValueError("get_grouped_quantized_members expects grouped quantized storage.")
 
-    quantized_members = getattr(grouped_tensor, "quantized_tensors", None)
-    if quantized_members is None:
+    return get_grouped_tensor_members(grouped_tensor, create_if_missing=create_if_missing)
+
+
+def get_grouped_tensor_members(
+    tensor: torch.Tensor, *, create_if_missing: bool = False
+) -> List[torch.Tensor]:
+    """Return cached per-member views for a high-precision or quantized GroupedTensor.
+
+    Transformer Engine uses ``quantized_tensors`` and
+    ``split_into_quantized_tensors`` for these members even when the grouped
+    storage is high precision. Keep that upstream cache convention so TE and
+    MCore share the same stable member views.
+    """
+    grouped_tensor = _unwrap_parameter_data(tensor)
+    if not is_grouped_tensor(grouped_tensor):
+        raise ValueError("get_grouped_tensor_members expects a TE GroupedTensor.")
+
+    members = getattr(grouped_tensor, "quantized_tensors", None)
+    if members is None:
         if not create_if_missing:
             raise RuntimeError(
-                "Grouped quantized parameter is missing cached member tensors. "
+                "Grouped parameter is missing cached member tensors. "
                 "Create them outside the training critical path."
             )
-        quantized_members = grouped_tensor.split_into_quantized_tensors()
-        grouped_tensor.quantized_tensors = quantized_members
-    return quantized_members
+        members = grouped_tensor.split_into_quantized_tensors()
+        grouped_tensor.quantized_tensors = members
+    return members
 
 
 def copy_tensor_to_quantized_param(param: torch.Tensor, src: torch.Tensor) -> None:
@@ -730,13 +748,16 @@ def is_first_last_bf16_layer(config: TransformerConfig, layer_no: int):
 def is_mxfp8_output_proj_active(config) -> bool:
     """Return True when the LM-head output projection should run under MXFP8.
 
-    Active when ``fp8_output_proj=True``, ``fp8=True``, ``fp8_recipe='mxfp8'``,
-    and Transformer Engine is installed.
+    Active when ``fp8_output_proj=True`` and Transformer Engine is installed, with either
+    ``fp8=True`` and ``fp8_recipe='mxfp8'``, or an FP4 model (``fp4`` set), whose LM head then
+    runs under its own MXFP8 autocast.
     """
     if not HAVE_TE:
         return False
     if not getattr(config, "fp8_output_proj", False):
         return False
+    if getattr(config, "fp4", None):
+        return True
     if not getattr(config, "fp8", False):
         return False
 
@@ -807,6 +828,12 @@ if HAVE_TE:
                 fp8_format=fp8_format,
                 override_linear_precision=(False, False, not config.fp8_wgrad),
             )
+
+        # Set recipe attrs
+        if fp8_recipe is not None and config.fp8_recipe_attrs is not None:
+            for key, val in config.fp8_recipe_attrs.items():
+                setattr(fp8_recipe, key, val)
+
         return fp8_recipe
 
     def get_fp8_recipe_for_a2a(a2a_dtype: str):
@@ -819,7 +846,7 @@ if HAVE_TE:
         communication payload).
 
         Arguments:
-            a2a_dtype (str): Wire dtype, 'bf16' (returns None) or 'mxfp8'.
+            a2a_dtype (str): Wire dtype, 'bf16' (returns None), 'mxfp8' or 'nvfp4'.
         """
         if a2a_dtype == 'bf16':
             return None
@@ -827,6 +854,8 @@ if HAVE_TE:
             return transformer_engine.common.recipe.MXFP8BlockScaling(
                 fp8_format=transformer_engine.common.recipe.Format.E4M3
             )
+        if a2a_dtype == 'nvfp4':
+            return transformer_engine.common.recipe.NVFP4BlockScaling()
         raise ValueError(f"Unsupported a2a wire dtype: {a2a_dtype!r}.")
 
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
