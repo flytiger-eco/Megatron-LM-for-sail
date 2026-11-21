@@ -1,11 +1,11 @@
-<!---
+{/*
    Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
    and proprietary rights in and to this software, related documentation
    and any modifications thereto. Any use, reproduction, disclosure or
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
--->
+*/}
 
 # dist_checkpointing package
 
@@ -47,7 +47,7 @@ torch.serialization.add_safe_globals([argparse.Namespace])
 
 Beginning with **mcore v0.14**, the ``flattened_range`` attribute was removed from ``dist_checkpointing``. As a result:
 
-- Optimizer states saved with mcore versions <= 0.14 can no longer be loaded directly. Loading these legacy optimizer states is not supported because the required sharded metadata is no longer available. If you need to continue training from older checkpoints, refer to the workaround described below.
+- Optimizer states saved with mcore versions &lt;= 0.14 can no longer be loaded directly. Loading these legacy optimizer states is not supported because the required sharded metadata is no longer available. If you need to continue training from older checkpoints, refer to the workaround described below.
 - Model weights from older checkpoints remain fully compatible. No extra steps are needed—model weights from checkpoints created by earlier versions load automatically; simply add the ``--no-load-optim`` flag.
 
 ### Workaround: Loading legacy optimizer states with ToT MCore
@@ -127,25 +127,7 @@ You can combine formats to optimize both flexibility and performance:
 
 The framework supports asynchronous checkpoint saving to improve training performance by offloading I/O operations. 
 
-We are transitioning to a new async saving implementation based on the **NVRx (NVIDIA Resiliency Extension)** package. The legacy async strategy (referred to as **mcore**) is being deprecated.
-
-### Migration to NVRx
-
-- The **NVRx-based async strategy** will become the **default** in mcore v0.17.
-- The existing **mcore async strategy** is **deprecated** and will be removed in future versions.
-- A deprecation warning is emitted when using the mcore strategy.
-
-### Selecting Async Strategy
-
-`--async-strategy` flag is introduced to control the async strategy. To use legacy async strategy (**mcore**), set:
-
-```bash
---async-strategy mcore
-```
-
-### NVRx Dependency
-
-To use the NVRx-based async strategy, you must install the `nvidia-resiliency-ext` package.
+To use the async strategy, you must install the `nvidia-resiliency-ext` package.
 
 ```bash
 git clone https://github.com/NVIDIA/nvidia-resiliency-ext
@@ -155,21 +137,15 @@ pip install .
 
 > NOTE
 
-- If `nvidia-resiliency-ext` is not installed, the NVRx async strategy will not be available.
-- The `mcore` strategy will remain temporarily to ensure a smooth transition but will be removed in future releases.
-- It is strongly recommended to migrate to the NVRx strategy as soon as possible.
+- If `nvidia-resiliency-ext` is not installed, the async strategy will not be available.
 
 ### Async Saving for `fsdp_dtensor` and `torch_dcp` checkpoints
 
 Starting from mcore v0.17, asynchronous checkpoint saving is supported for `fsdp_dtensor` and `torch_dcp` formats.
 
-Note that async saving for these formats requires the `nvidia-resiliency-ext` package. As a result, the only supported `async_strategy` in this context is `nvrx`.
+Note that async saving for these formats requires the `nvidia-resiliency-ext` package.
 
 ## Subpackages
 
-```{toctree}
-:maxdepth: 4
-
-dist_checkpointing.strategies
-```
+- [dist_checkpointing.strategies package](dist_checkpointing.strategies.md)
 

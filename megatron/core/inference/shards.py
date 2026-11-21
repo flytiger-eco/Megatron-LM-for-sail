@@ -142,6 +142,13 @@ def build_inference_pg_collection(
         if rank in pos_embd_ranks:
             pos_embd_group = group
 
+    # Inference never rematerializes weights, so the GTP_remat axes have size 1: one
+    # singleton group per rank in this window, as the MPU builds them for gtp_remat_size=1.
+    # MTP hidden-state mixing (mtp_hsm) reads the dense one to seed its RNG lanes.
+    window = range(rank_offset, rank_offset + world_size)
+    gtp_remat_group, _ = dist.new_subgroups_by_enumeration([[r] for r in window])
+    expt_gtp_remat_group, _ = dist.new_subgroups_by_enumeration([[r] for r in window])
+
     return ProcessGroupCollection(
         tp=tp_group,
         cp=cp_group,
@@ -158,6 +165,12 @@ def build_inference_pg_collection(
         tp_ep_pp=tp_ep_pp_group,
         dp_cp=dp_cp_group,
         tp_dp_cp=tp_dp_cp_group,
+        # Set the GTP_remat axes explicitly rather than leaving them unset:
+        # `resolve_gtp_remat_group` falls back to the MPU globals for a field that is
+        # absent from `vars(pg_collection)` -- which would hand this collection the
+        # *training* GTP layout and build a GTP-sharded inference model.
+        gtp_remat=gtp_remat_group,
+        expt_gtp_remat=expt_gtp_remat_group,
     )
 
 
@@ -178,12 +191,15 @@ class InferenceShard:
             the collective process-group creation for every shard
             (``dist.new_group`` is world-collective); only members get a usable
             handle.
+        process_group: Group spanning every rank in this shard, used for
+            shard-scoped operations such as checkpoint metadata validation.
     """
 
     spec: InferenceShardSpec
     rank_offset: int
     world_size: int
     pg_collection: Optional[ProcessGroupCollection]
+    process_group: Optional[dist.ProcessGroup] = None
 
 
 def build_inference_pg_collections_for_shards(
@@ -235,6 +251,7 @@ def build_inference_pg_collections_for_shards(
             use_tp_pp_dp_mapping=use_tp_pp_dp_mapping,
             rank_offset=offset,
         )
+        shard_group = dist.new_group(ranks=list(range(offset, offset + shard_world)))
         in_shard = offset <= rank < offset + shard_world
         results.append(
             InferenceShard(
@@ -242,6 +259,7 @@ def build_inference_pg_collections_for_shards(
                 rank_offset=offset,
                 world_size=shard_world,
                 pg_collection=pgc if in_shard else None,
+                process_group=shard_group if in_shard else None,
             )
         )
         offset += shard_world
