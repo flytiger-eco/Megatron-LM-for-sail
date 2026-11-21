@@ -36,6 +36,10 @@ def _make_pg():
     # With a single optimizer instance the intra-instance groups are the full groups.
     pg.intra_dp_cp.size.return_value = 1
     pg.intra_expt_dp.size.return_value = 1
+    # A real ProcessGroupCollection returns None for an unset field, and a module with no
+    # GTP axis leaves this unset. Mock would otherwise auto-create a group whose rank is
+    # a Mock rather than an int.
+    pg.gtp_remat = None
     return pg
 
 
@@ -233,6 +237,20 @@ class TestPrintNumParams:
         _print_num_params(model, pg_collection=pg)
         captured = capsys.readouterr()
         assert captured.out == ""
+
+    @pytest.mark.parametrize("gtp_remat_rank, expect_output", [(0, True), (1, False)])
+    def test_gtp_remat_rank_gates_output(self, capsys, gtp_remat_rank, expect_output):
+        # GTP-remat peers hold replicas and report identical counts, so only the first of
+        # them prints. get_pg_rank short-circuits to 0 when torch.distributed is down, so
+        # pin it to keep this independent of how the suite is launched.
+        pg = _make_pg()
+        pg.gtp_remat = Mock()
+        pg.gtp_remat.rank.return_value = gtp_remat_rank
+        model = [_make_model_module()]
+        with patch("torch.distributed.is_initialized", return_value=True):
+            _print_num_params(model, pg_collection=pg)
+        captured = capsys.readouterr()
+        assert bool(captured.out) is expect_output
 
     def test_param_count_is_correct(self, capsys):
         pg = _make_pg()
@@ -522,7 +540,34 @@ class TestDdpWrap:
         mock_stream_context.assert_called_once_with(shared_stream)
         mock_current_stream.return_value.wait_stream.assert_called_once_with(shared_stream)
 
-    @pytest.mark.parametrize("cuda_graph_impl", ["none", "local", "transformer_engine"])
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    @patch("megatron.training.models.dist_utils.get_shared_capture_stream")
+    def test_uses_current_stream_when_cuda_graph_is_disabled(
+        self,
+        mock_shared_stream,
+        mock_stream,
+        mock_current_stream,
+        mock_stream_context,
+        mock_config,
+        mock_ddp,
+    ):
+        mock_stream_context.return_value.__enter__ = Mock(return_value=None)
+        mock_stream_context.return_value.__exit__ = Mock(return_value=False)
+        current_stream = mock_current_stream.return_value
+        mock_config.return_value.cuda_graph_impl = "none"
+
+        _ddp_wrap(self.model, False, self.ddp_config, False, pg_collection=self.pg)
+
+        mock_shared_stream.assert_not_called()
+        mock_stream.assert_not_called()
+        mock_stream_context.assert_called_once_with(current_stream)
+        current_stream.wait_stream.assert_not_called()
+
+    @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
     @patch("megatron.training.models.dist_utils.DistributedDataParallel")
     @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)
@@ -586,11 +631,9 @@ class TestDdpWrapBucketSize:
         self.model = [_make_model_module()]
 
     def _ddp_config(self, **overrides):
-        cfg = Mock()
-        cfg.num_buckets = None
-        cfg.bucket_size = None
-        cfg.overlap_grad_reduce = True
-        cfg.use_distributed_optimizer = False
+        from megatron.core.distributed import DistributedDataParallelConfig
+
+        cfg = DistributedDataParallelConfig(overlap_grad_reduce=True)
         for k, v in overrides.items():
             setattr(cfg, k, v)
         return cfg
@@ -679,18 +722,17 @@ class TestDdpWrapFullParamLayout:
         self._opt_patcher.stop()
 
     def _ddp_config(self, **overrides):
-        cfg = Mock()
-        cfg.num_buckets = None
-        cfg.bucket_size = 8_000
-        cfg.overlap_grad_reduce = True
-        cfg.use_distributed_optimizer = True
+        from megatron.core.distributed import DistributedDataParallelConfig
+
+        cfg = DistributedDataParallelConfig(
+            bucket_size=8_000, overlap_grad_reduce=True, use_distributed_optimizer=True
+        )
         for k, v in overrides.items():
             setattr(cfg, k, v)
         return cfg
 
     def _make_chunk_with_params(self):
-        p = Mock()
-        p.requires_grad = True
+        p = torch.nn.Parameter(torch.zeros(1))
         chunk = Mock()
         chunk.parameters.return_value = [p]
         chunk.modules.return_value = []
@@ -830,10 +872,8 @@ class TestDdpWrapFullParamLayout:
     ):
         mock_ctx.return_value.__enter__ = Mock(return_value=None)
         mock_ctx.return_value.__exit__ = Mock(return_value=False)
-        p_grad = Mock()
-        p_grad.requires_grad = True
-        p_no_grad = Mock()
-        p_no_grad.requires_grad = False
+        p_grad = torch.nn.Parameter(torch.zeros(1))
+        p_no_grad = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
         chunk = Mock()
         chunk.parameters.return_value = [p_grad, p_no_grad]
         chunk.modules.return_value = []
@@ -1164,3 +1204,58 @@ class TestUnimodalBuildDistributedModels:
             assert result is ddp_result
         finally:
             self._stop_patches()
+
+
+class TestExplicitExecutionDevice:
+    @pytest.mark.parametrize("device", ["cuda", "cpu"])
+    def test_cpu_initialization_does_not_override_execution_device(self, device):
+        from megatron.training.models.dist_utils import (
+            prepare_existing_model_chunks_for_distributed_training,
+        )
+
+        model = _make_model_module()
+        config = _make_transformer_config(use_cpu_initialization=True)
+        with (
+            patch(f"{_MODULE}._print_num_params"),
+            patch(f"{_MODULE}.correct_amax_history_if_needed"),
+        ):
+            prepare_existing_model_chunks_for_distributed_training(
+                [model], config, _make_pg(), wrap_with_ddp=False, device=device
+            )
+        model.to.assert_called_once_with(torch.device(device))
+
+    def test_cpu_export_materializes_only_meta_tensors(self):
+        from megatron.training.models.dist_utils import (
+            prepare_existing_model_chunks_for_distributed_training,
+        )
+
+        model = nn.Module()
+        model.register_parameter("weight", nn.Parameter(torch.empty(4, device="meta")))
+        model.register_buffer("scale", torch.tensor([7.0]))
+        config = _make_transformer_config(init_model_with_meta_device=True)
+        with (
+            patch(f"{_MODULE}._print_num_params"),
+            patch(f"{_MODULE}.correct_amax_history_if_needed"),
+        ):
+            result = prepare_existing_model_chunks_for_distributed_training(
+                [model], config, _make_pg(), wrap_with_ddp=False, device="cpu"
+            )
+        assert result[0].weight.device.type == "cpu"
+        assert result[0].scale.item() == 7.0
+
+    @pytest.mark.parametrize("fsdp", ["use_torch_fsdp2", "use_megatron_fsdp"])
+    def test_explicit_device_rejects_fsdp_owned_placement(self, fsdp):
+        from megatron.training.models.dist_utils import (
+            prepare_existing_model_chunks_for_distributed_training,
+        )
+
+        with patch(f"{_MODULE}._print_num_params"):
+            with pytest.raises(ValueError, match="FSDP-managed"):
+                prepare_existing_model_chunks_for_distributed_training(
+                    [_make_model_module()],
+                    _make_transformer_config(),
+                    _make_pg(),
+                    wrap_with_ddp=False,
+                    device="cpu",
+                    **{fsdp: True},
+                )

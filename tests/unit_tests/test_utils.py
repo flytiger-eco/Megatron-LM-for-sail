@@ -164,6 +164,24 @@ def test_safely_set_viewless_tensor_data():
     assert torch.equal(tensor, new_data_tensor)
 
 
+def test_copy_parameter_metadata_copies_public_attributes_only():
+    source = torch.nn.Parameter(torch.ones(1))
+    destination = torch.nn.Parameter(torch.zeros(1))
+    process_group = object()
+
+    source.tensor_model_parallel = True
+    source.group = process_group
+    source.future_planner_metadata = "preserved without a name allowlist"
+    source._quantizer = "tensor-subclass implementation detail"
+
+    util.copy_parameter_metadata(destination, source)
+
+    assert destination.tensor_model_parallel is True
+    assert destination.group is process_group
+    assert destination.future_planner_metadata == "preserved without a name allowlist"
+    assert not hasattr(destination, "_quantizer")
+
+
 def test_assert_viewless_tensor():
     tensor = torch.rand((3, 4))
     assert torch.equal(util.assert_viewless_tensor(tensor), tensor)
@@ -215,6 +233,32 @@ def test_nvtx_range(msg, suffix):
     util.configure_nvtx_profiling(True)
     _call_nvtx_range()
     assert execution_tracker['ranges']
+    util.configure_nvtx_profiling(False)
+
+
+def test_nvtx_range_names_itself_from_the_calling_frame(monkeypatch):
+    """Without a message a range is named `<module>.<function>` of its caller, read from the
+    frame alone: the source file is not looked at (a forward pass opens hundreds of ranges)."""
+    pushed = []
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", pushed.append)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+
+    def _no_source_lookup(*args, **kwargs):
+        raise AssertionError("an NVTX range looked its caller up in the source")
+
+    monkeypatch.setattr(util.inspect, "getframeinfo", _no_source_lookup)
+    monkeypatch.setattr(util.inspect, "getmodule", _no_source_lookup)
+
+    def _a_caller():
+        util.nvtx_range_push(suffix="part")
+        util.nvtx_range_pop(suffix="part")
+
+    util.configure_nvtx_profiling(True)
+    try:
+        _a_caller()
+    finally:
+        util.configure_nvtx_profiling(False)
+    assert pushed == [f"{__name__}._a_caller.part"]
 
 
 def test_nvtx_decorator():
