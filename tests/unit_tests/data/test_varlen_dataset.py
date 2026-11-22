@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Unit tests for :mod:`megatron.training.datasets.varlen_dataset`.
 
@@ -19,6 +19,8 @@ import torch
 # Import via the public module path so this test gets discovered through the
 # regular pytest entry point. The functions under test are pure Python and do
 # not require torch.distributed.
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+from megatron.training.config import DataConfig, DataloaderConfig
 from megatron.training.datasets.sft_dataset import IGNORE_INDEX
 from megatron.training.datasets.varlen_dataset import (
     MockVarlenDataset,
@@ -464,7 +466,7 @@ def _make_config(tokenizer, seq_length=64, *, cp=1, dp=1, sp=1, sbhd=False):
         varlen_sbhd_validation=sbhd,
         data_parallel_size=dp,
         context_parallel_size=cp,
-        hybrid_context_parallel=False,
+        dynamic_context_parallel=False,
         sequence_parallel_size=sp,
     )
 
@@ -679,20 +681,57 @@ def _build_varlen_for_loader(items, config, num_samples):
 
 
 def _loader_args(*, use_varlen, sbhd, scheduler, mbs, gbs=None):
+    """The legacy namespace these tests register (the runtime still expects one); the loader reads
+    none of it: the loader-owned values come from the data section, the model-parallel values
+    from the run config's model section."""
     return SimpleNamespace(
         dataloader_type='single',
         micro_batch_size=mbs,
         global_batch_size=mbs if gbs is None else gbs,
         full_validation=False,
         num_workers=0,
-        hybrid_context_parallel=False,
+        dynamic_context_parallel=False,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
         use_varlen_dataset=use_varlen,
         varlen_sbhd_validation=sbhd,
         sequence_packing_scheduler=scheduler,
     )
 
 
-def test_sbhd_validation_dataloader_uses_default_collate():
+def _loader_section(run_config, *, seq_length, sbhd):
+    """The data section the loader reads: a varlen dataset config (a source, so the resolver
+    accepts the real class) with the SBHD flag of the run, the single loader, no workers."""
+    dataset = GPTDatasetConfig(
+        sequence_length=seq_length,
+        random_seed=1,
+        blend=(["prefix"], None),
+        split="9,1,0",
+        varlen_sbhd_validation=sbhd,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
+    run_config.data = DataConfig(
+        dataset=dataset,
+        dataset_type=VarlenDataset,
+        dataloader=DataloaderConfig(dataloader_type="single", num_workers=0),
+    )
+
+
+@pytest.fixture
+def loader_model_config(run_config):
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training.models import GPTModelConfig
+
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=64,
+    )
+    return run_config.model.transformer
+
+
+def test_sbhd_validation_dataloader_uses_default_collate(run_config, loader_model_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
@@ -702,6 +741,8 @@ def test_sbhd_validation_dataloader_uses_default_collate():
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         seq_len, mbs = 16, 2
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = mbs
         # One global batch needs micro_batch_size * data_parallel_size samples;
         # size the dataset off the runtime DP world size so this passes under
         # any --nproc-per-node (the CI default is 8 ranks -> dp=8).
@@ -709,6 +750,7 @@ def test_sbhd_validation_dataloader_uses_default_collate():
         n = mbs * dp * 4
         cfg = _make_config(tok, seq_length=seq_len, sbhd=True)
         ds = _build_varlen_for_loader(["hello world"] * n, cfg, num_samples=n)
+        _loader_section(run_config, seq_length=seq_len, sbhd=True)
         set_args(_loader_args(use_varlen=True, sbhd=True, scheduler=None, mbs=mbs))
         loader = build_pretraining_data_loader(ds, consumed_samples=0)
         batch = next(iter(loader))
@@ -722,16 +764,19 @@ def test_sbhd_validation_dataloader_uses_default_collate():
         Utils.destroy_model_parallel()
 
 
-def test_thd_dataloader_uses_identity_collate():
+def test_thd_dataloader_uses_identity_collate(run_config, loader_model_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
     from tests.unit_tests.test_utilities import Utils
 
     Utils.initialize_model_parallel(1, 1)
+    loader_model_config.sequence_packing_scheduler = "dp_balanced"
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         mbs = 2
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = mbs
         dp = parallel_state.get_data_parallel_world_size()
         n = mbs * dp * 4
         cfg = _make_config(tok, seq_length=64, sbhd=False)
@@ -739,6 +784,7 @@ def test_thd_dataloader_uses_identity_collate():
         variable = ["a", "abcdef", "xy", "qwerty"]
         items = [variable[i % len(variable)] for i in range(n)]
         ds = _build_varlen_for_loader(items, cfg, num_samples=n)
+        _loader_section(run_config, seq_length=64, sbhd=False)
         set_args(_loader_args(use_varlen=True, sbhd=False, scheduler="dp_balanced", mbs=mbs))
         loader = build_pretraining_data_loader(ds, consumed_samples=0)
         batch = next(iter(loader))
@@ -751,24 +797,28 @@ def test_thd_dataloader_uses_identity_collate():
         Utils.destroy_model_parallel()
 
 
-def test_packing_scheduler_dataloader_yields_microbatches():
+def test_packing_scheduler_dataloader_yields_microbatches(run_config, loader_model_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
     from tests.unit_tests.test_utilities import Utils
 
     Utils.initialize_model_parallel(1, 1)
+    loader_model_config.sequence_packing_scheduler = "dp_balanced"
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         mbs = 2
         num_microbatches = 3
         dp = parallel_state.get_data_parallel_world_size()
         gbs = mbs * dp * num_microbatches
+        run_config.train.micro_batch_size = mbs
+        run_config.train.global_batch_size = gbs
         n = gbs * 2
         cfg = _make_config(tok, seq_length=64, dp=dp, cp=1)
         variable = ["a", "abcdef", "xy", "qwerty"]
         items = [variable[i % len(variable)] for i in range(n)]
         ds = _build_varlen_for_loader(items, cfg, num_samples=n)
+        _loader_section(run_config, seq_length=64, sbhd=False)
         set_args(
             _loader_args(use_varlen=True, sbhd=False, scheduler="dp_balanced", mbs=mbs, gbs=gbs)
         )

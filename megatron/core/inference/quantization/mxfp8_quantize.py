@@ -22,6 +22,8 @@ try:
     import triton
     import triton.language as tl
 
+    from megatron.core.inference.triton_pdl import gdc_wait, pdl_kwargs
+
     HAVE_TRITON = True
 except ImportError:
     from unittest.mock import MagicMock
@@ -39,68 +41,18 @@ def _ceil_div(a, b):
 
 
 @triton.jit
-def _mxfp8_quant_swizzle_kernel(
-    out_ptr,  # [M, K] output buffer for float8_e4m3fn quantized data
-    scale_ptr,  # 1D output buffer for swizzled uint8 scales (e8m0 exponents)
-    src_ptr,  # [M, K] input tensor in bf16/fp16/fp32
-    K,  # number of columns in the input (must be divisible by 32)
-    n_col_blocks,  # ceil(K/32 / 4) — number of macro-tile columns in the swizzle layout
-    REAL_GROUPS: tl.constexpr,  # actual number of scale groups per row (K // 32)
-    BLOCK_K: tl.constexpr,  # next_power_of_2(K) — padded column count for tl.reshape
-    BLOCK_GROUPS: tl.constexpr,  # BLOCK_K // 32 — padded group count (must be power of 2)
+def _mxfp8_quant_swizzle_row(
+    row,
+    out_ptr,
+    scale_ptr,
+    src_ptr,
+    K,
+    n_col_blocks,
+    REAL_GROUPS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
 ):
-    """Each triton block quantizes one row → FP8 e4m3, write scales directly in swizzled layout.
-
-    We use round up in scale calculation. see: Mishra et al.,
-    Recipes for Pre-training LLMs with MXFP8 (https://arxiv.org/pdf/2506.08027)
-
-    The implementation borrows code from the triton upstream MXFP downcast kernel:
-    https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/numerics_details/mxfp_details/_downcast_to_mxfp.py
-
-    Note on swizzled scale layout (torch.nn.functional.SwizzleType.SWIZZLE_32_4_4):
-
-        Background: In MXFP8, every group of 32 elements shares one 1-byte scale
-        (an e8m0 exponent). For an [M, K] matrix, this gives an [M, K//32] scale
-        matrix. cuBLAS doesn't read these scales in simple row-major order — it
-        expects a "swizzled" layout optimized for its internal access patterns.
-
-        Step 1 — Divide into macro-tiles:
-            The scale matrix is partitioned into 128-row x 4-col macro-tiles.
-            Each tile is stored as a contiguous 512-byte (128 x 4) block.
-
-        Step 2 — Interleave within each tile:
-            Within a macro-tile, the 128 rows are NOT stored sequentially.
-            Instead, they are split into 4 groups of 32 rows:
-                group 0: rows   0- 31
-                group 1: rows  32- 63
-                group 2: rows  64- 95
-                group 3: rows  96-127
-
-            Rows with the same position within their group (same "sub_row")
-            are placed next to each other. So the memory layout is:
-
-            Concretely, for sub_row=0:
-                byte 0:  row  0, col 0
-                byte 1:  row  0, col 1
-                byte 2:  row  0, col 2
-                byte 3:  row  0, col 3
-                byte 4:  row 32, col 0
-                byte 5:  row 32, col 1
-                byte 6:  row 32, col 2
-                byte 7:  row 32, col 3
-                byte 8:  row 64, col 0
-                ...
-                byte 15: row 96, col 3
-
-        The formula to map logical (row, col) → byte offset:
-            tile_idx = (row // 128) * n_col_blocks + (col // 4)
-            sub_row  = row % 32
-            group    = (row % 128) // 32
-            local_col = col % 4
-            offset   = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
-
-    """
-    row = tl.program_id(0)
+    """Quantize one row (int64 index) to FP8 e4m3 and store its swizzled scales."""
     src_row = src_ptr + row * K
     out_row = out_ptr + row * K
 
@@ -161,6 +113,94 @@ def _mxfp8_quant_swizzle_kernel(
     tl.store(scale_ptr + swizzled_offs, scale_exp, mask=col_mask)
 
 
+@triton.jit
+def _mxfp8_zero_scale_cols(row, scale_ptr, n_col_blocks, col_start, col_end, ZBLOCK: tl.constexpr):
+    """Store zero scales for columns [col_start, col_end) of one row in the swizzled layout."""
+    col_offs = col_start + tl.arange(0, ZBLOCK)
+    col_mask = col_offs < col_end
+    local_row = row % 128
+    tile_idx = (row // 128) * n_col_blocks + col_offs // 4
+    swizzled_offs = tile_idx * 512 + (local_row % 32) * 16 + (local_row // 32) * 4 + col_offs % 4
+    tl.store(scale_ptr + swizzled_offs, tl.zeros([ZBLOCK], dtype=tl.uint8), mask=col_mask)
+
+
+@triton.jit
+def _mxfp8_quant_swizzle_kernel(
+    out_ptr,  # [M, K] output buffer for float8_e4m3fn quantized data
+    scale_ptr,  # 1D output buffer for swizzled uint8 scales (e8m0 exponents)
+    src_ptr,  # [M, K] input tensor in bf16/fp16/fp32
+    K,  # number of columns in the input (must be divisible by 32)
+    n_col_blocks,  # ceil(K/32 / 4) — number of macro-tile columns in the swizzle layout
+    REAL_GROUPS: tl.constexpr,  # actual number of scale groups per row (K // 32)
+    BLOCK_K: tl.constexpr,  # next_power_of_2(K) — padded column count for tl.reshape
+    BLOCK_GROUPS: tl.constexpr,  # BLOCK_K // 32 — padded group count (must be power of 2)
+    M,  # rows of real data; programs >= M only zero their padded scale row
+    ZBLOCK: tl.constexpr,  # next_power_of_2(n_col_blocks * 4)
+    USE_PDL: tl.constexpr = False,
+):
+    """Each triton block quantizes one row → FP8 e4m3, write scales directly in swizzled layout.
+
+    We use round up in scale calculation. see: Mishra et al.,
+    Recipes for Pre-training LLMs with MXFP8 (https://arxiv.org/pdf/2506.08027)
+
+    The implementation borrows code from the triton upstream MXFP downcast kernel:
+    https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/numerics_details/mxfp_details/_downcast_to_mxfp.py
+
+    Note on swizzled scale layout (torch.nn.functional.SwizzleType.SWIZZLE_32_4_4):
+
+        Background: In MXFP8, every group of 32 elements shares one 1-byte scale
+        (an e8m0 exponent). For an [M, K] matrix, this gives an [M, K//32] scale
+        matrix. cuBLAS doesn't read these scales in simple row-major order — it
+        expects a "swizzled" layout optimized for its internal access patterns.
+
+        Step 1 — Divide into macro-tiles:
+            The scale matrix is partitioned into 128-row x 4-col macro-tiles.
+            Each tile is stored as a contiguous 512-byte (128 x 4) block.
+
+        Step 2 — Interleave within each tile:
+            Within a macro-tile, the 128 rows are NOT stored sequentially.
+            Instead, they are split into 4 groups of 32 rows:
+                group 0: rows   0- 31
+                group 1: rows  32- 63
+                group 2: rows  64- 95
+                group 3: rows  96-127
+
+            Rows with the same position within their group (same "sub_row")
+            are placed next to each other. So the memory layout is:
+
+            Concretely, for sub_row=0:
+                byte 0:  row  0, col 0
+                byte 1:  row  0, col 1
+                byte 2:  row  0, col 2
+                byte 3:  row  0, col 3
+                byte 4:  row 32, col 0
+                byte 5:  row 32, col 1
+                byte 6:  row 32, col 2
+                byte 7:  row 32, col 3
+                byte 8:  row 64, col 0
+                ...
+                byte 15: row 96, col 3
+
+        The formula to map logical (row, col) → byte offset:
+            tile_idx = (row // 128) * n_col_blocks + (col // 4)
+            sub_row  = row % 32
+            group    = (row % 128) // 32
+            local_col = col % 4
+            offset   = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
+
+    """
+    if USE_PDL:
+        gdc_wait()
+    row = tl.program_id(0).to(tl.int64)
+    if row < M:
+        _mxfp8_quant_swizzle_row(
+            row, out_ptr, scale_ptr, src_ptr, K, n_col_blocks, REAL_GROUPS, BLOCK_K, BLOCK_GROUPS
+        )
+        _mxfp8_zero_scale_cols(row, scale_ptr, n_col_blocks, REAL_GROUPS, n_col_blocks * 4, ZBLOCK)
+    else:
+        _mxfp8_zero_scale_cols(row, scale_ptr, n_col_blocks, 0, n_col_blocks * 4, ZBLOCK)
+
+
 def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torch.Tensor) -> None:
     """Quantize a 2D tensor into existing MXFP8 data and scale storage.
 
@@ -187,15 +227,18 @@ def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torc
     total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
     assert out_scale.numel() == total_scale_bytes
 
-    # The quantization kernel only writes logical scale entries. Clear the
-    # padded rows and columns so reused storage matches freshly quantized output.
+    # The kernel reads rows as contiguous storage.
+    x = x.contiguous()
+
+    # Reused storage must match freshly quantized output, so the padded scale rows and
+    # columns are zeroed in the same launch: one program per padded row, programs past the
+    # real rows only store zeros (no separate fill kernel).
     out_scale_bytes = out_scale.view(torch.uint8)
-    out_scale_bytes.zero_()
 
     BLOCK_K = triton.next_power_of_2(K)
     BLOCK_GROUPS = BLOCK_K // MXFP8_BLOCK_SIZE
 
-    _mxfp8_quant_swizzle_kernel[(M,)](
+    _mxfp8_quant_swizzle_kernel[(n_row_blocks * MXFP8_SCALE_ROW_BLOCK,)](
         out_data,
         out_scale_bytes,
         x,
@@ -204,7 +247,87 @@ def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torc
         REAL_GROUPS=scale_cols,
         BLOCK_K=BLOCK_K,
         BLOCK_GROUPS=BLOCK_GROUPS,
+        M=M,
+        ZBLOCK=triton.next_power_of_2(n_col_blocks * MXFP8_SCALE_COL_BLOCK),
+        **pdl_kwargs(),
     )
+
+
+@triton.jit
+def _mxfp8_quant_swizzle_rows_kernel(
+    out_ptr,
+    scale_ptr,
+    src_ptr,
+    n_rows_ptr,  # scalar int32/int64 CUDA tensor: rows [0, n_rows) are quantized
+    K,
+    n_col_blocks,
+    REAL_GROUPS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
+):
+    """Persistent variant: a fixed grid quantizes only the first ``n_rows`` rows.
+
+    The row count is read on device, so the launch is CUDA-graph safe while the work
+    scales with the live rows instead of the worst-case buffer. Each row runs the same
+    code as ``_mxfp8_quant_swizzle_kernel``, so the quantized rows are bitwise equal.
+    """
+    if USE_PDL:
+        gdc_wait()
+    pid = tl.program_id(0)
+    n_rows = tl.load(n_rows_ptr).to(tl.int64)
+    for row in tl.range(pid, n_rows, NUM_PROGRAMS):
+        _mxfp8_quant_swizzle_row(
+            row.to(tl.int64),
+            out_ptr,
+            scale_ptr,
+            src_ptr,
+            K,
+            n_col_blocks,
+            REAL_GROUPS,
+            BLOCK_K,
+            BLOCK_GROUPS,
+        )
+
+
+def mxfp8_quantize_rows(
+    x: torch.Tensor, n_rows: torch.Tensor, max_programs: int = 4096
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Like ``mxfp8_quantize`` but only rows ``[0, n_rows)`` are quantized.
+
+    ``n_rows`` is a 1-element CUDA tensor (device-side count, CUDA-graph safe). Data rows
+    at or beyond ``n_rows`` are left uninitialized and their scales are zero; callers
+    must not read them (grouped GEMMs bounded by expert offsets ending at ``n_rows``).
+    Quantized rows are bitwise identical to ``mxfp8_quantize``.
+    """
+    assert x.is_cuda and x.dim() == 2
+    assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+    assert n_rows.is_cuda and n_rows.numel() == 1
+    M, K = x.shape
+    assert K % MXFP8_BLOCK_SIZE == 0, f"K ({K}) must be divisible by {MXFP8_BLOCK_SIZE}"
+    scale_cols = K // MXFP8_BLOCK_SIZE
+    n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)
+    n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)
+    total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
+    out_data = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
+    out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=x.device)
+    BLOCK_K = triton.next_power_of_2(K)
+    num_programs = max(1, min(M, max_programs))
+    _mxfp8_quant_swizzle_rows_kernel[(num_programs,)](
+        out_data,
+        out_scale,
+        x,
+        n_rows,
+        K,
+        n_col_blocks,
+        REAL_GROUPS=scale_cols,
+        BLOCK_K=BLOCK_K,
+        BLOCK_GROUPS=BLOCK_K // MXFP8_BLOCK_SIZE,
+        NUM_PROGRAMS=num_programs,
+        **pdl_kwargs(),
+    )
+    return out_data, out_scale.view(torch.float8_e8m0fnu)
 
 
 def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

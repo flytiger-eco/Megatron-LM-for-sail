@@ -27,6 +27,7 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_decoder_with_transformer_engine_block_spec,
     get_t5_encoder_with_transformer_engine_block_spec,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -83,13 +84,19 @@ class TestEncoderDecoderTextGenerationController:
             post_process=True,
             add_encoder=True,
             add_decoder=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'pp', 'embd']
+            ),
         ).cuda()
 
         inference_context = StaticInferenceContext(max_batch_size=8, max_sequence_length=2560)
 
         inference_wrapped_model = T5InferenceWrapper(t5_model, inference_context)
 
+        # Set before construction: __init__ reads `tokenizer.eod`, an int per the
+        # tokenizer interface, and a bare Mock yields a Mock.
         self.mock_tokenizer = mock.Mock()
+        self.mock_tokenizer.eod = self.vocab_size - 1
 
         self.text_generation_controller = EncoderDecoderTextGenerationController(
             inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer

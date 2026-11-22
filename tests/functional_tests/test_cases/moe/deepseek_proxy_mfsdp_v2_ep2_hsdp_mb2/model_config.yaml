@@ -17,6 +17,7 @@ ENV_VARS:
 MODEL_ARGS:
   # Precision
   --bf16: true
+  --grad-reduce-in-bf16: true
   # Distributed args
   --distributed-timeout-minutes: 60
   --tensor-model-parallel-size: 1
@@ -33,7 +34,6 @@ MODEL_ARGS:
   --data-parallel-sharding-strategy: "optim_grads_params"
   --num-distributed-optimizer-instances: 2
   --outer-dp-sharding-strategy: "no_shard"
-  --expert-outer-dp-sharding-strategy: "no_shard"
   --deterministic-mode: true
   --ckpt-format: "fsdp_dtensor"
   --no-gradient-accumulation-fusion: true
