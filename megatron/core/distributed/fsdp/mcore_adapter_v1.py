@@ -161,6 +161,15 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         self.num_moe_experts = getattr(config, "num_moe_experts", None)
 
         self.ddp_config = ddp_config
+        if ddp_config.megatron_fsdp_track_grad_usage:
+            if pg_collection is None or pg_collection.dp_cp is None:
+                raise ValueError("Gradient usage tracking requires an explicit fixed DPxCP group.")
+            if (
+                config.tensor_model_parallel_size != 1
+                or config.pipeline_model_parallel_size != 1
+                or config.expert_model_parallel_size != 1
+            ):
+                raise ValueError("Gradient usage tracking currently requires TP1/PP1/EP1.")
         log_single_rank(
             logger,
             logging.INFO,
@@ -245,6 +254,9 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 disable_bucketing=disable_bucketing,
                 device=self.device,
                 dist_index=self.megatron_fsdp_dist_index,
+                grad_usage_group=(
+                    pg_collection.dp_cp if ddp_config.megatron_fsdp_track_grad_usage else None
+                ),
                 calculate_per_token_loss=config.calculate_per_token_loss,
                 init_model_with_meta_device=config.init_model_with_meta_device,
                 # EP overlap schedule calls sub-modules directly instead of

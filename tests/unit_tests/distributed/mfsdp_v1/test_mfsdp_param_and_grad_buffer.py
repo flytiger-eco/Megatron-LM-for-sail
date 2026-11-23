@@ -7,11 +7,13 @@ import pytest
 import torch
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp import param_and_grad_buffer
+from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
 from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
     AllGatherPipeline,
     BucketingPolicy,
     FixedPoolAllocator,
     MaxPoolAllocator,
+    ParamAndGradBuffer,
     ParameterGroup,
     _get_parameter_groups,
 )
@@ -168,6 +170,80 @@ def test_grouped_expert_weights_split_when_chunk_size_factors_differ():
             "params": [("layer.experts.linear_fc2", shapes["linear_fc2"])],
         },
     ]
+
+
+@pytest.mark.parametrize("use_decoupled_grad", [False, True])
+def test_unused_gradient_survives_scaling_and_rebinding(use_decoupled_grad):
+    """Skip unused Adam updates and rebind gradients when the parameter is used again."""
+    original = torch.nn.Parameter(torch.ones(2))
+    master = torch.nn.Parameter(torch.ones(2))
+    master.orig_param = original
+    master.grad = torch.ones_like(master)
+    master.decoupled_grad = torch.ones_like(master)
+    optimizer = torch.optim.AdamW([master], lr=0.1, weight_decay=0.1)
+    optimizer.step()
+    saved_weight = master.detach().clone()
+    saved_state = {key: value.clone() for key, value in optimizer.state[master].items()}
+
+    data = torch.zeros_like(master)
+    grad_buffer = SimpleNamespace(data=data, param_idx={original: 0}, get_item=lambda *a, **k: data)
+    buffer = ParamAndGradBuffer.__new__(ParamAndGradBuffer)
+    buffer.ddp_config = SimpleNamespace(megatron_fsdp_track_grad_usage=True)
+    buffer.optimizer_named_parameters = [("conditional", master)]
+    buffer.parameter_groups = [
+        SimpleNamespace(
+            main_grad_buffer=grad_buffer, main_weight_buffer=None, sharding_strategy="no_shard"
+        )
+    ]
+    buffer.param_to_param_group = {original: 0}
+    buffer.dist_main_grad = {"conditional": data}
+    buffer.use_decoupled_grad = use_decoupled_grad
+    original._fsdp_has_global_grad = False
+
+    buffer.update_main_grads()
+    buffer.scale_gradients(0.5)
+    buffer.update_main_grads()
+    assert master.grad is None
+    assert master.decoupled_grad is None
+    optimizer.step()
+    torch.testing.assert_close(master, saved_weight, rtol=0, atol=0)
+    for key, value in saved_state.items():
+        torch.testing.assert_close(optimizer.state[master][key], value, rtol=0, atol=0)
+
+    original._fsdp_has_global_grad = True
+    buffer.update_main_grads()
+    gradient = master.decoupled_grad if use_decoupled_grad else master.grad
+    assert gradient is not None
+    torch.testing.assert_close(gradient, torch.zeros_like(master), rtol=0, atol=0)
+
+
+def test_global_gradient_usage_includes_remote_only_parameters(monkeypatch):
+    """Reduce flags in stable name order and retain gradients for remote-only usage."""
+    parameters = [torch.nn.Parameter(torch.ones(1)) for _ in range(3)]
+    local, remote, unused = parameters
+    local._fsdp_local_grad_used = True
+    remote._fsdp_local_grad_used = False
+    unused._fsdp_local_grad_used = False
+    masters = [SimpleNamespace(orig_param=param) for param in parameters]
+    pool = object()
+
+    def all_reduce(flags, *, group):
+        assert group is pool
+        assert flags.tolist() == [1, 0, 0]
+        flags.add_(torch.tensor([0, 1, 0], dtype=flags.dtype))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    buffer = SimpleNamespace(
+        parameter_groups=[SimpleNamespace(requires_grad=True, params=[unused, remote, local])],
+        param_to_name=dict(zip(parameters, ["a", "b", "c"])),
+        optimizer_named_parameters=list(zip(["a", "b", "c"], masters)),
+        update_main_grads=lambda: None,
+    )
+    state = SimpleNamespace(param_and_grad_buffer=buffer, device="cpu", grad_usage_group=pool)
+    MegatronFSDP._apply_global_grad_usage(state)
+    assert local._fsdp_has_global_grad is True
+    assert remote._fsdp_has_global_grad is True
+    assert unused._fsdp_has_global_grad is False
 
 
 def test_per_expert_2d_weights_avoid_lcm_padding():
