@@ -21,8 +21,6 @@ on:
         required: false
       PPU_POD_ASSETS_ROOT:
         required: false
-      PPU_TOKENIZER_RECEIPTS_ROOT:
-        required: false
   push:
     branches: [main, dev]
     tags: ['v*']
@@ -281,7 +279,6 @@ jobs:
       PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
       PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
       PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
-      PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
     with:
       artifact_prefix: ${{ inputs.artifact_prefix || '' }}
       allowed: ${{ needs.authorize.outputs.allowed == 'true' }}

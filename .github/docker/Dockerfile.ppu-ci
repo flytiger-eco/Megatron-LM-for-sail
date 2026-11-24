@@ -184,7 +184,6 @@ ENV VIRTUAL_ENV=/opt/ppu-ci-venv UV_PROJECT_ENVIRONMENT=/opt/ppu-ci-venv \
 FROM dependencies AS runtime
 ARG TARGET_SHA
 ARG CONTROL_SHA
-ARG EXPORT_FORMAT=archive
 WORKDIR /build/source
 COPY source/ ./
 COPY control/ /build/control/
@@ -200,9 +199,7 @@ RUN --network=none test "${#TARGET_SHA}" = 40 && test "${#CONTROL_SHA}" = 40 \
     && python -m pip install --no-index --no-deps --ignore-installed \
         --report /build/source-package-install.json /build/wheels/*.whl \
     && python -m pip check \
-    && if [[ "$EXPORT_FORMAT" == image ]]; then python /build/export_environment.py runtime-image; \
-       elif [[ "$EXPORT_FORMAT" == archive ]]; then python /build/export_environment.py runtime; \
-       else exit 1; fi
+    && python /build/export_environment.py runtime-image
 FROM scratch AS runtime-export
 COPY --from=runtime /exports/ /
 

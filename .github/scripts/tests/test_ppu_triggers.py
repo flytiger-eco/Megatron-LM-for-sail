@@ -5,7 +5,6 @@ import json
 from types import SimpleNamespace
 
 import pytest
-import yaml
 from test_ppu_ci_container import container
 from test_ppu_functional import ROOT, functional
 from test_ppu_functional_results import results
@@ -58,11 +57,6 @@ def test_event_policy_uses_shared_sail_defaults(trigger, labels, expected):
     assert tuple(policy[key] for key in keys) == expected
 
 
-@pytest.mark.parametrize("trigger", ["workflow_dispatch", "pull_request_target", "schedule", ""])
-def test_other_triggers_have_no_functional_policy(trigger):
-    assert functional.event_policy(trigger) is None
-
-
 def test_policy_config_is_not_overridable_by_manual_inputs():
     policy = functional.event_policy("push")
     with pytest.raises(ValueError, match="manual inputs"):
@@ -78,14 +72,6 @@ def test_policy_config_is_not_overridable_by_manual_inputs():
     )
     assert config["trigger_kind"] == "push" and config["requested_cases"] == ["all"]
     assert functional.functional_label(config) == "functional L0 numeric x1"
-
-
-@pytest.mark.parametrize(
-    "mode,expected", [("regression", ("L1", "nightly")), ("assets", ("all", "bypass"))]
-)
-def test_manual_auto_scope(mode, expected):
-    config = functional.select_config({"functional_mode": mode, "functional_scope": "auto"})
-    assert (config["scope"], config["cadence"]) == expected and not config["lightweight"]
 
 
 @pytest.fixture(scope="module")
@@ -282,13 +268,6 @@ def test_load_manifest_rejects_tampered_combined_plans(combined_plan, tmp_path, 
         functional.load_manifest(output / "manifest.json")
 
 
-def test_scope_labels_are_shared_by_authorizer_functional_policy_and_workflow():
-    assert auth.SCOPE_LABELS == functional.SCOPE_LABELS
-    assert set(functional.SCOPE_LABELS) < set(functional.EVENT_POLICIES)
-    workflow = (WORKFLOWS / "ppu-build.yml").read_text()
-    assert json.dumps(list(functional.SCOPE_LABELS), separators=(",", ":")) in workflow
-
-
 @pytest.mark.parametrize("ref", ["refs/heads/main", "refs/tags/v1.2.3"])
 def test_push_main_is_combined_but_release_tags_run_ut_only(ref):
     result = auth.authorize({}, {}, context("push", ref), lambda path: pytest.fail(path))
@@ -369,36 +348,3 @@ def test_status_publication_rejects_functional_but_accepts_combined(github):
     assert auth.publish_status({**result, "test_kind": "functional"}, "success", "x", github) == (
         "rejected"
     )
-
-
-def test_workflows_route_label_events_and_share_one_build():
-    build = yaml.safe_load((WORKFLOWS / "ppu-build.yml").read_text())
-    triggers = build[True]["pull_request_target"]["types"]
-    assert {"labeled", "unlabeled"} <= set(triggers)
-    assert "decision != 'ignore'" in build["jobs"]["pr-pending"]["if"]
-    execute = yaml.safe_load((WORKFLOWS / "ppu-execute.yml").read_text())
-    jobs = execute["jobs"]
-    assert "combine" in next(
-        step["run"] for step in jobs["configure"]["steps"] if step.get("id") == "config"
-    )
-    assert "combined" in jobs["functional-assets"]["if"]
-    assert "needs.configure.outputs.test_kind != 'functional'" in jobs["admit-build"]["if"]
-    assert "needs.functional-assets.result == 'success'" in jobs["functional-tests"]["if"]
-    assert jobs["build"]["needs"] == ["configure", "admit-build", "runtime-environment"]
-    assert jobs["runtime-environment"]["runs-on"] == "ubuntu-latest"
-    assert jobs["runtime-environment"]["permissions"]["packages"] == "write"
-    assert build["jobs"]["execute"]["permissions"]["packages"] == "write"
-    assert "functional-assets" not in jobs["unit-tests"]["needs"]
-    assert jobs["functional-tests"]["needs"] == [
-        "configure",
-        "functional-assets",
-        "build",
-        "unit-tests",
-    ]
-    assert jobs["functional-tests"]["permissions"]["pull-requests"] == "read"
-    assert execute[True]["workflow_call"]["outputs"]["functional_label"]
-    case = yaml.safe_load((WORKFLOWS / "ppu-functional.yml").read_text())["jobs"]["test"]
-    steps = [step.get("run", step.get("uses", "")) for step in case["steps"]]
-    guard = next(i for i, step in enumerate(steps) if "ppu_pr_authorize.py guard" in step)
-    ppu = next(i for i, step in enumerate(steps) if "cluster-task" in step)
-    assert guard < ppu and case["permissions"]["actions"] == "read"

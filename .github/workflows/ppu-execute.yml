@@ -12,8 +12,6 @@ on:
         required: false
       PPU_POD_ASSETS_ROOT:
         required: false
-      PPU_TOKENIZER_RECEIPTS_ROOT:
-        required: false
     inputs:
       artifact_prefix:
         description: Isolate artifacts and NAS output for main and dev in one synchronization run
@@ -178,11 +176,9 @@ jobs:
           PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
           PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
           PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
-          PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
         run: |
           python3 -I .ppu-ci/control/ppu_ci_paths.py assets
-          "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_functional.py assets --output .ppu-ci \
-            --tokenizer-receipts "$PPU_TOKENIZER_RECEIPTS_ROOT"
+          "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_functional.py assets --output .ppu-ci --location cpu
       - name: Export checked public evidence
         id: public-functional-assets-166
         if: ${{ always() && !cancelled() }}
@@ -190,7 +186,6 @@ jobs:
           PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
           PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
           PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
-          PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
           EXPORT_SOURCE: .ppu-ci/assets-report.json
         run: '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/functional-assets-166 --kind evidence'
       - uses: actions/upload-artifact@v4
@@ -513,7 +508,6 @@ jobs:
       PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
       PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
       PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
-      PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
     with:
       artifact_prefix: ${{ inputs.artifact_prefix }}
       matrix: ${{ needs.configure.outputs.unit_matrix }}
@@ -545,7 +539,6 @@ jobs:
       PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
       PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
       PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
-      PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
     with:
       artifact_prefix: ${{ inputs.artifact_prefix }}
       matrix: ${{ needs.configure.outputs.functional_matrix }}

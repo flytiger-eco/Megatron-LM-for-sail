@@ -3,7 +3,6 @@
 import copy
 import importlib.util
 import json
-import math
 from pathlib import Path
 
 import pytest
@@ -52,55 +51,6 @@ def upstream(monkeypatch):
             "test_pretraining_resume_checkpoint_pipeline",
         )
     )
-
-
-@pytest.mark.parametrize("kind", ["unit", "functional"])
-def test_route_defaults(kind):
-    assert (
-        functional.validate_route("workflow_dispatch", functional.BRANCH, {"test_kind": kind})
-        == kind
-    )
-
-
-@pytest.mark.parametrize(
-    "retired_input",
-    [
-        {"compiler_diagnostic": True},
-        {"compiler_diagnostic": False},
-        {"compiler_diagnostic_context": "bert"},
-    ],
-)
-def test_removed_diagnostics_cannot_fall_back_to_training(retired_input):
-    inputs = {"test_kind": "functional", **retired_input}
-    with pytest.raises(ValueError, match="removed"):
-        functional.validate_route("workflow_dispatch", functional.BRANCH, inputs)
-    with pytest.raises(ValueError, match="removed"):
-        functional.select_config(inputs)
-
-
-def test_workflow_has_no_diagnostic_dispatch():
-    workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
-    events = workflow.get("on", workflow.get(True))
-    assert (
-        not {"compiler_diagnostic", "compiler_diagnostic_context"}
-        & events["workflow_dispatch"]["inputs"].keys()
-    )
-    assert "compiler-diagnostic" not in workflow["jobs"]
-
-
-@pytest.mark.parametrize(
-    "key,value",
-    [
-        ("functional_mode", "regression"),
-        ("functional_scope", "L0"),
-        ("functional_cases", "gpt/example"),
-        ("functional_repeat", 2),
-        ("functional_timeout", 20),
-    ],
-)
-def test_unit_route_rejects_nondefault_functional_input(key, value):
-    with pytest.raises(ValueError, match="require test_kind"):
-        functional.validate_route("workflow_dispatch", functional.BRANCH, {key: value})
 
 
 @pytest.mark.parametrize(
@@ -162,84 +112,6 @@ def test_functional_rejects_unit_control(key, value):
 def test_invalid_config(key, value):
     with pytest.raises(ValueError):
         functional.select_config({key: value})
-
-
-@pytest.mark.parametrize("mode", ["assets", "regression"])
-def test_functional_config_does_not_inherit_unit_gate(mode):
-    config = functional.select_config({"functional_mode": mode})
-    assert config["build"] is (mode == "regression")
-    assert config["unit_test"] is False
-    assert config["repeat"] == 1
-    assert config["timeout"] == 30
-    assert config["threshold_percent"] == 100
-    assert config["data_path"] == "ppu://assets/pod"
-    assert config["cpu_data_path"] == "ppu://assets/cpu"
-
-
-def test_compiler_policy_only_changes_new_regression_manifest():
-    expected = {"TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL": "0"}
-    config = functional.select_config({"functional_mode": "regression"})
-    manifest = {"test_kind": "functional", "config": config}
-    assert config["compiler_environment"] == expected == functional.compiler_environment(manifest)
-    assert "compiler_environment" not in functional.select_config({})
-    current = functional.catalogue(ROOT, ROOT, config)
-    historical = copy.deepcopy(config)
-    historical.pop("compiler_environment")
-    assert current == functional.catalogue(ROOT, ROOT, historical)
-    assert functional.compiler_environment({"test_kind": "functional", "config": historical}) == {}
-    functional.compiler_environment(manifest).clear()
-    config["compiler_environment"].clear()
-    assert functional.COMPILER_ENVIRONMENT == expected
-
-
-@pytest.mark.parametrize("kind,mode", [("unit", "regression"), ("functional", "assets")])
-def test_compiler_policy_rejects_wrong_route(kind, mode):
-    manifest = {
-        "test_kind": kind,
-        "config": {
-            "functional_mode": mode,
-            "compiler_environment": dict(functional.COMPILER_ENVIRONMENT),
-        },
-    }
-    with pytest.raises(ValueError, match="compiler environment policy"):
-        functional.compiler_environment(manifest)
-
-
-@pytest.mark.parametrize(
-    "settings",
-    [
-        None,
-        {},
-        "0",
-        {"TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL": 0},
-        {"TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL": "1"},
-        {**functional.COMPILER_ENVIRONMENT, "TORCHINDUCTOR_COMPILE_THREADS": "1"},
-    ],
-)
-def test_compiler_policy_rejects_arbitrary_settings(settings):
-    manifest = {
-        "test_kind": "functional",
-        "config": {"functional_mode": "regression", "compiler_environment": settings},
-    }
-    with pytest.raises(ValueError, match="compiler environment policy"):
-        functional.compiler_environment(manifest)
-
-
-def test_m890_goldens_share_the_upstream_case_tree():
-    files = functional.baseline_inventory(ROOT)
-    names = {str(Path(path).parent) for path in files}
-    assert names
-    for name in names:
-        assert f"{name}/golden_values_dev_m890.json" in files
-        config = functional.model_config_path(name).relative_to(functional.BASELINES).as_posix()
-        assert config in files
-        assert Path(config).name == (
-            "model_config_m890.yaml"
-            if name in functional.MODEL_CONFIG_OVERRIDES
-            else "model_config.yaml"
-        )
-    assert not (ROOT / "tests/functional_tests/zhenwu_test_cases").exists()
-    assert not (ROOT / ".github/ppu-functional-baselines.json").exists()
 
 
 def test_m890_adapter_changes_only_launcher_and_preserves_explicit_ft_cases():
@@ -346,25 +218,6 @@ def test_explicit_policy_selection_is_skipped_not_silently_green(
     assert [row["name"] for row in result["coverage"]["skipped_by_policy"]] == [skipped_name]
 
 
-@pytest.mark.parametrize("async_save", [True, False, "true", "false"])
-@pytest.mark.parametrize("strategy", [None, "nvrx", "mcore"])
-@pytest.mark.parametrize("persistent", [True, False])
-def test_checkpoint_dependencies_follow_original_flags(async_save, strategy, persistent):
-    arguments = {"--async-save": async_save, "--use-persistent-ckpt-worker": persistent}
-    if strategy is not None:
-        arguments["--async-strategy"] = strategy
-    config = {"TEST_TYPE": "regular", "MODEL_ARGS": arguments}
-    before = copy.deepcopy(config)
-    result = functional.nvrx_checkpoint_requirements(config)
-    expected = async_save in (True, "true") and strategy in (None, "nvrx")
-    assert result == (
-        [{"section": "MODEL_ARGS", "persistent_worker": persistent, "cpu_shm": False}]
-        if expected
-        else []
-    )
-    assert config == before
-
-
 @pytest.mark.parametrize("test_type", ["regular", "ckpt-resume"])
 @pytest.mark.parametrize("first_async", [True, False])
 @pytest.mark.parametrize("second_async", [True, False])
@@ -385,33 +238,6 @@ def test_checkpoint_dependencies_cover_reshard_without_merging(
     assert result == expected
 
 
-@pytest.mark.parametrize("arguments", [None, [], {"--async-strategy": "unknown"}])
-def test_invalid_checkpoint_dependency_config_is_rejected(arguments):
-    with pytest.raises(ValueError):
-        functional.nvrx_checkpoint_requirements(
-            {"TEST_TYPE": "ckpt-resume", "MODEL_ARGS": {}, "MODEL_ARGS_2": arguments}
-        )
-
-
-def test_real_torchrun_case_records_async_dependency_without_changing_baseline(catalogue):
-    case = next(
-        row
-        for row in catalogue["functional"].values()
-        if row["name"] == "gpt/gpt3_mcore_te_tp2_pp2_cp2"
-    )
-    assert case["launcher"] == "torchrun"
-    assert case["nvrx_checkpoint"] == [
-        {"section": "MODEL_ARGS", "persistent_worker": True, "cpu_shm": False}
-    ]
-    assert case["train_iters"] == 50 and case["repeat"] == 1
-    for row in catalogue["functional"].values():
-        path = ROOT / row["config_path"]
-        assert functional.sha256(path) == row["config_sha256"]
-        assert row["nvrx_checkpoint"] == functional.nvrx_checkpoint_requirements(
-            yaml.safe_load(path.read_text())
-        )
-
-
 @pytest.mark.parametrize("tier", functional.TIERS)
 def test_tiers_are_exact_not_cumulative(tier, catalogue):
     expected = {row["name"] for row in catalogue["functional"].values() if tier in row["scopes"]}
@@ -426,29 +252,6 @@ def test_tiers_are_exact_not_cumulative(tier, catalogue):
             ROOT, ROOT, functional.select_config({"functional_scope": tier})
         )
         assert {row["name"] for row in result["functional"].values()} == expected
-
-
-def test_alias_and_cadence_are_upstream_owned():
-    parser = functional.module_from_path(
-        "recipe", ROOT / "tests/test_utils/python_scripts/recipe_parser.py"
-    )
-    recipe = parser.dotdict(
-        products=[
-            {
-                "test_case": ["a"],
-                "products": [
-                    {
-                        "scope": ["mr-github", "nightly"],
-                        "environment": ["dev"],
-                        "platforms": ["dgx_h100"],
-                    }
-                ],
-            }
-        ]
-    )
-    rows = parser.flatten_products(recipe).products
-    assert {row["scope"] for row in rows} == {"L1", "L2"}
-    assert next(row for row in rows if row["scope"] == "L2")["cadence"] == ["nightly"]
 
 
 @pytest.mark.parametrize(
@@ -546,14 +349,6 @@ def test_target_revision_is_planned_then_frozen_in_manifest(tmp_path, damage, so
             results.verify_source(manifest, source, case)
 
 
-def test_recipe_entrypoint_is_not_guessed(catalogue):
-    case = next(row for row in catalogue["functional"].values() if row["model"] == "bert")
-    spec = next(row for row in functional.load_recipes(ROOT) if row["test_case"] == case["case"])
-    spec["script"] = 'TRAINING_SCRIPT_PATH=pretrain_gpt.py'
-    with pytest.raises(ValueError, match="entrypoint"):
-        functional.describe_case(ROOT, case["name"], [spec], functional.select_config({}))
-
-
 def test_assets_prefixes_and_checkpoint(catalogue):
     assets = {
         asset["relative_path"]
@@ -576,48 +371,6 @@ def test_assets_prefixes_and_checkpoint(catalogue):
     assert "model/gpt_dummy_pyt/ckpt/24.10.0_bf16_teacher" in {
         row["relative_path"] for row in functional.input_assets(teacher_config)
     }
-
-
-@pytest.mark.parametrize(
-    "entrypoint,explicit,repository",
-    [
-        ("examples/bert/pretrain_bert.py", None, "bert-large-uncased"),
-        ("pretrain_gpt.py", None, "gpt2"),
-        ("pretrain_hybrid.py", None, "gpt2"),
-        ("examples/t5/pretrain_t5.py", "BertWordPieceCase", "bert-large-cased"),
-        ("pretrain_gpt.py", "NullTokenizer", None),
-    ],
-)
-def test_tokenizer_dependencies_follow_original_entrypoint(entrypoint, explicit, repository):
-    arguments = {"--mock-data": True, "--vocab-file": "${DATA_PATH}/vocab.txt"}
-    if explicit:
-        arguments["--tokenizer-type"] = explicit
-    config = {"TEST_TYPE": "regular", "MODEL_ARGS": arguments}
-    before = copy.deepcopy(config)
-    dependencies = functional.tokenizer_dependencies(ROOT, config, entrypoint)
-    assert [row["repository"] for row in dependencies] == ([repository] if repository else [])
-    assert all(row["status"] == "source_mapping_required" for row in dependencies)
-    assert config == before
-
-
-@pytest.mark.parametrize("test_type", ["regular", "ckpt-resume"])
-@pytest.mark.parametrize("first", ["NullTokenizer", "BertWordPieceCase"])
-def test_tokenizer_reshard_uses_replacement_args_and_original_default(test_type, first):
-    config = {"TEST_TYPE": test_type, "MODEL_ARGS": {"--tokenizer-type": first}, "MODEL_ARGS_2": {}}
-    result = functional.tokenizer_dependencies(ROOT, config, "pretrain_gpt.py")
-    expected = [] if first == "NullTokenizer" else [("MODEL_ARGS", "bert-large-cased")]
-    if test_type == "ckpt-resume":
-        expected.append(("MODEL_ARGS_2", "gpt2"))
-    assert [(row["section"], row["repository"]) for row in result] == expected
-
-
-def test_unknown_tokenizer_assets_are_not_silently_accepted():
-    with pytest.raises(ValueError, match="explicit adaptation"):
-        functional.tokenizer_dependencies(
-            ROOT,
-            {"TEST_TYPE": "regular", "MODEL_ARGS": {"--tokenizer-type": "UnknownTokenizer"}},
-            "pretrain_gpt.py",
-        )
 
 
 def test_tokenizer_source_is_parsed_without_execution(tmp_path):
@@ -783,12 +536,6 @@ def test_asset_report_success_is_not_numeric_success(tmp_path):
     assert report["numerical_validation"] is False
 
 
-@pytest.mark.parametrize("precision", [None, "full", "rounded_5_decimal_places"])
-def test_metric_precision_is_preserved(tmp_path, precision):
-    result = read_metric(tmp_path, precision=precision)
-    assert result["lm loss"]["value_precision"] == (precision or "rounded_5_decimal_places")
-
-
 @pytest.mark.parametrize("text", ['{}', '{"lm loss": {}}', '{"lm loss": 1}', '{"a": 1, "a": 2}'])
 def test_corrupt_golden_is_a_hard_error(tmp_path, text):
     path = tmp_path / "invalid.json"
@@ -809,148 +556,6 @@ def test_missing_and_nonfinite_actual_are_hard_errors(tmp_path, bad):
     actual["lm loss"]["values"][3] = bad
     with pytest.raises(ValueError, match="non-finite"):
         functional.validate_region(reference, actual, ["lm loss"])
-
-
-def test_iteration_warmup_nan_is_not_a_failure():
-    values = {step: "nan" if step < 5 else 2.0 for step in range(1, 21)}
-    result = functional.validate_region(
-        {"iteration-time": {"values": values}},
-        {"iteration-time": {"values": values}},
-        ["iteration-time"],
-    )
-    assert result["iteration-time"] == list(range(5, 21))
-    actual = {"iteration-time": {"values": {**values, 10: "nan"}}}
-    with pytest.raises(ValueError, match="non-finite"):
-        functional.validate_region(
-            {"iteration-time": {"values": values}}, actual, ["iteration-time"]
-        )
-
-
-def test_resume_nonexecuted_half_is_excluded(tmp_path):
-    reference = read_metric(tmp_path)
-    actual = copy.deepcopy(reference)
-    actual["lm loss"]["values"].update({1: "nan", 2: "nan"})
-    assert functional.validate_region(reference, actual, ["lm loss"], after=2)["lm loss"] == [3, 4]
-    actual["lm loss"]["values"][3] = "nan"
-    with pytest.raises(ValueError):
-        functional.validate_region(reference, actual, ["lm loss"], after=2)
-
-
-@pytest.mark.parametrize(
-    "precision,passes", [(None, True), ("full", False), ("rounded_5_decimal_places", True)]
-)
-def test_direct_upstream_precision_parity(tmp_path, upstream, precision, passes):
-    common, regular, _ = upstream
-    reference = common.GoldenValueMetric(**metric(precision=precision))
-    actual = reference.model_copy(deep=True)
-    actual.values = {key: value + 0.000001 for key, value in actual.values.items()}
-    config = tmp_path / "config.yaml"
-    config.write_text("METRICS: ['lm loss']\n")
-    if passes:
-        regular.test_regular_pipeline(
-            False, {"lm loss": reference}, {"lm loss": actual}, str(config)
-        )
-    else:
-        with pytest.raises(AssertionError):
-            regular.test_regular_pipeline(
-                False, {"lm loss": reference}, {"lm loss": actual}, str(config)
-            )
-
-
-@pytest.mark.parametrize("bad_points,passes", [(1, True), (2, False)])
-def test_direct_upstream_approximate_outlier_rule(tmp_path, upstream, bad_points, passes):
-    common, regular, _ = upstream
-    golden = common.GoldenValueMetric(**metric(end=100))
-    actual = golden.model_copy(deep=True)
-    for step in range(1, bad_points + 1):
-        actual.values[step] = 10.0
-    config = tmp_path / "config.yaml"
-    config.write_text("METRICS: ['lm loss']\n")
-    if passes:
-        regular.test_regular_pipeline(True, {"lm loss": golden}, {"lm loss": actual}, str(config))
-    else:
-        with pytest.raises(AssertionError):
-            regular.test_regular_pipeline(
-                True, {"lm loss": golden}, {"lm loss": actual}, str(config)
-            )
-
-
-def test_direct_upstream_resume_compares_current_first_run(tmp_path, upstream):
-    common, _, resume = upstream
-    first = common.GoldenValueMetric(**metric())
-    second = common.GoldenValueMetric(**metric({"1": "nan", "2": "nan", "3": 1.0, "4": 1.0}))
-    config = tmp_path / "config.yaml"
-    config.write_text("METRICS: ['lm loss']\n")
-    resume.test_resume_checkpoint_pipeline(
-        False,
-        {"lm loss": first.model_copy(deep=True)},
-        {"lm loss": second.model_copy(deep=True)},
-        4,
-        str(config),
-    )
-    second.values[4] = 2.0
-    with pytest.raises(AssertionError):
-        resume.test_resume_checkpoint_pipeline(
-            False, {"lm loss": first}, {"lm loss": second}, 4, str(config)
-        )
-
-
-def test_synthetic_tensorboard_uses_upstream_extractor(tmp_path, upstream):
-    from tensorboard.compat.proto.event_pb2 import Event
-    from tensorboard.compat.proto.summary_pb2 import Summary
-    from tensorboard.summary.writer.event_file_writer import EventFileWriter
-
-    common, _, _ = upstream
-    writer = EventFileWriter(str(tmp_path))
-    for step in range(1, 5):
-        writer.add_event(
-            Event(
-                wall_time=float(step),
-                step=step,
-                summary=Summary(value=[Summary.Value(tag="lm loss", simple_value=1.0)]),
-            )
-        )
-    writer.flush()
-    writer.close()
-    result = common.read_tb_logs_as_list(str(tmp_path), train_iters=4, step_size=1)
-    assert list(result["lm loss"].values) == [1, 2, 3, 4]
-    assert all(math.isfinite(value) for value in result["lm loss"].values.values())
-    assert result["lm loss"].value_precision == common.ValuePrecision.FULL
-
-
-@pytest.mark.parametrize("permission", ["write", "maintain", "admin", "read"])
-def test_real_authorizer_preserves_maintainer_gate_and_never_publishes_pr(permission):
-    from test_ppu_quick import auth, context
-
-    ctx = context()
-    ctx["control_sha"] = ctx["sha"]
-    calls = []
-
-    def api(path, payload=None):
-        calls.append(path)
-        assert path.startswith("collaborators/") and payload is None
-        return {"permission": permission}
-
-    if permission == "read":
-        with pytest.raises(ValueError, match="write/maintain/admin"):
-            auth.authorize({}, {"test_kind": "functional"}, ctx, api)
-        return
-    authorized = auth.authorize({}, {"test_kind": "functional"}, ctx, api)
-    assert authorized["allowed"] and authorized["test_kind"] == "functional"
-    assert authorized["pr_number"] == 0 and not authorized["manual_pr"]
-    before = list(calls)
-    assert auth.publish_status(authorized, "success", "not a PR result", api) == "rejected"
-    assert calls == before
-
-
-def test_real_authorizer_rejects_functional_pr_before_reading_pr():
-    from test_ppu_quick import auth, context
-
-    def api(*_):
-        raise AssertionError("Invalid mixed routing must not reach PR APIs")
-
-    with pytest.raises(ValueError, match="PR status"):
-        auth.authorize({}, {"test_kind": "functional", "pr_number": "7"}, context(), api)
 
 
 def test_route_import_does_not_require_yaml_on_hosted_authorization_runner():

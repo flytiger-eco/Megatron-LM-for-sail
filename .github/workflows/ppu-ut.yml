@@ -12,8 +12,6 @@ on:
         required: false
       PPU_POD_ASSETS_ROOT:
         required: false
-      PPU_TOKENIZER_RECEIPTS_ROOT:
-        required: false
     inputs:
       artifact_prefix:
         description: Isolate artifacts and NAS output for main and dev in one synchronization run

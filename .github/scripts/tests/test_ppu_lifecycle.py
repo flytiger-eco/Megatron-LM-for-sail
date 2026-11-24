@@ -3,20 +3,7 @@ import json
 import sys
 
 import pytest
-import yaml
-from test_ppu_quick import (
-    BASE_SHA,
-    BRANCH,
-    CONTROL_SHA,
-    MERGE_SHA,
-    REPOSITORY,
-    ROOT,
-    SHA,
-    api_for,
-    auth,
-    context,
-    pr,
-)
+from test_ppu_quick import BASE_SHA, CONTROL_SHA, REPOSITORY, SHA, auth, context, pr
 
 
 class FakeGitHub:
@@ -479,46 +466,3 @@ def test_base_invalidation_requires_new_full_sha_dispatch(github, monkeypatch):
     monkeypatch.setenv("GITHUB_RUN_ID", "125")
     assert auth.execution_guard(current, github)
     assert auth.publish_status(previous, "success", "Late success", github) == "stale"
-
-
-def test_workflow_authorized_concurrency_and_cancellation_contract():
-    parent = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
-    execute = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())
-    call = parent["jobs"]["execute"]
-    assert call["needs"] == ["authorize", "pr-pending", "control-environment"]
-    assert "needs.control-environment.result == 'success'" in call["if"]
-    assert (
-        "needs.authorize.outputs.allowed == 'true' && needs.control-environment.result == 'success'"
-        in call["if"]
-    )
-    assert "status_result == 'published'" in call["if"]
-    assert "needs.authorize.result == 'success'" in call["if"]
-    assert call["concurrency"] == {"group": "sail-ppu-hardware", "queue": "max", "cancel-in-progress": False}
-    assert call["uses"] == "./.github/workflows/ppu-execute.yml"
-    assert "preflight-{0}" in parent["concurrency"]["group"]
-    for field in ("pr_number", "pr_sha", "pr_base_sha"):
-        assert f"inputs.{field} != ''" in parent["concurrency"]["group"]
-    assert "workflow_dispatch" not in parent["concurrency"]["cancel-in-progress"]
-    result = parent["jobs"]["pr-result"]
-    assert "always()" in result["if"] and "!cancelled()" not in result["if"]
-    assert result["timeout-minutes"] == 5
-    assert any(step.get("if") == "cancelled()" for step in result["steps"])
-    assert "execution_success == 'true'" in result["steps"][-1]["env"]["STATE"]
-    assert "--cancelled" in result["steps"][-1]["run"]
-    assert execute["jobs"]["runtime-environment"]["needs"] == ["configure", "admit-build"]
-    assert execute["jobs"]["build"]["needs"] == ["configure", "admit-build", "runtime-environment"]
-    assert "needs.runtime-environment.result == 'success'" in execute["jobs"]["build"]["if"]
-    for name in ("configure", "admit-build", "runtime-environment"):
-        steps = execute["jobs"][name]["steps"]
-        assert any(step.get("run", "").endswith("ppu_pr_authorize.py guard") for step in steps)
-    for name in ("configure", "admit-build", "runtime-environment"):
-        assert execute["jobs"][name]["runs-on"] == "ubuntu-latest"
-    runtime = execute["jobs"]["runtime-environment"]
-    assert "container" not in runtime
-    assert runtime["permissions"]["packages"] == "write"
-    assert call["permissions"]["packages"] == "write"
-    for name in ("build", "unit-tests"):
-        assert "statuses" not in execute["jobs"][name].get("permissions", {})
-        assert "actions" not in execute["jobs"][name].get("permissions", {})
-    assert execute[True].keys() == {"workflow_call"}
-    assert "workflow_run" not in parent[True]

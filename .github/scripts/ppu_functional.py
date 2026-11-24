@@ -1003,18 +1003,6 @@ def write_asset_report(report: dict, output: Path) -> None:
             lines.append(
                 f"| {case['name']} | {dependency['purpose']}: {dependency['repository']} | unconfirmed | not checked | unknown | unknown | — | {dependency['reason']} |"
             )
-    candidate = report.get("tokenizer_source_candidate")
-    if candidate:
-        lines.extend(
-            [
-                "",
-                "### HF source candidate (not trusted)",
-                f"Status: `{candidate['status']}`; files matching candidate: {candidate['file_count']}.",
-                f"Candidate path: `{candidate['checked_path']}`.",
-                "Candidate metadata is included in assets-report.json for review only; "
-                "it does not replace the trusted source lock or change the asset gate.",
-            ]
-        )
     lines.append("")
     lines.extend(
         f"- Skipped by policy: `{case['name']}` ({case['reason']}); not executed or counted as passed."
@@ -1055,7 +1043,6 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path, default=Path(".ppu-ci"))
     parser.add_argument("--assets-root", type=Path)
-    parser.add_argument("--tokenizer-receipts", type=Path)
     parser.add_argument("--location", choices=("cpu", "pod"), default="cpu")
     parser.add_argument("--case-id")
     args = parser.parse_args()
@@ -1069,17 +1056,6 @@ def main() -> None:
         if args.assets_root is not None and args.assets_root != trusted_root:
             raise ValueError("Asset CLI root differs from trusted configuration")
         report = asset_report(manifest, trusted_root, location=args.location, case_id=args.case_id)
-        if (
-            args.location == "cpu"
-            and manifest["config"]["functional_mode"] == "assets"
-            and report["root"]["ok"]
-        ):
-            report["tokenizer_source_candidate"] = hf.inspect_candidate(trusted_root)
-            if args.tokenizer_receipts:
-                receipts = paths.root("PPU_TOKENIZER_RECEIPTS_ROOT")
-                if args.tokenizer_receipts != receipts:
-                    raise ValueError("Receipt CLI root differs from trusted configuration")
-                report["tokenizer_preparation_receipts"] = hf.inspect_receipts(receipts)
         write_asset_report(report, args.output)
         raise SystemExit(0 if report["ok"] else 1)
     inputs = json.loads(os.environ.get("PPU_INPUTS", "{}"))

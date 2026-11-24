@@ -507,46 +507,6 @@ def verify_public(directory: Path) -> dict:
     return report
 
 
-def checkpoint_audit(source: Path, destination: Path) -> None:
-    """Advisory, read-only payload inventory; never creates or alters private run directories."""
-    if not source.is_dir():
-        return
-    if destination.resolve().is_relative_to(source.resolve()):
-        raise ValueError("Checkpoint audit must not write into private evidence")
-    rows = []
-    try:
-        for directory in sorted(source.rglob("*")):
-            if (
-                directory.name not in OMITTED_DIRS
-                or directory.is_symlink()
-                or not directory.is_dir()
-            ):
-                continue
-            sizes = []
-            for path in directory.rglob("*"):
-                try:
-                    if path.is_file() and not path.is_symlink():
-                        sizes.append(path.stat().st_size)
-                except OSError:
-                    continue
-            rows.append(
-                {
-                    "path": directory.relative_to(source).as_posix(),
-                    "files": len(sizes),
-                    "bytes": sum(sizes),
-                }
-            )
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(json.dumps({"omitted": rows}) + "\n")
-    except OSError:
-        try:
-            destination.unlink(missing_ok=True)
-        except OSError:
-            pass
-        print("::warning::Unable to record omitted checkpoint payloads")
-    print(f"Recorded {len(rows)} omitted checkpoint payload groups")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path)
@@ -554,7 +514,6 @@ def main() -> None:
     parser.add_argument("--kind", choices=("evidence", "bundle"), default="evidence")
     parser.add_argument("--action-outputs", action="store_true")
     parser.add_argument("--overlay", type=Path)
-    parser.add_argument("--checkpoint-audit", action="store_true")
     args = parser.parse_args()
     if args.action_outputs:
         print(paths.redact(action_outputs(os.environ.get("ACTION_OUTPUTS", "{}"))))
@@ -562,9 +521,6 @@ def main() -> None:
     paths.register_masks()
     if args.source is None or args.destination is None:
         parser.error("--source and --destination are required")
-    if args.checkpoint_audit:
-        checkpoint_audit(args.source, args.destination)
-        return
     try:
         report = export(args.source, args.destination, kind=args.kind, overlay=args.overlay)
     except Exception as error:

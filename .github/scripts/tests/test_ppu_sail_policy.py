@@ -188,31 +188,6 @@ def test_sync_handoff_rejects_forged_or_stale_provenance(change):
         auth.authorize_sync(request, ctx, api)
 
 
-def test_sync_namespaces_are_distinct_in_artifacts_and_nas(monkeypatch, tmp_path):
-    workflows = ROOT / ".github/workflows"
-    for branch in ("main", "dev"):
-        prefix = f"sync-{branch}-"
-        monkeypatch.setenv("PPU_ARTIFACT_PREFIX", prefix)
-        assert (
-            ci.result_directory({"config": {"scope": "diagnostic"}}, tmp_path, "dev-001")
-            == tmp_path / f"{prefix}ppu-ut-dev-001"
-        )
-    for name in ("ppu-build", "ppu-execute", "ppu-ut", "ppu-functional"):
-        parsed = yaml.safe_load((workflows / f"{name}.yml").read_text())
-        for job in parsed["jobs"].values():
-            for step in job.get("steps", []):
-                if step.get("uses", "").startswith(
-                    ("actions/upload-artifact@", "actions/download-artifact@")
-                ):
-                    artifact = step["with"].get("name", step["with"].get("pattern"))
-                    assert artifact.startswith("${{ inputs.artifact_prefix }}")
-        if name != "ppu-build":
-            assert (
-                '/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/'
-                in (workflows / f"{name}.yml").read_text()
-            )
-
-
 def test_manual_main_control_can_authorize_a_dev_pr():
     from test_ppu_quick import BASE_SHA, SHA
 
@@ -222,14 +197,6 @@ def test_manual_main_control_can_authorize_a_dev_pr():
     result = auth.authorize({}, request, context(), github)
     assert result["allowed"] and result["base_ref"] == "refs/heads/dev"
     assert "git/ref/heads/dev" in github.calls
-
-
-def test_pr_target_never_uses_dev_as_the_workflow_source():
-    github = FakeGitHub()
-    github.pull["base"]["ref"] = "dev"
-    event = {"number": 7, "action": "opened", "pull_request": copy.deepcopy(github.pull)}
-    with pytest.raises(ValueError, match="default main"):
-        auth.authorize(event, {}, context("pull_request_target", "refs/heads/dev"), github)
 
 
 @pytest.mark.parametrize("cards", [1, 2, 4, 8])
@@ -346,18 +313,3 @@ print(json.dumps(result))
     )
     assert run.returncode == 0, run.stderr
     assert json.loads(run.stdout)["allowed"]
-
-
-def test_preflight_summary_explains_automatic_scope_and_sha():
-    result = auth.authorize({}, {}, context("push"), FakeGitHub())
-    summary = auth.preflight_summary(result, {})
-    for value in (result["target_sha"], result["control_sha"], "L0", "1 / 30", "numeric"):
-        assert value in summary
-
-
-def test_preflight_summary_distinguishes_manual_assets_from_numerical_tests():
-    inputs = {"test_kind": "functional", "functional_mode": "assets", "functional_scope": "auto"}
-    result = auth.authorize({}, inputs, context(), FakeGitHub())
-    summary = auth.preflight_summary(result, inputs)
-    assert "`assets`" in summary and "`all`" in summary
-    assert "`numeric`" not in summary

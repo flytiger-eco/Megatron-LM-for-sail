@@ -12,8 +12,6 @@ on:
         required: false
       PPU_POD_ASSETS_ROOT:
         required: false
-      PPU_TOKENIZER_RECEIPTS_ROOT:
-        required: false
     inputs:
       artifact_prefix:
         description: Isolate artifacts and NAS output for main and dev in one synchronization run
@@ -153,15 +151,6 @@ jobs:
           ACTION_OUTPUTS=$("$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --action-outputs)
           printf '{"requested_at":%s,"completed_at":%s,"action_outcome":"%s","action_status":"%s","outputs":%s}\n' \
             "${REQUESTED_AT:-0}" "$(date +%s)" "$ACTION_OUTCOME" "$ACTION_STATUS" "$ACTION_OUTPUTS" > "$RESULT_DIR/action-timing.json"
-      - name: Record omitted checkpoint payloads
-        if: always()
-        shell: bash
-        env:
-          RESULT_DIR: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
-        run: |
-          # Advisory and read-only; unreadable checkpoint payloads do not change the case gate.
-          "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --checkpoint-audit \
-            --source "$RESULT_DIR" --destination .ppu-action/checkpoint-omissions.json
       - name: Export checked public evidence
         id: public-test-152
         if: ${{ always() && !cancelled() }}

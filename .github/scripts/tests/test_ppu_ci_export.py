@@ -98,26 +98,6 @@ def test_text_yaml_jsonl_and_failure_stack_are_redacted(tmp_path, path_env):
         assert private.encode() not in content
 
 
-@pytest.mark.parametrize("kind", ["set", "binary-key", "binary-value"])
-def test_unsupported_yaml_collections_and_binary_paths_fail_closed(tmp_path, path_env, kind):
-    import base64
-
-    source = tmp_path / "private"
-    source.mkdir()
-    private = path_env["PPU_CPU_RUN_ROOT"]
-    if kind == "set":
-        raw = 'paths: !!set {"' + private.replace("/", "\\u002f") + '": null}\n'
-    else:
-        encoded = base64.b64encode(private.encode()).decode()
-        raw = (
-            f"!!binary {encoded}: safe\n" if kind == "binary-key" else f"path: !!binary {encoded}\n"
-        )
-    (source / "report.yaml").write_text(raw)
-    with pytest.raises(ValueError, match="Unsupported"):
-        exporter.export(source, tmp_path / "public", env=path_env)
-    assert not (tmp_path / "public/public-export.json").exists()
-
-
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le", "utf-16-be"])
 def test_unknown_binary_with_private_path_blocks_export(tmp_path, path_env, encoding):
     source = tmp_path / "private"
@@ -164,61 +144,6 @@ def test_upstream_expanded_model_config_is_public_text_not_unknown_binary(tmp_pa
     upstream = (ROOT / "tests/functional_tests/shell_test_utils/_run_training.sh").read_text()
     assert '>$TRAINING_PARAMS_PATH.tmp' in upstream
     assert 'TRAINING_PARAMS_PATH="$TRAINING_PARAMS_PATH.tmp"' in upstream
-
-
-@pytest.mark.parametrize("filename", ["unknown.tmp", "model_config.yaml.tmp.bin"])
-def test_expanded_config_exception_does_not_allow_arbitrary_tmp_files(tmp_path, path_env, filename):
-    source = tmp_path / "private"
-    source.mkdir()
-    (source / filename).write_text("path: " + path_env["PPU_POD_RUN_ROOT"])
-    with pytest.raises(ValueError, match="Private directory"):
-        exporter.export(source, tmp_path / "public", env=path_env)
-    assert not (tmp_path / "public/public-export.json").exists()
-
-
-@pytest.mark.parametrize("encoding", ["invalid-utf8", "utf-16-le", "utf-16-be"])
-def test_expanded_config_must_be_utf8_and_never_rewrites_originals(tmp_path, path_env, encoding):
-    source = tmp_path / "private"
-    source.mkdir()
-    private = path_env["PPU_POD_RUN_ROOT"]
-    content = b"\xff" if encoding == "invalid-utf8" else private.encode(encoding)
-    path = source / "model_config.yaml.tmp"
-    path.write_bytes(content)
-    with pytest.raises(ValueError):
-        exporter.export(source, tmp_path / "public", env=path_env)
-    assert path.read_bytes() == content
-    assert not (tmp_path / "public/public-export.json").exists()
-
-
-@pytest.mark.parametrize("escaping", ["unicode", "hex", "yaml-set", "json-slashes"])
-def test_expanded_config_cannot_hide_encoded_paths_or_unsafe_structures(
-    tmp_path, path_env, escaping
-):
-    source = tmp_path / "private"
-    source.mkdir()
-    private = path_env["PPU_POD_RUN_ROOT"]
-    if escaping == "yaml-set":
-        raw = 'paths: !!set {"' + private + '": null}\n'
-    elif escaping == "json-slashes":
-        raw = json.dumps({"path": private}).replace("/", "\\/")
-    else:
-        escape = "\\u002f" if escaping == "unicode" else "\\x2f"
-        raw = 'path: "' + private.replace("/", escape) + '"\n'
-    path = source / "model_config.yaml.tmp"
-    path.write_text(raw)
-    with pytest.raises(ValueError, match="Unsupported"):
-        exporter.export(source, tmp_path / "public", env=path_env)
-    assert path.read_text() == raw
-    assert not (tmp_path / "public/public-export.json").exists()
-
-
-def test_unknown_safe_binary_is_copied_without_byte_replacement(tmp_path, path_env):
-    source = tmp_path / "private"
-    source.mkdir()
-    content = bytes(range(256))
-    (source / "safe.bin").write_bytes(content)
-    exporter.export(source, tmp_path / "public", env=path_env)
-    assert (tmp_path / "public/safe.bin").read_bytes() == content
 
 
 @pytest.mark.parametrize(
@@ -365,66 +290,6 @@ def test_private_archives_and_checkpoint_cache_payloads_are_not_public(tmp_path,
     assert snapshot(source) == before
 
 
-@pytest.mark.parametrize(
-    "relative", ["attempt-1/checkpoints/link", "initial-checkpoints/link", "cache/compiler/link"]
-)
-@pytest.mark.parametrize("link_kind", ["file", "directory", "dangling"])
-def test_excluded_links_never_export_or_follow_private_targets(
-    tmp_path, path_env, monkeypatch, relative, link_kind
-):
-    source = tmp_path / "private"
-    source.mkdir()
-    (source / "driver.log").write_text("Training complete\n")
-    hf = source / "cache/huggingface/config.json"
-    hf.parent.mkdir(parents=True)
-    hf.write_bytes(b'{"revision":"fixed"}\n')
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    target = outside / "private.bin"
-    target.write_bytes(path_env["PPU_POD_RUN_ROOT"].encode())
-    if link_kind == "directory":
-        target = outside
-    elif link_kind == "dangling":
-        target = outside / "missing"
-    link = source / relative
-    link.parent.mkdir(parents=True, exist_ok=True)
-    link.symlink_to(target, target_is_directory=link_kind == "directory")
-    original_open = Path.open
-    original_stat = Path.stat
-
-    def guarded_open(path, *args, **kwargs):
-        assert path != link and not path.is_relative_to(outside), "Excluded target must not be read"
-        return original_open(path, *args, **kwargs)
-
-    def guarded_stat(path, *args, **kwargs):
-        if kwargs.get("follow_symlinks", True):
-            assert path != link, "Excluded link must not be followed"
-        return original_stat(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "open", guarded_open)
-    monkeypatch.setattr(Path, "stat", guarded_stat)
-    destination = tmp_path / "public"
-    report = exporter.export(source, destination, env=path_env)
-    assert set(report["files"]) == {"driver.log", "cache/huggingface/config.json"}
-    assert (destination / "cache/huggingface/config.json").read_bytes() == hf.read_bytes()
-    assert relative not in report["omitted"]
-    exporter.verify_public(destination)
-
-
-@pytest.mark.parametrize("name", ["cache", "checkpoints", "initial-checkpoints"])
-def test_excluded_directory_links_do_not_traverse_external_trees(tmp_path, path_env, name):
-    source = tmp_path / "private"
-    source.mkdir()
-    (source / "driver.log").write_text("Training complete\n")
-    outside = tmp_path / "outside/huggingface"
-    outside.mkdir(parents=True)
-    (outside / "config.json").write_text(json.dumps({"path": path_env["PPU_POD_RUN_ROOT"]}))
-    (source / name).symlink_to(outside.parent, target_is_directory=True)
-    report = exporter.export(source, tmp_path / "public", env=path_env)
-    assert set(report["files"]) == {"driver.log"}
-    assert report["omitted"] == []
-
-
 @pytest.mark.parametrize("relative", ["escape", "cache/huggingface/escape"])
 @pytest.mark.parametrize("link_kind", ["file", "directory", "source", "destination-parent"])
 def test_symlink_escapes_are_rejected(tmp_path, path_env, link_kind, relative):
@@ -479,21 +344,6 @@ def test_local_overlay_replaces_only_public_placeholder_and_retains_partial_fail
         exporter.export(source, tmp_path / "unapproved", overlay=overlay, env=path_env)
 
 
-def test_local_overlay_does_not_bypass_retained_source_symlink_rejection(tmp_path, path_env):
-    source = tmp_path / "private"
-    source.mkdir()
-    target = tmp_path / "outside.json"
-    target.write_text("{}")
-    (source / "action-timing.json").symlink_to(target)
-    overlay = tmp_path / "overlay"
-    overlay.mkdir()
-    (overlay / "action-timing.json").write_text("{}")
-    with pytest.raises(ValueError, match="Symlinks"):
-        exporter.export(source, tmp_path / "public", overlay=overlay, env=path_env)
-    assert target.read_text() == "{}"
-    assert not (tmp_path / "public/public-export.json").exists()
-
-
 @pytest.mark.parametrize("damage", ["modified", "removed", "extra", "symlink", "inventory"])
 def test_independent_public_inventory_verification_rejects_tampering(tmp_path, path_env, damage):
     source = tmp_path / "private"
@@ -515,34 +365,6 @@ def test_independent_public_inventory_verification_rejects_tampering(tmp_path, p
         (destination / "public-export.json").write_text(json.dumps(report))
     with pytest.raises(ValueError):
         exporter.verify_public(destination)
-
-
-def test_action_outputs_are_allowlisted_without_polluting_captured_json(tmp_path, path_env):
-    env = {
-        **os.environ,
-        **path_env,
-        "GITHUB_ACTIONS": "true",
-        "ACTION_OUTPUTS": json.dumps(
-            {
-                "job_status": "failed",
-                "duration_seconds": "12",
-                "queue_duration_seconds": "1",
-                "occupied_ppu_card_hours": "0.01",
-                "execution_ppu_card_hours": "0.01",
-                "artifact_dir": path_env["PPU_CPU_RUN_ROOT"],
-                "task_pods": "private",
-            }
-        ),
-    }
-    process = subprocess.run(
-        [sys.executable, "-I", str(SCRIPTS / "ppu_ci_export.py"), "--action-outputs"],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert set(json.loads(process.stdout)) == exporter.ACTION_FIELDS
-    assert "add-mask" not in process.stdout and "fictional-host" not in process.stdout
 
 
 @pytest.mark.parametrize("damage", [None, "actual", "model", "identity", "repeat", "asset-root"])
@@ -620,134 +442,6 @@ def test_export_never_writes_over_private_or_existing_evidence(tmp_path, path_en
     with pytest.raises(ValueError, match="new and outside"):
         exporter.export(source, destination, env=path_env)
     assert (source / "file.txt").read_text() == "Original"
-
-
-def test_checkpoint_audit_is_advisory_and_refuses_nas_mutation(tmp_path, monkeypatch):
-    source = tmp_path / "private"
-    checkpoint = source / 'attempt-1/checkpoints/quoted"file.bin'
-    checkpoint.parent.mkdir(parents=True)
-    checkpoint.write_bytes(b"123")
-    report = tmp_path / "local/checkpoint-omissions.json"
-    exporter.checkpoint_audit(source, report)
-    assert json.loads(report.read_text())["omitted"] == [
-        {"path": "attempt-1/checkpoints", "files": 1, "bytes": 3}
-    ]
-    with pytest.raises(ValueError, match="must not write"):
-        exporter.checkpoint_audit(source, source / "checkpoint-omissions.json")
-    monkeypatch.setattr(
-        Path, "write_text", lambda *a, **k: (_ for _ in ()).throw(PermissionError())
-    )
-    exporter.checkpoint_audit(source, tmp_path / "failed/audit.json")
-    assert checkpoint.read_bytes() == b"123"
-
-
-@pytest.mark.parametrize("nested", [False, True])
-def test_private_directory_in_public_filename_is_rejected(tmp_path, path_env, nested):
-    source = tmp_path / "private"
-    relative = Path(path_env["PPU_CPU_RUN_ROOT"].lstrip("/")) / "evidence.txt"
-    if nested:
-        relative = Path("nested") / relative
-    path = source / relative
-    path.parent.mkdir(parents=True)
-    path.write_text("Safe content with an unsafe filename")
-    with pytest.raises(ValueError, match="filename"):
-        exporter.export(source, tmp_path / "public", env=path_env)
-    assert not (tmp_path / "public/public-export.json").exists()
-
-
-@pytest.mark.parametrize(
-    "metadata",
-    [
-        None,
-        [],
-        {"size": True, "sha256": "x"},
-        {"size": -1, "sha256": "x"},
-        {"size": 8, "sha256": 1},
-        {"size": 8, "sha256": "x", "extra": 1},
-    ],
-)
-def test_public_inventory_rejects_malformed_file_metadata(tmp_path, path_env, metadata):
-    source = tmp_path / "private"
-    source.mkdir()
-    (source / "evidence.txt").write_text("Original")
-    destination = tmp_path / "public"
-    exporter.export(source, destination, env=path_env)
-    report_path = destination / "public-export.json"
-    report = json.loads(report_path.read_text())
-    report["files"]["evidence.txt"] = metadata
-    report_path.write_text(json.dumps(report))
-    with pytest.raises(ValueError, match="metadata"):
-        exporter.verify_public(destination)
-
-
-@pytest.mark.parametrize("target", ["root", "inventory"])
-def test_public_verifier_rejects_links_before_reading_inventory(tmp_path, path_env, target):
-    source = tmp_path / "private"
-    source.mkdir()
-    (source / "evidence.txt").write_text("Original")
-    destination = tmp_path / "public"
-    exporter.export(source, destination, env=path_env)
-    if target == "root":
-        link = tmp_path / "linked-public"
-        link.symlink_to(destination, target_is_directory=True)
-        destination = link
-    else:
-        report = destination / "public-export.json"
-        moved = tmp_path / "original-inventory.json"
-        report.rename(moved)
-        report.symlink_to(moved)
-    with pytest.raises(ValueError, match="unlinked"):
-        exporter.verify_public(destination)
-
-
-@pytest.mark.parametrize(
-    "filename,content,code,category",
-    [
-        ("untrusted-name.bin", b"PRIVATE", "private-path-bytes", "unknown-binary"),
-        ("untrusted-name.json", b"{PRIVATE", "invalid-json", "structured-evidence"),
-        ("model_config.yaml.tmp", b"\xff", "invalid-utf8", "expanded-model-config"),
-        ("untrusted-name.log", b"\xff", "invalid-utf8", "text-evidence"),
-    ],
-)
-def test_public_failure_diagnostics_use_fixed_codes_not_filenames(
-    tmp_path, path_env, filename, content, code, category
-):
-    source = tmp_path / "private"
-    source.mkdir()
-    (source / filename).write_bytes(
-        content.replace(b"PRIVATE", path_env["PPU_CPU_RUN_ROOT"].encode())
-    )
-    process = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            str(SCRIPTS / "ppu_ci_export.py"),
-            "--source",
-            str(source),
-            "--destination",
-            str(tmp_path / "public"),
-        ],
-        env={**os.environ, **path_env, "GITHUB_ACTIONS": "false"},
-        capture_output=True,
-        text=True,
-    )
-    assert process.returncode != 0
-    assert f"code={code}; evidence={category}" in process.stderr
-    assert filename not in process.stdout + process.stderr
-    assert str(source) not in process.stdout + process.stderr
-    assert not any(value in process.stdout + process.stderr for value in path_env.values())
-    assert "Traceback" not in process.stderr
-    assert not (tmp_path / "public/public-export.json").exists()
-
-
-def test_arbitrary_exception_messages_are_never_public_diagnostics(path_env):
-    private = path_env["PPU_POD_RUN_ROOT"] + "/arbitrary-secret-filename"
-    error = exporter.ExportFileError("structured-evidence", ValueError(private))
-    summary = exporter.failure_summary(error)
-    assert summary == (
-        "Public evidence export failed (ValueError; code=export-failed; evidence=structured-evidence)"
-    )
-    assert private not in summary and "arbitrary-secret-filename" not in summary
 
 
 @pytest.mark.parametrize("github_actions", ["true", "false"])

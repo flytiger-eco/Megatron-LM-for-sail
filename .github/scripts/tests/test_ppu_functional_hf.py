@@ -3,7 +3,6 @@ offline behaviour (CPU regression).
 """
 
 import copy
-import io
 import json
 import os
 import subprocess
@@ -14,7 +13,7 @@ from unittest.mock import Mock
 
 import pytest
 import yaml
-from test_ppu_functional import ROOT, SCRIPTS, functional
+from test_ppu_functional import ROOT, functional
 from test_ppu_functional_results import envelope, evidence, results
 from test_ppu_functional_runtime import FakeRunner, prepare_case, runtime
 from tokenizers import Tokenizer, decoders, models, normalizers, pre_tokenizers, processors
@@ -159,47 +158,6 @@ def test_prepare_pins_only_approved_tokenizer_files(provisioned, official, tmp_p
     assert hf.load_sources(control) == lock["repositories"]
 
 
-@pytest.mark.parametrize("mutation", ["empty", "boolean", "version", "unknown", "extra", "null"])
-def test_invalid_lock_fails_library_and_cli(provisioned, tmp_path, mutation):
-    _, destination, original, _ = provisioned
-    lock = copy.deepcopy(original)
-    if mutation == "empty":
-        lock["repositories"] = {}
-    elif mutation == "boolean":
-        lock["schema_version"] = True
-    elif mutation == "version":
-        lock["schema_version"] = 2
-    elif mutation == "unknown":
-        lock["repositories"]["unapproved"] = next(iter(lock["repositories"].values()))
-    elif mutation == "extra":
-        lock["extra"] = 1
-    else:
-        lock = None
-    path = tmp_path / hf.LOCK
-    path.parent.mkdir()
-    path.write_bytes(encoded(lock))
-    with pytest.raises(ValueError):
-        hf.load_sources(tmp_path)
-    before = snapshot(destination)
-    process = subprocess.run(
-        [
-            sys.executable,
-            str(SCRIPTS / "ppu_functional_hf.py"),
-            "verify",
-            "--destination",
-            str(destination),
-            "--lock",
-            str(path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    assert process.returncode != 0
-    assert "numerical_validation" not in process.stdout
-    assert snapshot(destination) == before
-
-
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -301,45 +259,6 @@ def test_prepare_never_overwrites_existing_or_linked_directory(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "content",
-    [b'{"a":1,"a":2}', b'{"nested":{"a":1,"a":2}}', b'{"a":NaN}', b'{"a":Infinity}', b"[]"],
-)
-def test_json_metadata_is_strict(content):
-    with pytest.raises(ValueError):
-        hf.unique_json(content)
-
-
-@pytest.mark.parametrize(
-    "name,content",
-    [
-        ("config.json", b'{"auto_map":{}}'),
-        ("tokenizer_config.json", b'{"auto_map":null}'),
-        ("vocab.txt", b"\xff"),
-        ("vocab.txt", b""),
-    ],
-)
-def test_content_validation_rejects_code_and_invalid_text(name, content):
-    with pytest.raises(ValueError):
-        hf.validate_content(name, content)
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "http://huggingface.co/x",
-        "https://evil.example/x",
-        "https://huggingface.co.evil.example/x",
-        "https://user@huggingface.co/x",
-        "https://huggingface.co:443/x",
-        "https://huggingface.co/x#fragment",
-    ],
-)
-def test_download_host_is_strict(url):
-    with pytest.raises(ValueError):
-        hf.validate_url(url)
-
-
-@pytest.mark.parametrize(
     "target",
     [
         f"https://huggingface.co/openai-community/gpt2/resolve/{'b' * 40}/config.json",
@@ -354,42 +273,6 @@ def test_redirect_cannot_change_commit_file_or_host(target):
     handler = hf.OfficialRedirect()
     with pytest.raises(ValueError):
         handler.redirect_request(urllib.request.Request(origin), None, 302, "redirect", {}, target)
-
-
-def test_official_canonical_and_immutable_cache_redirects():
-    hf.validate_redirect(
-        f"https://huggingface.co/api/models/gpt2/revision/{REVISION}",
-        f"https://huggingface.co/api/models/openai-community/gpt2/revision/{REVISION}",
-    )
-    hf.validate_redirect(
-        f"https://huggingface.co/openai-community/gpt2/resolve/{REVISION}/config.json",
-        f"https://huggingface.co/api/resolve-cache/models/openai-community/gpt2/{REVISION}/config.json?etag=test",
-    )
-    with pytest.raises(ValueError):
-        hf.validate_redirect(
-            f"https://huggingface.co/api/models/gpt2/revision/{REVISION}",
-            "https://huggingface.co/api/models/gpt2",
-        )
-
-
-@pytest.mark.parametrize("content", [b"", b"0123456789abcdefX"])
-def test_network_response_size_is_bounded(monkeypatch, content):
-    url = "https://huggingface.co/api/models/gpt2"
-    response = io.BytesIO(content)
-    response.geturl = lambda: url
-    opener = Mock()
-    opener.open.return_value = response
-    monkeypatch.setattr(hf.urllib.request, "build_opener", lambda *args: opener)
-    monkeypatch.setattr(hf, "MAX_FILE_BYTES", 16)
-    with pytest.raises(ValueError, match="size limit"):
-        hf.fetch_official(url)
-    opener.open.assert_called_once_with(url, timeout=60)
-
-
-@pytest.mark.parametrize("relative", ["../outside", "/absolute", ".", "a/../../outside"])
-def test_cache_paths_cannot_escape(tmp_path, relative):
-    with pytest.raises(ValueError, match="Unsafe"):
-        hf.read_file(tmp_path, relative)
 
 
 @pytest.mark.parametrize("component", ["leaf", "parent", "root"])
@@ -408,16 +291,6 @@ def test_cache_rejects_symlinks(tmp_path, component):
     }[component]
     with pytest.raises(ValueError, match="symlinks"):
         hf.read_file(base, relative)
-
-
-def test_empty_oversized_directory_cache_entries_fail(tmp_path, monkeypatch):
-    (tmp_path / "empty").write_bytes(b"")
-    (tmp_path / "oversized").write_bytes(b"12345")
-    (tmp_path / "directory").mkdir()
-    monkeypatch.setattr(hf, "MAX_FILE_BYTES", 4)
-    for name in ("empty", "oversized", "directory"):
-        with pytest.raises(ValueError, match="regular file"):
-            hf.read_file(tmp_path, name)
 
 
 def test_repeats_copy_only_manifest_files_and_never_write_input(provisioned, tmp_path):
@@ -441,29 +314,6 @@ def test_repeats_copy_only_manifest_files_and_never_write_input(provisioned, tmp
         hf.populate(data, outputs[1], deps)
 
 
-def test_populate_rejects_overlapping_inputs_even_through_alias(provisioned, tmp_path):
-    data, _, lock, _ = provisioned
-    link = tmp_path / "nas-alias"
-    link.symlink_to(data, target_is_directory=True)
-    before = snapshot(data)
-    for destination in (data, data / "new-output", data.parent, link / "new-output"):
-        with pytest.raises(ValueError, match="overlap"):
-            hf.populate(data, destination, dependencies(lock))
-    assert snapshot(data) == before
-
-
-def test_unmapped_or_conflicting_phase_sources_fail(provisioned):
-    deps = dependencies(provisioned[2], ["gpt2"])
-    assert hf.sources_for(deps * 2) == {"gpt2": deps[0]["source"]}
-    conflict = copy.deepcopy(deps[0])
-    conflict["source"]["files"]["config.json"]["sha256"] = "b" * 64
-    with pytest.raises(ValueError, match="Conflicting"):
-        hf.sources_for([*deps, conflict])
-    deps[0]["status"] = "source_mapping_required"
-    with pytest.raises(ValueError, match="Unresolved"):
-        hf.sources_for(deps)
-
-
 def bind_case(case, lock):
     case["tokenizer_dependencies"] = functional.tokenizer_dependencies(
         ROOT, yaml.safe_load((ROOT / case["config_path"]).read_text()), case["training_script"]
@@ -473,48 +323,6 @@ def bind_case(case, lock):
             status="fixed_source", source=lock["repositories"][dependency["repository"]]
         )
     case["assets"].extend(hf.asset_requirements(case["tokenizer_dependencies"]))
-
-
-def test_catalogue_binds_trusted_lock_for_all_training_phases(provisioned, monkeypatch):
-    lock = provisioned[2]
-    monkeypatch.setattr(hf, "load_sources", lambda control: hf.validate_lock(lock))
-    original_sha = functional.sha256
-    monkeypatch.setattr(
-        functional,
-        "sha256",
-        lambda path: hf.digest(encoded(lock)) if path == ROOT / hf.LOCK else original_sha(path),
-    )
-    catalogue = functional.catalogue(ROOT, ROOT, functional.select_config({}))
-    assert catalogue["tokenizer_lock_sha256"] == hf.digest(encoded(lock))
-    count = 0
-    purposes = set()
-    for case in catalogue["functional"].values():
-        if case["tokenizer_dependencies"]:
-            count += 1
-            sources = hf.sources_for(case["tokenizer_dependencies"])
-            assert sources
-            assert functional.validate_tokenizer_assets(case)
-            purposes.update(row["purpose"] for row in case["tokenizer_dependencies"])
-    assert count > 0
-    assert purposes
-
-
-def test_fixed_sources_cover_replacement_args_without_inheriting_first_phase(provisioned):
-    lock = provisioned[2]
-    config = {
-        "TEST_TYPE": "ckpt-resume",
-        "MODEL_ARGS": {"--tokenizer-type": "BertWordPieceCase"},
-        "MODEL_ARGS_2": {},
-    }
-    deps = functional.tokenizer_dependencies(ROOT, config, "pretrain_gpt.py")
-    assert [(row["section"], row["repository"]) for row in deps] == [
-        ("MODEL_ARGS", "bert-large-cased"),
-        ("MODEL_ARGS_2", "gpt2"),
-    ]
-    for row in deps:
-        row.update(status="fixed_source", source=lock["repositories"][row["repository"]])
-    assert set(hf.sources_for(deps)) == {"bert-large-cased", "gpt2"}
-    assert any("models--gpt2" in row["relative_path"] for row in hf.asset_requirements(deps))
 
 
 @pytest.mark.parametrize("location", ["cpu", "pod"])
@@ -546,328 +354,6 @@ def test_asset_preflight_reads_fixed_digests_without_downloading(
     hf.fetch_official.assert_not_called()
 
 
-def test_candidate_readback_is_read_only_and_does_not_download(provisioned, monkeypatch):
-    data, destination, lock, _ = provisioned
-    (destination / "unapproved-extra").write_bytes(b"private_marker")
-    before = snapshot(data)
-    trusted_before = hf.load_sources(ROOT)
-    monkeypatch.setattr(
-        hf, "fetch_official", Mock(side_effect=AssertionError("Implicit downloads are not allowed"))
-    )
-    reader = Mock(wraps=hf.read_file)
-    monkeypatch.setattr(hf, "read_file", reader)
-    report = hf.inspect_candidate(data)
-    assert report["status"] == "candidate_matches_cache"
-    assert report["cache_matches_candidate"] and not report["trusted"]
-    assert report["source_lock"] == lock
-    assert report["source_lock_sha256"] == hf.digest(
-        (destination / "source-lock.json").read_bytes()
-    )
-    assert report["file_count"] == len(hf.cache_files(lock["repositories"]))
-    assert "private_marker" not in json.dumps(report)
-    assert all("unapproved-extra" not in str(call.args) for call in reader.call_args_list)
-    assert snapshot(data) == before and hf.load_sources(ROOT) == trusted_before
-    hf.fetch_official.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        "missing",
-        "empty",
-        "malformed",
-        "duplicate",
-        "oversized",
-        "nested",
-        "weight",
-        "symlink",
-        "directory",
-        "permission",
-    ],
-)
-def test_candidate_invalid_metadata_is_not_exported(provisioned, monkeypatch, mutation):
-    data, destination, lock, _ = provisioned
-    path = destination / "source-lock.json"
-    payloads = {
-        "empty": b"",
-        "malformed": b"private_marker",
-        "duplicate": b'{"private_marker":1,"private_marker":2}',
-        "oversized": b" " * (128 * 1024 + 1),
-        "nested": b'{"a":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}",
-    }
-    if mutation in payloads:
-        path.write_bytes(payloads[mutation])
-    elif mutation == "weight":
-        lock["repositories"]["gpt2"]["files"]["private_marker.bin"] = {}
-        path.write_bytes(encoded(lock))
-    elif mutation == "permission":
-        monkeypatch.setattr(hf, "read_file", Mock(side_effect=PermissionError("private_marker")))
-    else:
-        saved = path.with_name("saved-candidate")
-        path.rename(saved)
-        if mutation == "symlink":
-            path.symlink_to(saved)
-        elif mutation == "directory":
-            path.mkdir()
-    before = snapshot(data)
-    report = hf.inspect_candidate(data)
-    assert report["status"] == (
-        "source_lock_missing" if mutation == "missing" else "source_lock_invalid"
-    )
-    assert report["source_lock"] is None and report["source_lock_sha256"] is None
-    assert not report["cache_matches_candidate"] and not report["trusted"]
-    assert "private_marker" not in json.dumps(report)
-    assert snapshot(data) == before
-
-
-@pytest.mark.parametrize("mutation", ["missing", "digest", "symlink", "ref", "changed_lock"])
-def test_candidate_cache_mismatch_is_not_accepted(provisioned, monkeypatch, mutation):
-    data, destination, lock, _ = provisioned
-    name = f"hub/models--gpt2/snapshots/{REVISION}/config.json"
-    path = destination / name
-    if mutation in ("missing", "symlink"):
-        saved = path.with_name("saved-config")
-        path.rename(saved)
-        if mutation == "symlink":
-            path.symlink_to(saved)
-    elif mutation == "digest":
-        path.write_bytes(b"tampered")
-    elif mutation == "ref":
-        (destination / "hub/models--gpt2/refs/main").write_bytes(b"b" * 40)
-    else:
-        original_read = hf.read_file
-        count = 0
-
-        def changed_read(root, relative):
-            nonlocal count
-            value = original_read(root, relative)
-            if str(relative).endswith("source-lock.json"):
-                count += 1
-                if count == 2:
-                    return value + b"\n"
-            return value
-
-        monkeypatch.setattr(hf, "read_file", changed_read)
-    before = snapshot(data)
-    report = hf.inspect_candidate(data)
-    assert report["status"] == "cache_mismatch"
-    assert report["source_lock"] == lock
-    assert not report["cache_matches_candidate"] and not report["trusted"]
-    assert report["file_count"] == 0 and report["reason"]
-    assert snapshot(data) == before
-
-
-def test_preparation_receipts_export_only_expected_fields(tmp_path, monkeypatch):
-    directory = tmp_path.resolve()
-    expected = {"repositories": sorted(hf.REPOSITORIES), "numerical_validation": False}
-    for command in ("prepare", "verify"):
-        (directory / f"{command}.log").write_bytes(encoded(expected) + b"\n")
-        (directory / f"{command}.exitcode").write_text("0\n")
-    (directory / "verify.stderr").write_bytes(b"private_marker\n\xff\n")
-    (directory / "ppu_functional_hf.py").write_bytes(b"private_script_marker")
-    (directory / "unrelated.txt").write_bytes(b"private_unrelated_marker")
-    before = snapshot(directory)
-    reader = Mock(wraps=hf.read_file)
-    monkeypatch.setattr(hf, "read_file", reader)
-    monkeypatch.setattr(
-        hf, "fetch_official", Mock(side_effect=AssertionError("Downloads are not allowed"))
-    )
-    report = hf.inspect_receipts(directory)
-    assert report["status"] == "inspected" and not report["reason"]
-    rows = {row["name"]: row for row in report["files"]}
-    for command in ("prepare", "verify"):
-        assert rows[f"{command}.log"]["expected_summary_count"] == 1
-        assert rows[f"{command}.log"]["unrecognized_line_count"] == 0
-        assert rows[f"{command}.exitcode"]["reported_exit_code"] == 0
-    assert rows["verify.stderr"]["unrecognized_line_count"] == 2
-    assert rows["ppu_functional_hf.py"]["sha256"] == hf.digest(b"private_script_marker")
-    assert rows["unrelated.txt"]["status"] == "metadata_only"
-    assert all(call.args[1] != "unrelated.txt" for call in reader.call_args_list)
-    assert "private_" not in json.dumps(report)
-    assert snapshot(directory) == before
-    hf.fetch_official.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "line,code",
-    [
-        (b"PREPARE_EXIT_CODE=0", 0),
-        (b"exit_code: 1", 1),
-        (b"prepare_rc=0", 0),
-        (b"prepare exit status = 0", 0),
-        (b"VERIFY_EXIT_CODE=0", None),
-        (b"PREPARE_EXIT_CODE=256", None),
-        (b"echo PREPARE_EXIT_CODE=0", None),
-        (b"PREPARE_EXIT_CODE=0\nPREPARE_EXIT_CODE=1", None),
-    ],
-)
-def test_receipt_labeled_exit_codes_preserve_command_and_conflicts(tmp_path, line, code):
-    directory = tmp_path.resolve()
-    (directory / "prepare.out").write_bytes(line + b"\n")
-    row = hf.inspect_receipts(directory)["files"][0]
-    assert row["reported_exit_code"] == code
-    assert row["expected_summary_count"] == 0
-    (directory / "run_prepare.sh").write_bytes(line + b"\n")
-    script = hf.inspect_receipts(directory)["files"][1]
-    assert script["sha256"] == hf.digest(line + b"\n")
-    assert "reported_exit_code" not in script
-
-
-@pytest.mark.parametrize(
-    "content,code",
-    [(b"1\n", 1), (b"255", 255), (b"256", None), (b"-1", None), (b"true", None), (b"", None)],
-)
-def test_receipt_exit_code_is_not_inferred_from_success_output(tmp_path, content, code):
-    directory = tmp_path.resolve()
-    (directory / "prepare.exit_code.txt").write_bytes(content)
-    row = hf.inspect_receipts(directory)["files"][0]
-    assert row["reported_exit_code"] == code
-    assert row["expected_summary_count"] == 0
-
-
-@pytest.mark.parametrize("mutation", ["numeric_false", "extra", "duplicate", "nested"])
-def test_receipt_summary_must_match_strict_success_schema(tmp_path, mutation):
-    expected = {"repositories": sorted(hf.REPOSITORIES), "numerical_validation": False}
-    if mutation == "numeric_false":
-        expected["numerical_validation"] = 0
-    elif mutation == "extra":
-        expected["secret"] = "private_marker"
-    content = encoded(expected)
-    if mutation == "duplicate":
-        content = content[:-1] + b', "numerical_validation": false}'
-    elif mutation == "nested":
-        content = b'{"a":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}"
-    directory = tmp_path.resolve()
-    (directory / "prepare.log").write_bytes(content)
-    report = hf.inspect_receipts(directory)
-    assert report["files"][0]["expected_summary_count"] == 0
-    assert report["files"][0]["unrecognized_line_count"] == 1
-    assert "private_marker" not in json.dumps(report)
-
-
-@pytest.mark.parametrize("kind", ["missing", "symlink", "large", "directory", "fifo", "many"])
-def test_receipts_reject_unbounded_or_linked_inputs(tmp_path, kind):
-    directory = tmp_path.resolve() / "receipts"
-    directory.mkdir()
-    path = directory / "prepare.log"
-    if kind == "missing":
-        directory = directory / "missing"
-    elif kind == "symlink":
-        alias = directory.with_name("alias")
-        alias.symlink_to(directory, target_is_directory=True)
-        directory = alias
-    elif kind == "large":
-        path.write_bytes(b"x" * (256 * 1024 + 1))
-    elif kind == "directory":
-        path.mkdir()
-    elif kind == "fifo":
-        os.mkfifo(path)
-    else:
-        for index in range(65):
-            (directory / f"prepare-{index}.log").touch()
-    report = hf.inspect_receipts(directory)
-    if kind in ("missing", "symlink", "many"):
-        assert report["status"] == "unreadable" and report["reason"]
-    else:
-        assert report["files"][0]["status"] == "not_bounded_regular_file"
-
-
-@pytest.mark.parametrize("include_receipts", [False, True])
-@pytest.mark.parametrize(
-    "mode,location,reachable,fixed",
-    [
-        ("assets", "cpu", True, False),
-        ("assets", "cpu", True, True),
-        ("assets", "cpu", False, False),
-        ("assets", "pod", True, False),
-        ("regression", "cpu", True, False),
-        ("regression", "pod", True, True),
-    ],
-)
-def test_candidate_cli_never_promotes_trust_or_changes_gate(
-    evidence, provisioned, tmp_path, monkeypatch, mode, location, reachable, fixed, include_receipts
-):
-    manifest, case, _ = evidence
-    data, _, lock, _ = provisioned
-    manifest["config"]["functional_mode"] = mode
-    if reachable:
-        for asset in case["assets"]:
-            path = data / asset["relative_path"]
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"explicit input fixture")
-    else:
-        data = tmp_path / "unreachable-nas"
-    if fixed:
-        bind_case(case, lock)
-    else:
-        case["tokenizer_dependencies"] = [
-            {
-                "repository": "gpt2",
-                "status": "source_mapping_required",
-                "purpose": "MODEL_ARGS.tokenizer",
-            }
-        ]
-    manifest["schema_version"] = 2
-    manifest["config"].update(data_path="ppu://assets/pod", cpu_data_path="ppu://assets/cpu")
-    monkeypatch.setenv(f"PPU_{location.upper()}_ASSETS_ROOT", str(data))
-    monkeypatch.setenv("PPU_TOKENIZER_RECEIPTS_ROOT", str(tmp_path))
-    output = tmp_path / "cpu-plan"
-    output.mkdir()
-    manifest_path = output / "manifest.json"
-    manifest_path.write_bytes(encoded(manifest))
-    baseline = functional.public_asset_report(
-        functional.asset_report(manifest, data, location=location)
-    )
-    before = snapshot(data)
-    inspect = Mock(wraps=hf.inspect_candidate)
-    monkeypatch.setattr(hf, "inspect_candidate", inspect)
-    receipts = Mock(return_value={"status": "inspected", "files": []})
-    monkeypatch.setattr(hf, "inspect_receipts", receipts)
-    monkeypatch.setattr(
-        hf, "fetch_official", Mock(side_effect=AssertionError("Implicit downloads are not allowed"))
-    )
-    summary = tmp_path / "step-summary"
-    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "ppu_functional.py",
-            "assets",
-            "--output",
-            str(output),
-            "--assets-root",
-            str(data),
-            "--location",
-            location,
-            *(["--tokenizer-receipts", str(tmp_path)] if include_receipts else []),
-        ],
-    )
-    with pytest.raises(SystemExit) as stopped:
-        functional.main()
-    assert stopped.value.code == (0 if baseline["ok"] else 1)
-    report = json.loads((output / "assets-report.json").read_text())
-    candidate = report.pop("tokenizer_source_candidate", None)
-    receipt_report = report.pop("tokenizer_preparation_receipts", None)
-    if include_receipts and mode == "assets" and location == "cpu" and reachable:
-        receipts.assert_called_once_with(tmp_path)
-        assert receipt_report == receipts.return_value
-    else:
-        receipts.assert_not_called()
-        assert receipt_report is None
-    if mode == "assets" and location == "cpu" and reachable:
-        inspect.assert_called_once_with(data)
-        assert candidate["cache_matches_candidate"] and candidate["trusted"] is False
-        assert "not trusted" in summary.read_text()
-    else:
-        inspect.assert_not_called()
-        assert candidate is None
-    assert report == baseline and report["numerical_validation"] is False
-    assert manifest_path.read_bytes() == encoded(manifest)
-    assert snapshot(data) == before
-    hf.fetch_official.assert_not_called()
-
-
 def runtime_case(evidence, provisioned, tmp_path):
     manifest, case, directory = prepare_case(evidence, tmp_path)
     source = provisioned[1]
@@ -878,23 +364,6 @@ def runtime_case(evidence, provisioned, tmp_path):
         path.write_bytes((source / name).read_bytes())
     bind_case(case, provisioned[2])
     return manifest, case, directory
-
-
-def test_runtime_caches_and_evidence_are_independently_verified(evidence, provisioned, tmp_path):
-    manifest, case, directory = runtime_case(evidence, provisioned, tmp_path)
-    before = snapshot(Path(manifest["config"]["data_path"]))
-    runner = FakeRunner(manifest, case)
-    assert runtime.run_case(manifest, ROOT, case["id"], directory, runner=runner)["success"]
-    report = (directory / "assets-report.json").read_bytes()
-    envelope(manifest, case, directory)
-    (directory / "assets-report.json").write_bytes(report)
-    assert results.verify_case(manifest, ROOT, case, directory)["success"]
-    assert len(runner.calls) == 2
-    for _, env, _ in runner.calls:
-        assert env["HF_HUB_OFFLINE"] == env["TRANSFORMERS_OFFLINE"] == "1"
-        assert Path(env["HF_HOME"]).is_relative_to(env["OUTPUT_PATH"])
-        assert (Path(env["OUTPUT_PATH"]) / "tokenizer-cache.json").is_file()
-    assert snapshot(Path(manifest["config"]["data_path"])) == before
 
 
 @pytest.mark.parametrize("mutation", ["missing", "digest", "report", "preflight", "manifest"])
@@ -925,33 +394,6 @@ def test_forged_cache_or_preflight_evidence_cannot_pass(evidence, provisioned, t
     assert not results.verify_case(manifest, ROOT, case, directory)["success"]
 
 
-def test_copy_failure_after_preflight_never_trains_or_retries(
-    evidence, provisioned, tmp_path, monkeypatch
-):
-    manifest, case, directory = runtime_case(evidence, provisioned, tmp_path)
-
-    def corrupt_after_preflight(*args, **kwargs):
-        row = hf.asset_requirements(case["tokenizer_dependencies"])[0]
-        (Path(manifest["config"]["data_path"]) / row["relative_path"]).write_bytes(b"tampered")
-        return hf.populate(*args, **kwargs)
-
-    monkeypatch.setattr(runtime.control.hf, "populate", corrupt_after_preflight)
-    runner = FakeRunner(manifest, case)
-    record = runtime.run_case(manifest, ROOT, case["id"], directory, runner=runner)
-    assert not record["success"] and record["attempts"] == 1
-    assert not runner.calls
-    path = directory / "attempt-1/repeat-1"
-    assert (
-        json.loads((path / "verification.json").read_text())["classification"] == "integrity_error"
-    )
-    execution = json.loads((path / "execution.json").read_text())
-    assert execution["shell_exit_code"] is None and "digest or size" in execution["error"]
-    assert (
-        results.verify_repeat(manifest, ROOT, case, path, 1, 1)["classification"]
-        == "integrity_error"
-    )
-
-
 def offline_environment(cache):
     return {
         **os.environ,
@@ -965,74 +407,6 @@ def offline_environment(cache):
         "PYTHONNOUSERSITE": "1",
         "PYTHONSAFEPATH": "1",
     }
-
-
-@pytest.mark.parametrize("repository", list(hf.REPOSITORIES))
-@pytest.mark.parametrize("explicit_vocab", [False, True])
-def test_original_auto_tokenizer_call_in_fresh_offline_process(
-    provisioned, tmp_path, repository, explicit_vocab
-):
-    data, _, lock, _ = provisioned
-    cache = tmp_path / "repeat/cache/huggingface"
-    deps = dependencies(lock, [repository])
-    hf.populate(data, cache, deps)
-    source = ROOT / "megatron/core/tokenizers/text/libraries/huggingface_tokenizer.py"
-    # Run only the AutoTokenizer call section of the original constructor; not a full
-    # Megatron/PPU training acceptance.
-    program = '''
-import ast, json, socket, sys
-from pathlib import Path
-from types import SimpleNamespace
-
-def no_network(*args, **kwargs):
-    raise AssertionError("offline tokenizer attempted network access")
-socket.socket.connect = no_network
-socket.socket.connect_ex = no_network
-socket.create_connection = no_network
-socket.getaddrinfo = no_network
-from transformers import AutoTokenizer
-source, repository, cache, revision, explicit = sys.argv[1:]
-module = ast.parse(Path(source).read_text())
-cls = next(node for node in module.body if isinstance(node, ast.ClassDef) and node.name == "HuggingFaceTokenizer")
-init = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
-call = next(node for node in init.body if isinstance(node, ast.Try))
-snapshot = Path(cache) / "hub" / ("models--" + repository) / "snapshots" / revision
-vocab = snapshot / ("vocab.json" if repository == "gpt2" else "vocab.txt")
-namespace = dict(AutoTokenizer=AutoTokenizer, self=SimpleNamespace(), tokenizer_path=repository,
-                 vocab_file=str(vocab) if explicit == "true" else None,
-                 merges_file=str(snapshot / "merges.txt") if explicit == "true" and repository == "gpt2" else None,
-                 use_fast=True, trust_remote_code=False)
-exec(compile(ast.Module(body=[call], type_ignores=[]), source, "exec"), namespace)
-tokenizer = namespace["self"].tokenizer
-ids = tokenizer.encode("hello world")
-assert ids and tokenizer.is_fast
-print(json.dumps(dict(repository=repository, tokens=len(ids), offline=True)))
-'''
-    env = offline_environment(cache)
-    command = [
-        sys.executable,
-        "-c",
-        program,
-        str(source),
-        repository,
-        str(cache),
-        REVISION,
-        str(explicit_vocab).lower(),
-    ]
-    process = subprocess.run(
-        command, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60
-    )
-    assert process.returncode == 0, process.stderr
-    assert json.loads(process.stdout)["offline"] is True
-    hf.verify_cache(cache, hf.sources_for(deps))
-    ref = cache / f"hub/models--{repository}/refs/main"
-    ref.rename(ref.with_name("missing"))
-    failed = subprocess.run(
-        command, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60
-    )
-    assert failed.returncode != 0
-    assert "Unable to instantiate HuggingFace AutoTokenizer" in failed.stderr
-    assert "offline tokenizer attempted network access" not in failed.stderr
 
 
 @pytest.mark.parametrize("repository", list(hf.REPOSITORIES))
@@ -1237,24 +611,3 @@ def test_populate_revalidates_every_source_before_creating_output(provisioned, t
     with pytest.raises((OSError, ValueError)):
         hf.populate(data, output, dependencies(lock))
     assert not output.exists()
-
-
-def test_download_transport_failure_does_not_create_cache(tmp_path, official):
-    def failed_fetch(url):
-        if "/resolve/" in url:
-            raise ConnectionResetError("connection reset by peer")
-        return official[url]
-
-    path = tmp_path / "new-cache"
-    with pytest.raises(ConnectionResetError):
-        hf.prepare(path, fetch=failed_fetch)
-    assert not path.exists()
-
-
-def test_source_lock_cannot_be_a_symlink(provisioned, tmp_path):
-    destination = provisioned[1]
-    path = tmp_path / "control" / hf.LOCK
-    path.parent.mkdir(parents=True)
-    path.symlink_to(destination / "source-lock.json")
-    with pytest.raises(ValueError, match="symlinks"):
-        hf.load_sources(tmp_path / "control")

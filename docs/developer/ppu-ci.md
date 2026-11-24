@@ -1,311 +1,103 @@
-# SAIL PPU CI 维护
+# SAIL PPU CI
 
-本分支聚焦正式 PPU CI：复用上游训练脚本与比较器，在 SAIL runner 上执行。
-维护提交统一使用 `DavidSophus <95245426@qq.com>`。历史专项诊断和本地调试工具
-已移出交付内容。
+复用 NV recipe、UT/FT 驱动和数值比较器。SAIL 只维护准入与选例、平台镜像、
+runner/NAS 接线、M890 golden 和结果汇总；不在适配层重新实现模型测试。
 
-## 同步与 PR 的统一入口
-
-代码同步沿用主线已有的 Copilot 同步流程；这里仅增加发布结果与测试流水线的交接。
-main 发布同步候选分支并创建 PR，dev 直接发布到 dev；原有合并和冲突处理逻辑不变。
-同步发布成功后，worker 输出 `sync_request`（被测 SHA、两个父提交、发布分支），
-父 workflow 直接调用 `ppu-build.yml` 的 `workflow_call`，再复用同一套 Build→UT→FT。
-不依赖 `GITHUB_TOKEN` 的 push 触发后续 Actions。main 和 dev 的 artifacts、NAS 目录分别使用
-`sync-main-` / `sync-dev-` 前缀，共享仓库级 `sail-ppu-hardware` 串行队列。
-排队的 PR 在进入设备前重新检查 head/base 和状态归属。测试失败不会回滚已发布的 dev 同步提交。
-没有新提交、仅 dry-run 或发布失败时，不输出交接请求，也不启动同步后的硬件测试。
-
-普通分支更新、同步及无标签 PR 共用 UT 的 `quick` 范围；FT 默认使用相同的上游 L0 测试集、一次重复、30 分钟预算。
-其中上游标注为 lightweight 的 case 只记录观察结果，不计为数值精度通过；其余 case 使用正式 golden 比较。
-`Run tests` 保留显式轻量观察模式，`Run functional tests` 可扩大到 L1；常规路径不需要标签。
-文档和纯 CI 编排 PR 可豁免硬件测试，CPU 检查按各 workflow 的路径规则触发；
-执行器、镜像/依赖、recipe、golden、被测代码变更仍运行硬件测试。同步与普通 push 不做路径豁免。
-改名同时检查原路径，变更列表不完整时不豁免。
-
-GitHub 自 2025-12-08 起从默认分支加载 `pull_request_target`，即使 PR 合入 dev，控制代码仍来自 main。
-因此入口用 PR 的 `base.ref` 判断目标分支，用默认分支 SHA 固定控制代码。
-自动 PR 事件入口必须在 main 上线后验收；历史独立分支验证使用真实 PR 的 full-SHA 手动授权。
-参考：[GitHub 变更说明](https://github.blog/changelog/2025-11-07-actions-pull_request_target-and-environment-branch-protections-changes/)。
-
-正式入口只信任 main/dev；临时测试分支、同步模拟交接和专用组合 smoke 模式不进入正式控制代码。
-已有集成测试分支保留这些验证工具和历史记录；后续改动先运行 CPU 控制测试，再按需选择单个设备 case。
-
-dev 的 UT recipe 目前还包含 `examples/multimodal_dev/tests` 和 2/4 卡分组。
-选择器直接读取 recipe 的 `gpus`，GTP bucket 按上游脚本显式设置的 `GPUS_PER_NODE=4` 执行；
-这条例外集中在 `ppu_policy.py`。新增测试根目录、超出单机 1/2/4/8 卡的拓扑会在 CPU 选例阶段报错。
-NVRx 预检查同时支持旧 `get_async_strategy()` 与 dev 的直接 NVRx 接口，环境报告记录 `source_api`。
-两条路径均检查上游能力和原始 API 签名，不创建 checkpoint worker，也不因接口变化跳过检查。
-构建阶段的推理通信预检查也集中在 `ppu_functional_environment.py`：根据实际 engine 类的来源，
-检查旧 `dynamic_engine` 或 dev 拆分后的 `dynamic.coordinator` 中的 ZMQ/MessagePack 能力；
-未知布局和缺少能力均失败，日志记录本轮检查的模块。
-
-## 准入与测试范围的维护边界
-
-流程沿用 NV 的职责划分：preflight 确认本轮是否需要设备测试并固定待测版本，
-configure 再展开 recipe、生成 UT/FT 计划。SAIL 的入口仍是现有 `pull_request_target`、
-同步交接和手动运行；没有接入 NV 的 copy-pr-bot，也没有直接调用依赖合成 PR 分支元数据的
-`NVIDIA-NeMo/FW-CI-templates/_cicd_preflight.yml`。NVIDIA SSO 和 NV runner 路由不属于 SAIL 准入策略。
-参考：[NV 主 workflow](https://github.com/NVIDIA/Megatron-LM/blob/main/.github/workflows/cicd-main.yml)、
-[本次对照的共享 preflight](https://github.com/NVIDIA-NeMo/FW-CI-templates/blob/037094bcc9138c72bc125418e6e3653f9e1c4160/.github/workflows/_cicd_preflight.yml)。
-
-维护策略时先查看 `ppu_policy.py`：
-
-| 要调整的规则 | 位置 |
-|---|---|
-| 可测试的分支、手动运行权限 | `BRANCHES`、`MANUAL_RUN_PERMISSIONS` |
-| 文档/CI 路径豁免 | `CPU_ONLY_PREFIXES`、`CPU_ONLY_FILES`、`cpu_only_path()` |
-| PR 标签优先级、默认 FT 范围/重复/预算 | `SCOPE_LABELS`、`FUNCTIONAL_EVENT_POLICIES` |
-| 手动输入和 UT/FT 路由约束 | `validate_route()`、`functional_request()` |
-
-`ppu_pr_authorize.py` 调用上述策略并读取 GitHub 当前状态，继续负责确认合成 merge 的父提交、
-排队后版本是否过期、最终状态属于哪次运行。它只依赖 Python 标准库和 `ppu_policy.py`，
-不再导入 functional planner、Hugging Face 或 recipe/golden 模块，授权产物也不再携带 planner。
-`ppu_functional.py` 复用同一份输入策略，然后补充设备配置并解析实际 recipe/golden。
-已有 UT quick 分组及阈值继续在 `.github/ppu-pr-tests.json` 中维护。
-
-Actions 的 authorize 汇总列出准入决定、原因、control/target/head/base SHA，以及 FT 范围、
-模式、重复次数和时间预算。这里展示的是本轮计划，数值通过与否仍由后续结果汇总判定。
-SHA 与状态适配目前仍是 SAIL 自有代码；要进一步删除它，需要另行设计机器人/原生 check
-如何绑定 PR head 和合成 merge，不能仅删除脚本后把旧任务结果当作新提交通过。
-
-## 执行路径
+## 流程与触发
 
 ```mermaid
 flowchart TD
-    S[同步成功：发布 SHA 与父提交] --> A[ppu-build.yml 共用入口]
-    P[main/dev PR] --> A
-    U[main/dev 分支更新] --> A
-    A --> B[pr_authorize 固定 control / target SHA]
-    B --> Q{PR 且满足文档或纯 CI 豁免？}
-    Q -->|是| X[硬件豁免；CPU 按路径规则触发]
-    Q -->|否| C[ppu-execute.yml 选例与 manifest]
-    C --> D[CPU 资产预检查]
-    C --> E[构建镜像与封装源码]
-    E --> F[SAIL Pod: UT]
-    E --> G[SAIL Pod: functional_run.sh]
-    D --> G
-    F -->|UT 成功后调度| G
-    G --> H[functional_runtime: 隔离目录、预算、进程清理]
-    H --> I[上游 run_ci_test.sh 与 pytest]
-    I --> J[ci_export 脱敏导出]
-    J --> K[CPU functional_results 复核]
-    K --> L[汇总正式结果]
-    F --> L
+    S[已有同步流程：发布成功] --> A[ppu-build：准入与固定 SHA]
+    P[main/dev push、PR、merge queue] --> A
+    A --> Q{文档或纯 CI 编排 PR？}
+    Q -->|是| X[豁免设备测试]
+    Q -->|否| C[ppu-execute：读取 recipe，生成计划]
+    C --> D[CPU：资产预检查]
+    C --> E[CPU：BuildKit 构建与校验镜像]
+    E --> U[SAIL Pod：UT]
+    U -->|通过| F[SAIL Pod：上游 FT 驱动与比较器]
+    D --> F
+    F --> R[汇总结果并更新状态]
 ```
 
-combined 流程仅在 UT 成功后启动 functional；最终组合结果要求 UT 和 functional 都成功。
-`control_sha` 标识控制代码，`target_sha` 标识被测源码；训练 PR 在旧 control 下通过，
-不能证明该 PR 修改的 CI 脚本已被执行。新控制代码需要单独的 CPU 验证和开发环境验证，
-不能为此放开正式授权规则。
-FT 的 scope、cadence 和预算来自 control 中受信任的 recipe；被测分支的 recipe 可以是另一版本。
-manifest 的 `control_files`、`source_files` 分别记录两者摘要，case 的 `recipe_sha256` 对应被测源码。
-执行前仍逐项验证 source；不能拿 main/control 的摘要要求 dev/source 文件相同。
+- 同步沿用现有 main 候选 PR / dev 直接发布机制。发布后通过 `sync_request`
+  调用 `ppu-build.yml`，无需依赖 `GITHUB_TOKEN` push 再触发 Actions。
+- 普通 push、同步和无标签 PR：UT quick、FT L0、重复一次、每 case 30 分钟训练预算。
+  `Run tests` 选择轻量观察，`Run functional tests` 扩大到 L1。
+- 文档和纯编排 PR 豁免设备；镜像、依赖、执行脚本、recipe、golden 和模型代码仍需测试。
+  自动 combined 路径先 UT 后 FT，共用镜像；任一失败则组合失败。
+- 手动 `ppu-build.yml` 支持单 UT bucket、FT assets 或 regression。assets 不训练；
+  release tag 当前只执行 UT。正式入口只允许 main/dev，临时验证分支另行维护。
+- `ppu-control-tests.yml` 是独立的 CPU 脚本回归，只在相关路径 PR 或手动运行时执行，
+  不是每次 Build/UT/FT 的前置 job，也不消耗 PPU。
 
-## 保留的脚本与责任
+`ppu_policy.py` 集中维护规则；`ppu_pr_authorize.py` 读取 GitHub 状态、固定 head/base/merge SHA，
+并在排队后复查，防止旧提交的结果用于新提交。SAIL 保留 `pull_request_target` 入口，
+没有接入 NV copy-pr-bot 或 NV runner。控制代码来自受信任分支，被测代码使用固定的 target SHA。
 
-以下文件均位于 `.github/scripts/`。CPU 测试在其 `tests/test_ppu_*.py` 下。
+## 维护入口
 
-| 文件 | 维护职责 |
+下表脚本均在 `.github/scripts/`；只为实际平台差异保留适配，不增加通用 CI 框架。
+
+| 内容 | 入口 |
 |---|---|
-| `ppu_policy.py` | 分支/权限/路径准入、UT/FT 输入路由与 FT 范围、UT 拓扑例外和同步产物前缀 |
-| `ppu_pr_authorize.py` | 授权、SHA、过期状态与 PR 状态归属 |
-| `ppu_ci.py`、`ppu_pytest_policy.py` | UT 选例、manifest、排除策略、结果门槛和证据 |
-| `ppu_ci_build.sh`、`ppu_ci_run.sh` | 构建准备和 UT 执行 |
-| `ppu_ci_container.py`、`.sh` | 镜像指纹、构建、导出/恢复和产物校验 |
-| `ppu_ci_paths.py`、`ppu_ci_export.py` | CPU/Pod 存储映射与公共产物脱敏 |
-| `ppu_functional.py` | recipe/golden 选择、计划与资产清单 |
-| `ppu_functional_hf.py` | 固定版本 tokenizer、receipt 与离线缓存 |
-| `ppu_functional_environment.py` | 包/API/工具/设备/编译环境检查 |
-| `ppu_functional_run.sh` | 正式 Pod 执行入口：镜像、环境、runtime |
-| `ppu_functional_runtime.py` | 上游 shell 调用、重复/预算/重试、进程族清理 |
-| `ppu_functional_pytest.py`、`ppu_functional_results.py` | pytest 证据记录及完整结果复核 |
+| 触发、权限、测试范围 | `ppu_policy.py`、`ppu_pr_authorize.py`；UT quick 清单 `.github/ppu-pr-tests.json` |
+| UT | `ppu_ci.py`、`ppu_ci_run.sh`、`ppu_pytest_policy.py`，调用上游 UT 驱动 |
+| FT 选例与运行 | `ppu_functional.py`、`ppu_functional_runtime.py`，调用上游 `run_ci_test.sh` |
+| 平台环境 | `.github/docker/Dockerfile.ppu-ci`、`ppu_ci_container.py`、`ppu_functional_environment.py` |
+| 数据与 tokenizer | `ppu_ci_paths.py`、`ppu_functional_hf.py`、`.github/ppu-functional-tokenizers.json` |
+| 结果与日志 | `ppu_functional_results.py`、`ppu_functional_pytest.py`、`ppu_ci_export.py` |
 
-进程族发现与信号清理函数现位于 runtime 内，不依赖诊断脚本；保留跨 session、孤儿进程、
-PID 重用、超时、取消和实际子进程清理测试。正常日志、错误分类、环境检查不属于可删除的
-临时 debug 内容。模型配置、golden、比较器及正式门槛未随此次清理修改。
+仓库变量 `PPU_CI_ENABLED=true` 开启设备流程；environment 使用 `ppu-ci`。
+存储接线使用 secrets：`PPU_HOST_VOLUMES`、`PPU_CPU_RUN_ROOT`、`PPU_POD_RUN_ROOT`、
+`PPU_CPU_ASSETS_ROOT`、`PPU_POD_ASSETS_ROOT`。CPU 与 Pod 路径必须映射到同一共享数据。
+公共 artifacts 不包含私有路径、checkpoint 或 tokenizer 缓存原件。
 
-维护时先按失败阶段定位，避免重跑整套硬件测试：
+## 镜像与缓存
 
-| 失败位置 / 证据 | 首先检查什么 | 负责文件 |
-|---|---|---|
-| authorize / `authorization.json` | PR 状态、head/base SHA、调用 workflow、是否属于 CPU 豁免路径 | `ppu_pr_authorize.py`、`ppu_policy.py` |
-| configure / `manifest.json`、`functional-manifest.json` | 上游 recipe 变化、被选 case、拓扑、M890 golden 和 tokenizer 锁定文件 | `ppu_ci.py`、`ppu_functional.py` |
-| runtime-environment / Docker 构建日志 | 基础镜像 digest、包约束、离线安装与编译 | `Dockerfile.ppu-ci`、`ppu_ci_container.py` |
-| functional-assets / `assets-report.json` | NAS 映射、数据文件、tokenizer receipt 与缓存 | `ppu_ci_paths.py`、`ppu_functional_hf.py` |
-| build / Pod 状态与构建日志 | 先区分排队、镜像拉取、实际执行，再检查包导入、设备接口与构建产物 | `ppu_ci_build.sh`、`ppu_functional_environment.py` |
-| UT Gate / `summary.json` | 实际执行数、failed/skipped、失败方法与各 rank 日志 | `ppu_ci.py`、`ppu_pytest_policy.py` |
-| Functional gate / `failure_categories`、`execution.json`、`pytest-regular.json` | 训练退出、比较器结果、证据是否完整、case 预算 | `ppu_functional_runtime.py`、`ppu_functional_results.py` |
+构建在 GitHub CPU runner 上进行，基础镜像来自 SAIL；运行镜像以 GHCR digest 交给 PPU。
+依赖来自被测 `pyproject.toml` 的 project/test/training 配置及 SAIL 原生包约束，
+当前不直接消费 NV `uv.lock`。安装与源码编译在镜像构建阶段完成，Pod 内不现场安装依赖。
 
-只有 `infrastructure_retryable` 可在剩余预算内自动重试；数值不一致、OOM、导入失败、证据错误
-不会通过反复重跑变成通过。`observation` 也不会加入 numeric 通过率。修改单个控制模块后，
-先运行对应的 CPU 测试文件；完整控制回归的依赖与命令以 `ppu-control-tests.yml` 为准。
+`.github/actions/ppu-build-cache/action.yml` 选择 registry BuildKit 依赖缓存：
+PR 优先读自己的同指纹缓存，再读目标分支；PR/候选提交分别写独立缓存，main/dev 发布提交更新 baseline。
+指纹由基础镜像 digest、平台和依赖构建输入决定；普通源码变化仍编译源码，但可以复用依赖层。
+缓存存放于 SAIL GHCR，不使用 NV 资源。`ppu-populate-build-cache.yml` 可在 CPU 上预热，
+不是每个 PR 的必需步骤，也不设置周期性预热。
 
-## M890 配置与 golden
+## M890 golden
 
-M890 使用 NVIDIA 的标准 case 目录与平台后缀：
+使用 `tests/functional_tests/test_cases/<model>/<case>/golden_values_dev_m890.json`。
+配置默认复用同目录 `model_config.yaml`；只有保留平台参数差异时才提供 `model_config_m890.yaml`。
+Git 管理 golden 版本，无需中央 baselines JSON 或 snapshot 脚本。
 
-```text
-tests/functional_tests/test_cases/<model>/<case>/
-├── model_config.yaml
-├── golden_values_dev_m890.json
-└── golden_values_dev_m890_2nd.json  # 部分历史 case 的第二份记录
-```
+`m890_model_config()` 集中适配 launcher：默认 torchrun，已有五个 FT launcher case 保持原样。
+历史 `_2nd.json` 只保留采样记录；ckpt-resume 比较本次两阶段输出，不等于验证故障注入恢复。
+轻量观察、缺资产跳过均不计作数值通过；缺 golden 或比较失败不能静默通过。
 
-迁移保留 93 份主 golden、38 份第二次运行 golden 的原始字节，不重新采样、不修改比较精度。
-第二份 golden 仅作为来源记录；ckpt-resume 仍由上游比较器比较本次两阶段训练结果。
-92 个 case 直接使用上游 `model_config.yaml`，删除平行的 `zhenwu_test_cases` 配置树。
-蒸馏 case `gpt/gpt3_mcore_te_tp2_pp1_modelopt_distill_resume` 的历史训练参数另存为
-同目录 `model_config_m890.yaml`；它仍因缺少 teacher checkpoint 被显式跳过，不能计为通过。
+## 最小验证
 
-`ppu_functional.py` 的 `m890_model_config()` 集中处理 launcher 差异：M890 默认使用
-上游支持的 `torchrun`，`FT_LAUNCHER_CASES` 中原先使用 `ft_launcher` 的五个 case 保持原样。
-选例、运行时临时配置和结果复核共用此适配，训练参数、指标与步数不变；上游配置文件不被改写。
-这里只保留已有 launcher 行为，不代表已经验证故障注入恢复能力。
-
-golden 的版本由 Git 管理。新增或更新 M890 golden 时提交对应 JSON 即可，
-不再维护 `.github/ppu-functional-baselines.json` 或运行 snapshot 脚本。
-选例阶段检查 golden 内容、指标和步数，并把本次源代码中的配置及 golden SHA256 写进 manifest；
-执行与结果复核继续检查这些摘要，拒绝计划生成后发生的文件变更。
-受信任的 control recipe 决定测试范围，待测 SHA 中的配置与 golden 决定本轮实际输入。
-control 分支已有的在选 M890 golden 如果在待测提交中缺失，会直接失败，不能靠删除文件
-缩小覆盖范围。暂时停用 case 应保留 golden，并通过 recipe 的 broken scope 或显式跳过策略说明原因。
-
-## 最小验证顺序
-
-先在具备 Python 3.12 和 `.github/docker/control-requirements.txt` 依赖的 CPU 环境中检查。
-不要为控制脚本在宿主机安装 Megatron GPU 依赖或同步整个项目环境。
-`ppu-control-tests.yml` 在面向 main/dev 的相关路径 PR 上运行，也支持手动调度；它只使用 CPU。
+在 Python 3.12 CPU 环境安装 `ppu-control-tests.yml` 声明的依赖；不安装宿主机 GPU 环境。
+改适配脚本先跑对应测试文件，合并前跑保留的关键回归：
 
 ```bash
-# 只验证选例、配置和 golden，不申请 Pod，也不检查 NAS 是否可读。
-PPU_INPUTS='{"functional_cases":"gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files"}' \
-  python .github/scripts/ppu_functional.py catalogue > /tmp/ppu-catalogue.json
-
-# 控制脚本回归；训练与数值检查使用合成证据，不占用 PPU。
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q \
-  .github/scripts/tests/test_ppu_functional.py \
-  .github/scripts/tests/test_ppu_functional_runtime.py \
-  .github/scripts/tests/test_ppu_functional_results.py
+python -m pytest -q -o addopts= .github/scripts/tests
 ```
 
-需要 NAS 或设备验证时，在 `ppu-build.yml` 的受信任分支上手动选择下列输入。
-功能测试控制 Build/UT，其他 UT 开关保持默认值；不要提交 `all` 个 case。
-
-| 输入 | 首先检查资产 | 确需训练时 |
-|---|---|---|
-| `test_kind` | `functional` | `functional` |
-| `functional_mode` | `assets` | `regression` |
-| `functional_scope` | `all`（由下列精确 case 再过滤） | 同左 |
-| `functional_cases` | `gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files` | 同左 |
-| `functional_repeat` | `1` | `1` |
-| `functional_timeout` | `5` | `5` 分钟总训练预算 |
-
-这个普通 GPT case 为 TP1/PP1、12 层、hidden size 512、50 步；选择它是为了减少特性组合，
-不是声称它已经实测最快。需要数据、vocab/merges 和固定的 GPT2 tokenizer 缓存。
-现有执行器仍要求单机 **8 卡**。`repeat=1` 不关闭正式基础设施重试：最多 3 次 attempt
-共用预算；排队、构建、资产预检查和退出清理另有开销。冷编译可能耗尽预算，不能据此判精度失败。
-
-仅定位 UT 时，使用已有的单 bucket 入口；下面命令在本流程上线后从 main 调度：
+上线后的手动诊断从 main 调度；独立验证分支使用该分支专用入口。每次只选一个 case：
 
 ```bash
-gh workflow run ppu-build.yml --repo flytiger-eco/Megatron-LM-for-sail \
-  --ref main -f test_kind=unit -f scope=full -f suite_family=nvidia-dev \
-  -f unit_bucket=tests/unit_tests/test_model_configs.py -f repeat=1
+gh workflow run ppu-build.yml --repo flytiger-eco/Megatron-LM-for-sail --ref main \
+  -f test_kind=functional -f functional_mode=assets -f functional_scope=all \
+  -f functional_cases=gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files \
+  -f functional_repeat=1 -f functional_timeout=15
 ```
 
-单 bucket 与单 FT case 是独立诊断请求，各自构建；都不能发布 PR 成功状态，也不代表完整覆盖。
-历史共享构建的组合 smoke 工具保留在集成测试分支，运行时必须核对该版本的 control/target SHA。
+资产通过后将 `functional_mode` 改为 `regression` 才申请 PPU；该 case 为 50 步，当前 runner 为单机 8 卡。
+UT 单 bucket 使用 `test_kind=unit scope=full suite_family=nvidia-dev unit_bucket=tests/unit_tests/test_model_configs.py repeat=1`。
+检查 UT failed=0；FT 检查 `numerical_validation=true`、`numeric_passed=1`、`numeric_failed=0`。
+CPU 回归、assets 成功和镜像缓存命中都不代表训练精度或性能已验收。
 
-已有正式产物直接在 CPU 复核，不重跑训练：
-
-```bash
-python .github/scripts/ppu_functional_results.py \
-  --manifest /path/to/manifest.json --root /path/to/target --results /path/to/results
-```
-
-结果目录保留 `functional-000/` 等子目录中的原始环境、action、rank、pytest、TensorBoard
-和导出证据。先定位失败阶段，再选择一个相关 case。`ckpt-resume` 检查保存/加载，不能证明
-故障注入后的自动恢复；一次 numeric 或 smoke 也不能证明性能稳定。
-
-## 独立分支验证记录（2026-11-20）
-
-以下均为 GitHub Actions 上的实际执行。CPU 控制测试与 PPU 训练证据分开记录，正式 main/dev 未写入测试提交。
-
-| 验证 | 代码 / 运行记录 | 结果与边界 |
-|---|---|---|
-| CPU 控制回归 | `b9fdbe4b8`；[44601645148](https://github.com/flytiger-eco/Megatron-LM-for-sail/actions/runs/44601645148) | 1,842 passed；覆盖授权、路径、选例、产物、比较与清理逻辑，不代表训练通过 |
-| 草稿 PR | [44571365750](https://github.com/flytiger-eco/Megatron-LM-for-sail/actions/runs/44571365750) | 保持 pending，不构建、不申请 PPU |
-| 文档 PR | [44572021070](https://github.com/flytiger-eco/Megatron-LM-for-sail/actions/runs/44572021070) | 按策略豁免硬件测试 |
-| 纯 CI PR | `506307b1d` 控制；[44577131713](https://github.com/flytiger-eco/Megatron-LM-for-sail/actions/runs/44577131713) | 明确发布 Docs/CI-only 豁免状态；构建和执行 job 跳过 |
-| main 源码最小流程 | control / target 均为 `069979312`；[44571681281](https://github.com/flytiger-eco/Megatron-LM-for-sail/actions/runs/44571681281) | UT：816 passed、0 failed、213 skipped；FT：1 个 numeric case 通过，1 attempt / 1 repeat；组合结果 success |
-| dev 跨分支校验修复前 | control `cdc427722` / target `b88d6d178`；[44593647743](https://github.com/flytiger-eco/Megatron-LM-for-sail/actions/runs/44593647743) | 构建成功，UT：244 passed、0 failed、67 skipped；FT 在训练前被 recipe 摘要混用问题拦截。已在 `b9fdbe4b8` 修复并用真实 dev 文件在 CPU 复现验证；此轮不算精度通过 |
-| dev 源码最小流程 | control `b9fdbe4b8` / target `891c690a2`；[44602771487](https://github.com/flytiger-eco/Megatron-LM-for-sail/actions/runs/44602771487) | UT：244 passed、0 failed、67 skipped；FT：1 个 numeric case 通过，1 attempt / 1 repeat；100% numeric gate 与组合结果 success |
-
-临时 PR [#21](https://github.com/flytiger-eco/Megatron-LM-for-sail/pull/21) 已关闭，未合并。
-PR 探针使用真实 PR 的 head/base SHA 手动授权；不能将它们写成自动 `pull_request_target` 事件已验收。
-
-历史生产同步 [44563433346](https://github.com/flytiger-eco/Megatron-LM-for-sail/actions/runs/44563433346)
-曾在创建 main 同步 PR 时被仓库设置拒绝（`GitHub Actions is not permitted to create or approve pull requests`）。
-集成验证没有修改仓库设置或凭据；正式发布权限以实际同步运行结果为准，不能用沙箱接线结果替代。
-
-main 最小运行的首次镜像拉取耗时 20 分 2 秒（压缩镜像约 7.11 GiB），实际构建检查 78 秒。
-UT 设备内执行 55 秒，FT 训练与比较约 184 秒。各项计时口径不同，不应相加作为稳定性能指标；
-冷启动开销与训练性能分别记录。此运行不覆盖完整 L0、checkpoint resume、FT 故障注入或性能回归。
-
-dev 成功运行的设备内构建检查为 75 秒，FT 训练与比较约 197 秒，Pod 内完整执行 209 秒。
-同样只代表单次最小诊断，不作为 main/dev 性能对比。原始环境报告确认使用 dev 的 `direct_nvrx`
-接口与新的推理通信模块；配置、golden、数值门槛和依赖版本均未为这轮通过而改动。
-最终文档提交只补充说明，实际硬件证据以表中 control/target SHA 为准。
-测试引用和复跑方法参见
-[集成测试分支的历史说明](https://github.com/flytiger-eco/Megatron-LM-for-sail/blob/40f53fed83b0007f0f2251460a20d07858b920c2/docs/developer/ppu-ci.md)。
-这些记录仅证明表中提交的最小流程；新的 main/dev 提交需要重新验证。
-
-## 维护约定
-
-我们分别维护平台环境、测试控制、模型基线、发布门禁；变更附对应的环境报告、CPU 测试、
-采样证据或 control/target 身份。长期 CODEOWNERS 沿用项目真实授权关系，不虚构维护账号。
-四项交付以此说明、现有最小调用方式、CPU 自验证和责任边界为基础逐步完善。
-
-项目依赖由 `pyproject.toml` / `uv.lock` 管理；PPU CI 使用独立的平台环境：Dockerfile 读取被测源码的
-project dependencies、test dependency group 和 training extra，再叠加 SAIL 原生包约束与测试工具。
-它不会直接执行整个 NV dev extra 的 `uv sync`。CPU 控制解释器使用 `control-requirements.txt`，
-tokenizer 则由固定 revision、文件摘要和 receipt 管理。产品镜像 `docker/Dockerfile.ppu` 另有用途。
-
-同一次流水线通过镜像 digest、安装报告、编译产物与环境摘要保证 Build / UT / FT 使用同一环境。
-这不等于所有传递依赖都已完全锁定：清空构建缓存后的解析结果仍需检查安装报告，并单独验证升级。
-禁止通过现场 pip 修复或改 golden 掩盖失败。历史 `_2nd.json` 保留采样来源；resume 比较本次
-第一阶段与恢复阶段。以后清理重复配置或依赖漂移，应另立小改动验证。
-
-本地 CPU 验证不代表远程 Linux runner、SAIL 训练、精度或性能验收；硬件验证单独记录。
-
-## 构建缓存与 NV 对齐
-
-设备测试仍先执行 runtime-environment 的构建和离线镜像验证，再以镜像 digest 交给 Build / UT / FT。
-依赖层使用 BuildKit registry cache，存放在 `ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci`，
-构建运行在 `ubuntu-latest`，基础镜像来自 SAIL 的 `pkg.flytiger-eco.com`；不使用 NVIDIA runner 或缓存仓库。
-CPU 控制解释器体积较小，继续使用原有 GitHub Actions cache。
-
-维护入口为 `.github/actions/ppu-build-cache/action.yml`（选择缓存）、
-`ppu_ci_container.py build_identity/build`（指纹与 Docker 构建）、
-`Dockerfile.ppu-ci` 的 `dependencies` stage（实际依赖）。没有另加 Python 缓存脚本。
-依赖指纹包含不可变基础镜像 digest、平台、Docker 构建文件和被测 `pyproject.toml`；
-普通源码、提交 SHA、控制脚本及仅供控制解释器使用的 requirements 不改变运行时依赖指纹。
-控制与源码身份仍绑定最终镜像；源码扩展继续单独编译。当前依赖安装未消费 `uv.lock`，
-因此不能把这一改动描述成已采用 NV 的完整依赖锁定方案。
-
-| 运行来源 | 优先读取 | 写入 |
-| --- | --- | --- |
-| PR | 本 PR 同指纹 → 目标分支同指纹 → 目标分支 baseline | 本 PR 同指纹 |
-| main/dev 已发布提交 | 目标分支同指纹 → 目标分支 baseline | 目标分支 baseline |
-| 合并队列或 main 同步候选 | 候选同指纹 → 目标分支同指纹 → 目标分支 baseline | 候选同指纹 |
-| 显式 CPU 预热 | 目标分支同指纹 → 目标分支 baseline | 目标分支同指纹 |
-
-只导出 `dependencies` stage 的缓存。缓存只是加速输入，BuildKit 会继续核对各层；
-Actions summary 显示选中的读取、写入位置，选中 donor 不代表每层都命中。
-相比 NV，这里没有历史 registry cache 的兼容回退，因为原实现使用 GitHub Actions cache。
-
-`ppu-populate-build-cache.yml` 在 main/dev 的构建输入变化时或手动触发，只构建依赖层，不申请 PPU，
-也不执行目标源码、UT 或 FT。为控制资源开销，不设置每六小时定时预热。
-已有同步流程用 `GITHUB_TOKEN` 推送 dev 时不会再次触发 push workflow；同步后正常 runtime build
-已能更新 baseline，不需要新增同步接线。新 workflow 合入后可从 main/dev 手动预热。
-实际缓存命中率、CPU 耗时和镜像拉取耗时，需要在线 Docker/GHCR 运行记录验收；CPU 单测不替代此项。
+失败先按 authorize / configure / assets / runtime-environment / UT / FT 定位；保留日志与对应 SHA。
+仅已识别的基础设施故障允许在 case 剩余预算内重试；数值失败不靠重试或修改 golden 消除。
+历史调试记录查 Git 历史和 Actions，不在这份维护说明中累积运行日志。

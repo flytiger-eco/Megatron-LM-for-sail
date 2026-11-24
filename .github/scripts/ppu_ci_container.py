@@ -543,6 +543,7 @@ def readable_probe_export(output, context):
 def build(args):
     image_mode = getattr(args, 'mode', '') == 'build-image'
     cache_only = getattr(args, 'mode', '') == 'build-cache'
+    require(args.kind == 'control' or image_mode or cache_only, 'Runtime builds require build-image')
     cache_from, cache_to = getattr(args, 'cache_from', ''), getattr(args, 'cache_to', '')
     for ref in (cache_from, cache_to):
         require(
@@ -609,7 +610,6 @@ def build(args):
                 re.fullmatch(r'ppu-ci-runtime:run-[0-9]+-[0-9]+', args.local_image),
                 'Invalid local execution image tag',
             )
-            common += ['--build-arg', 'EXPORT_FORMAT=image']
         if cache and (cache / 'index.json').is_file():
             common += ['--cache-from', f'type=local,src={cache}']
         if cache_from:
@@ -731,16 +731,11 @@ def build(args):
             '--mount',
             f'type=bind,source={root / ".github/scripts"},target=/trusted,readonly',
         ]
-        if args.kind == 'runtime':
-            mounts += [
-                '--mount',
-                f'type=bind,source={context / "source"},target=/source,readonly',
-            ]
         probe = [
             'python3',
             '-I',
             '/trusted/ppu_ci_container.py',
-            'offline-probe',
+            'restore-control',
             '--artifact',
             '/exports',
             '--digest',
@@ -750,10 +745,8 @@ def build(args):
             '--destination',
             '/tmp/ppu-control-runtime',
         ]
-        if args.kind == 'runtime':
-            probe += ['--target-sha', args.target_sha, '--image-digest', pinned]
         started = time.monotonic()
-        probe_output = command(
+        command(
             [
                 'docker',
                 'run',
@@ -776,8 +769,6 @@ def build(args):
             'device_validation': False,
             'elapsed_seconds': round(time.monotonic() - started, 3),
         }
-        if args.kind == 'runtime':
-            metadata['offline_verification'].update(json.loads(probe_output.splitlines()[-1]))
         (output / 'docker-build.json').write_text(json.dumps(metadata, sort_keys=True) + '\n')
         sha = digest(output / 'docker-build.json')
         print(
@@ -951,43 +942,6 @@ def restore_control(args):
     )
 
 
-def restore_runtime(args):
-    metadata_path = Path(args.artifact) / 'docker-build.json'
-    require(metadata_path.is_file(), 'Missing Dockerfile environment metadata')
-    metadata = verify_export(
-        args.artifact, args.digest, args.control_sha, args.target_sha, subset=True
-    )
-    require(
-        args.image_digest == metadata['image_digest'], 'Restored environment base image mismatch'
-    )
-    destination = no_links(args.destination)
-    require(not (destination / 'ppu-ci-venv').exists(), 'Refusing to overwrite the PPU environment')
-    environment = Path(args.artifact) / 'environment.tar.gz'
-    compiled = Path(args.artifact) / 'compiled-source.tar.gz'
-    extract_archive(environment, destination, prefix='ppu-ci-venv', check_only=True)
-    if args.source_root:
-        extract_archive(compiled, args.source_root, overlay=True, check_only=True, compiled=True)
-    if getattr(args, 'check_only', False):
-        return
-    started = time.monotonic()
-    extract_archive(environment, destination, prefix='ppu-ci-venv')
-    if args.source_root:
-        extract_archive(compiled, args.source_root, overlay=True, compiled=True)
-    print(json.dumps({'environment_restore_seconds': round(time.monotonic() - started, 3)}))
-
-
-def offline_probe(args):
-    """Fresh-base, network-disabled portability checks; never claim device acceptance."""
-    if args.target_sha is None:
-        restore_control(args)
-        return
-    source = Path('/tmp/ppu-offline-source')
-    shutil.copytree('/source', source)
-    args.source_root, args.destination = source, Path('/opt')
-    restore_runtime(args)
-    portable_checks(source)
-
-
 def portable_checks(source, *, execution_image=False):
     environment = client_env()
     environment.update(
@@ -1114,7 +1068,11 @@ def main():
         if mode == 'build-image':
             create.add_argument('--local-image', required=True)
         elif mode != 'build-cache':
-            create.add_argument('--kind', choices=('control', 'runtime'), required=True)
+            create.add_argument(
+                '--kind',
+                choices=('control',) if mode == 'build' else ('control', 'runtime'),
+                required=True,
+            )
         create.add_argument('--control-root', type=Path, required=True)
         create.add_argument('--control-sha', required=True)
         create.add_argument('--source-root', type=Path)
@@ -1125,17 +1083,11 @@ def main():
             create.add_argument('--cache-root', type=Path)
             create.add_argument('--cache-from', default='')
             create.add_argument('--cache-to', default='')
-    for mode in ('restore-control', 'restore-runtime', 'offline-probe'):
-        restore = sub.add_parser(mode)
-        restore.add_argument('--artifact', type=Path, required=True)
-        restore.add_argument('--digest', required=True)
-        restore.add_argument('--control-sha', required=True)
-        restore.add_argument('--target-sha')
-        restore.add_argument('--source-root', type=Path)
-        restore.add_argument('--destination', type=Path, required=True)
-        if mode in ('restore-runtime', 'offline-probe'):
-            restore.add_argument('--image-digest', required=mode == 'restore-runtime')
-            restore.add_argument('--check-only', action='store_true')
+    restore = sub.add_parser('restore-control')
+    restore.add_argument('--artifact', type=Path, required=True)
+    restore.add_argument('--digest', required=True)
+    restore.add_argument('--control-sha', required=True)
+    restore.add_argument('--destination', type=Path, required=True)
     for mode in ('publish-image', 'verify-image', 'image-probe'):
         image = sub.add_parser(mode)
         image.add_argument('--artifact', type=Path, required=True)
@@ -1173,10 +1125,8 @@ def main():
         'image-probe': image_probe,
         'fingerprint': fingerprint,
         'restore-control': restore_control,
-        'restore-runtime': restore_runtime,
         'restore-source': restore_source,
         'archive-source': archive_source,
-        'offline-probe': offline_probe,
         'mark-plan': mark_plan,
     }[args.mode](args)
 

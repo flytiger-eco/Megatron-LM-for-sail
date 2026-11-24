@@ -10,7 +10,6 @@ ROOT_NAMES = (
     "PPU_POD_RUN_ROOT",
     "PPU_CPU_ASSETS_ROOT",
     "PPU_POD_ASSETS_ROOT",
-    "PPU_TOKENIZER_RECEIPTS_ROOT",
 )
 LOGICAL = {"cpu": "ppu://assets/cpu", "pod": "ppu://assets/pod"}
 
@@ -73,8 +72,6 @@ def validate(route: str, env=None) -> None:
             or inverse[0][0] / pod.relative_to(inverse[0][1]) != cpu
         ):
             raise ValueError(f"CPU and Pod trusted {kind.lower()} roots do not share a mount")
-    if route == "assets":
-        root("PPU_TOKENIZER_RECEIPTS_ROOT", env)
 
 
 def asset_root(manifest: dict, location: str, env=None) -> Path:
@@ -109,7 +106,6 @@ def replacements(env=None) -> dict:
                 "PPU_POD_RUN_ROOT": "ppu://runs/pod",
                 "PPU_CPU_ASSETS_ROOT": LOGICAL["cpu"],
                 "PPU_POD_ASSETS_ROOT": LOGICAL["pod"],
-                "PPU_TOKENIZER_RECEIPTS_ROOT": "ppu://receipts/cpu",
             }[name]
             values[path] = reference
     if env.get("PPU_HOST_VOLUMES"):

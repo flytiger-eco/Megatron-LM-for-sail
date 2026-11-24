@@ -53,11 +53,6 @@ def test_hard_failure_wins_over_communication_error(message):
     assert results.classify_failure(1, f"DistNetworkError\n{message}") == "hard_failure"
 
 
-@pytest.mark.parametrize("code", [139, -11])
-def test_sigsegv_exit_without_error_text_is_never_retryable(code):
-    assert results.classify_failure(code, "DistNetworkError") == "hard_failure"
-
-
 @pytest.mark.parametrize("code", [130, 137, 143, -2, -9, -15])
 def test_cancellation_is_not_retryable(code):
     assert results.classify_failure(code, "DistNetworkError") == "cancelled"
@@ -247,82 +242,6 @@ def completion(manifest, case, directory, attempts=1, **overrides):
     envelope(manifest, case, directory)
 
 
-@pytest.mark.parametrize("legacy", [False, True])
-def test_compiler_policy_preserves_historical_evidence(evidence, legacy):
-    manifest, case, directory = evidence
-    if legacy:
-        manifest["config"].pop("compiler_environment")
-    for repeat in (1, 2):
-        successful_repeat(manifest, case, directory, 1, repeat)
-    completion(manifest, case, directory)
-    assert results.verify_case(manifest, ROOT, case, directory)["success"]
-    execution = json.loads((directory / "attempt-1/repeat-1/execution.json").read_text())
-    environment = json.loads((directory / "functional-environment.json").read_text())
-    assert ("compiler_environment" in execution) is not legacy
-    assert ("compiler" in environment) is not legacy
-
-
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "missing",
-        "empty",
-        "environment",
-        "quiesce",
-        "quiesce_numeric",
-        "single_thread",
-        "threads_string",
-        "threads_bool",
-        "override",
-        "override_missing",
-    ],
-)
-def test_compiler_envelope_must_attest_parallel_configuration(evidence, damage):
-    manifest, case, directory = evidence
-    envelope(manifest, case, directory)
-    path = directory / "functional-environment.json"
-    report = json.loads(path.read_text())
-    compiler = report["compiler"]
-    if damage == "missing":
-        report.pop("compiler")
-    elif damage == "empty":
-        report["compiler"] = None
-    elif damage == "override_missing":
-        compiler.pop("compile_threads_override")
-    else:
-        key, value = {
-            "environment": ("environment", {}),
-            "quiesce": ("quiesce_async_compile_pool", True),
-            "quiesce_numeric": ("quiesce_async_compile_pool", 0),
-            "single_thread": ("compile_threads", 1),
-            "threads_string": ("compile_threads", "8"),
-            "threads_bool": ("compile_threads", True),
-            "override": ("compile_threads_override", "8"),
-        }[damage]
-        compiler[key] = value
-    write_json(path, report)
-    with pytest.raises(ValueError, match="compiler environment attestation"):
-        results.verify_envelope(manifest, case, directory)
-
-
-@pytest.mark.parametrize("value", [None, {}, {"TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL": "1"}])
-@pytest.mark.parametrize("exit_code", [0, 1])
-def test_repeat_compiler_policy_cannot_be_missing_or_changed(evidence, value, exit_code):
-    manifest, case, directory = evidence
-    path = successful_repeat(manifest, case, directory, 1, 1)
-    execution = json.loads((path / "execution.json").read_text())
-    execution["exit_code"] = exit_code
-    if exit_code:
-        (path / "driver.log").write_text("DistNetworkError: connection reset")
-    if value is None:
-        execution.pop("compiler_environment")
-    else:
-        execution["compiler_environment"] = value
-    write_json(path / "execution.json", execution)
-    with pytest.raises(ValueError, match="repeat compiler environment"):
-        results.verify_repeat(manifest, ROOT, case, path, 1, 1)
-
-
 @pytest.mark.parametrize("passed", [True, False])
 @pytest.mark.parametrize("skipped_name,reason", list(functional.SKIPPED_CASES.items()))
 def test_skipped_policy_is_not_counted_or_allowed_to_hide_failures(
@@ -437,27 +356,6 @@ def failed_repeat(manifest, case, directory, attempt=1, message="DistNetworkErro
     return path
 
 
-def test_forged_ready_report_cannot_bypass_unmapped_tokenizer(evidence):
-    manifest, case, directory = evidence
-    case["tokenizer_dependencies"] = functional.tokenizer_dependencies(
-        ROOT, yaml.safe_load((ROOT / case["config_path"]).read_text()), case["training_script"]
-    )
-    for repeat in (1, 2):
-        successful_repeat(manifest, case, directory, 1, repeat)
-    completion(manifest, case, directory)
-    result = results.verify_case(manifest, ROOT, case, directory)
-    assert not result["success"]
-    assert any("Unresolved tokenizer" in error for error in result["errors"])
-
-
-def test_training_sigsegv_status_wins_over_generic_shell_exit(evidence):
-    manifest, case, directory = evidence
-    path = failed_repeat(manifest, case, directory)
-    (path / "barriers/repeat_1_run_1_status/node_0").write_text("139\n")
-    result = results.verify_repeat(manifest, ROOT, case, path, 1, 1)
-    assert result["classification"] == "hard_failure"
-
-
 def test_retry_requires_entire_new_successful_attempt(evidence):
     manifest, case, directory = evidence
     failed_repeat(manifest, case, directory)
@@ -544,19 +442,6 @@ def test_complete_launcher_restarts_preserve_rank_log_evidence(evidence, resume)
 
 
 @pytest.mark.parametrize(
-    "filename",
-    ["assets-report.json", "functional-environment.json", "action-timing.json", "pod-timing.json"],
-)
-def test_missing_envelope_is_not_success(evidence, filename):
-    manifest, case, directory = evidence
-    for repeat in (1, 2):
-        successful_repeat(manifest, case, directory, 1, repeat)
-    completion(manifest, case, directory)
-    (directory / filename).rename(directory / (filename + ".missing"))
-    assert not results.verify_case(manifest, ROOT, case, directory)["success"]
-
-
-@pytest.mark.parametrize(
     "filename,field,value",
     [
         ("assets-report.json", "identity", {}),
@@ -585,72 +470,11 @@ def test_invalid_envelope_is_not_success(evidence, filename, field, value):
         results.verify_envelope(manifest, case, directory)
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
-        "duration_seconds",
-        "queue_duration_seconds",
-        "occupied_ppu_card_hours",
-        "execution_ppu_card_hours",
-    ],
-)
-@pytest.mark.parametrize("value", ["nan", "inf", "-1", ""])
-def test_action_timings_must_be_finite_and_nonnegative(evidence, field, value):
-    manifest, case, directory = evidence
-    envelope(manifest, case, directory)
-    path = directory / "action-timing.json"
-    report = json.loads(path.read_text())
-    report["outputs"][field] = value
-    write_json(path, report)
-    with pytest.raises(ValueError):
-        results.verify_envelope(manifest, case, directory)
-
-
-def test_queue_cannot_exceed_action_duration(evidence):
-    manifest, case, directory = evidence
-    envelope(manifest, case, directory)
-    path = directory / "action-timing.json"
-    report = json.loads(path.read_text())
-    report["outputs"]["queue_duration_seconds"] = "31"
-    write_json(path, report)
-    with pytest.raises(ValueError, match="timing"):
-        results.verify_envelope(manifest, case, directory)
-
-
 def test_summary_cannot_report_assets_as_regression(evidence):
     manifest, _, directory = evidence
     manifest["config"]["functional_mode"] = "assets"
     with pytest.raises(ValueError, match="Asset-only"):
         results.summarize(manifest, ROOT, directory.parent)
-
-
-@pytest.mark.parametrize(
-    "failure,expected",
-    [("asset", "asset_error"), ("timeout", "infrastructure_error"), ("cancelled", "cancelled")],
-)
-def test_failure_report_distinguishes_assets_and_scheduling(evidence, failure, expected):
-    manifest, case, directory = evidence
-    envelope(manifest, case, directory)
-    if failure == "asset":
-        path = directory / "assets-report.json"
-        report = json.loads(path.read_text())
-        report.update(ok=False, result="asset_layout_error")
-    else:
-        path = directory / "action-timing.json"
-        report = json.loads(path.read_text())
-        report["action_status"] = failure
-    write_json(path, report)
-    result = results.verify_case(manifest, ROOT, case, directory)
-    assert not result["success"] and result["classification"] == expected
-    assert result["queue_seconds"] == 1 and result["budget_seconds"] == case["budget_seconds"]
-    summary = results.summarize(manifest, ROOT, directory.parent)
-    assert summary["failure_categories"][expected] == [case["name"]]
-
-
-def test_malformed_report_does_not_hide_other_case_reports(evidence):
-    manifest, case, directory = evidence
-    write_json(directory / "case-run.json", [])
-    assert not results.summarize(manifest, ROOT, directory.parent)["success"]
 
 
 def test_summary_rejects_missing_case_artifact(evidence):

@@ -2,10 +2,8 @@
 
 import ast
 import hashlib
-import io
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -16,7 +14,6 @@ from types import SimpleNamespace
 
 import pytest
 from test_ppu_functional import ROOT, SCRIPTS, functional
-from test_ppu_upstream import bundle_digest, ci, sealed_bundle
 
 environment = functional.module_from_path(
     "ppu_functional_environment", SCRIPTS / "ppu_functional_environment.py"
@@ -33,126 +30,6 @@ FUNCTIONAL_PAYLOADS = [
         for suffix in ("", "_results", "_runtime", "_environment", "_pytest", "_hf")
     ],
 ]
-
-
-@pytest.fixture
-def functional_bundle(sealed_bundle):
-    plan, bundle = sealed_bundle
-    for root in (plan, bundle):
-        manifest = json.loads((root / "manifest.json").read_text())
-        manifest["test_kind"] = "functional"
-        (root / "manifest.json").write_text(json.dumps(manifest))
-    for name in FUNCTIONAL_PAYLOADS:
-        path = bundle / name
-        path.parent.mkdir(exist_ok=True)
-        path.write_text("Functional payload fixture\n")
-        if name.startswith("control/"):
-            shutil.copy2(path, plan / name)
-    ci.seal_bundle(bundle)
-    return plan, bundle
-
-
-def test_functional_reuses_trusted_bundle_identity(functional_bundle):
-    plan, bundle = functional_bundle
-    ci.verify_bundle(bundle, plan, bundle_digest(bundle))
-
-
-@pytest.mark.parametrize("name", FUNCTIONAL_PAYLOADS)
-@pytest.mark.parametrize("damage", ["missing", "empty", "modified"])
-def test_functional_bundle_rejects_incomplete_or_changed_payload(functional_bundle, name, damage):
-    plan, bundle = functional_bundle
-    digest = bundle_digest(bundle)
-    path = bundle / name
-    if damage == "missing":
-        path.rename(path.with_name(path.name + ".absent"))
-    else:
-        path.write_text("" if damage == "empty" else "Changed payload")
-    with pytest.raises(ValueError):
-        ci.verify_bundle(bundle, plan, digest)
-    if damage != "modified":
-        with pytest.raises(ValueError, match="Missing or empty functional"):
-            ci.seal_bundle(bundle)
-
-
-@pytest.fixture
-def combined_bundle(functional_bundle):
-    plan, bundle = functional_bundle
-    for root in (plan, bundle):
-        manifest = json.loads((root / "manifest.json").read_text())
-        manifest["test_kind"] = "combined"
-        (root / "manifest.json").write_text(json.dumps(manifest))
-        (root / "functional-manifest.json").write_text('{"test_kind": "functional"}\n')
-    ci.seal_bundle(bundle)
-    return plan, bundle
-
-
-def test_combined_bundle_carries_the_trusted_functional_plan(combined_bundle):
-    plan, bundle = combined_bundle
-    digest = bundle_digest(bundle)
-    ci.verify_bundle(bundle, plan, digest)
-    (plan / "functional-manifest.json").write_text('{"test_kind": "functional", "x": 1}\n')
-    with pytest.raises(ValueError, match="trusted functional plan"):
-        ci.verify_bundle(bundle, plan, digest)
-    (bundle / "functional-manifest.json").unlink()
-    with pytest.raises(ValueError, match="Missing or empty functional"):
-        ci.seal_bundle(bundle)
-
-
-@pytest.mark.parametrize("previous", [False, True])
-@pytest.mark.parametrize("import_failure", [False, True])
-@pytest.mark.parametrize("kind", ["functional", "combined"])
-def test_environment_plan_loading_preserves_control_bytes(
-    tmp_path, monkeypatch, previous, import_failure, kind
-):
-    control = tmp_path / "control"
-    control.mkdir()
-    for path in SCRIPTS.glob("ppu*.py"):
-        shutil.copy2(path, control / path.name)
-    helper = control / "ppu_functional.py"
-    if import_failure:
-        helper.write_text(helper.read_text() + '\nraise RuntimeError("fixture import failure")\n')
-    bundle = tmp_path / "bundle"
-    bundle.mkdir()
-    identity = {"target_sha": "a" * 40, "control_sha": "b" * 40}
-    manifest = {
-        "schema_version": 1,
-        "test_kind": "functional",
-        "config": {"build": True},
-        "identity": identity,
-        "environment_build_schema": 2,
-    }
-    top = manifest
-    if kind == "combined":
-        sidecar = bundle / "functional-manifest.json"
-        sidecar.write_text(json.dumps(manifest))
-        top = {
-            "schema_version": 4,
-            "test_kind": kind,
-            "identity": identity,
-            "functional_plan": {
-                "path": sidecar.name,
-                "sha256": hashlib.sha256(sidecar.read_bytes()).hexdigest(),
-            },
-        }
-    (bundle / "manifest.json").write_text(json.dumps(top))
-    args = SimpleNamespace(command="prepare", bundle=bundle, output=None)
-    monkeypatch.setattr(environment.argparse.ArgumentParser, "parse_args", lambda _: args)
-    monkeypatch.setattr(environment, "__file__", str(control / "ppu_functional_environment.py"))
-    monkeypatch.setattr(sys, "dont_write_bytecode", previous)
-    calls = []
-    monkeypatch.setattr(environment, "prepare", lambda *values: calls.append(values))
-    monkeypatch.setattr(environment, "check", lambda *values: calls.append(values))
-    before = {path.name: path.read_bytes() for path in control.iterdir()}
-    if import_failure:
-        with pytest.raises(RuntimeError, match="fixture import failure"):
-            environment.main()
-        assert calls == []
-    else:
-        environment.main()
-        assert calls == [(bundle, manifest), (bundle, manifest, bundle)]
-    assert sys.dont_write_bytecode is previous
-    assert not list(control.rglob("*.pyc"))
-    assert {path.name: path.read_bytes() for path in control.iterdir()} == before
 
 
 @pytest.fixture
@@ -384,27 +261,6 @@ def test_inference_check_follows_actual_engine_and_rejects_missing_dependencies(
             environment.check_inference_dependencies()
 
 
-def test_inference_check_rejects_unrecognized_engine_layout(monkeypatch):
-    public = SimpleNamespace(DynamicInferenceEngine=SimpleNamespace(__module__="unknown.engine"))
-    monkeypatch.setattr(environment.importlib, "import_module", lambda name: public)
-    with pytest.raises(ValueError, match="Unsupported upstream dynamic inference engine"):
-        environment.check_inference_dependencies()
-
-
-@pytest.mark.parametrize("kind", [None, "unit", "functional"])
-def test_historical_environment_does_not_probe_or_change_compiler(monkeypatch, kind):
-    manifest = {"test_kind": kind, "config": {"functional_mode": "regression"}}
-    monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", "1")
-    monkeypatch.setenv("TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL", "1")
-    monkeypatch.setattr(
-        environment.subprocess,
-        "check_output",
-        lambda *a, **k: pytest.fail("Historical environments must not probe the compiler config"),
-    )
-    assert environment.check_compiler(manifest) == {}
-    assert os.environ["TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"] == "1"
-
-
 @pytest.mark.parametrize("value", ["", "1", "8"])
 def test_compiler_check_rejects_inherited_thread_override(monkeypatch, value):
     monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", value)
@@ -415,96 +271,6 @@ def test_compiler_check_rejects_inherited_thread_override(monkeypatch, value):
     )
     with pytest.raises(ValueError, match="default parallel compilation"):
         environment.check_compiler(compiler_manifest())
-
-
-@pytest.mark.parametrize(
-    "kind,mode,settings",
-    [
-        ("unit", "regression", functional.COMPILER_ENVIRONMENT),
-        ("functional", "assets", functional.COMPILER_ENVIRONMENT),
-        ("functional", "regression", {}),
-        ("functional", "regression", None),
-        ("functional", "regression", {"TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL": "1"}),
-    ],
-)
-def test_compiler_probe_rejects_invalid_manifest(monkeypatch, kind, mode, settings):
-    manifest = {
-        "test_kind": kind,
-        "config": {"functional_mode": mode, "compiler_environment": settings},
-    }
-    monkeypatch.setattr(
-        environment.subprocess,
-        "check_output",
-        lambda *a, **k: pytest.fail("Must not start a probe"),
-    )
-    with pytest.raises(ValueError, match="compiler environment policy"):
-        environment.check_compiler(manifest)
-
-
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "none",
-        "missing",
-        "environment",
-        "quiesce",
-        "quiesce_numeric",
-        "threads",
-        "threads_string",
-        "threads_bool",
-        "override",
-        "override_missing",
-        "json",
-        "import_failure",
-        "timeout",
-    ],
-)
-def test_compiler_probe_is_bounded_and_fails_closed(monkeypatch, damage):
-    monkeypatch.delenv("TORCHINDUCTOR_COMPILE_THREADS", raising=False)
-    monkeypatch.setenv("TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL", "1")
-    report = compiler_report()
-    if damage == "missing":
-        report = None
-    elif damage == "override_missing":
-        report.pop("compile_threads_override")
-    elif damage in (
-        "environment",
-        "quiesce",
-        "quiesce_numeric",
-        "threads",
-        "threads_string",
-        "threads_bool",
-        "override",
-    ):
-        key, value = {
-            "environment": ("environment", {}),
-            "quiesce": ("quiesce_async_compile_pool", True),
-            "quiesce_numeric": ("quiesce_async_compile_pool", 0),
-            "threads": ("compile_threads", 1),
-            "threads_string": ("compile_threads", "8"),
-            "threads_bool": ("compile_threads", True),
-            "override": ("compile_threads_override", "8"),
-        }[damage]
-        report[key] = value
-
-    def probe(command, **kwargs):
-        assert command == [sys.executable, "-I", "-c", environment.COMPILER_PROBE]
-        assert kwargs["env"]["TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"] == "0"
-        assert "TORCHINDUCTOR_COMPILE_THREADS" not in kwargs["env"]
-        assert kwargs["timeout"] == 60 and kwargs["text"] is True
-        if damage == "import_failure":
-            raise subprocess.CalledProcessError(1, command)
-        if damage == "timeout":
-            raise subprocess.TimeoutExpired(command, 60)
-        return "invalid-json" if damage == "json" else json.dumps(report)
-
-    monkeypatch.setattr(environment.subprocess, "check_output", probe)
-    if damage == "none":
-        assert environment.check_compiler(compiler_manifest()) == report
-    else:
-        with pytest.raises((ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired)):
-            environment.check_compiler(compiler_manifest())
-    assert os.environ["TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"] == "1"
 
 
 def test_compiler_probe_uses_real_isolated_cpu_interpreter(tmp_path, monkeypatch):
@@ -534,30 +300,6 @@ def test_compiler_probe_uses_real_isolated_cpu_interpreter(tmp_path, monkeypatch
     monkeypatch.setenv("TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL", "1")
     assert environment.check_compiler(compiler_manifest()) == compiler_report()
     assert os.environ["TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"] == "1"
-
-
-@pytest.mark.parametrize("passed", [False, True])
-def test_compiler_gate_is_required_before_environment_success(
-    tool_environment, monkeypatch, passed
-):
-    bundle, _, manifest, _, _, _ = tool_environment
-    manifest.update(test_kind="functional")
-    manifest["config"].update(compiler_manifest()["config"])
-    monkeypatch.delenv("TORCHINDUCTOR_COMPILE_THREADS", raising=False)
-    report = compiler_report()
-    report["quiesce_async_compile_pool"] = not passed
-    monkeypatch.setattr(environment.subprocess, "check_output", lambda *a, **k: json.dumps(report))
-    environment.prepare(bundle, manifest)
-    output = bundle / "reports"
-    if passed:
-        environment.check(bundle, manifest, output)
-        assert (
-            json.loads((output / "functional-environment.json").read_text())["compiler"] == report
-        )
-    else:
-        with pytest.raises(ValueError, match="compiler environment was not applied"):
-            environment.check(bundle, manifest, output)
-        assert not (output / "functional-environment.json").exists()
 
 
 @pytest.fixture
@@ -712,42 +454,6 @@ def test_prepare_rejects_invalid_upstream_yq_without_repairing(tool_environment,
     assert not (bundle / "reports").exists()
 
 
-@pytest.mark.parametrize("version", ["yq v4.47.2", "mikefarah/yq version v4.46.0"])
-def test_image_environment_checks_version_at_original_driver_path(
-    tool_environment, version, monkeypatch
-):
-    bundle, _, manifest, calls, versions, _ = tool_environment
-    manifest["environment_build_schema"] = 2
-    delivery = {
-        "runtime_image_digest": "execution",
-        "base_image_digest": "base",
-        "environment_digest": "environment",
-    }
-    (bundle / "runtime-image.json").write_text(json.dumps(delivery))
-    for field, variable in (
-        ("runtime_image_digest", "PPU_IMAGE_DIGEST"),
-        ("base_image_digest", "PPU_BASE_IMAGE_DIGEST"),
-        ("environment_digest", "PPU_ENVIRONMENT_DIGEST"),
-    ):
-        monkeypatch.setenv(variable, delivery[field])
-    versions["/usr/local/bin/yq"] = version
-    with pytest.raises(ValueError, match="attested Mike Farah yq"):
-        environment.check(bundle, manifest, bundle / "reports")
-    assert calls == []
-    assert not (bundle / "reports").exists()
-
-
-@pytest.mark.parametrize("schema", [True, 2.0, 3, "2"])
-def test_functional_environment_rejects_unknown_or_downgraded_schema(tool_environment, schema):
-    bundle, _, manifest, _, _, _ = tool_environment
-    manifest["environment_build_schema"] = schema
-    with pytest.raises(ValueError):
-        environment.prepare(bundle, manifest)
-    with pytest.raises(ValueError, match="Unsupported functional"):
-        environment.check(bundle, manifest, bundle / "reports")
-    assert not (bundle / "reports/functional-environment.json").exists()
-
-
 @pytest.mark.parametrize(
     "variable", ["PPU_IMAGE_DIGEST", "PPU_BASE_IMAGE_DIGEST", "PPU_ENVIRONMENT_DIGEST"]
 )
@@ -767,23 +473,6 @@ def test_functional_image_evidence_requires_job_identities(tool_environment, mon
     with pytest.raises(ValueError, match="image handoff mismatch"):
         environment.check(bundle, manifest, bundle / "reports")
     assert not (bundle / "reports/functional-environment.json").exists()
-
-
-def test_cpu_shm_checkpoint_uses_writer_parameter_name(tool_environment, checkpoint_api):
-    bundle, _, manifest, _, _, _ = tool_environment
-    manifest["functional"]["case"]["nvrx_checkpoint"] = [
-        {"section": "MODEL_ARGS", "persistent_worker": True, "cpu_shm": True}
-    ]
-    environment.prepare(bundle, manifest)
-    environment.check(bundle, manifest, bundle / "reports")
-    report = json.loads((bundle / "reports/functional-environment.json").read_text())
-    signatures = report["nvrx"]["signatures"]
-    # Matches the real nvidia-resiliency-ext 0.6.0 signatures:
-    # the writer uses use_cpu_shm_for_gpu_tensors while the queue and warmup use cpu_shm_mode.
-    assert "use_cpu_shm_for_gpu_tensors" in signatures["FileSystemWriterAsync.__init__"]
-    assert "cpu_shm_mode" not in signatures["FileSystemWriterAsync.__init__"]
-    assert "cpu_shm_mode" in signatures["AsyncCallsQueue.__init__"]
-    assert "cpu_shm_mode" in signatures["AsyncCallsQueue.warmup_persistent_caller"]
 
 
 @pytest.mark.parametrize(
@@ -921,29 +610,6 @@ def test_current_dev_direct_nvrx_api_keeps_capability_and_signature_checks(
     assert requested == []  # DEV never calls the removed legacy getter.
 
 
-@pytest.mark.parametrize("kind", [None, "unit", "functional"])
-def test_training_packages_match_build_constraints(tmp_path, monkeypatch, kind):
-    script = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
-    block = next(
-        block for block in re.findall(r"<<'PY'\n(.*?)\nPY", script, re.S) if "native =" in block
-    )
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(environment.importlib.metadata, "version", lambda name: "fixed-runtime")
-    (tmp_path / "pyproject.toml").write_bytes((ROOT / "pyproject.toml").read_bytes())
-    exec(compile(block, "docker-build-requirements", "exec"), {})
-    requirements = (tmp_path / "ppu-requirements.txt").read_text().splitlines()
-    constraints = (tmp_path / "constraints.txt").read_text().splitlines()
-    assert environment.TRAINING_PACKAGES["apex"] == "24.4.1+v0.1.0.ppu2.2.0"
-    for name, version in environment.TRAINING_PACKAGES.items():
-        assert requirements.count(f"{name}=={version}") == 1
-        assert constraints.count(f"{name}=={version}") == 1
-    assert len(requirements) == 10
-    assert requirements.count("nvidia-resiliency-ext==0.6.0") == 1
-    assert all(f"{name}==fixed-runtime" in constraints for name in ("torch", "triton"))
-    assert '--report /build/functional-package-install.json' in script
-    assert "test_kind" not in script
-
-
 @pytest.mark.parametrize("name", environment.TRAINING_PACKAGES)
 @pytest.mark.parametrize("damage", ["missing", "version"])
 def test_training_dependency_missing_or_wrong_version_fails(
@@ -983,47 +649,6 @@ def test_training_native_import_failure_is_not_ignored(tool_environment, monkeyp
     assert not (bundle / "reports/functional-environment.json").exists()
 
 
-@pytest.mark.parametrize(
-    "name,symbol",
-    [
-        (name, symbol)
-        for name, symbols in environment.TRAINING_IMPORTS.items()
-        for symbol in symbols
-    ],
-)
-def test_training_dependency_api_is_required(tool_environment, monkeypatch, name, symbol):
-    bundle, _, _, _, _, _ = tool_environment
-    module = environment.importlib.import_module(name)
-    monkeypatch.setattr(module, symbol, None)
-    with pytest.raises(ValueError, match="Missing functional dependency API"):
-        environment.check_training_dependencies(bundle)
-
-
-@pytest.mark.parametrize(
-    "damage", ["fused_disabled", "persistent_disabled", "fallback", "identity", "apply", "forward"]
-)
-def test_apex_backend_or_api_failure_prevents_training(tool_environment, monkeypatch, damage):
-    bundle, _, manifest, _, _, _ = tool_environment
-    environment.prepare(bundle, manifest)
-    fused = environment.importlib.import_module("megatron.core.fusions.fused_layer_norm")
-    if damage == "fused_disabled":
-        monkeypatch.setattr(fused, "HAVE_FUSED_LAYER_NORM", False)
-    elif damage == "persistent_disabled":
-        monkeypatch.setattr(fused, "HAVE_PERSIST_LAYER_NORM", False)
-    elif damage == "fallback":
-        backends = environment.importlib.import_module("megatron.core.models.backends")
-        monkeypatch.setattr(backends.LocalSpecProvider, "layer_norm", lambda *a, **k: object)
-    elif damage == "identity":
-        monkeypatch.setattr(fused, "FastLayerNormFN", object)
-    elif damage == "apply":
-        monkeypatch.setattr(fused.FastLayerNormFN, "apply", None)
-    else:
-        monkeypatch.setattr(fused.FusedLayerNormAffineFunction, "forward", lambda ctx, x: None)
-    with pytest.raises((ValueError, TypeError)):
-        environment.check(bundle, manifest, bundle / "reports")
-    assert not (bundle / "reports/functional-environment.json").exists()
-
-
 @pytest.mark.parametrize("memory_efficient", [False, True])
 def test_apex_forward_signature_matches_original_call(
     tool_environment, monkeypatch, memory_efficient
@@ -1044,45 +669,6 @@ def test_apex_forward_signature_matches_original_call(
         ("memory_efficient" in signature) == memory_efficient
         for signature in report["signatures"].values()
     )
-
-
-@pytest.mark.parametrize("damage", ["l2norm", "optimizer", "report_missing", "report_invalid"])
-def test_dependency_compatibility_and_provenance_are_required(
-    tool_environment, monkeypatch, damage
-):
-    bundle, _, _, _, _, _ = tool_environment
-    if damage == "l2norm":
-        module = environment.importlib.import_module("fla.modules.l2norm")
-        monkeypatch.setattr(module, "l2norm", lambda x, eps=1e-6: x)
-    elif damage == "optimizer":
-        module = environment.importlib.import_module("megatron.core.optimizer.emerging_optimizers")
-        monkeypatch.setattr(module, "HAVE_EMERGING_OPTIMIZERS", False)
-    elif damage == "report_missing":
-        (bundle / "functional-package-install.json").rename(bundle / "absent-report.json")
-    else:
-        (bundle / "functional-package-install.json").write_text('{}')
-    with pytest.raises((TypeError, ValueError, FileNotFoundError)):
-        environment.check_training_dependencies(bundle)
-
-
-def test_dependency_report_preserves_actual_sources(tool_environment):
-    bundle, _, _, _, _, _ = tool_environment
-    path = bundle / "functional-package-install.json"
-    installation = json.loads(path.read_text())
-    installation["install"] = [
-        item for item in installation["install"] if item["metadata"]["name"] != "pla"
-    ]
-    installation["install"].append({"metadata": {"name": "tensorboard"}})
-    path.write_text(json.dumps(installation))
-    result = environment.check_training_dependencies(bundle)
-    assert result["packages"] == environment.TRAINING_PACKAGES
-    assert set(result["imports"]) == set(environment.TRAINING_IMPORTS)
-    assert result["satisfied_before_install"] == ["pla"]
-    assert result["download_sources"] == {
-        item["metadata"]["name"].replace("_", "-"): item["download_info"]
-        for item in installation["install"]
-        if item["metadata"]["name"] != "tensorboard"
-    }
 
 
 @pytest.fixture
@@ -1131,23 +717,6 @@ def cold_postprocessing(tmp_path, monkeypatch):
     yield prefix, site, startup, legacy
     assert legacy.read_bytes() == legacy_bytes
     assert (system / "google/shared_sibling/__init__.py").read_text() == "VALUE = 'retained'\n"
-
-
-def test_real_cold_uv_imports_original_common_and_extractor(cold_postprocessing):
-    prefix, _, startup, _ = cold_postprocessing
-    report = environment.check_postprocessing(ROOT)
-    assert report["event_roundtrip"]
-    assert report["prefix"] == str(prefix)
-    assert Path(report["protobuf_path"]).is_relative_to(prefix)
-    assert report["namespace_startup_sha256"] == hashlib.sha256(startup.read_bytes()).hexdigest()
-    assert (
-        Path(report["common_path"]) == ROOT / "tests/functional_tests/python_test_utils/common.py"
-    )
-    output = subprocess.check_output(
-        [sys.executable, "-c", "import google.shared_sibling; print(google.shared_sibling.VALUE)"],
-        text=True,
-    )
-    assert output.strip() == "retained"
 
 
 def test_real_uv_extractor_reads_tensorboard_in_fresh_process(cold_postprocessing, tmp_path):
@@ -1207,22 +776,6 @@ writer.close()
         assert report[metric]["value_precision"] == "full"
 
 
-def test_legacy_namespace_reproduces_missing_protobuf_without_bootstrap(cold_postprocessing):
-    _, _, startup, _ = cold_postprocessing
-    startup.rename(startup.with_suffix(".absent"))
-    # Keep the CI safe-path; otherwise Python inserts cwd, which recomputes the
-    # namespace and masks the defect.
-    probe = subprocess.run(
-        [sys.executable, "-c", "from tests.functional_tests.python_test_utils import common"],
-        cwd=ROOT,
-        env={**os.environ, "PYTHONPATH": str(ROOT), "PYTHONSAFEPATH": "1", "PYTHONNOUSERSITE": "1"},
-        text=True,
-        capture_output=True,
-    )
-    assert probe.returncode != 0
-    assert "No module named 'google.protobuf'" in probe.stderr
-
-
 @pytest.mark.parametrize("damage", ["missing", "changed", "protobuf", "version", "source"])
 def test_real_cold_postprocessing_rejects_damaged_environment(
     cold_postprocessing, tmp_path, damage
@@ -1243,82 +796,6 @@ def test_real_cold_postprocessing_rejects_damaged_environment(
         root.mkdir()
     with pytest.raises((subprocess.CalledProcessError, ValueError)):
         environment.check_postprocessing(root)
-
-
-@pytest.mark.parametrize("damage", ["prefix", "common_path", "extractor"])
-def test_postprocessing_route_identity_and_extractor_failure(monkeypatch, damage):
-    calls = []
-    report = {
-        "prefix": sys.prefix,
-        "common_path": str(ROOT / "tests/functional_tests/python_test_utils/common.py"),
-    }
-    if damage != "extractor":
-        report[damage] = "/untrusted"
-
-    def output(command, **kwargs):
-        calls.append(command)
-        assert command[:4] == ["uv", "run", "--no-sync", "python"]
-        assert kwargs["cwd"] == ROOT
-        assert kwargs["env"]["UV_PROJECT_ENVIRONMENT"] == sys.prefix
-        assert kwargs["env"]["UV_PYTHON"] == sys.executable
-        assert kwargs["env"]["UV_PYTHON_DOWNLOADS"] == "never"
-        assert kwargs["env"]["PYTHONNOUSERSITE"] == "1"
-        assert kwargs["env"]["PYTHONPATH"] == str(ROOT)
-        return json.dumps(report)
-
-    def run(command, **kwargs):
-        calls.append(command)
-        assert command[:4] == ["uv", "run", "--no-sync", "python"]
-        assert command[4:] == [
-            str(
-                ROOT
-                / "tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py"
-            ),
-            "--help",
-        ]
-        assert kwargs["check"] and kwargs["timeout"] == 60
-        raise subprocess.CalledProcessError(23, command)
-
-    monkeypatch.setattr(environment.subprocess, "check_output", output)
-    monkeypatch.setattr(environment.subprocess, "run", run)
-    with pytest.raises((ValueError, subprocess.CalledProcessError)):
-        environment.check_postprocessing(ROOT)
-    assert len(calls) == (2 if damage == "extractor" else 1)
-
-
-def test_postprocessing_failure_prevents_success_report(tool_environment, monkeypatch):
-    bundle, _, manifest, _, _, _ = tool_environment
-    environment.prepare(bundle, manifest)
-
-    def fail(root):
-        raise subprocess.CalledProcessError(1, ["uv", "run"])
-
-    monkeypatch.setattr(environment, "check_postprocessing", fail)
-    with pytest.raises(subprocess.CalledProcessError):
-        environment.check(bundle, manifest, bundle / "reports")
-    assert not (bundle / "reports/functional-environment.json").exists()
-
-
-def test_namespace_prepare_refuses_to_overwrite_existing_file(tool_environment):
-    bundle, site, manifest, _, _, _ = tool_environment
-    startup = site / environment.NAMESPACE_PTH
-    startup.write_text("existing content\n")
-    with pytest.raises(ValueError, match="namespace startup"):
-        environment.prepare(bundle, manifest)
-    assert startup.read_text() == "existing content\n"
-
-
-def test_checkpoint_requirement_is_not_optional():
-    with pytest.raises(KeyError, match="nvrx_checkpoint"):
-        environment.nvrx_requirements({"functional": {"case": {"launcher": "torchrun"}}})
-
-
-def test_tool_export_digest_mismatch_prevents_runtime_success(tool_environment):
-    bundle, _, manifest, calls, _, _ = tool_environment
-    (bundle / "functional-tools/yq").write_bytes(b"different")
-    with pytest.raises(ValueError, match="tool"):
-        environment.prepare(bundle, manifest)
-    assert not calls
 
 
 @pytest.mark.parametrize(

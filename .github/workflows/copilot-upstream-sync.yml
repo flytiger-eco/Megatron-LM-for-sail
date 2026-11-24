@@ -76,7 +76,6 @@ jobs:
       PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
       PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
       PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
-      PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}
 
   test-dev:
     needs: dev
@@ -97,4 +96,3 @@ jobs:
       PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
       PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
       PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
-      PPU_TOKENIZER_RECEIPTS_ROOT: ${{ secrets.PPU_TOKENIZER_RECEIPTS_ROOT }}

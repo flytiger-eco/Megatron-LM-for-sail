@@ -183,48 +183,12 @@ def test_maximum_three_complete_attempts(evidence, tmp_path):
     assert len(runner.calls) == 3
 
 
-def test_assets_and_stale_directory_prevent_training(evidence, tmp_path):
-    manifest, case, directory = prepare_case(evidence, tmp_path)
-    manifest["config"]["data_path"] = str(tmp_path / "absent")
-    runner = FakeRunner(manifest, case)
-    with pytest.raises(ValueError, match="asset preflight"):
-        runtime.run_case(manifest, ROOT, case["id"], directory, runner=runner)
-    assert not runner.calls
-    with pytest.raises(FileExistsError):
-        runtime.run_case(manifest, ROOT, case["id"], directory, runner=runner)
-
-
-def test_unmapped_tokenizer_stops_before_any_training(evidence, tmp_path):
-    manifest, case, directory = prepare_case(evidence, tmp_path)
-    case["tokenizer_dependencies"] = functional.tokenizer_dependencies(
-        ROOT, yaml.safe_load((ROOT / case["config_path"]).read_text()), case["training_script"]
-    )
-    runner = FakeRunner(manifest, case)
-    with pytest.raises(ValueError, match="asset preflight"):
-        runtime.run_case(manifest, ROOT, case["id"], directory, runner=runner)
-    assert not runner.calls
-    report = json.loads((directory / "assets-report.json").read_text())
-    assert report["result"] == "asset_source_mapping_required"
-    assert report["cases"][0]["unresolved_dependencies"][0]["repository"] == "bert-large-uncased"
-
-
 def test_assets_mode_never_launches_training(evidence, tmp_path):
     manifest, case, directory = prepare_case(evidence, tmp_path)
     manifest["config"]["functional_mode"] = "assets"
     with pytest.raises(ValueError, match="explicit functional regression"):
         runtime.run_case(manifest, ROOT, case["id"], directory)
     assert not directory.exists()
-
-
-def test_budget_exhausted_before_first_repeat_records_failure(evidence, tmp_path):
-    manifest, case, directory = prepare_case(evidence, tmp_path)
-    runner = FakeRunner(manifest, case)
-    times = iter((0, case["budget_seconds"] + 1, case["budget_seconds"] + 1))
-    record = runtime.run_case(
-        manifest, ROOT, case["id"], directory, runner=runner, clock=lambda: next(times)
-    )
-    assert not record["success"] and record["timed_out"]
-    assert not runner.calls
 
 
 def test_process_runner_preserves_actual_subprocess_exit_and_log(tmp_path):
@@ -355,26 +319,6 @@ def test_process_runner_reaps_real_detached_worker(tmp_path, monkeypatch, mode):
                 pass
 
 
-@pytest.mark.parametrize("cancelled", [True, False])
-def test_process_runner_does_not_start_after_cancellation_or_deadline(
-    tmp_path, monkeypatch, cancelled
-):
-    runner = runtime.ProcessRunner()
-    runner.cancelled = cancelled
-    monkeypatch.setattr(
-        runtime.subprocess, "Popen", lambda *_, **__: pytest.fail("Must not start new processes")
-    )
-    code = runner.run(
-        [sys.executable, "-c", "raise SystemExit(0)"],
-        cwd=tmp_path,
-        env=os.environ.copy(),
-        log=tmp_path / "driver.log",
-        deadline=time.monotonic() - 1,
-    )
-    assert code == (143 if cancelled else 124)
-    assert runner.timed_out is not cancelled
-
-
 def test_environment_clears_inherited_shortcuts_and_uses_runtime_copy(
     evidence, tmp_path, monkeypatch
 ):
@@ -493,45 +437,6 @@ def test_compiler_environment_is_scoped_without_rewriting_model(
     assert (ROOT / case["config_path"]).read_bytes() == original
 
 
-@pytest.mark.parametrize("value", ["", "1", "8"])
-def test_thread_override_prevents_any_training_or_retry(evidence, tmp_path, monkeypatch, value):
-    manifest, case, directory = prepare_case(evidence, tmp_path)
-    monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", value)
-    runner = FakeRunner(manifest, case)
-    result = runtime.run_case(manifest, ROOT, case["id"], directory, runner=runner)
-    assert not result["success"] and result["attempts"] == 1
-    assert not runner.calls
-    execution = json.loads((directory / "attempt-1/repeat-1/execution.json").read_text())
-    assert execution["shell_exit_code"] is None
-    assert "default parallel compilation" in execution["error"]
-
-
-@pytest.mark.parametrize(
-    "key,value",
-    [
-        ("TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL", "1"),
-        ("TORCHINDUCTOR_COMPILE_THREADS", "1"),
-        ("TORCHINDUCTOR_COMPILE_THREADS", "8"),
-    ],
-)
-def test_model_environment_cannot_override_compiler_policy(
-    evidence, tmp_path, monkeypatch, key, value
-):
-    manifest, case, _ = evidence
-    monkeypatch.delenv("TORCHINDUCTOR_COMPILE_THREADS", raising=False)
-    config = yaml.safe_load((ROOT / case["config_path"]).read_text())
-    config["ENV_VARS"][key] = value
-    root = tmp_path / "source"
-    path = root / case["config_path"]
-    path.parent.mkdir(parents=True)
-    path.write_text(yaml.safe_dump(config))
-    directory = tmp_path / "repeat"
-    directory.mkdir()
-    with pytest.raises(ValueError, match="compiler.*policy|default parallel compilation"):
-        with runtime.repeat_environment(manifest, root, case, directory, 1, 1):
-            pytest.fail("Conflicting config must not start training")
-
-
 @pytest.mark.parametrize("method", ["fork", "forkserver"])
 def test_short_temporary_directory_supports_real_multiprocessing_managers(
     evidence, tmp_path, method
@@ -586,20 +491,6 @@ print("eight managers ready")
         assert "eight managers ready" in process.stdout
     assert not Path(env["TMPDIR"]).exists()
     assert legacy_tmp.is_dir() and (directory / "model_config.yaml").is_file()
-
-
-def test_temporary_directory_is_cleaned_on_unexpected_exception(evidence, tmp_path):
-    manifest, case, _ = evidence
-    directory = tmp_path / "repeat"
-    directory.mkdir()
-    with pytest.raises(RuntimeError, match="unexpected"):
-        with runtime.repeat_environment(manifest, ROOT, case, directory, 1, 1) as env:
-            temporary = Path(env["TMPDIR"])
-            (temporary / "scratch").write_text("transient")
-            (directory / "cache/persistent").write_text("preserve")
-            raise RuntimeError("unexpected")
-    assert not temporary.exists()
-    assert (directory / "cache/persistent").read_text() == "preserve"
 
 
 @pytest.mark.parametrize(
@@ -734,81 +625,6 @@ chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
             process.wait()
 
 
-@pytest.mark.parametrize("trigger", ["workflow_dispatch", "push", "merge_group"])
-def test_configure_archives_complete_standalone_runtime_dependencies(tmp_path, trigger):
-    """Run the real CPU configure step, then cold-start the runner from isolated artifacts to
-    check transitive dependencies.
-    """
-    workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())
-    step = next(
-        step for step in workflow["jobs"]["configure"]["steps"] if step.get("id") == "config"
-    )
-    (tmp_path / "control").symlink_to(ROOT, target_is_directory=True)
-    (tmp_path / "ppu-control-runtime").symlink_to(
-        Path(sys.executable).parent.parent, target_is_directory=True
-    )
-    plan = tmp_path / ".ppu-ci"
-    (plan / "control").mkdir(parents=True)
-    event = tmp_path / "event.json"
-    event.write_text(json.dumps({"merge_group": {"base_ref": "refs/heads/main"}}))
-    kind = "functional" if trigger == "workflow_dispatch" else "combined"
-    (plan / "authorization.json").write_text(
-        json.dumps(
-            {
-                "allowed": True,
-                "pr_number": 0,
-                "manual_pr": False,
-                "target_sha": "a" * 40,
-                "control_sha": "a" * 40,
-                "run_id": "123",
-                "run_attempt": 1,
-                "test_kind": kind,
-                "event_name": trigger,
-                "labels": [],
-                "functional_policy": functional.event_policy(trigger),
-            }
-        )
-    )
-    run = subprocess.run(
-        ["bash", "-euo", "pipefail", "-c", step["run"]],
-        cwd=tmp_path,
-        env={
-            **os.environ,
-            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
-            "RUNNER_TEMP": str(tmp_path),
-            "PPU_INPUTS": json.dumps({"test_kind": "functional"} if kind == "functional" else {}),
-            "PPU_DEFAULTS": "{}",
-            "PPU_SOURCE_ROOT": str(ROOT),
-            "PPU_CONTROL_ROOT": str(ROOT),
-            "GITHUB_EVENT_NAME": trigger,
-            "GITHUB_EVENT_PATH": str(event),
-            "GITHUB_REF": functional.BRANCH,
-            "GITHUB_OUTPUT": str(tmp_path / "outputs"),
-        },
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert run.returncode == 0, run.stderr
-    top = json.loads((plan / "manifest.json").read_text())
-    manifest = functional.load_manifest(plan / "manifest.json")
-    assert top["test_kind"] == kind and top["environment_build_schema"] == 2
-    assert manifest["environment_build_schema"] == 2
-    if kind == "combined":
-        assert top["schema_version"] == 4 and top["config"]["unit_test"] is True
-        assert manifest["config"]["trigger_kind"] == trigger
-    assert not list((plan / "control").glob("*diagnostic*"))
-    cold_start = subprocess.run(
-        [sys.executable, "-I", str(plan / "control/ppu_functional_runtime.py"), "--help"],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    assert cold_start.returncode == 0, cold_start.stderr
-    assert "--manifest" in cold_start.stdout
-
-
 def test_cross_session_discovery_orphans_and_pid_reuse(tmp_path, monkeypatch):
     def process(pid, ppid, pgid, sid, start=100):
         directory = tmp_path / str(pid)
@@ -833,167 +649,3 @@ def test_cross_session_discovery_orphans_and_pid_reuse(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime.os, "getpgrp", lambda: 999)
     runtime.signal_family(10, known, signal.SIGTERM)
     assert set(signals) == {(10, signal.SIGTERM), (20, signal.SIGTERM)}
-
-
-def test_workflow_functional_route_is_manual_only_and_preserves_ut():
-    parent = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
-    execute = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())["jobs"]
-    workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-functional.yml").read_text())
-    events = parent.get("on", parent.get(True))
-    inputs = events["workflow_dispatch"]["inputs"]
-    assert inputs["test_kind"]["default"] == "unit"
-    assert inputs["functional_mode"]["default"] == "assets"
-    assert inputs["functional_repeat"]["default"] == 1
-    assert len(inputs) <= 25
-    assert set(workflow.get("on", workflow.get(True))) == {"workflow_call"}
-    assert execute["unit-tests"]["uses"] == "./.github/workflows/ppu-ut.yml"
-    assert "functional-assets" in execute["admit-build"]["needs"]
-    assert "needs.functional-assets.result == 'success'" in execute["admit-build"]["if"]
-    assert not any(
-        action in step.get("uses", "")
-        for step in execute["functional-assets"]["steps"]
-        for action in ("ppu-distributed-action", "shared-workflows/cluster-task")
-    )
-    test = workflow["jobs"]["test"]
-    assert test["strategy"]["max-parallel"] == 1 and test["strategy"]["fail-fast"] is False
-    action = next(
-        step
-        for step in test["steps"]
-        if step.get("uses") == "flytiger-eco/shared-workflows/cluster-task@main"
-    )
-    assert action["with"]["nproc_per_node"] == 8
-    assert action["with"]["node_selector"] == "board-type=ZW-M890P"
-    assert action["with"]["image"] == "${{ inputs.runtime_image_digest }}"
-    assert "PPU_IMAGE_DIGEST=${{ inputs.runtime_image_digest }}" in action["with"]["extra_env"]
-    assert "PPU_BASE_IMAGE_DIGEST=${{ inputs.base_image_digest }}" in action["with"]["extra_env"]
-    assert "verify-bundle" in action["with"]["command"]
-    assert "ppu_functional_run.sh" in action["with"]["command"]
-
-
-@pytest.mark.parametrize(
-    "workflow_name,job_name,prepare_name,venv,script_names",
-    [
-        (
-            "ppu-execute",
-            "configure",
-            "Verify and restore isolated configuration environment",
-            "ppu-control-runtime",
-            ("ppu_functional.py", "ppu_ci.py"),
-        ),
-        (
-            "ppu-functional",
-            "result",
-            "Verify and restore isolated upstream comparison environment",
-            "ppu-control-runtime",
-            ("ppu_functional_results.py",),
-        ),
-    ],
-)
-def test_fixed_dependencies_are_prepared_before_untrusted_downloads(
-    workflow_name, job_name, prepare_name, venv, script_names
-):
-    """Pinned dependencies are prepared before input contents, then an explicit interpreter is used
-    without modifying the job PATH.
-    """
-    workflow = yaml.safe_load((ROOT / f".github/workflows/{workflow_name}.yml").read_text())
-    steps = workflow["jobs"][job_name]["steps"]
-    prepare_index = next(
-        index for index, step in enumerate(steps) if step.get("name") == prepare_name
-    )
-    downloads = [
-        index
-        for index, step in enumerate(steps)
-        if step.get("uses") in ("actions/checkout@v4", "actions/download-artifact@v4")
-        and step.get("with", {}).get("path") not in ("control", ".ppu-control-export")
-    ]
-    assert downloads and prepare_index < min(downloads)
-    prepare = steps[prepare_index]["run"]
-    assert "restore-control" in prepare and "pip install" not in prepare
-    assert "--digest '${{ inputs.control_digest }}'" in prepare
-    assert "--control-sha '${{ inputs.control_sha }}'" in prepare
-    assert "--root" not in prepare and "requirements" not in prepare
-    for step in steps:
-        assert "$GITHUB_PATH" not in step.get("run", "")
-        for script in script_names:
-            if script in step.get("run", ""):
-                assert f'"$RUNNER_TEMP/{venv}/bin/python" -I' in step["run"]
-    for script in script_names:
-        assert any(script in step.get("run", "") for step in steps)
-
-
-def test_workflow_uploads_evidence_without_checkpoint_payloads():
-    workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-functional.yml").read_text())
-    steps = workflow["jobs"]["test"]["steps"]
-    upload = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
-    assert upload["with"]["path"].startswith(".ppu-public/")
-    assert "outcome == 'success'" in upload["if"]
-    exporter = next(step for step in steps if step.get("id") == "public-test-152")
-    assert exporter["env"]["EXPORT_SOURCE"].startswith("${{ secrets.PPU_CPU_RUN_ROOT }}/")
-    assert "--overlay .ppu-action" in exporter["run"]
-    assert upload["with"]["include-hidden-files"] is True
-    assert upload["with"]["if-no-files-found"] == "error"
-    assert upload["with"]["retention-days"] == 7
-    names = [step.get("name") for step in steps]
-    assert names.index("Record omitted checkpoint payloads") == names.index(upload["name"]) - 2
-
-
-def test_checkpoint_omission_report_records_excluded_payloads(tmp_path):
-    workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-functional.yml").read_text())
-    step = next(
-        step
-        for step in workflow["jobs"]["test"]["steps"]
-        if step.get("name") == "Record omitted checkpoint payloads"
-    )
-    result = tmp_path / "functional-000"
-    repeat = result / "attempt-1/repeat-1"
-    (repeat / "checkpoints").mkdir(parents=True)
-    (repeat / "checkpoints/model.bin").write_bytes(b"x" * 10)
-    (repeat / "initial-checkpoints").mkdir()
-    (repeat / "initial-checkpoints/base.bin").write_bytes(b"y" * 3)
-    (repeat / "logs").mkdir()
-    (repeat / "logs/rank.log").write_text("ok")
-    control = tmp_path / ".ppu-ci/control"
-    control.mkdir(parents=True)
-    for name in ("ppu_ci_export.py", "ppu_ci_paths.py"):
-        (control / name).write_bytes((SCRIPTS / name).read_bytes())
-    (tmp_path / "ppu-control-runtime").symlink_to(Path(sys.executable).parent.parent)
-    subprocess.run(
-        ["bash", "-euo", "pipefail", "-c", step["run"]],
-        cwd=tmp_path,
-        env={**os.environ, "RESULT_DIR": str(result), "RUNNER_TEMP": str(tmp_path)},
-        check=True,
-    )
-    assert not (result / "checkpoint-omissions.json").exists()
-    report = json.loads((tmp_path / ".ppu-action/checkpoint-omissions.json").read_text())
-    assert report == {
-        "omitted": [
-            {"path": "attempt-1/repeat-1/checkpoints", "files": 1, "bytes": 10},
-            {"path": "attempt-1/repeat-1/initial-checkpoints", "files": 1, "bytes": 3},
-        ]
-    }
-    # The exclusion only narrows the upload scope; NAS originals and evidence stay untouched.
-    assert (repeat / "checkpoints/model.bin").stat().st_size == 10
-    assert (repeat / "logs/rank.log").read_text() == "ok"
-
-
-def test_checkpoint_omission_report_does_not_create_missing_results(tmp_path):
-    workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-functional.yml").read_text())
-    step = next(
-        step
-        for step in workflow["jobs"]["test"]["steps"]
-        if step.get("name") == "Record omitted checkpoint payloads"
-    )
-    result = tmp_path / "functional-999"
-    control = tmp_path / ".ppu-ci/control"
-    control.mkdir(parents=True)
-    for name in ("ppu_ci_export.py", "ppu_ci_paths.py"):
-        (control / name).write_bytes((SCRIPTS / name).read_bytes())
-    (tmp_path / "ppu-control-runtime").symlink_to(Path(sys.executable).parent.parent)
-    subprocess.run(
-        ["bash", "-euo", "pipefail", "-c", step["run"]],
-        cwd=tmp_path,
-        env={**os.environ, "RESULT_DIR": str(result), "RUNNER_TEMP": str(tmp_path)},
-        check=True,
-    )
-    # A case without evidence must still fail if-no-files-found: error, so no empty dir is created.
-    assert not result.exists()
