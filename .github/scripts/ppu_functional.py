@@ -104,16 +104,6 @@ def enabled(value) -> bool:
 
 def validate_route(event_name: str, ref: str, inputs: dict) -> str:
     kind = inputs.get("test_kind", "unit")
-    if kind == "smoke":
-        if event_name != "workflow_dispatch" or ref != policy.SANDBOX_REF:
-            raise ValueError("Smoke diagnostics require manual dispatch on the sandbox branch")
-        if any(inputs.get(key) for key in ("pr_number", "pr_sha", "pr_base_sha")):
-            raise ValueError("Smoke diagnostics cannot authorize PRs or publish PR success")
-        if any(str(inputs.get(key, default)) != default for key, default in DEFAULTS.items()):
-            raise ValueError(
-                "Smoke diagnostics use a fixed functional case; leave functional inputs at defaults"
-            )
-        return "combined"
     if kind not in ("unit", "functional"):
         raise ValueError("test_kind must be unit or functional")
     if {"compiler_diagnostic", "compiler_diagnostic_context"} & inputs.keys():
@@ -143,16 +133,6 @@ def validate_route(event_name: str, ref: str, inputs: dict) -> str:
 
 def event_policy(trigger: str, labels=()) -> dict | None:
     """Functional policy of an automatic trigger; release tags and other events run UT only."""
-    if trigger == "smoke":
-        return {
-            "trigger": "smoke",
-            "functional_scope": "all",
-            "cadence": "bypass",
-            "repeat": 1,
-            "timeout": 15,
-            "lightweight": False,
-            "requested_cases": [policy.SMOKE_FUNCTIONAL_CASE],
-        }
     if trigger == "pr":
         # `Run tests` wins over `Run functional tests`, as in the upstream workflow.
         trigger = next((label for label in SCOPE_LABELS if label in labels), "pr")
@@ -171,14 +151,6 @@ def event_policy(trigger: str, labels=()) -> dict | None:
 
 def authorization_trigger(authorization: dict) -> str:
     event = authorization.get("event_name")
-    if authorization.get("diagnostic_smoke"):
-        if (
-            event != "workflow_dispatch"
-            or authorization.get("pr_number")
-            or authorization.get("base_ref") != policy.SANDBOX_REF
-        ):
-            raise ValueError("Smoke policy is only valid for a manual sandbox diagnostic")
-        return "smoke"
     if event in ("push", "merge_group"):
         return event
     if authorization.get("pr_number") and event in ("pull_request_target", "workflow_dispatch"):

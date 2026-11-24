@@ -27,17 +27,17 @@ on:
     branches: [main, dev]
     tags: ['v*']
   pull_request_target:
-    branches: [main, dev, davidsophus/ppu-ci-integration]
+    branches: [main, dev]
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, edited, closed, labeled, unlabeled]
   merge_group:
     types: [checks_requested]
-    branches: [main, dev, davidsophus/ppu-ci-integration]
+    branches: [main, dev]
   workflow_dispatch:
     inputs:
       test_kind:
-        description: Unit, functional, or one-bucket plus one-case sandbox smoke diagnostic
+        description: Unit tests or functional asset/regression checks
         type: choice
-        options: [unit, functional, smoke]
+        options: [unit, functional]
         default: unit
       functional_mode:
         description: Read-only CPU asset preflight or explicitly requested PPU regression
@@ -112,9 +112,9 @@ jobs:
   authorize:
     if: >-
       vars.PPU_CI_ENABLED == 'true' &&
-      (contains(fromJSON('["refs/heads/main","refs/heads/dev","refs/heads/davidsophus/ppu-ci-integration"]'), github.ref) ||
+      (contains(fromJSON('["refs/heads/main","refs/heads/dev"]'), github.ref) ||
        (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-       (github.event_name == 'merge_group' && contains(fromJSON('["refs/heads/main","refs/heads/dev","refs/heads/davidsophus/ppu-ci-integration"]'), github.event.merge_group.base_ref))) &&
+       (github.event_name == 'merge_group' && contains(fromJSON('["refs/heads/main","refs/heads/dev"]'), github.event.merge_group.base_ref))) &&
       !(github.event_name == 'pull_request_target' && github.event.action == 'edited' && !github.event.changes.base) &&
       !(github.event_name == 'pull_request_target' &&
         contains(fromJSON('["labeled","unlabeled"]'), github.event.action) &&
@@ -185,7 +185,7 @@ jobs:
         run: python3 -I .ppu-ci/control/ppu_pr_authorize.py status
   invalidate-base:
     needs: authorize
-    if: github.event_name == 'push' && contains(fromJSON('["refs/heads/main","refs/heads/dev","refs/heads/davidsophus/ppu-ci-integration"]'), github.ref)
+    if: github.event_name == 'push' && contains(fromJSON('["refs/heads/main","refs/heads/dev"]'), github.ref)
     runs-on: ubuntu-latest
     permissions:
       contents: read

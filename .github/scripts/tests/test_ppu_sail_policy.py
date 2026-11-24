@@ -7,7 +7,7 @@ import yaml
 from test_ppu_lifecycle import FakeGitHub
 from test_ppu_quick import ROOT, auth, ci, context
 
-BRANCHES = ("main", "dev", "davidsophus/ppu-ci-integration")
+BRANCHES = ("main", "dev")
 
 
 @pytest.mark.parametrize("branch", BRANCHES)
@@ -57,26 +57,11 @@ def test_combined_functional_job_requires_successful_unit_tests():
     }
 
 
-def test_smoke_shares_build_but_cannot_publish_a_pr_gate():
-    from test_ppu_functional import functional
-
-    ref = "refs/heads/davidsophus/ppu-ci-integration"
-    inputs = {"test_kind": "smoke"}
-    authorization = auth.authorize({}, inputs, context(ref=ref), FakeGitHub())
-    assert authorization["test_kind"] == "combined" and authorization["pr_number"] == 0
-    assert functional.authorization_trigger(authorization) == "smoke"
-    unit = ci.select_config({"ref": ref}, "workflow_dispatch", inputs)
-    assert unit["scope"] == "diagnostic" and unit["repeat"] == 1 and unit["unit_test"]
-    assert unit["unit_bucket"] == "tests/unit_tests/test_model_configs.py"
-    selection = functional.select_config({}, authorization["functional_policy"])
-    cases = functional.catalogue(ROOT, ROOT, selection)["functional"]
-    assert len(cases) == 1
-    assert next(iter(cases.values()))["name"] == functional.policy.SMOKE_FUNCTIONAL_CASE
-    assert selection["repeat"] == 1 and not selection["lightweight"]
-    with pytest.raises(ValueError, match="PR"):
-        auth.authorize({}, {**inputs, "pr_number": "7"}, context(ref=ref), FakeGitHub())
-    with pytest.raises(ValueError, match="sandbox"):
-        auth.authorize({}, inputs, context(), FakeGitHub())
+@pytest.mark.parametrize("branch", BRANCHES)
+@pytest.mark.parametrize("kind", ["smoke", "combined"])
+def test_manual_dispatch_cannot_request_a_test_only_combined_route(branch, kind):
+    with pytest.raises(ValueError, match="test_kind must be unit or functional"):
+        auth.authorize({}, {"test_kind": kind}, context(ref=f"refs/heads/{branch}"), FakeGitHub())
 
 
 @pytest.mark.parametrize(
@@ -108,20 +93,16 @@ def test_cpu_only_filter_preserves_runtime_and_dependency_coverage(filename, exp
         assert not auth.cpu_only(7, pull, lambda _: renamed)
 
 
-def sync_fixture(branch, sandbox=False):
-    from test_ppu_quick import BASE_SHA, CONTROL_SHA, MERGE_SHA, REPOSITORY
+def sync_fixture(branch):
+    from test_ppu_quick import BASE_SHA, MERGE_SHA, REPOSITORY
 
-    ref = auth.policy.SANDBOX_REF if sandbox else auth.BRANCH
+    ref = auth.BRANCH
     ctx = context("workflow_dispatch", ref)
     ctx["workflow_ref"] = f"{REPOSITORY}/.github/workflows/copilot-upstream-sync.yml@{ref}"
     ctx["artifact_prefix"] = f"sync-{branch}-"
     base = BASE_SHA
-    upstream = CONTROL_SHA if sandbox else "e" * 40
-    source = (
-        f"davidsophus/ppu-sync-{branch}"
-        if sandbox
-        else "dev" if branch == "dev" else f"sync/upstream-main/{upstream}"
-    )
+    upstream = "e" * 40
+    source = "dev" if branch == "dev" else f"sync/upstream-main/{upstream}"
     request = dict(
         target_branch=branch,
         source_ref=source,
@@ -144,15 +125,16 @@ def sync_fixture(branch, sandbox=False):
 
 
 @pytest.mark.parametrize("branch", ["main", "dev"])
-@pytest.mark.parametrize("sandbox", [False, True])
-def test_sync_handoff_uses_published_commit_and_rechecks_before_execution(branch, sandbox):
+@pytest.mark.parametrize("event", ["schedule", "workflow_dispatch"])
+def test_sync_handoff_uses_published_commit_and_rechecks_before_execution(branch, event):
     from test_ppu_functional import functional
 
-    request, ctx, api, state = sync_fixture(branch, sandbox)
+    request, ctx, api, state = sync_fixture(branch)
+    ctx["event_name"] = event
     result = auth.authorize_sync(request, ctx, api)
     assert result["allowed"] and result["target_sha"] == request["target_sha"]
     assert result["test_kind"] == "combined" and result["pr_number"] == 0
-    assert result["functional_policy"] == functional.event_policy("smoke" if sandbox else "push")
+    assert result["functional_policy"] == functional.event_policy("push")
     assert auth.execution_guard(result, api)
     state["head"] = "f" * 40
     assert not auth.execution_guard(result, api)
@@ -162,12 +144,26 @@ def test_sync_handoff_uses_published_commit_and_rechecks_before_execution(branch
 
 @pytest.mark.parametrize(
     "change",
-    ["caller", "event", "prefix", "control", "destination", "parents", "extra", "branch", "base"],
+    [
+        "caller",
+        "ref",
+        "event",
+        "prefix",
+        "control",
+        "destination",
+        "parents",
+        "extra",
+        "branch",
+        "base",
+    ],
 )
 def test_sync_handoff_rejects_forged_or_stale_provenance(change):
     request, ctx, api, state = sync_fixture("main")
     if change == "caller":
         ctx["workflow_ref"] = ctx["workflow_ref"].replace("copilot-upstream-sync", "ppu-build")
+    elif change == "ref":
+        ctx["ref"] = "refs/heads/dev"
+        ctx["workflow_ref"] = ctx["workflow_ref"].replace("refs/heads/main", ctx["ref"])
     elif change == "event":
         ctx["event_name"] = "pull_request_target"
     elif change == "prefix":

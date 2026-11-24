@@ -160,10 +160,6 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
         "base_ref": base_ref,
         "test_kind": test_kind,
     }
-    if inputs.get("test_kind") == "smoke":
-        result.update(
-            diagnostic_smoke=True, labels=[], functional_policy=functional.event_policy("smoke")
-        )
     if event_name == "workflow_dispatch":
         expected_workflow = f"{repository}/.github/workflows/ppu-build.yml@{ref}"
         if context["workflow_ref"] != expected_workflow:
@@ -330,7 +326,7 @@ def sync_is_current(request: dict, api=github_api) -> bool:
         != request["target_sha"]
     ):
         return False
-    if request["source_ref"].startswith(("sync/upstream-main/", "davidsophus/ppu-sync-")):
+    if request["source_ref"].startswith("sync/upstream-main/"):
         return (
             current_base_sha(api, f"refs/heads/{request['target_branch']}") == request["base_sha"]
         )
@@ -340,11 +336,8 @@ def sync_is_current(request: dict, api=github_api) -> bool:
 def authorize_sync(request: dict, context: dict, api=github_api) -> dict:
     """Accept only an explicit handoff from the trusted synchronization workflow."""
     ref = context["ref"]
-    if ref not in (BRANCH, policy.SANDBOX_REF) or context["event_name"] not in (
-        "schedule",
-        "workflow_dispatch",
-    ):
-        raise ValueError("Sync handoff requires the trusted main or sandbox workflow")
+    if ref != BRANCH or context["event_name"] not in ("schedule", "workflow_dispatch"):
+        raise ValueError("Sync handoff requires the trusted main workflow")
     expected = f"{context['repository']}/.github/workflows/copilot-upstream-sync.yml@{ref}"
     if context["workflow_ref"] != expected or full_sha(context["sha"]) != full_sha(
         context["control_sha"]
@@ -360,17 +353,8 @@ def authorize_sync(request: dict, context: dict, api=github_api) -> dict:
         request[key] = full_sha(request[key])
     if context.get("artifact_prefix") != f"sync-{branch}-":
         raise ValueError("Sync handoff requires an isolated artifact namespace")
-    sandbox = ref == policy.SANDBOX_REF
-    expected_source = (
-        f"davidsophus/ppu-sync-{branch}"
-        if sandbox
-        else "dev" if branch == "dev" else f"sync/upstream-main/{request['upstream_sha']}"
-    )
-    if (
-        request["source_ref"] != expected_source
-        or sandbox
-        and request["upstream_sha"] != context["control_sha"]
-    ):
+    expected_source = "dev" if branch == "dev" else f"sync/upstream-main/{request['upstream_sha']}"
+    if request["source_ref"] != expected_source:
         raise ValueError("Sync source is outside the permitted publication destination")
     commit = api(f"git/commits/{request['target_sha']}")
     if [full_sha(row["sha"]) for row in commit["parents"]] != [
@@ -395,16 +379,15 @@ def authorize_sync(request: dict, context: dict, api=github_api) -> dict:
         "base_sha": request["base_sha"],
         "pr_number": 0,
         "manual_pr": False,
-        "base_ref": policy.SANDBOX_REF if sandbox else f"refs/heads/{branch}",
+        "base_ref": f"refs/heads/{branch}",
         "actor": context["actor"],
         "run_id": context["run_id"],
         "run_attempt": int(context["run_attempt"]),
-        "event_name": "workflow_dispatch" if sandbox else "push",
+        "event_name": "push",
         "test_kind": "combined",
         "labels": [],
-        "diagnostic_smoke": sandbox,
         "sync_request": request,
-        "functional_policy": functional.event_policy("smoke" if sandbox else "push"),
+        "functional_policy": functional.event_policy("push"),
     }
 
 

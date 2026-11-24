@@ -1,9 +1,8 @@
 name: PPU control tests
 on:
-  push:
-    branches: [davidsophus/ppu-ci-integration]
+  workflow_dispatch:
   pull_request:
-    branches: [main, dev, davidsophus/ppu-ci-integration]
+    branches: [main, dev]
     paths: ['.github/**', 'tests/test_utils/**', 'tests/functional_tests/**']
 permissions:
   contents: read

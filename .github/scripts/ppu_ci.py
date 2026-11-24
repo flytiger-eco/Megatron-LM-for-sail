@@ -59,18 +59,6 @@ def positive(value: object, name: str, maximum: int = 10000) -> int:
 def select_config(event: dict, event_name: str, inputs: dict) -> dict:
     if event_name not in {"pull_request_target", "push", "workflow_dispatch", "merge_group"}:
         raise ValueError(f"Unsupported trigger event: {event_name}")
-    if inputs.get("test_kind") == "smoke":
-        if event_name != "workflow_dispatch" or event.get("ref") != policy.SANDBOX_REF:
-            raise ValueError("Smoke diagnostics require a manual sandbox dispatch")
-        inputs = {
-            **inputs,
-            "scope": "full",
-            "suite_family": "nvidia-dev",
-            "repeat": 1,
-            "unit_bucket": policy.SMOKE_UNIT_BUCKET,
-            "build": True,
-            "unit_test": True,
-        }
     config = {"build": inputs.get("build", True), "unit_test": inputs.get("unit_test", True)}
     for key, value in config.items():
         text = str(value).lower()
@@ -966,7 +954,7 @@ def main() -> None:
         authorization = json.loads((args.output / "authorization.json").read_text())
         if authorization.get("sync_request"):
             event, event_name = {"ref": authorization["base_ref"]}, authorization["event_name"]
-            inputs = {"test_kind": "smoke"} if authorization.get("diagnostic_smoke") else {}
+            inputs = {}
         config = select_config(event, event_name, inputs)
         if authorization["allowed"] is not True:
             config.update(build=False, unit_test=False)

@@ -4,56 +4,31 @@
 维护提交统一使用 `DavidSophus <95245426@qq.com>`。历史专项诊断和本地调试工具
 已移出交付内容。
 
-## 独立测试分支
-
-`davidsophus/ppu-ci-integration` 用于集成验证，普通 push 只运行 CPU 控制测试。
-测试分支与 main/dev 使用同一套入口、授权及执行组件；不向 main/dev 推送测试提交。
-硬件执行使用仓库级 `sail-ppu-hardware` 串行队列；排队的 PR 在进入设备前重新检查 head/base 和状态归属。
-
-手动触发此分支的 `PPU Build`，选择 `test_kind=smoke`，其余输入保持默认：
-
-- UT 只运行上游 `tests/unit_tests/test_model_configs.py` bucket。
-- FT 只运行 `gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files`，一次完整数值比较。
-- 两者使用同一份构建产物；UT 失败则 FT 不启动。
-- 这是调试证据，不是完整 UT/FT 覆盖；此模式不能用于发布 PR 成功状态。
-
 ## 同步与 PR 的统一入口
 
-main/dev 同步发布成功后，worker 输出 `sync_request`（被测 SHA、两个父提交、发布分支），
+代码同步沿用主线已有的 Copilot 同步流程；这里仅增加发布结果与测试流水线的交接。
+main 发布同步候选分支并创建 PR，dev 直接发布到 dev；原有合并和冲突处理逻辑不变。
+同步发布成功后，worker 输出 `sync_request`（被测 SHA、两个父提交、发布分支），
 父 workflow 直接调用 `ppu-build.yml` 的 `workflow_call`，再复用同一套 Build→UT→FT。
 不依赖 `GITHUB_TOKEN` 的 push 触发后续 Actions。main 和 dev 的 artifacts、NAS 目录分别使用
-`sync-main-` / `sync-dev-` 前缀，共享同一个硬件队列。
+`sync-main-` / `sync-dev-` 前缀，共享仓库级 `sail-ppu-hardware` 串行队列。
+排队的 PR 在进入设备前重新检查 head/base 和状态归属。测试失败不会回滚已发布的 dev 同步提交。
+没有新提交、仅 dry-run 或发布失败时，不输出交接请求，也不启动同步后的硬件测试。
 
 普通分支更新、同步及无标签 PR 共用 UT 的 `quick` 范围；FT 默认使用相同的上游 L0 测试集、一次重复、30 分钟预算。
 其中上游标注为 lightweight 的 case 只记录观察结果，不计为数值精度通过；其余 case 使用正式 golden 比较。
 `Run tests` 保留显式轻量观察模式，`Run functional tests` 可扩大到 L1；常规路径不需要标签。
-文档和纯 CI 编排变更仅走 CPU 检查；执行器、镜像/依赖、recipe、golden、被测代码变更仍运行硬件测试。
+文档和纯 CI 编排 PR 可豁免硬件测试，CPU 检查按各 workflow 的路径规则触发；
+执行器、镜像/依赖、recipe、golden、被测代码变更仍运行硬件测试。同步与普通 push 不做路径豁免。
 改名同时检查原路径，变更列表不完整时不豁免。
 
 GitHub 自 2025-12-08 起从默认分支加载 `pull_request_target`，即使 PR 合入 dev，控制代码仍来自 main。
 因此入口用 PR 的 `base.ref` 判断目标分支，用默认分支 SHA 固定控制代码。
-独立分支通过真实 PR 的 full-SHA 手动授权验证执行和状态；自动 PR 事件入口必须在 main 上线后验收。
+自动 PR 事件入口必须在 main 上线后验收；历史独立分支验证使用真实 PR 的 full-SHA 手动授权。
 参考：[GitHub 变更说明](https://github.blog/changelog/2025-11-07-actions-pull_request_target-and-environment-branch-protections-changes/)。
 
-测试同步接线时，在独立分支调度同步 workflow 并设置 `sandbox_handoff=true`。
-它只读取固定的 `davidsophus/ppu-sync-main` / `davidsophus/ppu-sync-dev` 测试引用，要求两个父提交分别是
-当前 main/dev 基线与当前控制 SHA，再调用同一流水线的最小诊断模式；不发布到 main/dev，不创建同步 PR。
-此模式验证发布后的接线和 SHA 隔离，不代表实际上游合并或完整测试集通过。
-本轮只维护 dev 的固定测试引用；main 使用集成分支自身的 smoke 入口。未准备并绑定 main 引用时，不使用 `target=all`。
-
-```bash
-# 使用集成分支自身的 main 产品源码验证共享流水线。
-gh workflow run ppu-build.yml --repo flytiger-eco/Megatron-LM-for-sail \
-  --ref davidsophus/ppu-ci-integration -f test_kind=smoke
-
-# 使用已绑定当前 control SHA 的 dev 测试引用验证同步后的交接。
-gh workflow run copilot-upstream-sync.yml --repo flytiger-eco/Megatron-LM-for-sail \
-  --ref davidsophus/ppu-ci-integration -f target=dev -f sandbox_handoff=true -f publish=false
-```
-
-测试引用使用合成 merge commit，只保留当前产品分支的源码并补齐已有 PPU baseline；第二父提交仅标识
-控制代码。它们不能合入产品分支。修改 control 或同步基线后，需重新绑定测试引用，旧引用会在 CPU 授权阶段被拒绝。
-运行期间不要移动被测引用；先等待该轮结束，再更新并记录新旧完整 SHA。
+正式入口只信任 main/dev；临时测试分支、同步模拟交接和专用组合 smoke 模式不进入正式控制代码。
+已有集成测试分支保留这些验证工具和历史记录；后续改动先运行 CPU 控制测试，再按需选择单个设备 case。
 
 dev 的 UT recipe 目前还包含 `examples/multimodal_dev/tests` 和 2/4 卡分组。
 选择器直接读取 recipe 的 `gpus`，GTP bucket 按上游脚本显式设置的 `GPUS_PER_NODE=4` 执行；
@@ -69,10 +44,11 @@ NVRx 预检查同时支持旧 `get_async_strategy()` 与 dev 的直接 NVRx 接�
 ```mermaid
 flowchart TD
     S[同步成功：发布 SHA 与父提交] --> A[ppu-build.yml 共用入口]
-    P[main/dev PR 或分支更新] --> A
+    P[main/dev PR] --> A
+    U[main/dev 分支更新] --> A
     A --> B[pr_authorize 固定 control / target SHA]
-    B --> Q{文档或纯 CI 改动？}
-    Q -->|是| X[CPU 检查与硬件豁免状态]
+    B --> Q{PR 且满足文档或纯 CI 豁免？}
+    Q -->|是| X[硬件豁免；CPU 按路径规则触发]
     Q -->|否| C[ppu-execute.yml 选例与 manifest]
     C --> D[CPU 资产预检查]
     C --> E[构建镜像与封装源码]
@@ -102,7 +78,7 @@ manifest 的 `control_files`、`source_files` 分别记录两者摘要，case �
 
 | 文件 | 维护职责 |
 |---|---|
-| `ppu_policy.py` | 受信任分支、最小诊断 case、CPU 豁免路径和同步产物前缀 |
+| `ppu_policy.py` | 受信任分支、CPU 豁免路径、UT 拓扑例外和同步产物前缀 |
 | `ppu_pr_authorize.py` | 授权、SHA、过期状态与 PR 状态归属 |
 | `ppu_ci.py`、`ppu_pytest_policy.py` | UT 选例、manifest、排除策略、结果门槛和证据 |
 | `ppu_ci_build.sh`、`ppu_ci_run.sh` | 构建准备和 UT 执行 |
@@ -140,6 +116,7 @@ PID 重用、超时、取消和实际子进程清理测试。正常日志、错�
 
 先在具备 Python 3.12 和 `.github/docker/control-requirements.txt` 依赖的 CPU 环境中检查。
 不要为控制脚本在宿主机安装 Megatron GPU 依赖或同步整个项目环境。
+`ppu-control-tests.yml` 在面向 main/dev 的相关路径 PR 上运行，也支持手动调度；它只使用 CPU。
 
 ```bash
 # 只验证选例与锁定文件，不申请 Pod，也不检查 NAS 是否可读。
@@ -170,8 +147,16 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q \
 现有执行器仍要求单机 **8 卡**。`repeat=1` 不关闭正式基础设施重试：最多 3 次 attempt
 共用预算；排队、构建、资产预检查和退出清理另有开销。冷编译可能耗尽预算，不能据此判精度失败。
 
-最小集成调试使用本页的 `smoke` 入口；历史四步专项诊断不属于当前交付。
-需要时独立 checkout 使用，并记录实际 control/target SHA；其 smoke 结果不计作精度通过。
+仅定位 UT 时，使用已有的单 bucket 入口；下面命令在本流程上线后从 main 调度：
+
+```bash
+gh workflow run ppu-build.yml --repo flytiger-eco/Megatron-LM-for-sail \
+  --ref main -f test_kind=unit -f scope=full -f suite_family=nvidia-dev \
+  -f unit_bucket=tests/unit_tests/test_model_configs.py -f repeat=1
+```
+
+单 bucket 与单 FT case 是独立诊断请求，各自构建；都不能发布 PR 成功状态，也不代表完整覆盖。
+历史共享构建的组合 smoke 工具保留在集成测试分支，运行时必须核对该版本的 control/target SHA。
 
 已有正式产物直接在 CPU 复核，不重跑训练：
 
@@ -201,9 +186,9 @@ python .github/scripts/ppu_functional_results.py \
 临时 PR [#21](https://github.com/flytiger-eco/Megatron-LM-for-sail/pull/21) 已关闭，未合并。
 PR 探针使用真实 PR 的 head/base SHA 手动授权；不能将它们写成自动 `pull_request_target` 事件已验收。
 
-正式上线还需处理现有同步权限：生产同步 [44563433346](https://github.com/flytiger-eco/Megatron-LM-for-sail/actions/runs/44563433346)
-在创建 main 同步 PR 时被仓库设置拒绝（`GitHub Actions is not permitted to create or approve pull requests`）。
-这次测试没有修改仓库设置或凭据。沙箱接线成功不能证明该生产发布步骤已恢复。
+历史生产同步 [44563433346](https://github.com/flytiger-eco/Megatron-LM-for-sail/actions/runs/44563433346)
+曾在创建 main 同步 PR 时被仓库设置拒绝（`GitHub Actions is not permitted to create or approve pull requests`）。
+集成验证没有修改仓库设置或凭据；正式发布权限以实际同步运行结果为准，不能用沙箱接线结果替代。
 
 main 最小运行的首次镜像拉取耗时 20 分 2 秒（压缩镜像约 7.11 GiB），实际构建检查 78 秒。
 UT 设备内执行 55 秒，FT 训练与比较约 184 秒。各项计时口径不同，不应相加作为稳定性能指标；
@@ -213,8 +198,9 @@ dev 成功运行的设备内构建检查为 75 秒，FT 训练与比较约 197 �
 同样只代表单次最小诊断，不作为 main/dev 性能对比。原始环境报告确认使用 dev 的 `direct_nvrx`
 接口与新的推理通信模块；配置、golden、数值门槛和依赖版本均未为这轮通过而改动。
 最终文档提交只补充说明，实际硬件证据以表中 control/target SHA 为准。
-已验证 dev 源码由 `davidsophus/ppu-sync-dev-validated` 保留；可重跑的 `davidsophus/ppu-sync-dev`
-会绑定到最新文档提交，其产品源码与已验证版本保持相同。
+测试引用和复跑方法参见
+[集成测试分支的历史说明](https://github.com/flytiger-eco/Megatron-LM-for-sail/blob/40f53fed83b0007f0f2251460a20d07858b920c2/docs/developer/ppu-ci.md)。
+这些记录仅证明表中提交的最小流程；新的 main/dev 提交需要重新验证。
 
 ## 维护约定
 
