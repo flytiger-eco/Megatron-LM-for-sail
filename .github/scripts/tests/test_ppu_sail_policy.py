@@ -361,3 +361,66 @@ def test_preflight_summary_distinguishes_manual_assets_from_numerical_tests():
     summary = auth.preflight_summary(result, inputs)
     assert "`assets`" in summary and "`all`" in summary
     assert "`numeric`" not in summary
+
+
+@pytest.mark.parametrize(
+    "kind,selection",
+    [
+        (
+            "unit",
+            {"scope": "full", "unit_bucket": auth.policy.VALIDATION_UNIT_BUCKET, "repeat": "1"},
+        ),
+        (
+            "functional",
+            {
+                "functional_cases": auth.policy.VALIDATION_FUNCTIONAL_CASE,
+                "functional_repeat": "1",
+                "functional_mode": "assets",
+            },
+        ),
+        (
+            "functional",
+            {
+                "functional_cases": auth.policy.VALIDATION_FUNCTIONAL_CASE,
+                "functional_repeat": "1",
+                "functional_mode": "regression",
+            },
+        ),
+    ],
+)
+def test_validation_branch_accepts_only_manual_single_case_requests(kind, selection):
+    inputs = {"test_kind": kind, **selection}
+    result = auth.authorize({}, inputs, context(ref=auth.policy.VALIDATION_REF), FakeGitHub())
+    assert result["allowed"] and result["pr_number"] == 0
+    assert result["control_sha"] == result["target_sha"]
+    assert result["test_kind"] == kind
+    for field in ("pr_number", "pr_sha", "pr_base_sha"):
+        with pytest.raises(ValueError, match="without PR status"):
+            auth.authorize(
+                {}, {**inputs, field: "7"}, context(ref=auth.policy.VALIDATION_REF), FakeGitHub()
+            )
+    with pytest.raises(ValueError, match="manual diagnostics"):
+        auth.policy.validate_route("push", auth.policy.VALIDATION_REF, inputs)
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        {},
+        {"test_kind": "functional", "functional_cases": "all"},
+        {
+            "test_kind": "functional",
+            "functional_cases": auth.policy.VALIDATION_FUNCTIONAL_CASE,
+            "functional_repeat": "2",
+        },
+        {
+            "test_kind": "unit",
+            "scope": "full",
+            "unit_bucket": auth.policy.VALIDATION_UNIT_BUCKET,
+            "repeat": "2",
+        },
+    ],
+)
+def test_validation_branch_cannot_accidentally_launch_full_suites(inputs):
+    with pytest.raises(ValueError, match="Validation requires"):
+        auth.authorize({}, inputs, context(ref=auth.policy.VALIDATION_REF), FakeGitHub())

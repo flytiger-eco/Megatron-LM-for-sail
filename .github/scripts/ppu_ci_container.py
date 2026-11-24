@@ -355,6 +355,24 @@ def command(
             else ''
         )
         raise ValidationError(failure + suffix)
+    if (
+        diagnostics
+        and args[:3] == ['docker', 'buildx', 'build']
+        and '--target' in args
+        and args[args.index('--target') + 1] == 'dependencies'
+    ):
+        log = process.stdout + '\n' + process.stderr
+        steps = set(re.findall(r'(?m)^#(\d+) \[dependencies [^\]]+\] RUN\b', log))
+        cached = set(re.findall(r'(?m)^#(\d+) CACHED\s*$', log))
+        observation = (
+            f'{len(steps & cached)}/{len(steps)} dependency RUN steps cached'
+            if steps
+            else 'dependency RUN cache observation unavailable'
+        )
+        print(f'BuildKit: {observation}', flush=True)
+        if os.environ.get('GITHUB_STEP_SUMMARY'):
+            with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+                stream.write(f'\nBuildKit: {observation}.\n')
     return process.stdout.rstrip('\n')
 
 
@@ -1189,7 +1207,6 @@ if __name__ == '__main__':
         # exceptions may contain credentials or private directory names.
         message = str(error) if isinstance(error, ValidationError) else type(error).__name__
         print(
-            f'PPU environment operation failed: {message}; raw details suppressed',
-            file=sys.stderr,
+            f'PPU environment operation failed: {message}; raw details suppressed', file=sys.stderr
         )
         raise SystemExit(1) from None

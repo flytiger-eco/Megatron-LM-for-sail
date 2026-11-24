@@ -1,5 +1,6 @@
 name: PPU Populate build cache
 on:
+  workflow_call:
   push:
     branches: [main, dev]
     paths:
@@ -20,7 +21,8 @@ jobs:
     if: >-
       github.repository == 'flytiger-eco/Megatron-LM-for-sail' &&
       vars.PPU_CI_ENABLED == 'true' &&
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/davidsophus/ppu-ci-validation'))
     runs-on: ubuntu-latest
     environment: ppu-ci
     timeout-minutes: 180

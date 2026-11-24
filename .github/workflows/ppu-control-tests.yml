@@ -1,6 +1,13 @@
 name: PPU control tests
+run-name: PPU validation / ${{ inputs.validation || 'control' }} / ${{ github.ref_name }}
 on:
   workflow_dispatch:
+    inputs:
+      validation:
+        description: CPU control tests or dependency-cache-only validation
+        type: choice
+        options: [control, cache]
+        default: control
   pull_request:
     branches: [main, dev]
     paths: ['.github/**', 'tests/test_utils/**', 'tests/functional_tests/**']
@@ -11,6 +18,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   test:
+    if: inputs.validation != 'cache'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -23,3 +31,11 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r .github/docker/control-requirements.txt transformers==4.57.3 tokenizers==0.22.2 uv==0.13.0
       - run: python -m pytest -q -o addopts= .github/scripts/tests
+  cache:
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.validation == 'cache' &&
+      github.ref == 'refs/heads/davidsophus/ppu-ci-validation'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/ppu-populate-build-cache.yml

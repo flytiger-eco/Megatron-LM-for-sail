@@ -2630,3 +2630,46 @@ def test_cache_scope_distinguishes_published_branches_from_candidates(tmp_path, 
                    env={**os.environ, 'GITHUB_OUTPUT': str(output)}, check=True, capture_output=True, timeout=10)
     values = dict(line.split('=', 1) for line in output.read_text().splitlines())
     assert values == {'base_ref': f'refs/heads/{branch}', 'pr_number': str(pr), 'write_baseline': expected}
+
+
+@pytest.mark.parametrize('stream', ['stdout', 'stderr'])
+@pytest.mark.parametrize(
+    'ending,expected',
+    [
+        ('#7 CACHED\n', '1/1 dependency RUN steps cached'),
+        ('#7 DONE 12.3s\n', '0/1 dependency RUN steps cached'),
+    ],
+)
+def test_buildkit_cache_summary_reports_only_observed_dependency_runs(
+    tmp_path, monkeypatch, capsys, stream, ending, expected
+):
+    output = {'stdout': '', 'stderr': ''}
+    output[stream] = (
+        '#6 [dependencies 3/5] COPY docker/export_environment.py /build/\n#6 CACHED\n#7 [dependencies 5/5] RUN <<PRIVATE_COMMAND\n#7 https://private-user:private-token@private-host/file\n'
+        + ending
+    )
+    monkeypatch.setattr(
+        container.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=0, **output)
+    )
+    summary = tmp_path / 'summary'
+    monkeypatch.setenv('GITHUB_STEP_SUMMARY', str(summary))
+    container.command(
+        ['docker', 'buildx', 'build', '--target', 'dependencies', '.'], diagnostics=True
+    )
+    printed = capsys.readouterr().out
+    assert printed == f'BuildKit: {expected}\n'
+    assert summary.read_text() == f'\nBuildKit: {expected}.\n'
+    assert 'private' not in printed + summary.read_text()
+
+
+def test_unknown_buildkit_log_does_not_claim_a_cache_hit(monkeypatch, capsys):
+    monkeypatch.delenv('GITHUB_STEP_SUMMARY', raising=False)
+    monkeypatch.setattr(
+        container.subprocess,
+        'run',
+        lambda *a, **kw: SimpleNamespace(returncode=0, stdout='', stderr='unrecognized format'),
+    )
+    container.command(
+        ['docker', 'buildx', 'build', '--target', 'dependencies', '.'], diagnostics=True
+    )
+    assert capsys.readouterr().out == 'BuildKit: dependency RUN cache observation unavailable\n'

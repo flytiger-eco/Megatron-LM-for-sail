@@ -828,8 +828,11 @@ def test_workflow_trust_and_resource_boundaries():
     assert auth.BRANCH == BRANCH == "refs/heads/main"
     assert events["push"]["branches"] == ["main", "dev"]
     for event_name in ("pull_request_target", "merge_group"):
-        assert events[event_name]["branches"] == list(auth.policy.BRANCHES)
+        assert events[event_name]["branches"] == ["main", "dev"]
     authorize_if = build["jobs"]["authorize"]["if"]
+    assert (
+        f"github.event_name == 'workflow_dispatch' && github.ref == '{auth.policy.VALIDATION_REF}'"
+    ) in authorize_if
     for ref in auth.policy.REFS:
         assert ref in authorize_if
     assert 'github.event.merge_group.base_ref)' in authorize_if

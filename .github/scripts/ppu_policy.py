@@ -5,7 +5,11 @@ import re
 
 MANUAL_RUN_PERMISSIONS = ("write", "maintain", "admin")
 
-BRANCHES = ("main", "dev")
+VALIDATION_BRANCH = "davidsophus/ppu-ci-validation"
+VALIDATION_REF = f"refs/heads/{VALIDATION_BRANCH}"
+VALIDATION_UNIT_BUCKET = "tests/unit_tests/test_model_configs.py"
+VALIDATION_FUNCTIONAL_CASE = "gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files"
+BRANCHES = ("main", "dev", VALIDATION_BRANCH)
 REFS = tuple(f"refs/heads/{branch}" for branch in BRANCHES)
 
 
@@ -73,6 +77,22 @@ def positive(value, name: str, maximum: int) -> int:
 
 def validate_route(event_name: str, ref: str, inputs: dict) -> str:
     kind = inputs.get("test_kind", "unit")
+    if ref == VALIDATION_REF:
+        if event_name != "workflow_dispatch" or any(
+            inputs.get(key) for key in ("pr_number", "pr_sha", "pr_base_sha")
+        ):
+            raise ValueError("Validation branch only permits manual diagnostics without PR status")
+        if kind == "unit" and (
+            inputs.get("scope") != "full"
+            or inputs.get("unit_bucket") != VALIDATION_UNIT_BUCKET
+            or str(inputs.get("repeat", "1")) != "1"
+        ):
+            raise ValueError("Validation requires the single model-config UT bucket with repeat=1")
+        if kind == "functional" and (
+            inputs.get("functional_cases") != VALIDATION_FUNCTIONAL_CASE
+            or str(inputs.get("functional_repeat", "1")) != "1"
+        ):
+            raise ValueError("Validation requires the single GPT functional case with repeat=1")
     if kind not in ("unit", "functional"):
         raise ValueError("test_kind must be unit or functional")
     if {"compiler_diagnostic", "compiler_diagnostic_context"} & inputs.keys():

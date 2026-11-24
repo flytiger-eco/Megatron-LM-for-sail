@@ -309,3 +309,44 @@ Actions summary 显示选中的读取、写入位置，选中 donor 不代表每
 已有同步流程用 `GITHUB_TOKEN` 推送 dev 时不会再次触发 push workflow；同步后正常 runtime build
 已能更新 baseline，不需要新增同步接线。新 workflow 合入后可从 main/dev 手动预热。
 实际缓存命中率、CPU 耗时和镜像拉取耗时，需要在线 Docker/GHCR 运行记录验收；CPU 单测不替代此项。
+
+## 独立验证分支（不随正式交付合并）
+
+`davidsophus/ppu-ci-validation` 基于 `ppu-ci-alignment`，仅增加手动验证入口、单 case 限制及
+安全的 BuildKit 缓存命中计数。正式 main/dev 交付仍使用 `ppu-ci-alignment`。
+测试入口不支持向 PR 发布成功状态，不自动触发设备任务；以下命令按步骤逐个运行。
+
+```bash
+SAIL_REPO=flytiger-eco/Megatron-LM-for-sail
+SAIL_REF=davidsophus/ppu-ci-validation
+SAIL_CASE=gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files
+
+# 1. GitHub hosted CPU 控制回归。
+gh workflow run ppu-control-tests.yml --repo "$SAIL_REPO" --ref "$SAIL_REF" -f validation=control
+
+# 2. 单 case 资产与 M890 路径检查；使用 CPU，不申请 PPU。
+gh workflow run ppu-build.yml --repo "$SAIL_REPO" --ref "$SAIL_REF" \
+  -f test_kind=functional -f functional_mode=assets -f functional_scope=all \
+  -f functional_cases="$SAIL_CASE" -f functional_repeat=1
+
+# 3. 仅 CPU 构建依赖缓存。第一次完成后，再运行同一命令验证复用。
+# 使用已登记的 control-tests 入口调用新预热 workflow，避免新文件尚未在默认分支登记的问题。
+gh workflow run ppu-control-tests.yml --repo "$SAIL_REPO" --ref "$SAIL_REF" -f validation=cache
+
+# 4. 单 case 数值回归：会申请 8 卡 M890；50 步、repeat=1、15 分钟总训练预算。
+gh workflow run ppu-build.yml --repo "$SAIL_REPO" --ref "$SAIL_REF" \
+  -f test_kind=functional -f functional_mode=regression -f functional_scope=all \
+  -f functional_cases="$SAIL_CASE" -f functional_repeat=1 -f functional_timeout=15
+
+# 5. UT 单桶：也会申请 8 卡；不运行完整 UT。
+gh workflow run ppu-build.yml --repo "$SAIL_REPO" --ref "$SAIL_REF" \
+  -f test_kind=unit -f scope=full -f suite_family=nvidia-dev \
+  -f unit_bucket=tests/unit_tests/test_model_configs.py -f repeat=1 -f timeout=15
+```
+
+每次检查运行的 head SHA 与该验证分支一致。资产报告应为 `assets_ready`，数值回归汇总应为
+`numerical_validation=true`、`numeric_passed=1`、`numeric_failed=0`；UT 的 `failed` 应为 0，
+不能只看诊断模式 90% gate 的绿色结论。缓存第二次运行应读取第一次写入的 diagnostic 指纹缓存，
+并在 Summary 中看到依赖 RUN 步骤命中（当前 Dockerfile 通常为 `1/1`）；不可识别的 BuildKit 日志
+会显示 observation unavailable，不能当成命中。镜像或缓存仍需拉取，所以耗时不是唯一判据。
+缓存及资产阶段不测试训练精度，CPU 控制回归也不证明正式 PR/同步事件已经在线部署。
