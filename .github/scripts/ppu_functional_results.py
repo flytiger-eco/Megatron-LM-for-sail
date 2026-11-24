@@ -112,7 +112,7 @@ def verify_source(manifest: dict, root: Path, case: dict) -> None:
 
 
 def verify_runtime_config(root: Path, case: dict, directory: Path) -> None:
-    expected = yaml.safe_load((root / case["config_path"]).read_text())
+    expected = control.m890_model_config(root / case["config_path"], case["name"])
     expected.setdefault("ENV_VARS", {})["N_REPEAT"] = 1
     expected["MODEL_ARGS"]["--exit-interval"] = case["effective_train_iters"]
     if case["observation"] == "lightweight":

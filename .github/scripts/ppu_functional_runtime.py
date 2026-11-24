@@ -151,7 +151,7 @@ def write_json(path: Path, value: dict) -> None:
 def repeat_environment(
     manifest: dict, root: Path, case: dict, directory: Path, attempt: int, repeat: int
 ) -> Iterator[dict]:
-    config = yaml.safe_load((root / case["config_path"]).read_text())
+    config = control.m890_model_config(root / case["config_path"], case["name"])
     config.setdefault("ENV_VARS", {})["N_REPEAT"] = 1
     (directory / "model_config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
     # Upstream consumes these through the environment; no arguments reach its eval parser.

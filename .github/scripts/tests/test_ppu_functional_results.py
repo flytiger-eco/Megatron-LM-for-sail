@@ -116,6 +116,7 @@ def successful_repeat(manifest, case, directory, attempt, repeat):
     path = directory / f"attempt-{attempt}" / f"repeat-{repeat}"
     path.mkdir(parents=True)
     config = yaml.safe_load((ROOT / case["config_path"]).read_text())
+    config.pop("LAUNCHER", None)  # The synthetic BERT evidence uses M890 torchrun.
     config.setdefault("ENV_VARS", {})["N_REPEAT"] = 1
     config["MODEL_ARGS"]["--exit-interval"] = case["effective_train_iters"]
     (path / "model_config.yaml").write_text(yaml.safe_dump(config))

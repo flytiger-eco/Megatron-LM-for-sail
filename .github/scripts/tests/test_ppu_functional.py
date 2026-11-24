@@ -14,7 +14,6 @@ SCRIPTS = ROOT / ".github/scripts"
 spec = importlib.util.spec_from_file_location("ppu_functional", SCRIPTS / "ppu_functional.py")
 functional = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(functional)
-snapshot = functional.module_from_path("snapshot", SCRIPTS / "ppu_functional_snapshot.py")
 
 
 def metric(values=None, start=1, end=4, interval=1, precision=None):
@@ -226,22 +225,63 @@ def test_compiler_policy_rejects_arbitrary_settings(settings):
         functional.compiler_environment(manifest)
 
 
-def test_imported_snapshot_matches_source_bytes():
-    files = snapshot.verify(ROOT, ROOT)
-    assert len(files) == 224
-    assert sum(Path(name).name == "model_config.yaml" for name in files) == 93
-    assert sum(Path(name).name == "golden_values_dev_ppu.json" for name in files) == 93
-    assert sum(Path(name).name == "golden_values_dev_ppu_2nd.json" for name in files) == 38
-    assert not any(".DS_Store" in name for name in files)
+def test_m890_goldens_share_the_upstream_case_tree():
+    files = functional.baseline_inventory(ROOT)
+    names = {str(Path(path).parent) for path in files}
+    assert names
+    for name in names:
+        assert f"{name}/golden_values_dev_m890.json" in files
+        config = functional.model_config_path(name).relative_to(functional.BASELINES).as_posix()
+        assert config in files
+        assert Path(config).name == (
+            "model_config_m890.yaml"
+            if name in functional.MODEL_CONFIG_OVERRIDES
+            else "model_config.yaml"
+        )
+    assert not (ROOT / "tests/functional_tests/zhenwu_test_cases").exists()
+    assert not (ROOT / ".github/ppu-functional-baselines.json").exists()
+
+
+def test_m890_adapter_changes_only_launcher_and_preserves_explicit_ft_cases():
+    for name in {str(Path(path).parent) for path in functional.baseline_inventory(ROOT)}:
+        path = ROOT / functional.model_config_path(name)
+        original = yaml.safe_load(path.read_text())
+        effective = functional.m890_model_config(path, name)
+        assert original.get("LAUNCHER", "torchrun") in ("torchrun", "ft_launcher")
+        expected_launcher = "ft_launcher" if name in functional.FT_LAUNCHER_CASES else "torchrun"
+        assert effective.get("LAUNCHER", "torchrun") == expected_launcher
+        assert {key: value for key, value in effective.items() if key != "LAUNCHER"} == {
+            key: value for key, value in original.items() if key != "LAUNCHER"
+        }
+    assert len(functional.FT_LAUNCHER_CASES) == 5
+
+
+@pytest.mark.parametrize("damage", ["missing_primary", "symlink", "invalid_json"])
+def test_m890_inventory_requires_a_valid_primary_reference(tmp_path, damage):
+    name = "gpt/example"
+    path = tmp_path / functional.BASELINES / name
+    path.mkdir(parents=True)
+    (path / "model_config.yaml").write_text("MODEL_ARGS: {}\n")
+    primary = path / "golden_values_dev_m890.json"
+    secondary = path / "golden_values_dev_m890_2nd.json"
+    secondary.write_text(json.dumps({"lm loss": metric()}))
+    if damage == "symlink":
+        primary.symlink_to(secondary)
+    elif damage == "invalid_json":
+        primary.write_text("{}")
+    with pytest.raises(ValueError):
+        functional.baseline_inventory(tmp_path)
 
 
 def test_catalogue_real_upstream_intersection(catalogue):
     cases = list(catalogue["functional"].values())
-    assert len(cases) == 83
-    assert len({row["name"] for row in cases}) == 83
+    selected = {row["name"] for row in cases}
+    baseline_names = {str(Path(path).parent) for path in functional.baseline_inventory(ROOT)}
+    omitted = {row["name"] for row in catalogue["coverage"]["baseline_not_selected"]}
+    assert cases and len(selected) == len(cases)
+    assert selected.isdisjoint(omitted) and selected | omitted == baseline_names
     assert all(row["environment"] == "dev" and row["cards"] == 8 for row in cases)
-    assert len(catalogue["coverage"]["baseline_not_selected"]) == 10
-    assert sum(not row["observation"] for row in cases) == 82
+    assert any(not row["observation"] for row in cases)
     assert {row["observation"] for row in cases if row["observation"]} == {"lightweight"}
     assert all(row["repeat"] == 1 for row in cases)
     assert not (set(functional.SKIPPED_CASES) & {row["name"] for row in cases})
@@ -281,7 +321,6 @@ def test_skip_policy_only_removes_isolated_cases_without_changing_other_cases(mo
     }
     assert actual == expected
     assert len(original["functional"]) == len(current["functional"]) + len(policy)
-    assert current["baseline_lock_sha256"] == original["baseline_lock_sha256"]
     assert current["tokenizer_lock_sha256"] == original["tokenizer_lock_sha256"]
 
 
@@ -447,50 +486,62 @@ def test_conflicting_recipe_fails(monkeypatch):
 
 
 @pytest.mark.parametrize("damage", ["none", "changed_after_plan", "missing", "symlink"])
-def test_different_control_and_target_recipes_keep_selection_and_integrity(tmp_path, damage):
+@pytest.mark.parametrize("source_kind", ["recipe", "config", "golden"])
+def test_target_revision_is_planned_then_frozen_in_manifest(tmp_path, damage, source_kind):
     config = functional.select_config(
         {
             "functional_mode": "regression",
-            "functional_cases": "gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files",
+            "functional_cases": (
+                "bert/bert_mcore_tp1_pp2,"
+                "gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files"
+            ),
         }
     )
     identity = {"target_sha": "a" * 40, "control_sha": "b" * 40, "run_id": "123", "run_attempt": 1}
     original = functional.build_manifest(ROOT, ROOT, config, identity)
     original_case = next(iter(original["functional"].values()))
     source = tmp_path / "source"
-    files = set(original["source_files"]) | {original_case["training_script"]}
+    files = set(original["source_files"]) | {
+        case["training_script"] for case in original["functional"].values()
+    }
     files.update(
-        path.relative_to(ROOT).as_posix()
-        for path in (ROOT / functional.BASELINES).rglob("*")
-        if path.is_file()
+        (functional.BASELINES / path).as_posix() for path in functional.baseline_inventory(ROOT)
     )
     for name in files:
         target = source / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((ROOT / name).read_bytes())
-    recipe_name = original_case["recipe_path"]
-    recipe = source / recipe_name
-    recipe.write_text("# The target branch has a different recipe revision.\n" + recipe.read_text())
-    expected_digest = functional.sha256(recipe)
+    changed_name = original_case[f"{source_kind}_path"]
+    changed = source / changed_name
+    if source_kind == "golden":
+        golden = json.loads(changed.read_text())
+        metric_name = original_case["metrics"][0]
+        step = next(iter(golden[metric_name]["values"]))
+        golden[metric_name]["values"][step] += 0.01
+        changed.write_text(json.dumps(golden))
+    else:
+        changed.write_text("# Target revision differs from control.\n" + changed.read_text())
+    expected_digest = functional.sha256(changed)
     if damage in ("missing", "symlink"):
-        recipe.unlink()
+        changed.unlink()
         if damage == "symlink":
-            recipe.symlink_to(ROOT / recipe_name)
-        with pytest.raises(ValueError, match="Missing or unsafe source file"):
+            changed.symlink_to(ROOT / changed_name)
+        with pytest.raises(ValueError):
             functional.build_manifest(source, ROOT, config, identity)
         return
     manifest = functional.build_manifest(source, ROOT, config, identity)
     case = next(iter(manifest["functional"].values()))
-    assert case == {**original_case, "recipe_sha256": expected_digest}
-    assert manifest["source_files"][recipe_name] == expected_digest
-    assert manifest["control_files"][recipe_name] == original_case["recipe_sha256"]
-    assert expected_digest != original_case["recipe_sha256"]
+    assert case == {**original_case, f"{source_kind}_sha256": expected_digest}
+    if source_kind == "recipe":
+        assert manifest["source_files"][changed_name] == expected_digest
+        assert manifest["control_files"][changed_name] == original_case["recipe_sha256"]
+    assert expected_digest != original_case[f"{source_kind}_sha256"]
     results = functional.module_from_path(
         "ppu_recipe_results", SCRIPTS / "ppu_functional_results.py"
     )
     results.verify_source(manifest, source, case)
     if damage == "changed_after_plan":
-        recipe.write_text(recipe.read_text() + "# Unreviewed change after planning.\n")
+        changed.write_text(changed.read_text() + "\n")
         with pytest.raises(ValueError, match="Functional source digest mismatch"):
             results.verify_source(manifest, source, case)
 
@@ -703,7 +754,7 @@ def test_skipped_teacher_is_reported_without_weakening_asset_gate(
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
     manifest = {**catalogue, "identity": {}, "config": functional.select_config({})}
     report = functional.asset_report(manifest, tmp_path)
-    assert len(report["cases"]) == 83
+    assert len(report["cases"]) == len(catalogue["functional"])
     assert report["ok"] is not missing_other_asset
     assert report["result"] == ("asset_layout_error" if missing_other_asset else "assets_ready")
     assert not report["numerical_validation"]

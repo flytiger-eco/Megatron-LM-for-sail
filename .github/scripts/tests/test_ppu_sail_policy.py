@@ -77,7 +77,7 @@ def test_manual_dispatch_cannot_request_a_test_only_combined_route(branch, kind)
         (".github/scripts/ppu_ci_run.sh", False),
         (".github/scripts/ppu_functional_runtime.py", False),
         (".github/docker/control-requirements.txt", False),
-        (".github/ppu-functional-baselines.json", False),
+        ("tests/functional_tests/test_cases/gpt/example/golden_values_dev_m890.json", False),
         ("tests/test_utils/recipes/h100/gpt.yaml", False),
         ("megatron/core/transformer/transformer_config.py", False),
         ("pyproject.toml", False),

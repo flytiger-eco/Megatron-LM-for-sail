@@ -136,7 +136,7 @@ def test_upstream_expanded_model_config_is_public_text_not_unknown_binary(tmp_pa
     source = tmp_path / "private/attempt-1/repeat-1"
     source.mkdir(parents=True)
     recipe = ROOT / (
-        "tests/functional_tests/zhenwu_test_cases/gpt/gpt3_mcore_te_tp2_pp2_cp2/model_config.yaml"
+        "tests/functional_tests/test_cases/gpt/gpt3_mcore_te_tp2_pp2_cp2/model_config.yaml"
     )
     original = recipe.read_bytes()
     (source / "model_config.yaml").write_bytes(original)

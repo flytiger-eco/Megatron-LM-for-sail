@@ -12,8 +12,20 @@ import shlex
 from pathlib import Path
 
 BRANCH = "refs/heads/main"
-BASELINES = Path("tests/functional_tests/zhenwu_test_cases")
-LOCK = Path(".github/ppu-functional-baselines.json")
+BASELINES = Path("tests/functional_tests/test_cases")
+PLATFORM = "m890"
+# Keep the previously validated M890 launch behavior while sharing NVIDIA model configs.
+# These five cases already used FT; the other M890 cases use the upstream torchrun default.
+FT_LAUNCHER_CASES = {
+    "gpt/gpt3_mcore_te_tp2_pp1_resume_torch_dist_multi_dist_optimizer_instances",
+    "gpt/gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather",
+    "moe/gpt3_mcore_te_tp1_pp2_resume_torch_dist_reshard_2x1x4_te_8experts2parallel_dist_optimizer",
+    "moe/gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_multi_dist_optimizer_instances",
+    "moe/gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer",
+}
+MODEL_CONFIG_OVERRIDES = {
+    "gpt/gpt3_mcore_te_tp2_pp1_modelopt_distill_resume": "model_config_m890.yaml"
+}
 POD_ASSETS = "ppu://assets/pod"
 CPU_ASSETS = "ppu://assets/cpu"
 IMAGE = "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
@@ -402,9 +414,52 @@ def supported_metrics(control: Path) -> set:
     raise ValueError("Unable to read upstream CHECK_THRESHOLDS metric names")
 
 
-def describe_case(root: Path, name: str, specs: list, config: dict) -> dict:
+def model_config_path(name: str) -> Path:
+    return BASELINES / name / MODEL_CONFIG_OVERRIDES.get(name, "model_config.yaml")
+
+
+def m890_model_config(path: Path, name: str) -> dict:
+    """Apply only the M890 launcher policy to a checked-in model configuration."""
     import yaml
 
+    config = yaml.safe_load(path.read_text())
+    if not isinstance(config, dict) or not isinstance(config.get("MODEL_ARGS"), dict):
+        raise ValueError(f"Invalid M890 model configuration: {name}")
+    if config.get("LAUNCHER", "torchrun") not in ("torchrun", "ft_launcher"):
+        raise ValueError(f"Unsupported launcher: {name}/{config['LAUNCHER']}")
+    if name in FT_LAUNCHER_CASES:
+        config["LAUNCHER"] = "ft_launcher"
+    else:
+        config.pop("LAUNCHER", None)
+    return config
+
+
+def baseline_inventory(root: Path) -> list[str]:
+    """Discover M890 goldens in the upstream case tree; Git owns their revisions."""
+    files = set()
+    primary = f"golden_values_dev_{PLATFORM}.json"
+    secondary = f"golden_values_dev_{PLATFORM}_2nd.json"
+    for path in sorted((root / BASELINES).glob(f"*/*/golden_values_dev_{PLATFORM}*.json")):
+        relative = path.relative_to(root)
+        if path.name not in (primary, secondary):
+            raise ValueError(f"Unexpected M890 golden filename: {relative}")
+        read_metrics(safe_file(root, relative))
+        name = path.parent.relative_to(root / BASELINES).as_posix()
+        # A secondary golden is provenance only; it cannot replace the numeric reference.
+        safe_file(root, BASELINES / name / primary)
+        config = safe_file(root, model_config_path(name))
+        files.update(
+            (
+                relative.relative_to(BASELINES).as_posix(),
+                config.relative_to(root / BASELINES).as_posix(),
+            )
+        )
+    if not files:
+        raise ValueError("M890 baseline inventory is empty")
+    return sorted(files)
+
+
+def describe_case(root: Path, name: str, specs: list, config: dict) -> dict:
     model, case = name.split("/")
     normalized = []
     for spec in specs:
@@ -419,10 +474,8 @@ def describe_case(root: Path, name: str, specs: list, config: dict) -> dict:
         raise ValueError(f"Training entrypoint requires explicit adaptation: {name}: {entries}")
     safe_file(root, entries[0])
     directory = BASELINES / name
-    path = safe_file(root, directory / "model_config.yaml")
-    model_config = yaml.safe_load(path.read_text())
-    if not isinstance(model_config, dict) or not isinstance(model_config.get("MODEL_ARGS"), dict):
-        raise ValueError(f"Invalid PPU model configuration: {name}")
+    path = safe_file(root, model_config_path(name))
+    model_config = m890_model_config(path, name)
     test_type = model_config.get("TEST_TYPE")
     if (
         test_type not in ("regular", "ckpt-resume")
@@ -444,14 +497,14 @@ def describe_case(root: Path, name: str, specs: list, config: dict) -> dict:
     metrics = model_config.get("METRICS", ["lm loss", "num-zeros"])
     if not isinstance(metrics, list) or not metrics or len(set(metrics)) != len(metrics):
         raise ValueError(f"Invalid metric selection: {name}")
-    golden_path = safe_file(root, directory / "golden_values_dev_ppu.json")
+    golden_path = safe_file(root, directory / f"golden_values_dev_{PLATFORM}.json")
     golden = read_metrics(golden_path)
     regions = {} if observation else validate_region(golden, golden, metrics)
     if not observation and any(
         golden[metric]["end_step"] < iters for metric in metrics if metric != "iteration-time"
     ):
         raise ValueError(f"Golden ends before configured training completes: {name}")
-    second = root / directory / "golden_values_dev_ppu_2nd.json"
+    second = root / directory / f"golden_values_dev_{PLATFORM}_2nd.json"
     if second.exists():
         read_metrics(safe_file(root, second.relative_to(root)))
     seconds = positive(
@@ -467,6 +520,7 @@ def describe_case(root: Path, name: str, specs: list, config: dict) -> dict:
         "model": model,
         "case": case,
         "environment": "dev",
+        "platform": PLATFORM,
         "cards": 8,
         "upstream_nodes": spec.get("nodes"),
         "upstream_gpus": spec.get("gpus"),
@@ -510,14 +564,8 @@ def describe_case(root: Path, name: str, specs: list, config: dict) -> dict:
 
 
 def catalogue(root: Path, control: Path, config: dict) -> dict:
-    snapshot = module_from_path(
-        "ppu_functional_snapshot", control / ".github/scripts/ppu_functional_snapshot.py"
-    )
-    files = snapshot.verify(root, control)
+    files = baseline_inventory(root)
     names = sorted({str(Path(path).parent) for path in files})
-    for path in files:
-        if path.endswith(".json"):
-            read_metrics(root / BASELINES / path)
     rows = load_recipes(control)
     tokenizer_sources = hf.load_sources(control)
     by_name = {}
@@ -553,9 +601,13 @@ def catalogue(root: Path, control: Path, config: dict) -> dict:
         if not eligible:
             outside.append(name)
             continue
-        has_config = (root / BASELINES / name / "model_config.yaml").is_file()
-        has_golden = (root / BASELINES / name / "golden_values_dev_ppu.json").is_file()
+        has_config = (root / model_config_path(name)).is_file()
+        has_golden = (root / BASELINES / name / f"golden_values_dev_{PLATFORM}.json").is_file()
         if not has_golden:
+            if (requested == ["all"] or name in requested) and (
+                control / BASELINES / name / f"golden_values_dev_{PLATFORM}.json"
+            ).is_file():
+                raise ValueError(f"Selected M890 golden is missing from the target: {name}")
             ignored.append({"name": name, "reason": "missing_PPU_golden"})
             continue
         if not has_config:
@@ -599,7 +651,7 @@ def catalogue(root: Path, control: Path, config: dict) -> dict:
             "upstream_disabled": disabled,
             "skipped_by_policy": skipped,
             "outside_scope": outside,
-            "baseline_configs": sum(Path(path).name == "model_config.yaml" for path in files),
+            "baseline_configs": len(names),
             "baseline_files": len(files),
             "baseline_not_selected": [
                 {
@@ -618,7 +670,6 @@ def catalogue(root: Path, control: Path, config: dict) -> dict:
                 if name not in {row["name"] for row in selected.values()}
             ],
         },
-        "baseline_lock_sha256": sha256(control / LOCK),
         "tokenizer_lock_sha256": sha256(control / hf.LOCK) if tokenizer_sources else None,
     }
 

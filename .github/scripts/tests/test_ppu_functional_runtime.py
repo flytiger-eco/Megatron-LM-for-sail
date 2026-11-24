@@ -407,6 +407,7 @@ def test_environment_clears_inherited_shortcuts_and_uses_runtime_copy(
         assert env["PYTEST_ADDOPTS"] == "" and "SLURM_JOB_END_TIME" not in env
         assert all(Path(env[key]).is_relative_to(directory / "cache") for key in cache_keys)
         expected = yaml.safe_load((ROOT / case["config_path"]).read_text())
+        expected.pop("LAUNCHER", None)  # This fixture is a M890 torchrun case.
         expected.setdefault("ENV_VARS", {})["N_REPEAT"] = 1
         assert yaml.safe_load((directory / "model_config.yaml").read_text()) == expected
 
@@ -419,6 +420,37 @@ def test_lightweight_policy_reaches_the_upstream_runner(evidence, tmp_path, monk
     directory.mkdir()
     with runtime.repeat_environment(manifest, ROOT, case, directory, 1, 1) as env:
         assert env["ENABLE_LIGHTWEIGHT_MODE"] == "true"
+
+
+@pytest.mark.parametrize(
+    "name,launcher",
+    [
+        ("gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files", "torchrun"),
+        (
+            "gpt/gpt3_mcore_te_tp2_pp1_resume_torch_dist_multi_dist_optimizer_instances",
+            "ft_launcher",
+        ),
+    ],
+)
+def test_m890_runtime_passes_the_preserved_launcher_to_upstream(evidence, tmp_path, name, launcher):
+    manifest, _, _ = evidence
+    catalogue = functional.catalogue(
+        ROOT, ROOT, functional.select_config({"functional_cases": name})
+    )
+    case = next(iter(catalogue["functional"].values()))
+    case["tokenizer_dependencies"] = []
+    directory = tmp_path / "launcher-repeat"
+    directory.mkdir()
+    source = ROOT / case["config_path"]
+    original = source.read_bytes()
+    with runtime.repeat_environment(manifest, ROOT, case, directory, 1, 1) as env:
+        config = yaml.safe_load(Path(env["TRAINING_PARAMS_PATH"]).read_text())
+        assert config.get("LAUNCHER", "torchrun") == launcher == case["launcher"]
+        assert Path(env["GOLDEN_VALUES_PATH"]).name == "golden_values_dev_m890.json"
+        config["MODEL_ARGS"]["--exit-interval"] = case["effective_train_iters"]
+        (directory / "model_config.yaml").write_text(yaml.safe_dump(config))
+        results.verify_runtime_config(ROOT, case, directory)
+    assert source.read_bytes() == original
 
 
 @pytest.mark.parametrize("legacy", [False, True])
@@ -440,6 +472,7 @@ def test_compiler_environment_is_scoped_without_rewriting_model(
     directory.mkdir()
     original = (ROOT / case["config_path"]).read_bytes()
     expected = yaml.safe_load(original)
+    expected.pop("LAUNCHER", None)  # This fixture is a M890 torchrun case.
     expected.setdefault("ENV_VARS", {})["N_REPEAT"] = 1
     with runtime.repeat_environment(manifest, ROOT, case, directory, 1, 1) as env:
         assert env.get(key) == (inherited if legacy else "0")

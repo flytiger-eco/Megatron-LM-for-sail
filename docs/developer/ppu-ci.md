@@ -114,7 +114,6 @@ manifest 的 `control_files`、`source_files` 分别记录两者摘要，case �
 | `ppu_ci_container.py`、`.sh` | 镜像指纹、构建、导出/恢复和产物校验 |
 | `ppu_ci_paths.py`、`ppu_ci_export.py` | CPU/Pod 存储映射与公共产物脱敏 |
 | `ppu_functional.py` | recipe/golden 选择、计划与资产清单 |
-| `ppu_functional_snapshot.py` | baseline 配置和 golden 的 SHA256 清单 |
 | `ppu_functional_hf.py` | 固定版本 tokenizer、receipt 与离线缓存 |
 | `ppu_functional_environment.py` | 包/API/工具/设备/编译环境检查 |
 | `ppu_functional_run.sh` | 正式 Pod 执行入口：镜像、环境、runtime |
@@ -130,7 +129,7 @@ PID 重用、超时、取消和实际子进程清理测试。正常日志、错�
 | 失败位置 / 证据 | 首先检查什么 | 负责文件 |
 |---|---|---|
 | authorize / `authorization.json` | PR 状态、head/base SHA、调用 workflow、是否属于 CPU 豁免路径 | `ppu_pr_authorize.py`、`ppu_policy.py` |
-| configure / `manifest.json`、`functional-manifest.json` | 上游 recipe 变化、被选 case、拓扑、baseline/tokenizer 锁定文件 | `ppu_ci.py`、`ppu_functional.py` |
+| configure / `manifest.json`、`functional-manifest.json` | 上游 recipe 变化、被选 case、拓扑、M890 golden 和 tokenizer 锁定文件 | `ppu_ci.py`、`ppu_functional.py` |
 | runtime-environment / Docker 构建日志 | 基础镜像 digest、包约束、离线安装与编译 | `Dockerfile.ppu-ci`、`ppu_ci_container.py` |
 | functional-assets / `assets-report.json` | NAS 映射、数据文件、tokenizer receipt 与缓存 | `ppu_ci_paths.py`、`ppu_functional_hf.py` |
 | build / Pod 状态与构建日志 | 先区分排队、镜像拉取、实际执行，再检查包导入、设备接口与构建产物 | `ppu_ci_build.sh`、`ppu_functional_environment.py` |
@@ -141,6 +140,36 @@ PID 重用、超时、取消和实际子进程清理测试。正常日志、错�
 不会通过反复重跑变成通过。`observation` 也不会加入 numeric 通过率。修改单个控制模块后，
 先运行对应的 CPU 测试文件；完整控制回归的依赖与命令以 `ppu-control-tests.yml` 为准。
 
+## M890 配置与 golden
+
+M890 使用 NVIDIA 的标准 case 目录与平台后缀：
+
+```text
+tests/functional_tests/test_cases/<model>/<case>/
+├── model_config.yaml
+├── golden_values_dev_m890.json
+└── golden_values_dev_m890_2nd.json  # 部分历史 case 的第二份记录
+```
+
+迁移保留 93 份主 golden、38 份第二次运行 golden 的原始字节，不重新采样、不修改比较精度。
+第二份 golden 仅作为来源记录；ckpt-resume 仍由上游比较器比较本次两阶段训练结果。
+92 个 case 直接使用上游 `model_config.yaml`，删除平行的 `zhenwu_test_cases` 配置树。
+蒸馏 case `gpt/gpt3_mcore_te_tp2_pp1_modelopt_distill_resume` 的历史训练参数另存为
+同目录 `model_config_m890.yaml`；它仍因缺少 teacher checkpoint 被显式跳过，不能计为通过。
+
+`ppu_functional.py` 的 `m890_model_config()` 集中处理 launcher 差异：M890 默认使用
+上游支持的 `torchrun`，`FT_LAUNCHER_CASES` 中原先使用 `ft_launcher` 的五个 case 保持原样。
+选例、运行时临时配置和结果复核共用此适配，训练参数、指标与步数不变；上游配置文件不被改写。
+这里只保留已有 launcher 行为，不代表已经验证故障注入恢复能力。
+
+golden 的版本由 Git 管理。新增或更新 M890 golden 时提交对应 JSON 即可，
+不再维护 `.github/ppu-functional-baselines.json` 或运行 snapshot 脚本。
+选例阶段检查 golden 内容、指标和步数，并把本次源代码中的配置及 golden SHA256 写进 manifest；
+执行与结果复核继续检查这些摘要，拒绝计划生成后发生的文件变更。
+受信任的 control recipe 决定测试范围，待测 SHA 中的配置与 golden 决定本轮实际输入。
+control 分支已有的在选 M890 golden 如果在待测提交中缺失，会直接失败，不能靠删除文件
+缩小覆盖范围。暂时停用 case 应保留 golden，并通过 recipe 的 broken scope 或显式跳过策略说明原因。
+
 ## 最小验证顺序
 
 先在具备 Python 3.12 和 `.github/docker/control-requirements.txt` 依赖的 CPU 环境中检查。
@@ -148,7 +177,7 @@ PID 重用、超时、取消和实际子进程清理测试。正常日志、错�
 `ppu-control-tests.yml` 在面向 main/dev 的相关路径 PR 上运行，也支持手动调度；它只使用 CPU。
 
 ```bash
-# 只验证选例与锁定文件，不申请 Pod，也不检查 NAS 是否可读。
+# 只验证选例、配置和 golden，不申请 Pod，也不检查 NAS 是否可读。
 PPU_INPUTS='{"functional_cases":"gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files"}' \
   python .github/scripts/ppu_functional.py catalogue > /tmp/ppu-catalogue.json
 
