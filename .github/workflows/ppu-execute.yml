@@ -283,10 +283,29 @@ jobs:
           bash control/.github/scripts/ppu_ci_container.sh fingerprint --kind runtime
           --control-root control --control-sha '${{ inputs.control_sha }}'
           --source-root source --target-sha '${{ inputs.target_sha }}'
-      - uses: actions/cache/restore@v4
+      - name: Login to GHCR for dependency cache and verified image publication
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
-          path: ${{ runner.temp }}/ppu-runtime-cache
-          key: ppu-runtime-linux-amd64-${{ steps.identity.outputs.cache_key }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Read authorized cache scope
+        id: cache-scope
+        run: |
+          jq -r '
+            "base_ref=\(.base_ref)", "pr_number=\(.pr_number)",
+            "write_baseline=\(.pr_number == 0
+              and (.event_name == "push" or .event_name == "workflow_dispatch")
+              and (.sync_request == null or .sync_request.source_ref == .sync_request.target_branch))"
+          ' .ppu-ci/authorization.json >> "$GITHUB_OUTPUT"
+      - name: Select dependency cache
+        id: cache
+        uses: ./control/.github/actions/ppu-build-cache
+        with:
+          key: ${{ steps.identity.outputs.cache_key }}
+          base-ref: ${{ steps.cache-scope.outputs.base_ref }}
+          pr-number: ${{ steps.cache-scope.outputs.pr_number }}
+          write-baseline: ${{ steps.cache-scope.outputs.write_baseline }}
       - name: Build and offline-verify the complete execution image on CPU
         id: runtime
         run: >-
@@ -295,17 +314,13 @@ jobs:
           --control-root control --control-sha '${{ inputs.control_sha }}'
           --source-root source --target-sha '${{ inputs.target_sha }}'
           --image-digest '${{ steps.identity.outputs.image_digest }}'
-          --output "$RUNNER_TEMP/ppu-runtime-export" --cache-root "$RUNNER_TEMP/ppu-runtime-cache"
+          --output "$RUNNER_TEMP/ppu-runtime-export"
+          --cache-from '${{ steps.cache.outputs.cache-from }}'
+          --cache-to '${{ steps.cache.outputs.cache-to }}'
       - name: Revalidate authorization before GHCR image publication
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I control/.github/scripts/ppu_pr_authorize.py guard
-      - name: Login to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
       - name: Publish the verified local image without rebuilding source
         id: publish
         run: >-
@@ -317,10 +332,6 @@ jobs:
           --local-image 'ppu-ci-runtime:run-${{ github.run_id }}-${{ github.run_attempt }}'
           --local-image-id '${{ steps.runtime.outputs.local_image_id }}'
           --image-tag 'ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci:run-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.target_sha }}'
-      - uses: actions/cache/save@v4
-        with:
-          path: ${{ runner.temp }}/ppu-runtime-cache
-          key: ppu-runtime-linux-amd64-${{ steps.identity.outputs.cache_key }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact_prefix }}ppu-runtime-environment

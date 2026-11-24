@@ -444,9 +444,20 @@ def build_identity(args):
         source = no_links(args.source_root)
         checked_git(source, args.target_sha)
         inputs['pyproject.toml'] = digest(no_links(source / 'pyproject.toml'))
-    inputs['ppu_ci_container.py'] = digest(no_links(root / '.github/scripts/ppu_ci_container.py'))
-    inputs['ppu_ci_container.sh'] = digest(no_links(root / '.github/scripts/ppu_ci_container.sh'))
-    dependency_key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+    # Only inputs consumed by the dependency stage belong in its cache key.
+    # Source/control SHAs and orchestration helpers still bind the final export.
+    dependency_inputs = dict(inputs)
+    if args.kind == 'runtime':
+        dependency_inputs.pop('control-requirements.txt')
+    dependency_key = hashlib.sha256(
+        json.dumps(dependency_inputs, sort_keys=True).encode()
+    ).hexdigest()
+    inputs['ppu_ci_container.py'] = digest(
+        no_links(root / '.github/scripts/ppu_ci_container.py')
+    )
+    inputs['ppu_ci_container.sh'] = digest(
+        no_links(root / '.github/scripts/ppu_ci_container.sh')
+    )
     for path in trusted_controls(root):
         inputs[path.name] = digest(path)
     inputs['control_sha'] = args.control_sha
@@ -531,10 +542,23 @@ def readable_probe_export(output, context):
 
 def build(args):
     image_mode = getattr(args, 'mode', '') == 'build-image'
+    cache_only = getattr(args, 'mode', '') == 'build-cache'
+    cache_from, cache_to = getattr(args, 'cache_from', ''), getattr(args, 'cache_to', '')
+    for ref in (cache_from, cache_to):
+        require(
+            not ref
+            or re.fullmatch(re.escape(GHCR_IMAGE) + r':cache-[a-z0-9][a-z0-9_.-]{0,121}', ref),
+            'Invalid dependency cache registry reference',
+        )
+    require(
+        not (args.cache_root and (cache_from or cache_to)),
+        'Choose local or registry dependency cache',
+    )
+    require(not cache_only or cache_to, 'Cache population requires a registry destination')
     root = no_links(args.control_root)
     image, pinned, _, inputs = build_identity(args)
-    output = no_links(args.output)
-    require(not output.exists(), 'Refusing to overwrite a container export')
+    output = None if cache_only else no_links(args.output)
+    require(cache_only or not output.exists(), 'Refusing to overwrite a container export')
     with tempfile.TemporaryDirectory(prefix='ppu-docker-context-', dir=root) as temporary:
         context = Path(temporary)
         docker = context / 'docker'
@@ -549,6 +573,7 @@ def build(args):
             checked_git(source, args.target_sha)
             shutil.copyfile(source / 'pyproject.toml', context / 'pyproject.toml')
             inputs['pyproject.toml'] = digest(context / 'pyproject.toml')
+        if args.kind == 'runtime' and not cache_only:
             (context / 'source').mkdir()
             names = command(
                 ['git', '-C', str(source), 'ls-files', '-z'],
@@ -587,21 +612,29 @@ def build(args):
             common += ['--build-arg', 'EXPORT_FORMAT=image']
         if cache and (cache / 'index.json').is_file():
             common += ['--cache-from', f'type=local,src={cache}']
-        if cache:
+        if cache_from:
+            common += ['--cache-from', f'type=registry,ref={cache_from}']
+        if cache or cache_to:
             dependency = 'dependencies' if args.kind == 'runtime' else 'control'
+            destination = (
+                f'type=registry,ref={cache_to},mode=max'
+                if cache_to
+                else f'type=local,dest={cache},mode=max'
+            )
+            print(
+                f'Building {args.kind} dependency cache (source compilation is a separate stage)',
+                flush=True,
+            )
             command(
-                common
-                + [
-                    '--target',
-                    dependency,
-                    '--cache-to',
-                    f'type=local,dest={cache},mode=max',
-                    str(context),
-                ],
+                common + ['--target', dependency, '--cache-to', destination, str(context)],
                 failure=f'Dockerfile {args.kind} dependency/cache build failed',
                 diagnostics=True,
             )
-            common += ['--cache-from', f'type=local,src={cache}']
+            print(f'Published {args.kind} dependency cache', flush=True)
+            if cache_only:
+                return
+            if cache:
+                common += ['--cache-from', f'type=local,src={cache}']
         started = time.time()
         command(
             common
@@ -629,7 +662,9 @@ def build(args):
         }
         (output / 'docker-build.json').write_text(json.dumps(metadata, sort_keys=True) + '\n')
         sha = digest(output / 'docker-build.json')
-        verify_export(output, sha, args.control_sha, args.target_sha, schema=2 if image_mode else 1)
+        verify_export(
+            output, sha, args.control_sha, args.target_sha, schema=2 if image_mode else 1
+        )
         # BuildKit local exports may be owned by the runner with mode 0700.
         # A root container without DAC capabilities cannot read that bind mount.
         # Keep original evidence private and mount a readable temporary snapshot.
@@ -648,7 +683,8 @@ def build(args):
                 ['docker', 'image', 'inspect', '--format', '{{.Id}}', args.local_image]
             )
             require(
-                re.fullmatch(r'sha256:[0-9a-f]{64}', local_id), 'Invalid local execution image ID'
+                re.fullmatch(r'sha256:[0-9a-f]{64}', local_id),
+                'Invalid local execution image ID',
             )
             command(
                 [
@@ -685,7 +721,9 @@ def build(args):
                 failure='Dockerfile execution image offline probe failed',
                 diagnostics=True,
             )
-            emit_outputs(environment_digest=sha, local_image_id=local_id, base_image_digest=pinned)
+            emit_outputs(
+                environment_digest=sha, local_image_id=local_id, base_image_digest=pinned
+            )
             return
         mounts = [
             '--mount',
@@ -694,7 +732,10 @@ def build(args):
             f'type=bind,source={root / ".github/scripts"},target=/trusted,readonly',
         ]
         if args.kind == 'runtime':
-            mounts += ['--mount', f'type=bind,source={context / "source"},target=/source,readonly']
+            mounts += [
+                '--mount',
+                f'type=bind,source={context / "source"},target=/source,readonly',
+            ]
         probe = [
             'python3',
             '-I',
@@ -744,7 +785,9 @@ def build(args):
                 {
                     'kind': args.kind,
                     'environment_digest': sha,
-                    'environment_bytes': sum(item['size'] for item in metadata['files'].values()),
+                    'environment_bytes': sum(
+                        item['size'] for item in metadata['files'].values()
+                    ),
                 }
             )
         )
@@ -1064,21 +1107,24 @@ def main():
     require(sys.version_info >= (3, 11), 'Environment bootstrap requires Python 3.11 or newer')
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='mode', required=True)
-    for mode in ('build', 'fingerprint', 'build-image'):
+    for mode in ('build', 'fingerprint', 'build-image', 'build-cache'):
         create = sub.add_parser(mode)
-        if mode == 'build-image':
+        if mode in ('build-image', 'build-cache'):
             create.set_defaults(kind='runtime')
+        if mode == 'build-image':
             create.add_argument('--local-image', required=True)
-        else:
+        elif mode != 'build-cache':
             create.add_argument('--kind', choices=('control', 'runtime'), required=True)
         create.add_argument('--control-root', type=Path, required=True)
         create.add_argument('--control-sha', required=True)
         create.add_argument('--source-root', type=Path)
         create.add_argument('--target-sha')
         create.add_argument('--image-digest')
-        if mode in ('build', 'build-image'):
-            create.add_argument('--output', type=Path, required=True)
+        if mode in ('build', 'build-image', 'build-cache'):
+            create.add_argument('--output', type=Path, required=mode != 'build-cache')
             create.add_argument('--cache-root', type=Path)
+            create.add_argument('--cache-from', default='')
+            create.add_argument('--cache-to', default='')
     for mode in ('restore-control', 'restore-runtime', 'offline-probe'):
         restore = sub.add_parser(mode)
         restore.add_argument('--artifact', type=Path, required=True)
@@ -1121,6 +1167,7 @@ def main():
     {
         'build': build,
         'build-image': build,
+        'build-cache': build,
         'publish-image': publish_image,
         'verify-image': verify_image,
         'image-probe': image_probe,
@@ -1142,6 +1189,7 @@ if __name__ == '__main__':
         # exceptions may contain credentials or private directory names.
         message = str(error) if isinstance(error, ValidationError) else type(error).__name__
         print(
-            f'PPU environment operation failed: {message}; raw details suppressed', file=sys.stderr
+            f'PPU environment operation failed: {message}; raw details suppressed',
+            file=sys.stderr,
         )
         raise SystemExit(1) from None

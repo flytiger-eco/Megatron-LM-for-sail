@@ -1,0 +1,64 @@
+name: PPU Populate build cache
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - '.github/docker/**'
+      - '.github/actions/ppu-build-cache/**'
+      - '.github/scripts/ppu_ci_container.py'
+      - '.github/scripts/ppu_ci_container.sh'
+      - '.github/workflows/ppu-populate-build-cache.yml'
+      - 'pyproject.toml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ppu-build-cache-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  populate:
+    if: >-
+      github.repository == 'flytiger-eco/Megatron-LM-for-sail' &&
+      vars.PPU_CI_ENABLED == 'true' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+    runs-on: ubuntu-latest
+    environment: ppu-ci
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Resolve dependency inputs and immutable base image
+        id: identity
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh fingerprint --kind runtime
+          --control-root control --control-sha '${{ github.sha }}'
+          --source-root control --target-sha '${{ github.sha }}'
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Select dependency cache
+        id: cache
+        uses: ./control/.github/actions/ppu-build-cache
+        with:
+          key: ${{ steps.identity.outputs.cache_key }}
+          base-ref: ${{ github.ref }}
+          publish-target-cache: 'true'
+      - name: Populate dependency layers on CPU
+        run: >-
+          bash control/.github/scripts/ppu_ci_container.sh build-cache
+          --control-root control --control-sha '${{ github.sha }}'
+          --source-root control --target-sha '${{ github.sha }}'
+          --image-digest '${{ steps.identity.outputs.image_digest }}'
+          --cache-from '${{ steps.cache.outputs.cache-from }}'
+          --cache-to '${{ steps.cache.outputs.cache-to }}'

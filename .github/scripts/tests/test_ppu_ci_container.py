@@ -892,10 +892,15 @@ def assert_build_arguments(argv, args):
     assert not any(value.endswith('--build-arg') for value in argv if value != '--build-arg')
 
 
+@pytest.mark.parametrize('backend', ['local', 'registry'])
 def test_build_uses_only_trusted_dockerfile_and_offline_unprivileged_probe(
-    build_inputs, monkeypatch
+    build_inputs, monkeypatch, backend
 ):
     args = build_inputs
+    if backend == 'registry':
+        args.cache_root = None
+        args.cache_from = container.GHCR_IMAGE + ':cache-main-runtime-amd64-baseline'
+        args.cache_to = container.GHCR_IMAGE + ':cache-main-runtime-amd64-pr-15-' + 'a' * 64
     malicious = args.source_root / 'Dockerfile'
     malicious.write_text('RUN steal-credentials')
     (args.source_root / 'Dockerfile-alias').symlink_to('Dockerfile')
@@ -1247,8 +1252,13 @@ def test_ghcr_publication_retains_authenticated_login_and_authorization_guard():
     workflow = yaml.safe_load((ROOT / '.github/workflows/ppu-execute.yml').read_text())
     job = workflow['jobs']['runtime-environment']
     steps = job['steps']
-    publish_index = next(index for index, step in enumerate(steps) if step.get('id') == 'publish')
-    publish, login, guard = steps[publish_index], steps[publish_index - 1], steps[publish_index - 2]
+    publish_index = next(
+        index for index, step in enumerate(steps) if step.get('id') == 'publish'
+    )
+    publish, guard = steps[publish_index], steps[publish_index - 1]
+    login = next(
+        step for step in steps if step.get('uses', '').startswith('docker/login-action@')
+    )
     assert 'ppu_pr_authorize.py guard' in guard['run']
     assert guard['env']['GH_TOKEN'] == '${{ github.token }}'
     assert login['uses'] == 'docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9'
@@ -1261,8 +1271,10 @@ def test_ghcr_publication_retains_authenticated_login_and_authorization_guard():
     assert 'secrets.' not in json.dumps(publish)
     assert '--source-root' not in publish['run']
     assert job['permissions']['packages'] == 'write'
-    runtime_index = next(index for index, step in enumerate(steps) if step.get('id') == 'runtime')
-    assert runtime_index < publish_index - 2
+    runtime_index = next(
+        index for index, step in enumerate(steps) if step.get('id') == 'runtime'
+    )
+    assert steps.index(login) < runtime_index < publish_index - 1
     for identity in ('runtime_image_digest', 'base_image_digest', 'environment_digest'):
         assert job['outputs'][identity] == '${{ steps.publish.outputs.' + identity + ' }}'
 
@@ -1543,13 +1555,21 @@ def test_docker_build_jobs_use_ubuntu_runner_after_authorization(filename, job_n
     setup = next(
         i
         for i, step in enumerate(steps)
-        if step.get('uses') == 'docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f'
+        if step.get('uses')
+        == 'docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f'
     )
     assert guard < setup
     identity = next(i for i, step in enumerate(steps) if step.get('id') == 'identity')
     assert f' fingerprint --kind {kind}' in steps[identity]['run']
     restore = next(
-        i for i, step in enumerate(steps) if step.get('uses') == 'actions/cache/restore@v4'
+        i
+        for i, step in enumerate(steps)
+        if step.get('uses')
+        == (
+            'actions/cache/restore@v4'
+            if kind == 'control'
+            else './control/.github/actions/ppu-build-cache'
+        )
     )
     build = next(
         i
@@ -1569,13 +1589,15 @@ def test_docker_build_jobs_use_ubuntu_runner_after_authorization(filename, job_n
         login = next(
             i
             for i, step in enumerate(steps)
-            if step.get('uses') == 'docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9'
+            if step.get('uses')
+            == 'docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9'
         )
         publish = next(i for i, step in enumerate(steps) if step.get('id') == 'publish')
-        assert build < guards[-1] < login < publish
+        assert guards[0] < login < restore < build < guards[-1] < publish
         assert steps[login]['with']['password'] == '${{ github.token }}'
         assert (
-            'publish-image' in steps[publish]['run'] and 'source-root' not in steps[publish]['run']
+            'publish-image' in steps[publish]['run']
+            and 'source-root' not in steps[publish]['run']
         )
         assert job['permissions']['packages'] == 'write'
     else:
@@ -2427,3 +2449,184 @@ def test_installation_reports_preserve_real_sources_and_already_satisfied_packag
     assert report.read_text() == content
     report.write_text('{"version":"1","install":[]}')
     exporter.verify_reports([report])
+
+
+@pytest.mark.parametrize(
+    'filename', ['ppu_ci_container.py', 'ppu_ci_container.sh', 'ppu_functional_pytest.py']
+)
+def test_orchestration_changes_do_not_invalidate_dependency_cache(build_inputs, filename):
+    args = build_inputs
+    before = container.build_identity(args)
+    helper = args.control_root / '.github/scripts' / filename
+    helper.write_text(helper.read_text() + '\n# orchestration change\n')
+    after = container.build_identity(args)
+    assert before[2] == after[2]
+    assert before[3] != after[3]
+
+
+def test_control_requirements_do_not_invalidate_runtime_dependencies(build_inputs):
+    args = build_inputs
+    before = container.build_identity(args)
+    requirements = args.control_root / '.github/docker/control-requirements.txt'
+    requirements.write_text(requirements.read_text() + '\n# control-only change\n')
+    after = container.build_identity(args)
+    assert before[2] == after[2] and before[3] != after[3]
+
+
+def test_cache_population_never_compiles_or_executes_target_source(build_inputs, monkeypatch):
+    args = build_inputs
+    args.mode, args.cache_root = 'build-cache', None
+    args.cache_from = container.GHCR_IMAGE + ':cache-main-runtime-amd64-baseline'
+    args.cache_to = container.GHCR_IMAGE + ':cache-main-runtime-amd64-build-' + 'a' * 64
+    calls = []
+
+    def command(argv, **kwargs):
+        calls.append(argv)
+        if argv[0] == 'git':
+            assert argv[2] == str(args.control_root)
+            return '.github/scripts/ppu_ci_container.py\0'
+        assert argv[:3] == ['docker', 'buildx', 'build']
+        assert argv[argv.index('--target') + 1] == 'dependencies'
+        assert argv[argv.index('--cache-from') + 1] == f'type=registry,ref={args.cache_from}'
+        assert (
+            argv[argv.index('--cache-to') + 1] == f'type=registry,ref={args.cache_to},mode=max'
+        )
+        assert '--load' not in argv and '--output' not in argv and '--push' not in argv
+        context = Path(argv[-1])
+        assert not (context / 'source').exists()
+        assert not (context / 'control').exists()
+        assert (context / 'pyproject.toml').read_bytes() == (
+            args.source_root / 'pyproject.toml'
+        ).read_bytes()
+        return ''
+
+    monkeypatch.setattr(container, 'command', command)
+    container.build(args)
+    assert len([call for call in calls if call[0] == 'docker']) == 1
+    assert not args.output.exists()
+
+
+@pytest.mark.parametrize(
+    'ref',
+    [
+        'other.example/cache:tag',
+        container.GHCR_IMAGE + ':run-123',
+        container.GHCR_IMAGE + ':cache-main,mode=min',
+        container.GHCR_IMAGE + ':cache-main\n',
+    ],
+)
+def test_registry_cache_rejects_invalid_destinations_before_build(
+    build_inputs, monkeypatch, ref
+):
+    args = build_inputs
+    args.cache_root, args.cache_to = None, ref
+    monkeypatch.setattr(
+        container, 'build_identity', lambda *a: pytest.fail('invalid cache reached build')
+    )
+    with pytest.raises(container.ValidationError, match='cache registry reference'):
+        container.build(args)
+
+
+@pytest.mark.parametrize(
+    'pr,available,populate,expected_read,expected_write',
+    [
+        ('15', ['pr', 'target', 'baseline'], 'false', 'pr', 'pr'),
+        ('15', ['target', 'baseline'], 'false', 'target', 'pr'),
+        ('15', ['baseline'], 'false', 'baseline', 'pr'),
+        ('15', [], 'false', '', 'pr'),
+        ('0', ['target', 'baseline'], 'false', 'target', 'baseline'),
+        ('0', ['baseline'], 'true', 'baseline', 'target'),
+        ('0', ['candidate', 'target'], 'false', 'candidate', 'candidate'),
+        ('0', ['baseline'], 'false', 'baseline', 'candidate'),
+    ],
+)
+@pytest.mark.parametrize('branch', ['main', 'dev'])
+def test_registry_cache_action_selects_donors_and_isolates_pr_writes(
+    tmp_path, pr, available, populate, expected_read, expected_write, branch
+):
+    action = yaml.safe_load((ROOT / '.github/actions/ppu-build-cache/action.yml').read_text())
+    script = action['runs']['steps'][0]['run']
+    prefix = container.GHCR_IMAGE + f':cache-{branch}-runtime-amd64'
+    key = 'b' * 64
+    refs = {
+        'pr': f'{prefix}-pr-{pr}-{key}',
+        'target': f'{prefix}-build-{key}',
+        'baseline': f'{prefix}-baseline',
+        'candidate': f'{prefix}-candidate-{key}',
+        '': '',
+    }
+    docker = tmp_path / 'docker'
+    docker.write_text(
+        '#!/bin/bash\n[[ "$1 $2 $3" == "buildx imagetools inspect" ]] || exit 9\nwhile IFS= read -r ref; do [[ "$4" == "$ref" ]] && exit 0; done < "$AVAILABLE"\nexit 1\n'
+    )
+    docker.chmod(0o755)
+    available_file = tmp_path / 'available'
+    available_file.write_text('\n'.join(refs[name] for name in available) + '\n')
+    output, summary = tmp_path / 'output', tmp_path / 'summary'
+    env = {
+        **os.environ,
+        'PATH': f'{tmp_path}{os.pathsep}{os.environ["PATH"]}',
+        'AVAILABLE': str(available_file),
+        'BUILD_KEY': key,
+        'BASE_REF': f'refs/heads/{branch}',
+        'PR_NUMBER': pr,
+        'PUBLISH_TARGET_CACHE': populate,
+        'WRITE_BASELINE': 'true' if expected_write == 'baseline' else 'false',
+        'GITHUB_OUTPUT': str(output),
+        'GITHUB_STEP_SUMMARY': str(summary),
+    }
+    subprocess.run(
+        ['bash', '-e', '-o', 'pipefail', '-c', script],
+        env=env,
+        check=True,
+        timeout=10,
+        capture_output=True,
+    )
+    values = dict(line.split('=', 1) for line in output.read_text().splitlines())
+    assert values == {'cache-from': refs[expected_read], 'cache-to': refs[expected_write]}
+    assert 'BuildKit validates individual layers' in summary.read_text()
+
+
+def test_cache_population_workflow_is_cpu_only_and_uses_the_same_dependency_builder():
+    workflow = yaml.safe_load(
+        (ROOT / '.github/workflows/ppu-populate-build-cache.yml').read_text()
+    )
+    event = workflow.get('on', workflow.get(True))
+    assert 'schedule' not in event
+    assert event['push']['branches'] == ['main', 'dev']
+    job = workflow['jobs']['populate']
+    assert job['runs-on'] == 'ubuntu-latest'
+    assert "refs/heads/main" in job['if'] and "refs/heads/dev" in job['if']
+    assert job['environment'] == 'ppu-ci'
+    assert job['permissions'] == {'contents': 'read', 'packages': 'write'}
+    assert any(
+        step.get('with', {}).get('publish-target-cache') == 'true' for step in job['steps']
+    )
+    text = json.dumps(job)
+    assert 'cluster-task' not in text and 'secrets.' not in text and 'build-image' not in text
+    assert ' build-cache ' in text
+
+
+@pytest.mark.parametrize('event,pr,sync_source,expected', [
+    ('push', 0, None, 'true'),
+    ('workflow_dispatch', 0, None, 'true'),
+    ('pull_request_target', 15, None, 'false'),
+    ('workflow_dispatch', 15, None, 'false'),
+    ('merge_group', 0, None, 'false'),
+    ('push', 0, 'sync/upstream-main/' + 'a' * 40, 'false'),
+    ('push', 0, 'dev', 'true'),
+])
+def test_cache_scope_distinguishes_published_branches_from_candidates(tmp_path, event, pr, sync_source, expected):
+    workflow = yaml.safe_load((ROOT / '.github/workflows/ppu-execute.yml').read_text())
+    step = next(s for s in workflow['jobs']['runtime-environment']['steps'] if s.get('id') == 'cache-scope')
+    branch = 'dev' if sync_source == 'dev' else 'main'
+    authorization = {'event_name': event, 'pr_number': pr, 'base_ref': f'refs/heads/{branch}'}
+    if sync_source:
+        authorization['sync_request'] = {'source_ref': sync_source, 'target_branch': branch}
+    (tmp_path / '.ppu-ci').mkdir()
+    (tmp_path / '.ppu-ci/authorization.json').write_text(json.dumps(authorization))
+    output = tmp_path / 'outputs'
+    subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', step['run']], cwd=tmp_path,
+                   env={**os.environ, 'GITHUB_OUTPUT': str(output)}, check=True, capture_output=True, timeout=10)
+    values = dict(line.split('=', 1) for line in output.read_text().splitlines())
+    assert values == {'base_ref': f'refs/heads/{branch}', 'pr_number': str(pr), 'write_baseline': expected}

@@ -219,3 +219,35 @@ tokenizer 则由固定 revision、文件摘要和 receipt 管理。产品镜像 
 第一阶段与恢复阶段。以后清理重复配置或依赖漂移，应另立小改动验证。
 
 本地 CPU 验证不代表远程 Linux runner、SAIL 训练、精度或性能验收；硬件验证单独记录。
+
+## 构建缓存与 NV 对齐
+
+设备测试仍先执行 runtime-environment 的构建和离线镜像验证，再以镜像 digest 交给 Build / UT / FT。
+依赖层使用 BuildKit registry cache，存放在 `ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci`，
+构建运行在 `ubuntu-latest`，基础镜像来自 SAIL 的 `pkg.flytiger-eco.com`；不使用 NVIDIA runner 或缓存仓库。
+CPU 控制解释器体积较小，继续使用原有 GitHub Actions cache。
+
+维护入口为 `.github/actions/ppu-build-cache/action.yml`（选择缓存）、
+`ppu_ci_container.py build_identity/build`（指纹与 Docker 构建）、
+`Dockerfile.ppu-ci` 的 `dependencies` stage（实际依赖）。没有另加 Python 缓存脚本。
+依赖指纹包含不可变基础镜像 digest、平台、Docker 构建文件和被测 `pyproject.toml`；
+普通源码、提交 SHA、控制脚本及仅供控制解释器使用的 requirements 不改变运行时依赖指纹。
+控制与源码身份仍绑定最终镜像；源码扩展继续单独编译。当前依赖安装未消费 `uv.lock`，
+因此不能把这一改动描述成已采用 NV 的完整依赖锁定方案。
+
+| 运行来源 | 优先读取 | 写入 |
+| --- | --- | --- |
+| PR | 本 PR 同指纹 → 目标分支同指纹 → 目标分支 baseline | 本 PR 同指纹 |
+| main/dev 已发布提交 | 目标分支同指纹 → 目标分支 baseline | 目标分支 baseline |
+| 合并队列或 main 同步候选 | 候选同指纹 → 目标分支同指纹 → 目标分支 baseline | 候选同指纹 |
+| 显式 CPU 预热 | 目标分支同指纹 → 目标分支 baseline | 目标分支同指纹 |
+
+只导出 `dependencies` stage 的缓存。缓存只是加速输入，BuildKit 会继续核对各层；
+Actions summary 显示选中的读取、写入位置，选中 donor 不代表每层都命中。
+相比 NV，这里没有历史 registry cache 的兼容回退，因为原实现使用 GitHub Actions cache。
+
+`ppu-populate-build-cache.yml` 在 main/dev 的构建输入变化时或手动触发，只构建依赖层，不申请 PPU，
+也不执行目标源码、UT 或 FT。为控制资源开销，不设置每六小时定时预热。
+已有同步流程用 `GITHUB_TOKEN` 推送 dev 时不会再次触发 push workflow；同步后正常 runtime build
+已能更新 baseline，不需要新增同步接线。新 workflow 合入后可从 main/dev 手动预热。
+实际缓存命中率、CPU 耗时和镜像拉取耗时，需要在线 Docker/GHCR 运行记录验收；CPU 单测不替代此项。
