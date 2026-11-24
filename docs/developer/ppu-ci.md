@@ -39,6 +39,35 @@ NVRx 预检查同时支持旧 `get_async_strategy()` 与 dev 的直接 NVRx 接�
 检查旧 `dynamic_engine` 或 dev 拆分后的 `dynamic.coordinator` 中的 ZMQ/MessagePack 能力；
 未知布局和缺少能力均失败，日志记录本轮检查的模块。
 
+## 准入与测试范围的维护边界
+
+流程沿用 NV 的职责划分：preflight 确认本轮是否需要设备测试并固定待测版本，
+configure 再展开 recipe、生成 UT/FT 计划。SAIL 的入口仍是现有 `pull_request_target`、
+同步交接和手动运行；没有接入 NV 的 copy-pr-bot，也没有直接调用依赖合成 PR 分支元数据的
+`NVIDIA-NeMo/FW-CI-templates/_cicd_preflight.yml`。NVIDIA SSO 和 NV runner 路由不属于 SAIL 准入策略。
+参考：[NV 主 workflow](https://github.com/NVIDIA/Megatron-LM/blob/main/.github/workflows/cicd-main.yml)、
+[本次对照的共享 preflight](https://github.com/NVIDIA-NeMo/FW-CI-templates/blob/037094bcc9138c72bc125418e6e3653f9e1c4160/.github/workflows/_cicd_preflight.yml)。
+
+维护策略时先查看 `ppu_policy.py`：
+
+| 要调整的规则 | 位置 |
+|---|---|
+| 可测试的分支、手动运行权限 | `BRANCHES`、`MANUAL_RUN_PERMISSIONS` |
+| 文档/CI 路径豁免 | `CPU_ONLY_PREFIXES`、`CPU_ONLY_FILES`、`cpu_only_path()` |
+| PR 标签优先级、默认 FT 范围/重复/预算 | `SCOPE_LABELS`、`FUNCTIONAL_EVENT_POLICIES` |
+| 手动输入和 UT/FT 路由约束 | `validate_route()`、`functional_request()` |
+
+`ppu_pr_authorize.py` 调用上述策略并读取 GitHub 当前状态，继续负责确认合成 merge 的父提交、
+排队后版本是否过期、最终状态属于哪次运行。它只依赖 Python 标准库和 `ppu_policy.py`，
+不再导入 functional planner、Hugging Face 或 recipe/golden 模块，授权产物也不再携带 planner。
+`ppu_functional.py` 复用同一份输入策略，然后补充设备配置并解析实际 recipe/golden。
+已有 UT quick 分组及阈值继续在 `.github/ppu-pr-tests.json` 中维护。
+
+Actions 的 authorize 汇总列出准入决定、原因、control/target/head/base SHA，以及 FT 范围、
+模式、重复次数和时间预算。这里展示的是本轮计划，数值通过与否仍由后续结果汇总判定。
+SHA 与状态适配目前仍是 SAIL 自有代码；要进一步删除它，需要另行设计机器人/原生 check
+如何绑定 PR head 和合成 merge，不能仅删除脚本后把旧任务结果当作新提交通过。
+
 ## 执行路径
 
 ```mermaid
@@ -78,7 +107,7 @@ manifest 的 `control_files`、`source_files` 分别记录两者摘要，case �
 
 | 文件 | 维护职责 |
 |---|---|
-| `ppu_policy.py` | 受信任分支、CPU 豁免路径、UT 拓扑例外和同步产物前缀 |
+| `ppu_policy.py` | 分支/权限/路径准入、UT/FT 输入路由与 FT 范围、UT 拓扑例外和同步产物前缀 |
 | `ppu_pr_authorize.py` | 授权、SHA、过期状态与 PR 状态归属 |
 | `ppu_ci.py`、`ppu_pytest_policy.py` | UT 选例、manifest、排除策略、结果门槛和证据 |
 | `ppu_ci_build.sh`、`ppu_ci_run.sh` | 构建准备和 UT 执行 |

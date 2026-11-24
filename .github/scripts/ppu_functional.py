@@ -17,17 +17,7 @@ LOCK = Path(".github/ppu-functional-baselines.json")
 POD_ASSETS = "ppu://assets/pod"
 CPU_ASSETS = "ppu://assets/cpu"
 IMAGE = "pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001"
-TIERS = ("L0", "L1", "L2", "L3")
 FUNCTIONAL_MANIFEST = "functional-manifest.json"
-SCOPE_LABELS = ("Run tests", "Run functional tests")
-# SAIL shares one numeric default across branch updates and PRs; upstream recipes remain authoritative.
-EVENT_POLICIES = {
-    "push": ("L0", "bypass", 1, 30, False),
-    "merge_group": ("L0", "bypass", 1, 30, False),
-    "Run tests": ("L1", "bypass", 1, 30, True),
-    "Run functional tests": ("L1", "bypass", 1, 30, False),
-    "pr": ("L0", "bypass", 1, 30, False),
-}
 # Python 3.12.3 may inherit a locked shutdown lock when it forks again
 # after the compile pool quiesces.
 # Only disable pool quiescing and keep default parallel compilation; see pytorch/pytorch#200848.
@@ -39,13 +29,6 @@ SKIPPED_CASES = {
     "gpt/gpt3_weekly_mcore_tp4_cp2_current_scaling_native_fp8_tp_sp_cp_tp_overlap": (
         "weekly_fp8_numerical_instability_temporarily_skipped"
     ),
-}
-DEFAULTS = {
-    "functional_mode": "assets",
-    "functional_scope": "all",
-    "functional_cases": "all",
-    "functional_repeat": "1",
-    "functional_timeout": "30",
 }
 ENTRYPOINTS = {
     "bert": "examples/bert/pretrain_bert.py",
@@ -88,65 +71,22 @@ def module_from_path(name: str, path: Path):
 
 policy = module_from_path("ppu_policy", Path(__file__).with_name("ppu_policy.py"))
 
+# Compatibility exports used by planners and callers; the policy has one owner.
+TIERS = policy.FUNCTIONAL_TIERS
+SCOPE_LABELS = policy.SCOPE_LABELS
+EVENT_POLICIES = policy.FUNCTIONAL_EVENT_POLICIES
+DEFAULTS = policy.FUNCTIONAL_DEFAULTS
+positive = policy.positive
+validate_route = policy.validate_route
+event_policy = policy.event_policy
+functional_request = policy.functional_request
+
 hf = module_from_path("ppu_functional_hf", Path(__file__).with_name("ppu_functional_hf.py"))
 paths = module_from_path("ppu_functional_paths", Path(__file__).with_name("ppu_ci_paths.py"))
 
 
-def positive(value, name: str, maximum: int) -> int:
-    if not re.fullmatch(r"[1-9][0-9]*", str(value)) or int(value) > maximum:
-        raise ValueError(f"{name} must be an integer in 1..{maximum}")
-    return int(value)
-
-
 def enabled(value) -> bool:
     return str(value).lower() in ("true", "1")
-
-
-def validate_route(event_name: str, ref: str, inputs: dict) -> str:
-    kind = inputs.get("test_kind", "unit")
-    if kind not in ("unit", "functional"):
-        raise ValueError("test_kind must be unit or functional")
-    if {"compiler_diagnostic", "compiler_diagnostic_context"} & inputs.keys():
-        raise ValueError("Compiler diagnostics have been removed from PPU CI")
-    if kind == "unit":
-        if any(str(inputs.get(key, default)) != default for key, default in DEFAULTS.items()):
-            raise ValueError("Functional inputs require test_kind=functional")
-        return kind
-    if event_name != "workflow_dispatch" or ref not in policy.REFS:
-        raise ValueError("Functional tests require manual dispatch on a trusted branch")
-    if any(inputs.get(key) for key in ("pr_number", "pr_sha", "pr_base_sha")):
-        raise ValueError("Functional tests cannot authorize or publish PR status")
-    unit_defaults = {
-        "scope": "auto",
-        "suite_family": "nvidia-dev",
-        "unit_bucket": "",
-        "repeat": "1",
-        "timeout": "30",
-    }
-    if any(str(inputs.get(key, default)) != default for key, default in unit_defaults.items()):
-        raise ValueError("Functional requests cannot contain non-default UT selection inputs")
-    for key in ("build", "unit_test"):
-        if key in inputs and str(inputs[key]).lower() not in ("true", "yes"):
-            raise ValueError("Functional mode controls Build and UT; do not set UT switches")
-    return kind
-
-
-def event_policy(trigger: str, labels=()) -> dict | None:
-    """Functional policy of an automatic trigger; release tags and other events run UT only."""
-    if trigger == "pr":
-        # `Run tests` wins over `Run functional tests`, as in the upstream workflow.
-        trigger = next((label for label in SCOPE_LABELS if label in labels), "pr")
-    elif trigger not in ("push", "merge_group"):
-        return None
-    scope, cadence, repeat, timeout, lightweight = EVENT_POLICIES[trigger]
-    return {
-        "trigger": trigger,
-        "functional_scope": scope,
-        "cadence": cadence,
-        "repeat": repeat,
-        "timeout": timeout,
-        "lightweight": lightweight,
-    }
 
 
 def authorization_trigger(authorization: dict) -> str:
@@ -177,43 +117,17 @@ def select_config(inputs: dict, policy: dict | None = None) -> dict:
             "timeout": positive(policy["timeout"], "functional_timeout", 1380),
             "trigger_kind": policy["trigger"],
         }
-    if {"compiler_diagnostic", "compiler_diagnostic_context"} & inputs.keys():
-        raise ValueError("Compiler diagnostics have been removed from PPU CI")
-    mode = inputs.get("functional_mode", "assets")
-    scope = inputs.get("functional_scope", "all")
-    if mode not in ("assets", "regression") or scope not in ("all", "auto", "mr", *TIERS):
-        raise ValueError("Invalid functional mode or scope")
-    cadence = "bypass"
-    if scope == "auto":
-        # Manual regression mirrors the upstream nightly L1 run; asset checks cover everything.
-        scope, cadence = ("L1", "nightly") if mode == "regression" else ("all", "bypass")
-    requested = inputs.get("functional_cases", "all")
-    if not isinstance(requested, str) or not requested:
-        raise ValueError("functional_cases must be all or full model/case names")
-    names = requested.split(",")
-    if requested != "all" and (
-        len(names) != len(set(names))
-        or any(not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+", name) for name in names)
-    ):
-        raise ValueError("Invalid or duplicate functional case request")
+    config = functional_request(inputs)
     return {
-        "test_kind": "functional",
-        "functional_mode": mode,
-        "scope": scope,
-        "cadence": cadence,
-        "lightweight": False,
-        "requested_cases": names,
-        "repeat": positive(inputs.get("functional_repeat", 1), "functional_repeat", 10),
-        "timeout": positive(inputs.get("functional_timeout", 30), "functional_timeout", 1380),
-        "build": mode == "regression",
-        "unit_test": False,
-        "threshold_percent": 100,
-        "trigger_kind": "manual",
-        "suite_family": "ppu-functional",
+        **config,
         "image": IMAGE,
         "data_path": POD_ASSETS,
         "cpu_data_path": CPU_ASSETS,
-        **({"compiler_environment": dict(COMPILER_ENVIRONMENT)} if mode == "regression" else {}),
+        **(
+            {"compiler_environment": dict(COMPILER_ENVIRONMENT)}
+            if config["functional_mode"] == "regression"
+            else {}
+        ),
     }
 
 

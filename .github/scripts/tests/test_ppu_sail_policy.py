@@ -1,6 +1,10 @@
 """Branch isolation and ordering for SAIL's shared PPU execution path."""
 
 import copy
+import json
+import shutil
+import subprocess
+import sys
 
 import pytest
 import yaml
@@ -305,3 +309,55 @@ def test_gtp_world_size_matches_upstream_script(tmp_path, monkeypatch, cards):
             ci.unit_cases(config)
     else:
         assert next(iter(ci.unit_cases(config).values()))["cards"] == 4
+
+
+@pytest.mark.parametrize(
+    "event,inputs",
+    [
+        ("push", {}),
+        ("workflow_dispatch", {}),
+        (
+            "workflow_dispatch",
+            {"test_kind": "functional", "functional_mode": "regression", "functional_scope": "L0"},
+        ),
+    ],
+)
+def test_admission_runs_without_the_functional_planner(tmp_path, event, inputs):
+    # The admission artifact must work with only its standard-library policy;
+    # missing planner/HF/recipe files must not break PR or manual preflight.
+    for name in ("ppu_pr_authorize.py", "ppu_policy.py"):
+        shutil.copyfile(ROOT / ".github/scripts" / name, tmp_path / name)
+    code = """
+import json, runpy, sys
+module = runpy.run_path(sys.argv[1])
+request = json.load(sys.stdin)
+def api(path):
+    assert path.startswith("collaborators/"), path
+    return {"permission": "write"}
+result = module["authorize"]({}, request["inputs"], request["context"], api)
+print(json.dumps(result))
+"""
+    run = subprocess.run(
+        [sys.executable, "-I", "-c", code, str(tmp_path / "ppu_pr_authorize.py")],
+        input=json.dumps({"inputs": inputs, "context": context(event)}),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout)["allowed"]
+
+
+def test_preflight_summary_explains_automatic_scope_and_sha():
+    result = auth.authorize({}, {}, context("push"), FakeGitHub())
+    summary = auth.preflight_summary(result, {})
+    for value in (result["target_sha"], result["control_sha"], "L0", "1 / 30", "numeric"):
+        assert value in summary
+
+
+def test_preflight_summary_distinguishes_manual_assets_from_numerical_tests():
+    inputs = {"test_kind": "functional", "functional_mode": "assets", "functional_scope": "auto"}
+    result = auth.authorize({}, inputs, context(), FakeGitHub())
+    summary = auth.preflight_summary(result, inputs)
+    assert "`assets`" in summary and "`all`" in summary
+    assert "`numeric`" not in summary

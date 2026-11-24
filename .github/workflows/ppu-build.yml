@@ -137,7 +137,8 @@ jobs:
           ref: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.workflow_sha }}
           path: control
           persist-credentials: false
-      - id: authorize
+      - name: Resolve admission, test scope and source SHA
+        id: authorize
         env:
           GH_TOKEN: ${{ github.token }}
           PPU_INPUTS: ${{ toJSON(inputs) }}
@@ -148,7 +149,7 @@ jobs:
         run: |
           python3 -I control/.github/scripts/ppu_pr_authorize.py authorize
           mkdir -p .ppu-ci/control
-          cp control/.github/scripts/{ppu_pr_authorize.py,ppu_policy.py,ppu_functional.py,ppu_ci_paths.py,ppu_ci_export.py} .ppu-ci/control/
+          cp control/.github/scripts/{ppu_pr_authorize.py,ppu_policy.py,ppu_ci_paths.py,ppu_ci_export.py} .ppu-ci/control/
       - name: Export checked public evidence
         id: public-authorize-140
         env:

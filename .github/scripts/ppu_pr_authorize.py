@@ -1,4 +1,4 @@
-"""PPU PR."""
+"""SAIL PR admission and result binding; test selection rules live in ppu_policy."""
 
 import argparse
 import importlib.util
@@ -12,8 +12,6 @@ from pathlib import Path
 
 BRANCH = "refs/heads/main"
 STATUS_CONTEXT = "PPU PR Quick"
-# Keep in sync with ppu_functional.SCOPE_LABELS; status jobs only ship this script.
-SCOPE_LABELS = ("Run tests", "Run functional tests")
 
 
 _policy_spec = importlib.util.spec_from_file_location(
@@ -21,6 +19,7 @@ _policy_spec = importlib.util.spec_from_file_location(
 )
 policy = importlib.util.module_from_spec(_policy_spec)
 exec(compile(Path(_policy_spec.origin).read_bytes(), _policy_spec.origin, "exec"), policy.__dict__)
+SCOPE_LABELS = policy.SCOPE_LABELS
 
 
 def github_api(path: str, payload: dict | None = None) -> dict:
@@ -128,14 +127,9 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
     )
     if not (event_name == "push" and ref.startswith("refs/tags/v")):
         policy.trusted_ref(base_ref)
-    spec = importlib.util.spec_from_file_location(
-        "ppu_functional_route", Path(__file__).with_name("ppu_functional.py")
-    )
-    functional = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(functional)
-    test_kind = functional.validate_route(event_name, ref, inputs)
+    test_kind = policy.validate_route(event_name, ref, inputs)
     if test_kind == "functional":
-        functional.select_config(inputs)
+        policy.functional_request(inputs)
         if full_sha(context["sha"]) != full_sha(context["control_sha"]):
             raise ValueError("Functional dispatch must use the same trusted source/control commit")
     number = str(inputs.get("pr_number", ""))
@@ -168,7 +162,7 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
             if not re.fullmatch(r"[A-Za-z0-9_\[\]-]+", actor):
                 raise ValueError("Invalid actor")
             permission = api(f"collaborators/{actor}/permission")["permission"]
-            if permission not in ("write", "maintain", "admin"):
+            if permission not in policy.MANUAL_RUN_PERMISSIONS:
                 raise ValueError("The actor must have write/maintain/admin permission")
         if manual_pr:
             if str(context["run_attempt"]) != "1":
@@ -205,7 +199,7 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
     if event_name in ("push", "merge_group") and ref.startswith("refs/heads/"):
         # Main pushes and merge queues pair UT with functional tests; release tags run UT only.
         result.update(
-            test_kind="combined", labels=[], functional_policy=functional.event_policy(event_name)
+            test_kind="combined", labels=[], functional_policy=policy.event_policy(event_name)
         )
 
     if not (manual_pr or event_name == "pull_request_target"):
@@ -239,7 +233,7 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
         head_repository=pr["head"]["repo"]["full_name"],
         test_kind="combined",
         labels=labels,
-        functional_policy=functional.event_policy("pr", labels),
+        functional_policy=policy.event_policy("pr", labels),
     )
     if pr["state"] != "open":
         if manual_pr:
@@ -364,11 +358,6 @@ def authorize_sync(request: dict, context: dict, api=github_api) -> dict:
         raise ValueError("Published sync commit does not match the two-parent handoff")
     if not sync_is_current(request, api):
         raise StaleSnapshot("Published sync ref or base changed; PPU not started")
-    spec = importlib.util.spec_from_file_location(
-        "ppu_functional_sync", Path(__file__).with_name("ppu_functional.py")
-    )
-    functional = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(functional)
     return {
         "allowed": True,
         "decision": "run",
@@ -387,7 +376,7 @@ def authorize_sync(request: dict, context: dict, api=github_api) -> dict:
         "test_kind": "combined",
         "labels": [],
         "sync_request": request,
-        "functional_policy": functional.event_policy("push"),
+        "functional_policy": policy.event_policy("push"),
     }
 
 
@@ -628,6 +617,42 @@ def invalidate_base(base_sha: str, api=github_api, base_ref: str = BRANCH) -> No
     raise ValueError("Open PR pagination limit exceeded")
 
 
+def preflight_summary(result: dict, inputs: dict) -> str:
+    """Expose the admission decision and immutable test identity in the Actions UI."""
+    rows = [("Decision", result["decision"]), ("Reason", result["reason"])]
+    rows += [
+        (key, result.get(key) or "—")
+        for key in (
+            "test_kind",
+            "base_ref",
+            "pr_number",
+            "control_sha",
+            "target_sha",
+            "pr_head_sha",
+            "base_sha",
+        )
+    ]
+    selection = (
+        policy.functional_request(inputs)
+        if result["test_kind"] == "functional"
+        else result.get("functional_policy")
+    )
+    if selection:
+        rows += [
+            ("FT scope", selection.get("functional_scope", selection.get("scope"))),
+            ("FT repeat / timeout (minutes)", f"{selection['repeat']} / {selection['timeout']}"),
+            (
+                "FT mode",
+                selection.get(
+                    "functional_mode", "lightweight" if selection["lightweight"] else "numeric"
+                ),
+            ),
+        ]
+    return "PPU preflight\n\n| Field | Value |\n|---|---|\n" + "".join(
+        f"| {key} | `{value}` |\n" for key, value in rows
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("authorize", "status", "invalidate-base", "guard"))
@@ -676,13 +701,12 @@ def main() -> None:
     context = {key: os.environ[value] for key, value in env_keys.items()}
     context["artifact_prefix"] = os.environ.get("PPU_ARTIFACT_PREFIX", "")
     sync_request = os.environ.get("PPU_SYNC_REQUEST", "")
+    inputs = json.loads(os.environ.get("PPU_INPUTS", "{}"))
     if sync_request:
         result = authorize_sync(json.loads(sync_request), context)
     else:
         result = authorize(
-            json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text()),
-            json.loads(os.environ.get("PPU_INPUTS", "{}")),
-            context,
+            json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text()), inputs, context
         )
     args.output.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -702,7 +726,7 @@ def main() -> None:
     print(json.dumps(result, ensure_ascii=False))
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
-            stream.write(f"PPU preflight: {result['decision']} - {result['reason']}\n")
+            stream.write(preflight_summary(result, inputs))
 
 
 if __name__ == "__main__":
