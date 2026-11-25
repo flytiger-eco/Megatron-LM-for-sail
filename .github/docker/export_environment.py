@@ -239,11 +239,6 @@ def runtime():
         + list((VENV / 'libexec/git-core').iterdir()),
         VENV / 'lib/ppu-system',
     )
-    source = Path('/build/source')
-    extension = list((source / 'megatron/core/datasets').glob('helpers_cpp*.so'))
-    if len(extension) != 1:
-        raise RuntimeError('Exactly one source dataset native extension is required')
-    archive(source, 'compiled-source.tar.gz', extension)
     for name in (
         'constraints.txt',
         'ppu-requirements.txt',
@@ -281,8 +276,4 @@ def runtime():
 
 
 if __name__ == '__main__':
-    {
-        'isolate': isolate,
-        'control': control,
-        'runtime-image': runtime,
-    }[sys.argv[1]]()
+    {'isolate': isolate, 'control': control, 'runtime-image': runtime}[sys.argv[1]]()

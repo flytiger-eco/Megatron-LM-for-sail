@@ -107,6 +107,23 @@ def evidence(tmp_path):
     return manifest, case, directory
 
 
+def pytest_inputs(case, directory, phase):
+    actual = directory / Path(case["golden_path"]).name
+    paths = {"model-config-path": directory / "model_config.yaml"}
+    if phase == "regular":
+        paths.update(
+            {"golden-values-path": ROOT / case["golden_path"], "actual-values-path": actual}
+        )
+    else:
+        paths.update(
+            {
+                "actual-values-first-run-path": actual,
+                "actual-values-second-run-path": actual.with_name(f"{actual.stem}_2nd.json"),
+            }
+        )
+    return {key: functional.sha256(path) for key, path in paths.items()}
+
+
 def successful_repeat(manifest, case, directory, attempt, repeat):
     path = directory / f"attempt-{attempt}" / f"repeat-{repeat}"
     path.mkdir(parents=True)
@@ -131,6 +148,9 @@ def successful_repeat(manifest, case, directory, attempt, repeat):
             logs.mkdir(parents=True)
             (logs / "stdout.log").write_text("Training\n")
             (logs / "stderr.log").write_text("")
+    if results.phase_count(case) == 2:
+        first = path / Path(case["golden_path"]).name
+        first.with_name(f"{first.stem}_2nd.json").write_bytes(first.read_bytes())
     identity = results.identity_fields(manifest, case, attempt, repeat)
     execution = {
         **identity,
@@ -150,6 +170,8 @@ def successful_repeat(manifest, case, directory, attempt, repeat):
         report = {
             **identity,
             "phase": phase,
+            "inputs": pytest_inputs(case, path, phase),
+            "train_iters": case["effective_train_iters"],
             "complete": True,
             "exitstatus": 0,
             "duration_seconds": 0.1,
@@ -266,8 +288,6 @@ def test_skipped_policy_is_not_counted_or_allowed_to_hide_failures(
             "ppu_functional_results.py",
             "--manifest",
             str(manifest_path),
-            "--root",
-            str(ROOT),
             "--results",
             str(directory.parent),
         ],
@@ -288,20 +308,20 @@ def test_skipped_policy_is_not_counted_or_allowed_to_hide_failures(
     assert f"{skipped_name}: {reason}" in summary
 
 
-def test_all_repeats_are_required_and_numerically_recomputed(evidence):
+def test_all_repeats_require_matching_upstream_pytest_results(evidence):
     manifest, case, directory = evidence
     successful_repeat(manifest, case, directory, 1, 1)
     completion(manifest, case, directory)
-    result = results.verify_case(manifest, ROOT, case, directory)
+    result = results.verify_case(manifest, case, directory)
     assert not result["success"]
     assert "required successful repetitions" in result["errors"][0]
     successful_repeat(manifest, case, directory, 1, 2)
-    assert results.verify_case(manifest, ROOT, case, directory)["success"]
+    assert results.verify_case(manifest, case, directory)["success"]
     path = directory / "attempt-1/repeat-2" / Path(case["golden_path"]).name
     actual = json.loads(path.read_text())
     actual["lm loss"]["values"]["10"] = 999
     write_json(path, actual)
-    assert not results.verify_case(manifest, ROOT, case, directory)["success"]
+    assert not results.verify_case(manifest, case, directory)["success"]
 
 
 @pytest.mark.parametrize(
@@ -324,7 +344,7 @@ def test_invalid_pytest_evidence_fails(evidence, field, value):
     report[field] = value
     write_json(report_path, report)
     with pytest.raises(ValueError):
-        results.verify_repeat(manifest, ROOT, case, path, 1, 1)
+        results.verify_repeat(manifest, case, path, 1, 1)
 
 
 @pytest.mark.parametrize(
@@ -343,7 +363,7 @@ def test_case_completion_fails_closed(evidence, field, value):
     for repeat in (1, 2):
         successful_repeat(manifest, case, directory, 1, repeat)
     completion(manifest, case, directory, **{field: value})
-    assert not results.verify_case(manifest, ROOT, case, directory)["success"]
+    assert not results.verify_case(manifest, case, directory)["success"]
 
 
 def failed_repeat(manifest, case, directory, attempt=1, message="DistNetworkError", code=1):
@@ -361,9 +381,9 @@ def test_retry_requires_entire_new_successful_attempt(evidence):
     failed_repeat(manifest, case, directory)
     successful_repeat(manifest, case, directory, 2, 1)
     completion(manifest, case, directory, attempts=2)
-    assert not results.verify_case(manifest, ROOT, case, directory)["success"]
+    assert not results.verify_case(manifest, case, directory)["success"]
     successful_repeat(manifest, case, directory, 2, 2)
-    result = results.verify_case(manifest, ROOT, case, directory)
+    result = results.verify_case(manifest, case, directory)
     assert result["success"] and result["retried"]
     assert len(result["attempts"]) == 2
 
@@ -384,7 +404,7 @@ def test_unauthorized_retry_is_rejected_even_after_success(evidence, message):
     for repeat in (1, 2):
         successful_repeat(manifest, case, directory, 2, repeat)
     completion(manifest, case, directory, attempts=2)
-    result = results.verify_case(manifest, ROOT, case, directory)
+    result = results.verify_case(manifest, case, directory)
     assert not result["success"] and "Retried" in result["errors"][0]
 
 
@@ -396,21 +416,8 @@ def test_runtime_copy_cannot_change_metrics_or_training_length(evidence):
     config["MODEL_ARGS"]["--train-iters"] = 4
     (path / "model_config.yaml").write_text(yaml.safe_dump(config))
     with pytest.raises(ValueError, match="Runtime configuration"):
-        results.verify_repeat(manifest, ROOT, case, path, 1, 1)
+        results.verify_repeat(manifest, case, path, 1, 1)
     assert functional.sha256(ROOT / case["config_path"]) == original
-
-
-@pytest.mark.parametrize("content", [b"", None])
-def test_missing_or_empty_tensorboard_is_not_success(evidence, content):
-    manifest, case, directory = evidence
-    path = successful_repeat(manifest, case, directory, 1, 1)
-    event = path / "1/tensorboard/events.out.tfevents.fixture"
-    if content is None:
-        event.rename(event.with_name("not-an-event"))
-    else:
-        event.write_bytes(content)
-    with pytest.raises(ValueError, match="TensorBoard"):
-        results.verify_repeat(manifest, ROOT, case, path, 1, 1)
 
 
 @pytest.mark.parametrize("missing", ["phase", "rank"])
@@ -420,12 +427,12 @@ def test_launcher_restarts_cannot_replace_resume_rank_logs(evidence, missing):
     path = successful_repeat(manifest, case, directory, 1, 1)
     first = path / Path(case["golden_path"]).name
     first.with_name(f"{first.stem}_2nd.json").write_bytes(first.read_bytes())
-    assert results.verify_repeat(manifest, ROOT, case, path, 1, 1)["success"]
+    assert results.verify_repeat(manifest, case, path, 1, 1)["success"]
     shutil.copytree(path / "logs/run-1/attempt_0", path / "logs/run-1/attempt_1")
     missing_path = path / ("logs/run-2" if missing == "phase" else "logs/run-2/attempt_0/7")
     missing_path.rename(path / "missing-logs")
     with pytest.raises(ValueError, match="rank/phase log"):
-        results.verify_repeat(manifest, ROOT, case, path, 1, 1)
+        results.verify_repeat(manifest, case, path, 1, 1)
 
 
 @pytest.mark.parametrize("resume", [False, True])
@@ -438,7 +445,7 @@ def test_complete_launcher_restarts_preserve_rank_log_evidence(evidence, resume)
         first = path / Path(case["golden_path"]).name
         first.with_name(f"{first.stem}_2nd.json").write_bytes(first.read_bytes())
     shutil.copytree(path / "logs/run-1/attempt_0", path / "logs/run-1/attempt_1")
-    assert results.verify_repeat(manifest, ROOT, case, path, 1, 1)["success"]
+    assert results.verify_repeat(manifest, case, path, 1, 1)["success"]
 
 
 @pytest.mark.parametrize(
@@ -474,12 +481,12 @@ def test_summary_cannot_report_assets_as_regression(evidence):
     manifest, _, directory = evidence
     manifest["config"]["functional_mode"] = "assets"
     with pytest.raises(ValueError, match="Asset-only"):
-        results.summarize(manifest, ROOT, directory.parent)
+        results.summarize(manifest, directory.parent)
 
 
 def test_summary_rejects_missing_case_artifact(evidence):
     manifest, _, directory = evidence
-    result = results.summarize(manifest, ROOT, directory.parent)
+    result = results.summarize(manifest, directory.parent)
     assert not result["success"] and not result["numerical_validation"]
     assert result["numeric_failed"] == 1
 

@@ -242,8 +242,8 @@ def test_original_shell_tensorboard_extraction_and_comparison(shell_case, kind, 
         + (repeat / "verification.json").read_text()
     )
     envelope(manifest, case, directory)
-    assert results.verify_case(manifest, ROOT, case, directory)["success"]
-    summary = results.summarize(manifest, ROOT, directory.parent)
+    assert results.verify_case(manifest, case, directory)["success"]
+    summary = results.summarize(manifest, directory.parent)
     assert summary["success"]
     assert summary["numerical_validation"] == (not bool(case["observation"]))
     assert summary["numeric_passed"] == (0 if case["observation"] else 1)
@@ -259,7 +259,7 @@ def test_original_shell_tensorboard_extraction_and_comparison(shell_case, kind, 
         assert first["final"] == 2000
     if case["observation"] and phases == 2:
         (repeat / "observation_2nd.json").rename(repeat / "absent-observation.json")
-        assert not results.verify_case(manifest, ROOT, case, directory)["success"]
+        assert not results.verify_case(manifest, case, directory)["success"]
 
 
 def test_original_shell_preserves_synthetic_reshard_configuration(tmp_path, provisioned):

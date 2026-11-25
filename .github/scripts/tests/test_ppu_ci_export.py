@@ -3,18 +3,12 @@
 import hashlib
 import json
 import os
-import struct
 import subprocess
 import sys
 from pathlib import Path
 from string import Template
 
 import pytest
-from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-from tensorboard.compat.proto.event_pb2 import Event
-from tensorboard.compat.proto.summary_pb2 import Summary, SummaryMetadata
-from tensorboard.compat.proto.tensor_pb2 import TensorProto
-from tensorboard.summary.writer.event_file_writer import EventFileWriter
 from test_ppu_ci_paths import path_env
 from test_ppu_functional import ROOT, SCRIPTS, functional
 from test_ppu_functional_results import completion, evidence, results, successful_repeat
@@ -28,38 +22,6 @@ def snapshot(directory):
         for path in directory.rglob("*")
         if path.is_file()
     }
-
-
-def write_events(directory, private):
-    writer = EventFileWriter(str(directory))
-    for step in range(1, 4):
-        writer.add_event(
-            Event(
-                step=step,
-                wall_time=100.0 + step,
-                summary=Summary(
-                    value=[
-                        Summary.Value(
-                            tag="lm loss",
-                            simple_value=1.25,
-                            metadata=SummaryMetadata(
-                                display_name="loss", summary_description=private
-                            ),
-                        ),
-                        Summary.Value(
-                            tag="note", tensor=TensorProto(dtype=7, string_val=[private.encode()])
-                        ),
-                    ]
-                ),
-            )
-        )
-    writer.close()
-    return next(directory.glob("events.out.tfevents.*"))
-
-
-def scalar_events(directory):
-    reader = EventAccumulator(str(directory)).Reload()
-    return [(row.step, row.wall_time, row.value) for row in reader.Scalars("lm loss")]
 
 
 @pytest.mark.parametrize("encoding", ["plain", "escaped-slashes", "unicode-escapes"])
@@ -98,20 +60,6 @@ def test_text_yaml_jsonl_and_failure_stack_are_redacted(tmp_path, path_env):
         assert private.encode() not in content
 
 
-@pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le", "utf-16-be"])
-def test_unknown_binary_with_private_path_blocks_export(tmp_path, path_env, encoding):
-    source = tmp_path / "private"
-    source.mkdir()
-    (source / "unknown.bin").write_bytes(
-        b"\x00\x01" + path_env["PPU_CPU_RUN_ROOT"].encode(encoding)
-    )
-    before = snapshot(source)
-    with pytest.raises(ValueError, match="Private directory"):
-        exporter.export(source, tmp_path / "public", env=path_env)
-    assert snapshot(source) == before
-    assert not (tmp_path / "public/public-export.json").exists()
-
-
 def test_upstream_expanded_model_config_is_public_text_not_unknown_binary(tmp_path, path_env):
     source = tmp_path / "private/attempt-1/repeat-1"
     source.mkdir(parents=True)
@@ -147,15 +95,9 @@ def test_upstream_expanded_model_config_is_public_text_not_unknown_binary(tmp_pa
 
 
 @pytest.mark.parametrize(
-    "filename",
-    [
-        "model_config.yaml",
-        "golden_values_fixture.json",
-        "observation.json",
-        "cache/huggingface/hub/tokenizer_config.json",
-    ],
+    "filename", ["model_config.yaml", "golden_values_fixture.json", "observation.json"]
 )
-def test_immutable_config_actual_and_hf_bytes_never_change(tmp_path, path_env, filename):
+def test_immutable_config_and_actual_bytes_never_change(tmp_path, path_env, filename):
     source = tmp_path / "private"
     path = source / filename
     path.parent.mkdir(parents=True)
@@ -166,9 +108,7 @@ def test_immutable_config_actual_and_hf_bytes_never_change(tmp_path, path_env, f
     assert report["files"][filename]["sha256"] == hashlib.sha256(content).hexdigest()
 
 
-@pytest.mark.parametrize(
-    "filename", ["model_config.yaml", "observation.json", "cache/huggingface/config.json"]
-)
+@pytest.mark.parametrize("filename", ["model_config.yaml", "observation.json"])
 def test_private_path_in_immutable_configuration_fails_instead_of_changing_hash(
     tmp_path, path_env, filename
 ):
@@ -180,59 +120,6 @@ def test_private_path_in_immutable_configuration_fails_instead_of_changing_hash(
     with pytest.raises(ValueError, match="Immutable"):
         exporter.export(source, tmp_path / "public", env=path_env)
     assert path.read_bytes() == before
-
-
-def test_real_tensorboard_text_redaction_preserves_every_scalar_and_crc(tmp_path, path_env):
-    source = tmp_path / "private"
-    events = source / "tensorboard"
-    original = write_events(events, path_env["PPU_POD_RUN_ROOT"] + "/attempt-1")
-    before = scalar_events(events)
-    private_bytes = original.read_bytes()
-    exporter.export(source, tmp_path / "public", env=path_env)
-    assert (
-        scalar_events(tmp_path / "public/tensorboard")
-        == before
-        == [(1, 101.0, 1.25), (2, 102.0, 1.25), (3, 103.0, 1.25)]
-    )
-    assert original.read_bytes() == private_bytes
-    public_file = tmp_path / "public/tensorboard" / original.name
-    assert path_env["PPU_POD_RUN_ROOT"].encode() not in public_file.read_bytes()
-    assert b"ppu://runs/pod/attempt-1" in public_file.read_bytes()
-    # A second pass validates rewritten length and payload checksums with no further text changes.
-    exporter.tensorboard(public_file, tmp_path / "second-pass", exporter.Redactor(path_env))
-    assert public_file.read_bytes() == (tmp_path / "second-pass").read_bytes()
-
-
-@pytest.mark.parametrize(
-    "damage", ["header-crc", "payload-crc", "truncated", "unknown-field", "tag"]
-)
-def test_tensorboard_corruption_or_unmodifiable_fields_fail_closed(tmp_path, path_env, damage):
-    source = tmp_path / "private"
-    path = write_events(source, path_env["PPU_CPU_RUN_ROOT"])
-    raw = bytearray(path.read_bytes())
-    if damage == "header-crc":
-        raw[8] ^= 1
-    elif damage == "payload-crc":
-        raw[-1] ^= 1
-    elif damage == "truncated":
-        raw = raw[:-1]
-    else:
-        event = Event(step=1, wall_time=123)
-        if damage == "unknown-field":
-            event.graph_def = path_env["PPU_CPU_RUN_ROOT"].encode()
-        else:
-            event.summary.value.add(tag=path_env["PPU_CPU_RUN_ROOT"], simple_value=1.25)
-        data = event.SerializeToString()
-        length = struct.pack("<Q", len(data))
-        raw = (
-            length
-            + struct.pack("<I", exporter.crc32c(length))
-            + data
-            + struct.pack("<I", exporter.crc32c(data))
-        )
-    path.write_bytes(raw)
-    with pytest.raises(ValueError):
-        exporter.export(source, tmp_path / "public", env=path_env)
 
 
 def test_private_archives_and_checkpoint_cache_payloads_are_not_public(tmp_path, path_env):
@@ -290,7 +177,7 @@ def test_private_archives_and_checkpoint_cache_payloads_are_not_public(tmp_path,
     assert snapshot(source) == before
 
 
-@pytest.mark.parametrize("relative", ["escape", "cache/huggingface/escape"])
+@pytest.mark.parametrize("relative", ["escape.txt", "logs/escape.txt"])
 @pytest.mark.parametrize("link_kind", ["file", "directory", "source", "destination-parent"])
 def test_symlink_escapes_are_rejected(tmp_path, path_env, link_kind, relative):
     source = tmp_path / "private"
@@ -368,7 +255,9 @@ def test_independent_public_inventory_verification_rejects_tampering(tmp_path, p
 
 
 @pytest.mark.parametrize("damage", [None, "actual", "model", "identity", "repeat", "asset-root"])
-def test_schema_two_public_evidence_recomputes_original_gates(evidence, tmp_path, damage):
+def test_public_evidence_preserves_upstream_results_and_rejects_tampering(
+    evidence, tmp_path, damage
+):
     manifest, case, directory = evidence
     manifest["schema_version"] = 2
     manifest["config"].update(data_path="ppu://assets/pod", cpu_data_path="ppu://assets/cpu")
@@ -384,10 +273,6 @@ def test_schema_two_public_evidence_recomputes_original_gates(evidence, tmp_path
     functional.write_asset_report(
         functional.asset_report(manifest, assets, location="pod", case_id=case["id"]), directory
     )
-    for index, path in enumerate(directory.rglob("events.out.tfevents.fixture")):
-        real = write_events(path.parent, str(assets))
-        path.write_bytes(real.read_bytes())
-        real.rename(tmp_path / f"removed-event-{index}")
     (directory / "driver.log").write_text(f"Read assets from {assets}\nTraining complete\n")
     for path in directory.rglob("model_config.yaml"):
         path.with_name("model_config.yaml.tmp").write_text(
@@ -422,7 +307,7 @@ def test_schema_two_public_evidence_recomputes_original_gates(evidence, tmp_path
         checked = tmp_path / "rehash"
         exporter.export(public, checked, env=env)
         public = checked
-    report = results.verify_case(manifest, ROOT, case, public)
+    report = results.verify_case(manifest, case, public)
     assert report["success"] is (damage is None), report
     if damage != "model":
         for path in directory.rglob("model_config.yaml"):
@@ -445,7 +330,9 @@ def test_export_never_writes_over_private_or_existing_evidence(tmp_path, path_en
 
 
 @pytest.mark.parametrize("github_actions", ["true", "false"])
-def test_required_export_failure_does_not_print_private_exception_paths(tmp_path, path_env, github_actions):
+def test_required_export_failure_does_not_print_private_exception_paths(
+    tmp_path, path_env, github_actions
+):
     source = tmp_path / "private"
     source.mkdir()
     (source / "unknown.bin").write_bytes(path_env["PPU_CPU_RUN_ROOT"].encode())
@@ -466,9 +353,35 @@ def test_required_export_failure_does_not_print_private_exception_paths(tmp_path
     assert process.returncode != 0 and "Public evidence export failed" in process.stderr
     # Captured subprocess output contains the masking protocol before Actions processes it.
     # Allow only exact registration commands; errors and all ordinary output must be redacted.
-    expected_masks = {
-        f"::add-mask::{value}"
-        for value in (path_env["PPU_HOST_VOLUMES"], *exporter.paths.replacements(path_env))
-    } if github_actions == "true" else set()
-    ordinary_output = "\n".join(line for line in process.stdout.splitlines() if line not in expected_masks)
+    expected_masks = (
+        {
+            f"::add-mask::{value}"
+            for value in (path_env["PPU_HOST_VOLUMES"], *exporter.paths.replacements(path_env))
+        }
+        if github_actions == "true"
+        else set()
+    )
+    ordinary_output = "\n".join(
+        line for line in process.stdout.splitlines() if line not in expected_masks
+    )
     assert not any(value in ordinary_output + process.stderr for value in path_env.values())
+
+
+def test_public_export_omits_raw_binary_and_cache_without_modifying_them(tmp_path, path_env):
+    source = tmp_path / "private"
+    source.mkdir()
+    (source / "summary.json").write_text('{"success": true}')
+    for name in (
+        "events.out.tfevents.raw",
+        "tensorboard/events.raw",
+        "cache/huggingface/config.json",
+        "unknown.bin",
+    ):
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"private binary:" + path_env["PPU_POD_RUN_ROOT"].encode())
+    before = snapshot(source)
+    report = exporter.export(source, tmp_path / "public", env=path_env)
+    assert set(report["files"]) == {"summary.json"}
+    assert len(report["omitted"]) == 4
+    assert snapshot(source) == before

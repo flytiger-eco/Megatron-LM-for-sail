@@ -1,15 +1,12 @@
 """Fail-closed evidence verification and summaries for PPU functional regression."""
 
 import argparse
-import copy
 import hashlib
-import importlib
 import importlib.util
 import json
 import math
 import os
 import re
-import sys
 from pathlib import Path
 
 import yaml
@@ -184,42 +181,32 @@ def verify_pytest(
     if report["tests"][nodes[0]] != {"setup": "passed", "call": "passed", "teardown": "passed"}:
         raise ValueError(f"Upstream pytest skipped or failed a test/fixture: {phase}")
     finite_seconds(report["duration_seconds"])
-
-
-def compare_upstream(root: Path, case: dict, directory: Path) -> None:
-    """Recompute with the original comparator, including its original precision policy."""
-    sys.path.insert(0, str(root))
-    try:
-        common = importlib.import_module("tests.functional_tests.python_test_utils.common")
-        regular = importlib.import_module(
-            "tests.functional_tests.python_test_utils.test_pretraining_regular_pipeline"
+    actual = directory / Path(case["golden_path"]).name
+    expected = {"model-config-path": control.sha256(directory / "model_config.yaml")}
+    if phase == "regular":
+        expected.update(
+            {
+                "golden-values-path": case["golden_sha256"],
+                "actual-values-path": control.sha256(actual),
+            }
         )
-        resume = importlib.import_module(
-            "tests.functional_tests.python_test_utils.test_pretraining_resume_checkpoint_pipeline"
+    else:
+        expected.update(
+            {
+                "actual-values-first-run-path": control.sha256(actual),
+                "actual-values-second-run-path": control.sha256(
+                    actual.with_name(f"{actual.stem}_2nd.json")
+                ),
+            }
         )
-        for module in (common, regular, resume):
-            if not Path(module.__file__).resolve().is_relative_to(root.resolve()):
-                raise ValueError("Comparator was imported from a different source tree")
-        golden = common.read_golden_values_from_json(root / case["golden_path"])
-        actual_path = directory / Path(case["golden_path"]).name
-        actual = common.read_golden_values_from_json(actual_path)
-        config_path = str(directory / "model_config.yaml")
-        regular.test_regular_pipeline(
-            case["approximate"], golden, copy.deepcopy(actual), config_path
-        )
-        if phase_count(case) == 2:
-            second_path = actual_path.with_name(f"{actual_path.stem}_2nd.json")
-            second = common.read_golden_values_from_json(second_path)
-            resume.test_resume_checkpoint_pipeline(
-                case["approximate"], actual, second, case["effective_train_iters"], config_path
-            )
-    finally:
-        sys.path.pop(0)
+    if (
+        report.get("inputs") != expected
+        or report.get("train_iters") != case["effective_train_iters"]
+    ):
+        raise ValueError("Upstream pytest report does not match the compared inputs")
 
 
-def verify_repeat(
-    manifest: dict, root: Path, case: dict, directory: Path, attempt: int, repeat: int
-) -> dict:
+def verify_repeat(manifest: dict, case: dict, directory: Path, attempt: int, repeat: int) -> dict:
     execution = json.loads((directory / "execution.json").read_text())
     verify_identity(execution, manifest, case, attempt, repeat)
     compiler_env = control.compiler_environment(manifest)
@@ -253,27 +240,11 @@ def verify_repeat(
             "classification": classification,
             "duration_seconds": execution["duration_seconds"],
         }
-    verify_source(manifest, root, case)
-    verify_runtime_config(root, case, directory)
-    if case["tokenizer_dependencies"]:
-        sources = control.hf.sources_for(case["tokenizer_dependencies"])
-        cache = control.hf.verify_cache(directory / "cache/huggingface", sources)
-        if json.loads((directory / "tokenizer-cache.json").read_text()) != cache:
-            raise ValueError("Missing or mismatched isolated tokenizer cache evidence")
     if statuses != {phase: 0 for phase in range(1, phase_count(case) + 1)}:
         raise ValueError("Training phase or resume phase did not finish successfully")
     if execution["runtime_config_sha256"] != control.sha256(directory / "model_config.yaml"):
         raise ValueError("Runtime configuration digest mismatch")
     verify_rank_logs(case, directory)
-    for phase in range(1, phase_count(case) + 1):
-        tensorboard = directory / "1/tensorboard"
-        if phase_count(case) == 2:
-            tensorboard /= f"run_{phase}"
-        if not any(
-            path.is_file() and path.stat().st_size
-            for path in tensorboard.rglob("events.out.tfevents.*")
-        ):
-            raise ValueError(f"Missing TensorBoard phase evidence: {phase}")
     if case["observation"]:
         for phase in range(1, phase_count(case) + 1):
             name = "observation.json" if phase == 1 else "observation_2nd.json"
@@ -290,8 +261,6 @@ def verify_repeat(
     else:
         first_path = directory / Path(case["golden_path"]).name
         first = control.read_metrics(first_path)
-        golden = control.read_metrics(root / case["golden_path"])
-        control.validate_region(golden, first, case["metrics"])
         if not any(
             control.finite(row["values"].get(case["effective_train_iters"]))
             for row in first.values()
@@ -300,16 +269,12 @@ def verify_repeat(
         verify_pytest(directory, "regular", manifest, case, attempt, repeat)
         if phase_count(case) == 2:
             second = control.read_metrics(first_path.with_name(f"{first_path.stem}_2nd.json"))
-            control.validate_region(
-                first, second, case["metrics"], after=case["effective_train_iters"] // 2
-            )
             if not any(
                 control.finite(row["values"].get(case["effective_train_iters"]))
                 for row in second.values()
             ):
                 raise ValueError("Resume did not reach its configured final iteration")
             verify_pytest(directory, "resume", manifest, case, attempt, repeat)
-        compare_upstream(root, case, directory)
     return {
         "success": True,
         "classification": "observation" if case["observation"] else "passed",
@@ -442,7 +407,7 @@ def verify_envelope(manifest: dict, case: dict, directory: Path) -> dict:
     }
 
 
-def verify_case(manifest: dict, root: Path, case: dict, directory: Path) -> dict:
+def verify_case(manifest: dict, case: dict, directory: Path) -> dict:
     report = {
         "id": case["id"],
         "name": case["name"],
@@ -504,7 +469,7 @@ def verify_case(manifest: dict, root: Path, case: dict, directory: Path) -> dict
                 if repeat_dir.name != f"repeat-{repeat}":
                     raise ValueError("Noncontiguous functional repetitions")
                 try:
-                    result = verify_repeat(manifest, root, case, repeat_dir, attempt, repeat)
+                    result = verify_repeat(manifest, case, repeat_dir, attempt, repeat)
                 except AssertionError:
                     report["classification"] = "numeric_failure"
                     raise
@@ -546,7 +511,7 @@ def verify_case(manifest: dict, root: Path, case: dict, directory: Path) -> dict
     return report
 
 
-def summarize(manifest: dict, root: Path, directory: Path) -> dict:
+def summarize(manifest: dict, directory: Path) -> dict:
     if (
         manifest.get("test_kind") != "functional"
         or manifest["config"]["functional_mode"] != "regression"
@@ -555,9 +520,7 @@ def summarize(manifest: dict, root: Path, directory: Path) -> dict:
     if not manifest.get("functional"):
         raise ValueError("Functional manifest has no cases")
     cases = [
-        verify_case(
-            manifest, root, case, directory / f"{control.policy.artifact_prefix()}{case['id']}"
-        )
+        verify_case(manifest, case, directory / f"{control.policy.artifact_prefix()}{case['id']}")
         for case in manifest["functional"].values()
     ]
     numeric = [case for case in cases if not case["observation"]]
@@ -586,11 +549,10 @@ def summarize(manifest: dict, root: Path, directory: Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True, type=Path)
-    parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--results", required=True, type=Path)
     args = parser.parse_args()
     manifest = control.load_manifest(args.manifest)
-    result = summarize(manifest, args.root, args.results)
+    result = summarize(manifest, args.results)
     args.results.mkdir(parents=True, exist_ok=True)
     (args.results / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
     summary = [

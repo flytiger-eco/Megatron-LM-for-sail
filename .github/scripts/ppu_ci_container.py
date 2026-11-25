@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 
 GHCR_IMAGE = 'ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci'
 PPU_IMAGE = 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001'
+SOURCE_ROOT = Path('/opt/ppu-ci-source')
 CONTROL_IMAGE = 'python:3.12-slim-bookworm'
 SHA = re.compile(r'[0-9a-f]{40}')
 DIGEST = re.compile(r'[0-9a-f]{64}')
@@ -139,7 +140,6 @@ def verify_export(
     required = (
         (
             'environment.tar.gz',
-            'compiled-source.tar.gz',
             'functional-package-install.json',
             'constraints.txt',
             'installed-packages.json',
@@ -170,9 +170,7 @@ def verify_export(
     return metadata
 
 
-def extract_archive(
-    archive, destination, *, prefix=None, overlay=False, check_only=False, compiled=False
-):
+def extract_archive(archive, destination):
     destination = no_links(destination)
     archive = no_links(archive)
     with tarfile.open(archive, 'r:gz') as stream:
@@ -181,12 +179,6 @@ def extract_archive(
         names, regular, total = set(), set(), 0
         for member in members:
             name = relative(member.name).as_posix()
-            if compiled:
-                require(
-                    re.fullmatch(r'megatron/core/datasets/helpers_cpp[^/]*\.so', name)
-                    and member.isfile(),
-                    'Invalid compiled source members',
-                )
             require(
                 name not in names and (member.isdir() or member.isfile()) and not member.issparse(),
                 'Unsupported or repeated archive member',
@@ -195,20 +187,11 @@ def extract_archive(
             if member.isfile():
                 regular.add(name)
             require(member.size >= 0, 'Invalid archive member size')
-            if prefix:
-                require(
-                    name == prefix or name.startswith(prefix + '/'),
-                    'Environment archive root mismatch',
-                )
             target = no_links(destination / name)
             require(target.is_relative_to(destination), 'Archive member escapes the restore root')
             if target.exists():
                 require(
-                    target.is_dir()
-                    and member.isdir()
-                    or overlay
-                    and target.is_file()
-                    and member.isfile(),
+                    target.is_dir() and member.isdir(),
                     'Refusing to overwrite an environment member',
                 )
             total += member.size
@@ -219,8 +202,6 @@ def extract_archive(
             'Archive file conflicts with a parent directory',
         )
         require(total <= 64 * 1024**3, 'Environment archive exceeds the size limit')
-        if check_only:
-            return
         ancestor = destination
         while not ancestor.exists():
             ancestor = ancestor.parent
@@ -235,14 +216,10 @@ def extract_archive(
                 target.mkdir(parents=True, exist_ok=True)
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with (
-                    stream.extractfile(member) as source,
-                    target.open('wb' if overlay else 'xb') as output,
-                ):
+                with stream.extractfile(member) as source, target.open('xb') as output:
                     shutil.copyfileobj(source, output)
                 target.chmod(member.mode & 0o755)
-                timestamp = time.time() if compiled else member.mtime
-                os.utime(target, (timestamp, timestamp))
+                os.utime(target, (member.mtime, member.mtime))
 
 
 def client_env():
@@ -452,12 +429,8 @@ def build_identity(args):
     dependency_key = hashlib.sha256(
         json.dumps(dependency_inputs, sort_keys=True).encode()
     ).hexdigest()
-    inputs['ppu_ci_container.py'] = digest(
-        no_links(root / '.github/scripts/ppu_ci_container.py')
-    )
-    inputs['ppu_ci_container.sh'] = digest(
-        no_links(root / '.github/scripts/ppu_ci_container.sh')
-    )
+    inputs['ppu_ci_container.py'] = digest(no_links(root / '.github/scripts/ppu_ci_container.py'))
+    inputs['ppu_ci_container.sh'] = digest(no_links(root / '.github/scripts/ppu_ci_container.sh'))
     for path in trusted_controls(root):
         inputs[path.name] = digest(path)
     inputs['control_sha'] = args.control_sha
@@ -543,7 +516,9 @@ def readable_probe_export(output, context):
 def build(args):
     image_mode = getattr(args, 'mode', '') == 'build-image'
     cache_only = getattr(args, 'mode', '') == 'build-cache'
-    require(args.kind == 'control' or image_mode or cache_only, 'Runtime builds require build-image')
+    require(
+        args.kind == 'control' or image_mode or cache_only, 'Runtime builds require build-image'
+    )
     cache_from, cache_to = getattr(args, 'cache_from', ''), getattr(args, 'cache_to', '')
     for ref in (cache_from, cache_to):
         require(
@@ -662,9 +637,7 @@ def build(args):
         }
         (output / 'docker-build.json').write_text(json.dumps(metadata, sort_keys=True) + '\n')
         sha = digest(output / 'docker-build.json')
-        verify_export(
-            output, sha, args.control_sha, args.target_sha, schema=2 if image_mode else 1
-        )
+        verify_export(output, sha, args.control_sha, args.target_sha, schema=2 if image_mode else 1)
         # BuildKit local exports may be owned by the runner with mode 0700.
         # A root container without DAC capabilities cannot read that bind mount.
         # Keep original evidence private and mount a readable temporary snapshot.
@@ -683,8 +656,7 @@ def build(args):
                 ['docker', 'image', 'inspect', '--format', '{{.Id}}', args.local_image]
             )
             require(
-                re.fullmatch(r'sha256:[0-9a-f]{64}', local_id),
-                'Invalid local execution image ID',
+                re.fullmatch(r'sha256:[0-9a-f]{64}', local_id), 'Invalid local execution image ID'
             )
             command(
                 [
@@ -700,8 +672,6 @@ def build(args):
                     f'type=bind,source={probe_export},target=/exports,readonly',
                     '--mount',
                     f'type=bind,source={root / ".github/scripts"},target=/trusted,readonly',
-                    '--mount',
-                    f'type=bind,source={context / "source"},target=/source,readonly',
                     local_id,
                     'python3',
                     '-I',
@@ -721,9 +691,7 @@ def build(args):
                 failure='Dockerfile execution image offline probe failed',
                 diagnostics=True,
             )
-            emit_outputs(
-                environment_digest=sha, local_image_id=local_id, base_image_digest=pinned
-            )
+            emit_outputs(environment_digest=sha, local_image_id=local_id, base_image_digest=pinned)
             return
         mounts = [
             '--mount',
@@ -776,9 +744,7 @@ def build(args):
                 {
                     'kind': args.kind,
                     'environment_digest': sha,
-                    'environment_bytes': sum(
-                        item['size'] for item in metadata['files'].values()
-                    ),
+                    'environment_bytes': sum(item['size'] for item in metadata['files'].values()),
                 }
             )
         )
@@ -874,12 +840,9 @@ def verify_installed_image(args, metadata):
     require((venv / 'bin/python').is_file(), 'Missing baked execution environment')
     embedded = no_links('/opt/ppu-ci-image/docker-build.json')
     require(embedded.is_file() and digest(embedded) == args.digest, 'Baked image metadata mismatch')
-    require(args.source_root is not None, 'Missing execution source directory')
-    extract_archive(
-        Path(args.artifact) / 'compiled-source.tar.gz',
-        args.source_root,
-        overlay=True,
-        compiled=True,
+    require(
+        args.source_root == SOURCE_ROOT and no_links(SOURCE_ROOT).is_dir(),
+        'Execution source must come from the immutable image',
     )
 
 
@@ -898,13 +861,6 @@ def verify_image(args):
         and published == image_record(metadata, args.digest, args.image_digest),
         'Execution image publication record mismatch',
     )
-    extract_archive(
-        Path(args.artifact) / 'compiled-source.tar.gz',
-        args.source_root or Path(args.artifact) / '.compiled-check',
-        overlay=True,
-        check_only=True,
-        compiled=True,
-    )
     if args.check_only:
         return
     verify_installed_image(args, metadata)
@@ -914,11 +870,9 @@ def image_probe(args):
     metadata = verify_export(
         args.artifact, args.digest, args.control_sha, args.target_sha, schema=2
     )
-    source = Path('/tmp/ppu-image-source')
-    shutil.copytree('/source', source)
-    args.source_root = source
+    args.source_root = SOURCE_ROOT
     verify_installed_image(args, metadata)
-    portable_checks(source, execution_image=True)
+    portable_checks(SOURCE_ROOT, execution_image=True)
 
 
 def restore_control(args):
@@ -997,53 +951,6 @@ def portable_checks(source, *, execution_image=False):
         )
 
 
-def archive_source(args):
-    """Package materialized tracked source and authenticated compiled extensions."""
-    source, directory = no_links(args.source_root), no_links(args.artifact)
-    checked_git(source, args.target_sha)
-    verify_export(directory, args.digest, args.control_sha, args.target_sha, subset=True, schema=2)
-    output = no_links(directory / 'source.tar.gz')
-    require(not output.exists(), 'Refusing to overwrite a source archive')
-    names = command(
-        ['git', '-C', str(source), 'ls-files', '-z'],
-        failure='Source archive tracked inventory read failed',
-    ).split('\0')
-    require(any(names), 'Missing tracked source archive members')
-    with tempfile.TemporaryDirectory(prefix='ppu-source-archive-', dir=directory) as temporary:
-        context = Path(temporary)
-        stage = context / 'source'
-        stage.mkdir()
-        materialize_tracked_source(source, stage, names)
-        extract_archive(directory / 'compiled-source.tar.gz', stage, overlay=True, compiled=True)
-        checked_git(source, args.target_sha)
-        candidate = context / 'source.tar.gz'
-        files = inventory(stage, exclude=())
-        with tarfile.open(candidate, 'w:gz', dereference=True) as stream:
-            for name in sorted(files):
-                stream.add(stage / name, arcname=name, recursive=False)
-        extract_archive(candidate, context / 'check', check_only=True)
-        with candidate.open('rb') as stream, output.open('xb') as target:
-            shutil.copyfileobj(stream, target)
-    print('Source archive creation and safety check passed')
-
-
-def restore_source(args):
-    directory = no_links(args.artifact)
-    require(DIGEST.fullmatch(args.bundle_digest or ''), 'Missing trusted source bundle digest')
-    sealed = no_links(directory / 'bundle-integrity.json')
-    require(digest(sealed) == args.bundle_digest, 'Source bundle inventory digest mismatch')
-    metadata = json.loads(sealed.read_text())
-    source = no_links(directory / 'source.tar.gz')
-    require(
-        type(metadata.get('schema_version')) is int
-        and metadata['schema_version'] == 1
-        and metadata['files'].get('source.tar.gz')
-        == {'size': source.stat().st_size, 'sha256': digest(source)},
-        'Source archive digest mismatch',
-    )
-    extract_archive(source, args.destination)
-
-
 def mark_plan(args):
     path = no_links(Path(args.artifact) / 'manifest.json')
     manifest = json.loads(path.read_text())
@@ -1103,16 +1010,6 @@ def main():
             image.add_argument('--image-digest', required=True)
             image.add_argument('--source-root', type=Path)
             image.add_argument('--check-only', action='store_true')
-    pack = sub.add_parser('archive-source')
-    pack.add_argument('--artifact', type=Path, required=True)
-    pack.add_argument('--source-root', type=Path, required=True)
-    pack.add_argument('--digest', required=True)
-    pack.add_argument('--control-sha', required=True)
-    pack.add_argument('--target-sha', required=True)
-    source = sub.add_parser('restore-source')
-    source.add_argument('--artifact', type=Path, required=True)
-    source.add_argument('--bundle-digest', required=True)
-    source.add_argument('--destination', type=Path, required=True)
     mark = sub.add_parser('mark-plan')
     mark.add_argument('--artifact', type=Path, required=True)
     args = parser.parse_args()
@@ -1125,8 +1022,6 @@ def main():
         'image-probe': image_probe,
         'fingerprint': fingerprint,
         'restore-control': restore_control,
-        'restore-source': restore_source,
-        'archive-source': archive_source,
         'mark-plan': mark_plan,
     }[args.mode](args)
 
@@ -1139,7 +1034,6 @@ if __name__ == '__main__':
         # exceptions may contain credentials or private directory names.
         message = str(error) if isinstance(error, ValidationError) else type(error).__name__
         print(
-            f'PPU environment operation failed: {message}; raw details suppressed',
-            file=sys.stderr,
+            f'PPU environment operation failed: {message}; raw details suppressed', file=sys.stderr
         )
         raise SystemExit(1) from None

@@ -1289,9 +1289,8 @@ def test_ut_workflow_restores_same_run_bundle_before_execution(sealed_bundle, tm
     assert (result.returncode == 0) is (damage == "none"), result.stdout + result.stderr
     assert ("UT_STARTED:dev-023" in result.stdout) is (damage == "none")
     if damage == "none":
-        assert (workspace / "source/source.py").read_text() == "VALUE = 1\n"
         assert (workspace / ".ppu-bundle/data/tokenizer").is_symlink()
-        assert not (bundle / "source").exists()
+        assert not (workspace / "source").exists()
 
 
 def test_bundle_workflow_digest_and_run_scoping():
@@ -1318,11 +1317,7 @@ def test_bundle_workflow_digest_and_run_scoping():
     )
     assert "PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }}" in action["with"]["extra_env"]
     command = action["with"]["command"]
-    assert (
-        command.index("verify-bundle")
-        < command.index("restore-source")
-        < command.index("ppu_ci_run.sh")
-    )
+    assert command.index("verify-bundle") < command.index("ppu_ci_run.sh")
     script = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
     assert script.index("seal-bundle") > script.index("verify-image")
     assert "tar -czf .ppu-ci/environment.tar.gz" not in script

@@ -55,16 +55,6 @@ def runtime_export(root, *, schema=1):
         archive(
             root / 'environment.tar.gz', [('ppu-ci-venv/bin/python', b'python', tarfile.REGTYPE)]
         )
-    archive(
-        root / 'compiled-source.tar.gz',
-        [
-            (
-                'megatron/core/datasets/helpers_cpp.cpython-312-x86_64-linux-gnu.so',
-                b'extension',
-                tarfile.REGTYPE,
-            )
-        ],
-    )
     for name in (
         'functional-package-install.json',
         'constraints.txt',
@@ -169,252 +159,6 @@ def test_archive_validates_all_members_before_writes(tmp_path, rows):
     assert not destination.exists()
 
 
-def test_source_restore_requires_sealed_archive_identity(tmp_path):
-    root = tmp_path / 'bundle'
-    root.mkdir()
-    archive(root / 'source.tar.gz', [('source.py', b'pass', tarfile.REGTYPE)])
-    inventory = root / 'bundle-integrity.json'
-    inventory.write_text(
-        json.dumps({'schema_version': 1, 'files': container.inventory(root, exclude=())})
-    )
-    args = SimpleNamespace(
-        artifact=root, bundle_digest=container.digest(inventory), destination=tmp_path / 'source'
-    )
-    container.restore_source(args)
-    assert (args.destination / 'source.py').read_bytes() == b'pass'
-    (root / 'source.tar.gz').write_bytes(b'corrupt')
-    with pytest.raises(container.ValidationError):
-        container.restore_source(args)
-
-
-def source_git(source, *args):
-    return subprocess.run(
-        ['git', '-C', str(source), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-        env={
-            **os.environ,
-            'GIT_AUTHOR_NAME': 'Source fixture',
-            'GIT_AUTHOR_EMAIL': 'fixture@example.com',
-            'GIT_COMMITTER_NAME': 'Source fixture',
-            'GIT_COMMITTER_EMAIL': 'fixture@example.com',
-        },
-    ).stdout.strip()
-
-
-@pytest.fixture
-def source_archive_inputs(tmp_path):
-    source = tmp_path / 'checkout'
-    source.mkdir()
-    rows = {
-        'AGENTS.md': b'guidelines\n',
-        'skills/nested/run.sh': b'#!/bin/sh\nexit 0\n',
-        'megatron/core/datasets/Makefile': b'all:\n\ttrue\n',
-        'hardlink-a': b'same bytes\n',
-        '-leading name.txt': b'not a tar option\n',
-    }
-    for name, data in rows.items():
-        member = source / name
-        member.parent.mkdir(parents=True, exist_ok=True)
-        member.write_bytes(data)
-    (source / 'skills/nested/run.sh').chmod(0o755)
-    os.link(source / 'hardlink-a', source / 'hardlink-b')
-    (source / 'CLAUDE.md').symlink_to('AGENTS.md')
-    (source / '.agents').mkdir()
-    (source / '.agents/skills').symlink_to('../skills')
-    source_git(source, 'init', '--quiet')
-    source_git(source, 'add', '--all')
-    tree = source_git(source, 'write-tree')
-    target = source_git(source, 'commit-tree', tree, '-m', 'source archive fixture')
-    source_git(source, 'update-ref', 'HEAD', target)
-    (source / 'skills/untracked-private').write_bytes(b'not exported')
-    (source / 'skills/untracked-link').symlink_to(tmp_path)
-    (source / 'megatron/core/datasets/helpers_cpp.untrusted.so').write_bytes(b'not exported')
-    root = tmp_path / 'runtime-evidence'
-    runtime_export(root, schema=2)
-    metadata = json.loads((root / 'docker-build.json').read_text())
-    metadata['target_sha'] = target
-    (root / 'docker-build.json').write_text(json.dumps(metadata))
-    trusted = container.digest(root / 'docker-build.json')
-    write_image_record(root, trusted)
-    return SimpleNamespace(
-        artifact=root, source_root=source, digest=trusted, control_sha=CONTROL, target_sha=target
-    )
-
-
-def source_archive_cli(args):
-    return subprocess.run(
-        [
-            sys.executable,
-            '-I',
-            '-B',
-            str(SCRIPTS / 'ppu_ci_container.py'),
-            'archive-source',
-            '--source-root',
-            str(args.source_root),
-            '--artifact',
-            str(args.artifact),
-            '--digest',
-            args.digest,
-            '--control-sha',
-            args.control_sha,
-            '--target-sha',
-            args.target_sha,
-        ],
-        capture_output=True,
-        text=True,
-    )
-
-
-def seal_source_archive(args, destination):
-    sealed = args.artifact / 'bundle-integrity.json'
-    sealed.write_text(
-        json.dumps({'schema_version': 1, 'files': container.inventory(args.artifact, exclude=())})
-    )
-    return SimpleNamespace(
-        artifact=args.artifact, bundle_digest=container.digest(sealed), destination=destination
-    )
-
-
-@pytest.mark.parametrize('tracked_extension', [False, True])
-def test_real_source_archive_materializes_aliases_and_restores_authenticated_helper(
-    source_archive_inputs, tmp_path, tracked_extension
-):
-    args = source_archive_inputs
-    helper = 'megatron/core/datasets/helpers_cpp.cpython-312-x86_64-linux-gnu.so'
-    if tracked_extension:
-        (args.source_root / helper).write_bytes(b'tracked-old-extension')
-        source_git(args.source_root, 'add', '--', helper)
-        tree = source_git(args.source_root, 'write-tree')
-        args.target_sha = source_git(args.source_root, 'commit-tree', tree, '-m', 'tracked helper')
-        source_git(args.source_root, 'update-ref', 'HEAD', args.target_sha)
-        metadata = json.loads((args.artifact / 'docker-build.json').read_text())
-        metadata['target_sha'] = args.target_sha
-        (args.artifact / 'docker-build.json').write_text(json.dumps(metadata))
-        args.digest = container.digest(args.artifact / 'docker-build.json')
-        write_image_record(args.artifact, args.digest)
-    evidence = tree_bytes(args.artifact)
-    result = source_archive_cli(args)
-    assert result.returncode == 0, result.stderr
-    expected = {
-        'AGENTS.md': b'guidelines\n',
-        'CLAUDE.md': b'guidelines\n',
-        'skills/nested/run.sh': b'#!/bin/sh\nexit 0\n',
-        '.agents/skills/nested/run.sh': b'#!/bin/sh\nexit 0\n',
-        'megatron/core/datasets/Makefile': b'all:\n\ttrue\n',
-        'hardlink-a': b'same bytes\n',
-        'hardlink-b': b'same bytes\n',
-        '-leading name.txt': b'not a tar option\n',
-        helper: b'extension',
-    }
-    with tarfile.open(args.artifact / 'source.tar.gz') as stream:
-        members = stream.getmembers()
-        assert len(members) == len(expected)
-        assert {member.name for member in members} == set(expected)
-        assert all(member.isfile() and not member.issparse() for member in members)
-        assert {member.name: stream.extractfile(member).read() for member in members} == expected
-    restore = seal_source_archive(args, tmp_path / 'restored')
-    result = subprocess.run(
-        [
-            sys.executable,
-            '-I',
-            '-B',
-            str(SCRIPTS / 'ppu_ci_container.py'),
-            'restore-source',
-            '--artifact',
-            str(args.artifact),
-            '--bundle-digest',
-            restore.bundle_digest,
-            '--destination',
-            str(restore.destination),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-    assert tree_bytes(restore.destination) == expected
-    assert all(not path.is_symlink() for path in restore.destination.rglob('*'))
-    assert (restore.destination / 'skills/nested/run.sh').stat().st_mode & 0o7777 == 0o755
-    assert (restore.destination / helper).stat().st_mode & 0o6000 == 0
-    assert (args.source_root / 'CLAUDE.md').is_symlink()
-    assert (args.source_root / '.agents/skills').is_symlink()
-    assert source_git(args.source_root, 'diff', '--quiet', 'HEAD', '--') == ''
-    assert all((args.artifact / name).read_bytes() == value for name, value in evidence.items())
-    assert not list(args.artifact.glob('ppu-source-archive-*'))
-    result = source_archive_cli(args)
-    assert result.returncode != 0 and 'Refusing to overwrite a source archive' in result.stderr
-
-
-@pytest.mark.parametrize(
-    'damage', ['digest', 'control', 'target', 'dirty', 'staged', 'compiled-bytes', 'output-link']
-)
-def test_real_source_archive_rejects_changed_identity_without_output(source_archive_inputs, damage):
-    args = source_archive_inputs
-    if damage == 'digest':
-        args.digest = 'f' * 64
-    elif damage == 'control':
-        args.control_sha = 'e' * 40
-    elif damage == 'target':
-        args.target_sha = 'e' * 40
-    elif damage == 'dirty':
-        (args.source_root / 'AGENTS.md').write_bytes(b'changed')
-    elif damage == 'staged':
-        (args.source_root / 'staged-new').write_bytes(b'new')
-        source_git(args.source_root, 'add', '--', 'staged-new')
-    elif damage == 'compiled-bytes':
-        (args.artifact / 'compiled-source.tar.gz').write_bytes(b'corrupt')
-    else:
-        (args.artifact / 'source.tar.gz').symlink_to(args.source_root / 'AGENTS.md')
-    before = (args.source_root / 'AGENTS.md').read_bytes()
-    result = source_archive_cli(args)
-    assert result.returncode != 0
-    assert 'raw details suppressed' in result.stderr
-    assert not (args.artifact / 'source.tar.gz').is_file() or damage == 'output-link'
-    assert (args.source_root / 'AGENTS.md').read_bytes() == before
-    assert not list(args.artifact.glob('ppu-source-archive-*'))
-
-
-@pytest.mark.parametrize('kind', ['external', 'untracked', 'chain', 'fifo'])
-def test_real_source_archive_rejects_unsafe_checkout_members(source_archive_inputs, tmp_path, kind):
-    args = source_archive_inputs
-    alias = args.source_root / 'CLAUDE.md'
-    alias.unlink()
-    if kind == 'external':
-        outside = tmp_path / 'private'
-        outside.write_bytes(b'private')
-        alias.symlink_to(outside)
-    elif kind == 'untracked':
-        alias.symlink_to('skills/untracked-private')
-    elif kind == 'chain':
-        (args.source_root / 'indirect').symlink_to('AGENTS.md')
-        alias.symlink_to('indirect')
-    else:
-        os.mkfifo(alias)
-    if kind != 'fifo':
-        source_git(args.source_root, 'add', '--', 'CLAUDE.md')
-        if kind == 'chain':
-            source_git(args.source_root, 'add', '--', 'indirect')
-        tree = source_git(args.source_root, 'write-tree')
-        args.target_sha = source_git(args.source_root, 'commit-tree', tree, '-m', 'unsafe source')
-        source_git(args.source_root, 'update-ref', 'HEAD', args.target_sha)
-        metadata = json.loads((args.artifact / 'docker-build.json').read_text())
-        metadata['target_sha'] = args.target_sha
-        (args.artifact / 'docker-build.json').write_text(json.dumps(metadata))
-        args.digest = container.digest(args.artifact / 'docker-build.json')
-    result = source_archive_cli(args)
-    assert result.returncode != 0
-    expected_error = {
-        'external': 'Build source alias escapes the checkout',
-        'untracked': 'Build source alias target is not tracked',
-        'chain': 'Environment path contains a symlink',
-        'fifo': 'Build checkout tracked-file validation failed',
-    }[kind]
-    assert expected_error in result.stderr
-    assert not (args.artifact / 'source.tar.gz').exists()
-    assert not list(args.artifact.glob('ppu-source-archive-*'))
-
-
 @pytest.fixture
 def build_inputs(tmp_path, monkeypatch):
     control, source = tmp_path / 'control', tmp_path / 'source'
@@ -477,7 +221,7 @@ def assert_build_arguments(argv, args):
 
 
 @pytest.mark.parametrize(
-    'damage', ['none', 'digest', 'base', 'image', 'record', 'file', 'legacy', 'archive', 'software']
+    'damage', ['none', 'digest', 'base', 'image', 'record', 'file', 'legacy', 'software']
 )
 def test_image_handoff_checks_all_identities_without_restoring_software(
     image_exported, tmp_path, damage
@@ -496,10 +240,6 @@ def test_image_handoff_checks_all_identities_without_restoring_software(
         (root / 'constraints.txt').write_text('corrupt')
     elif damage == 'legacy':
         args.digest = seal(root)
-        write_image_record(root, args.digest)
-    elif damage == 'archive':
-        archive(root / 'compiled-source.tar.gz', [('evil.py', b'exec', tarfile.REGTYPE)])
-        args.digest = seal(root, schema=2)
         write_image_record(root, args.digest)
     elif damage == 'software':
         (root / 'environment.tar.gz').write_bytes(b'unexpected')
@@ -666,7 +406,6 @@ def test_publication_only_pushes_verified_image_and_never_builds_or_runs_source(
 def test_schema_two_bundle_is_sealed_without_environment_archive(image_exported, damage):
     root, _ = image_exported
     for name in (
-        'source.tar.gz',
         'commit.txt',
         'control.txt',
         'build-timing.json',
@@ -697,7 +436,8 @@ def test_schema_two_bundle_is_sealed_without_environment_archive(image_exported,
     if damage == 'none':
         ci.seal_bundle(root)
         files = json.loads((root / 'bundle-integrity.json').read_text())['files']
-        assert 'runtime-image.json' in files and 'environment.tar.gz' not in files
+        assert 'runtime-image.json' in files
+        assert not {'source.tar.gz', 'compiled-source.tar.gz', 'environment.tar.gz'} & files.keys()
     else:
         with pytest.raises((ValueError, KeyError)):
             ci.seal_bundle(root)
@@ -1028,9 +768,7 @@ def test_cache_population_never_compiles_or_executes_target_source(build_inputs,
         assert argv[:3] == ['docker', 'buildx', 'build']
         assert argv[argv.index('--target') + 1] == 'dependencies'
         assert argv[argv.index('--cache-from') + 1] == f'type=registry,ref={args.cache_from}'
-        assert (
-            argv[argv.index('--cache-to') + 1] == f'type=registry,ref={args.cache_to},mode=max'
-        )
+        assert argv[argv.index('--cache-to') + 1] == f'type=registry,ref={args.cache_to},mode=max'
         assert '--load' not in argv and '--output' not in argv and '--push' not in argv
         context = Path(argv[-1])
         assert not (context / 'source').exists()
@@ -1055,9 +793,7 @@ def test_cache_population_never_compiles_or_executes_target_source(build_inputs,
         container.GHCR_IMAGE + ':cache-main\n',
     ],
 )
-def test_registry_cache_rejects_invalid_destinations_before_build(
-    build_inputs, monkeypatch, ref
-):
+def test_registry_cache_rejects_invalid_destinations_before_build(build_inputs, monkeypatch, ref):
     args = build_inputs
     args.cache_root, args.cache_to = None, ref
     monkeypatch.setattr(
@@ -1127,18 +863,25 @@ def test_registry_cache_action_selects_donors_and_isolates_pr_writes(
     assert 'BuildKit validates individual layers' in summary.read_text()
 
 
-@pytest.mark.parametrize('event,pr,sync_source,expected', [
-    ('push', 0, None, 'true'),
-    ('workflow_dispatch', 0, None, 'true'),
-    ('pull_request_target', 15, None, 'false'),
-    ('workflow_dispatch', 15, None, 'false'),
-    ('merge_group', 0, None, 'false'),
-    ('push', 0, 'sync/upstream-main/' + 'a' * 40, 'false'),
-    ('push', 0, 'dev', 'true'),
-])
-def test_cache_scope_distinguishes_published_branches_from_candidates(tmp_path, event, pr, sync_source, expected):
+@pytest.mark.parametrize(
+    'event,pr,sync_source,expected',
+    [
+        ('push', 0, None, 'true'),
+        ('workflow_dispatch', 0, None, 'true'),
+        ('pull_request_target', 15, None, 'false'),
+        ('workflow_dispatch', 15, None, 'false'),
+        ('merge_group', 0, None, 'false'),
+        ('push', 0, 'sync/upstream-main/' + 'a' * 40, 'false'),
+        ('push', 0, 'dev', 'true'),
+    ],
+)
+def test_cache_scope_distinguishes_published_branches_from_candidates(
+    tmp_path, event, pr, sync_source, expected
+):
     workflow = yaml.safe_load((ROOT / '.github/workflows/ppu-execute.yml').read_text())
-    step = next(s for s in workflow['jobs']['runtime-environment']['steps'] if s.get('id') == 'cache-scope')
+    step = next(
+        s for s in workflow['jobs']['runtime-environment']['steps'] if s.get('id') == 'cache-scope'
+    )
     branch = 'dev' if sync_source == 'dev' else 'main'
     authorization = {'event_name': event, 'pr_number': pr, 'base_ref': f'refs/heads/{branch}'}
     if sync_source:
@@ -1146,7 +889,48 @@ def test_cache_scope_distinguishes_published_branches_from_candidates(tmp_path, 
     (tmp_path / '.ppu-ci').mkdir()
     (tmp_path / '.ppu-ci/authorization.json').write_text(json.dumps(authorization))
     output = tmp_path / 'outputs'
-    subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', step['run']], cwd=tmp_path,
-                   env={**os.environ, 'GITHUB_OUTPUT': str(output)}, check=True, capture_output=True, timeout=10)
+    subprocess.run(
+        ['bash', '-e', '-o', 'pipefail', '-c', step['run']],
+        cwd=tmp_path,
+        env={**os.environ, 'GITHUB_OUTPUT': str(output)},
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
     values = dict(line.split('=', 1) for line in output.read_text().splitlines())
-    assert values == {'base_ref': f'refs/heads/{branch}', 'pr_number': str(pr), 'write_baseline': expected}
+    assert values == {
+        'base_ref': f'refs/heads/{branch}',
+        'pr_number': str(pr),
+        'write_baseline': expected,
+    }
+
+
+@pytest.mark.parametrize('damage', [None, 'metadata', 'source'])
+def test_execution_uses_only_the_source_baked_into_the_verified_image(
+    tmp_path, monkeypatch, damage
+):
+    source = tmp_path / 'baked-source'
+    source.mkdir()
+    venv = tmp_path / 'venv'
+    (venv / 'bin').mkdir(parents=True)
+    (venv / 'bin/python').write_text('python')
+    metadata = tmp_path / 'docker-build.json'
+    metadata.write_text('{}')
+    expected = container.digest(metadata)
+    if damage == 'metadata':
+        metadata.write_text('{"changed": true}')
+    roots = {Path('/opt/ppu-ci-venv'): venv, Path('/opt/ppu-ci-image/docker-build.json'): metadata}
+    monkeypatch.setattr(container, 'no_links', lambda path: roots.get(Path(path), Path(path)))
+    monkeypatch.setattr(container, 'SOURCE_ROOT', source)
+    args = SimpleNamespace(
+        base_image_digest=PINNED,
+        digest=expected,
+        source_root=tmp_path / 'uploaded-source' if damage == 'source' else source,
+    )
+    if damage:
+        with pytest.raises(container.ValidationError):
+            container.verify_installed_image(args, {'image_digest': PINNED})
+    else:
+        container.verify_installed_image(args, {'image_digest': PINNED})
+    assert not (tmp_path / 'uploaded-source').exists()
+    assert list(source.iterdir()) == []

@@ -369,29 +369,6 @@ jobs:
           bash control/.github/scripts/ppu_ci_container.sh restore-control
           --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
           --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
-      - name: Check out source under test
-        id: checkout
-        continue-on-error: true
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.configure.outputs.target_sha }}
-          path: source
-          fetch-depth: 1
-          persist-credentials: false
-          submodules: recursive
-      - name: Wait after checkout failure
-        if: steps.checkout.outcome == 'failure'
-        shell: bash
-        run: sleep 15
-      - name: Retry source checkout (final attempt)
-        if: steps.checkout.outcome == 'failure'
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.configure.outputs.target_sha }}
-          path: source
-          fetch-depth: 1
-          persist-credentials: false
-          submodules: recursive
       - uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.artifact_prefix }}ppu-plan
@@ -408,7 +385,7 @@ jobs:
             --control-sha '${{ inputs.control_sha }}' --target-sha '${{ inputs.target_sha }}' \
             --image-digest '${{ needs.runtime-environment.outputs.runtime_image_digest }}' \
             --base-image-digest '${{ needs.runtime-environment.outputs.base_image_digest }}' \
-            --source-root source --check-only
+            --check-only
           cp -R "$RUNNER_TEMP/ppu-runtime-export/." .ppu-ci/
       - name: Validate trusted runtime directories
         env:
@@ -433,7 +410,7 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ needs.configure.outputs.target_sha }},PPU_CONTROL_SHA=${{ needs.configure.outputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_ENVIRONMENT_DIGEST=${{ needs.runtime-environment.outputs.environment_digest }},PPU_IMAGE_DIGEST=${{ needs.runtime-environment.outputs.runtime_image_digest }},PPU_BASE_IMAGE_DIGEST=${{ needs.runtime-environment.outputs.base_image_digest }},PPU_IMAGE=${{ needs.runtime-environment.outputs.runtime_image_digest }},PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build
+          extra_env: PPU_TARGET_SHA=${{ needs.configure.outputs.target_sha }},PPU_CONTROL_SHA=${{ needs.configure.outputs.control_sha }},PPU_SOURCE_ROOT=/opt/ppu-ci-source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_ENVIRONMENT_DIGEST=${{ needs.runtime-environment.outputs.environment_digest }},PPU_IMAGE_DIGEST=${{ needs.runtime-environment.outputs.runtime_image_digest }},PPU_BASE_IMAGE_DIGEST=${{ needs.runtime-environment.outputs.base_image_digest }},PPU_IMAGE=${{ needs.runtime-environment.outputs.runtime_image_digest }},PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build
           command: |
             set -euo pipefail
             umask 022
@@ -466,7 +443,7 @@ jobs:
           [[ "$(< "$PPU_BUNDLE_DIR/control.txt")" == "$PPU_CONTROL_SHA" ]] || exit 1
           diff -r .ppu-ci/control "$PPU_BUNDLE_DIR/control"
           [[ "$(< "$PPU_BUNDLE_DIR/image.txt")" == "$PPU_IMAGE" ]] || exit 1
-          [[ -s "$PPU_BUNDLE_DIR/source.tar.gz" && -s "$PPU_BUNDLE_DIR/runtime-image.json" ]] || exit 1
+          [[ -s "$PPU_BUNDLE_DIR/runtime-image.json" ]] || exit 1
           "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_container.py verify-image \
             --artifact "$PPU_BUNDLE_DIR" --digest "$PPU_ENVIRONMENT_DIGEST" \
             --control-sha "$PPU_CONTROL_SHA" --target-sha "$PPU_TARGET_SHA" \

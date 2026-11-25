@@ -51,11 +51,14 @@ flowchart TD
 仓库变量 `PPU_CI_ENABLED=true` 开启设备流程；environment 使用 `ppu-ci`。
 存储接线使用 secrets：`PPU_HOST_VOLUMES`、`PPU_CPU_RUN_ROOT`、`PPU_POD_RUN_ROOT`、
 `PPU_CPU_ASSETS_ROOT`、`PPU_POD_ASSETS_ROOT`。CPU 与 Pod 路径必须映射到同一共享数据。
-公共 artifacts 不包含私有路径、checkpoint 或 tokenizer 缓存原件。
+公共 artifacts 只导出声明的文本和结构化结果，不包含私有路径。TensorBoard 原始二进制、
+checkpoint 和 tokenizer 缓存保留在内部 NAS；不再改写 TensorBoard 文件。
 
 ## 镜像与缓存
 
 构建在 GitHub CPU runner 上进行，基础镜像来自 SAIL；运行镜像以 GHCR digest 交给 PPU。
+源码和编译产物保存在镜像的 `/opt/ppu-ci-source`，与 cluster-task 搬运工作区的
+`/opt/megatron-lm` 分开；Build/UT/FT 不再额外打包或解压源码。
 依赖来自被测 `pyproject.toml` 的 project/test/training 配置及 SAIL 原生包约束，
 当前不直接消费 NV `uv.lock`。安装与源码编译在镜像构建阶段完成，Pod 内不现场安装依赖。
 
@@ -74,6 +77,8 @@ Git 管理 golden 版本，无需中央 baselines JSON 或 snapshot 脚本。
 `m890_model_config()` 集中适配 launcher：默认 torchrun，已有五个 FT launcher case 保持原样。
 历史 `_2nd.json` 只保留采样记录；ckpt-resume 比较本次两阶段输出，不等于验证故障注入恢复。
 轻量观察、缺资产跳过均不计作数值通过；缺 golden 或比较失败不能静默通过。
+数值比较只由上游 pytest 执行。适配层记录比较输入摘要与通过/失败/跳过结果，
+汇总检查结果绑定、重复次数和执行完整性，不再重新执行数值比较，也不需要 checkout 被测源码。
 
 ## 最小验证
 

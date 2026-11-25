@@ -766,7 +766,7 @@ def bundle_inventory(directory: Path) -> dict:
     image_schema = manifest.get("environment_build_schema") == 2
     for name in (
         "runtime-image.json" if image_schema else "environment.tar.gz",
-        "source.tar.gz",
+        *(() if image_schema else ("source.tar.gz",)),
         "manifest.json",
         "commit.txt",
         "control.txt",
@@ -794,7 +794,6 @@ def bundle_inventory(directory: Path) -> dict:
             raise ValueError("Unsupported Dockerfile environment schema")
         for name in (
             "docker-build.json",
-            "compiled-source.tar.gz",
             "compatibility-patches.json",
             "base-packages.json",
             "vendor-bytes.json",

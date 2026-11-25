@@ -123,7 +123,7 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_ENVIRONMENT_DIGEST=${{ inputs.environment_digest }},PPU_IMAGE_DIGEST=${{ inputs.runtime_image_digest }},PPU_BASE_IMAGE_DIGEST=${{ inputs.base_image_digest }},PPU_RESULTS_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }},PPU_POD_ASSETS_ROOT=${{ secrets.PPU_POD_ASSETS_ROOT }}
+          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/ppu-ci-source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_ENVIRONMENT_DIGEST=${{ inputs.environment_digest }},PPU_IMAGE_DIGEST=${{ inputs.runtime_image_digest }},PPU_BASE_IMAGE_DIGEST=${{ inputs.base_image_digest }},PPU_RESULTS_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }},PPU_POD_ASSETS_ROOT=${{ secrets.PPU_POD_ASSETS_ROOT }}
           command: |
             set -euo pipefail
             cd /opt/megatron-lm
@@ -134,8 +134,6 @@ jobs:
               --output "$PPU_ARTIFACT_DIR" --plan .ppu-ci --bundle-digest "$PPU_BUNDLE_DIGEST"
             [[ "$(< "$PPU_ARTIFACT_DIR/commit.txt")" == "$PPU_TARGET_SHA" ]]
             [[ "$(< "$PPU_ARTIFACT_DIR/control.txt")" == "$PPU_CONTROL_SHA" ]]
-            bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" restore-source \
-              --artifact "$PPU_ARTIFACT_DIR" --bundle-digest "$PPU_BUNDLE_DIGEST" --destination source
             bash "$PPU_CONTROL_DIR/ppu_functional_run.sh" '${{ matrix.id }}'
       - name: Record execution and scheduling envelope
         if: always()
@@ -164,7 +162,7 @@ jobs:
         run: >-
           "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py
           --source "$EXPORT_SOURCE" --destination .ppu-public/test-152 --kind evidence --overlay .ppu-action
-      - name: Upload every attempt, rank log, actual value and comparison report
+      - name: Upload declared reports, actual values and text logs
         uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-test-152.outcome == 'success' }}
         with:
@@ -196,16 +194,11 @@ jobs:
         with:
           name: ${{ inputs.artifact_prefix }}ppu-control-environment
           path: .ppu-control-export
-      - name: Verify and restore isolated upstream comparison environment
+      - name: Restore the result summary environment
         run: >-
           bash control/.github/scripts/ppu_ci_container.sh restore-control
           --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
           --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.target_sha }}
-          path: source
-          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.artifact_prefix }}ppu-plan
@@ -214,12 +207,12 @@ jobs:
         with:
           pattern: ${{ inputs.artifact_prefix }}functional-*
           path: results
-      - name: Independently verify all required repetitions using original comparators
+      - name: Require complete upstream pytest results for every repetition
         env:
           PPU_ARTIFACT_PREFIX: ${{ inputs.artifact_prefix }}
         run: |
           "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_functional_results.py \
-            --manifest .ppu-ci/manifest.json --root source --results results
+            --manifest .ppu-ci/manifest.json --results results
       - name: Require successful execution and artifact upload for every matrix job
         if: ${{ always() && !cancelled() }}
         env:

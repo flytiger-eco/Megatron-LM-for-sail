@@ -328,7 +328,9 @@ def run_repeat(manifest, root, case, directory, attempt, repeat, runner, deadlin
     try:
         if error:
             raise ValueError(error)
-        result = results.verify_repeat(manifest, root, case, directory, attempt, repeat)
+        if exit_code == 0:
+            results.verify_runtime_config(root, case, directory)
+        result = results.verify_repeat(manifest, case, directory, attempt, repeat)
     except (OSError, ValueError, KeyError, TypeError, AssertionError) as exc:
         result = {"success": False, "classification": "integrity_error", "error": str(exc)}
     write_json(directory / "verification.json", result)

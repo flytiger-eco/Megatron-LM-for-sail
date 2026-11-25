@@ -119,7 +119,7 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_ENVIRONMENT_DIGEST=${{ inputs.environment_digest }},PPU_IMAGE_DIGEST=${{ inputs.runtime_image_digest }},PPU_BASE_IMAGE_DIGEST=${{ inputs.base_image_digest }},PPU_RESULTS_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/unit/${{ matrix.id }}
+          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/ppu-ci-source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_ENVIRONMENT_DIGEST=${{ inputs.environment_digest }},PPU_IMAGE_DIGEST=${{ inputs.runtime_image_digest }},PPU_BASE_IMAGE_DIGEST=${{ inputs.base_image_digest }},PPU_RESULTS_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/unit/${{ matrix.id }}
           command: |
             set -euo pipefail
             cd /opt/megatron-lm
@@ -130,8 +130,6 @@ jobs:
               --output "$PPU_ARTIFACT_DIR" --plan .ppu-ci --bundle-digest "$PPU_BUNDLE_DIGEST"
             [[ "$(< "$PPU_ARTIFACT_DIR/commit.txt")" == "$PPU_TARGET_SHA" ]]
             [[ "$(< "$PPU_ARTIFACT_DIR/control.txt")" == "$PPU_CONTROL_SHA" ]]
-            bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" restore-source \
-              --artifact "$PPU_ARTIFACT_DIR" --bundle-digest "$PPU_BUNDLE_DIGEST" --destination source
             bash "$PPU_CONTROL_DIR/ppu_ci_run.sh" '${{ matrix.id }}'
       - name: Export checked public evidence
         id: public-test-100

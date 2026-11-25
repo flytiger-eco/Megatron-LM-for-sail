@@ -25,7 +25,6 @@ export GIT_EXEC_PATH=/opt/ppu-ci-venv/libexec/git-core
 export SSL_CERT_FILE=/opt/ppu-ci-venv/etc/ssl/certs/ca-certificates.crt
 export GIT_SSL_CAINFO="$SSL_CERT_FILE"
 export TORCH_CPP_LOG_LEVEL=ERROR
-[[ "$(git rev-parse HEAD)" == "$PPU_TARGET_SHA" ]]
 python -m pip check
 python -I - <<'PY'
 import importlib
@@ -207,12 +206,6 @@ for name in json.loads(Path('.ppu-ci/data/hf-tokenizers.json').read_text()):
 PY
     touch .ppu-ci/data/.ready
 fi
-git diff --quiet HEAD --
-git ls-files -z > .ppu-ci/source-files.txt
-bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" archive-source \
-    --artifact "$PPU_ARTIFACT_DIR" --source-root "$PPU_SOURCE_ROOT" \
-    --digest "$PPU_ENVIRONMENT_DIGEST" \
-    --control-sha "$PPU_CONTROL_SHA" --target-sha "$PPU_TARGET_SHA"
 [[ -s .ppu-ci/runtime-image.json && ! -e .ppu-ci/environment.tar.gz ]]
 printf '%s\n' "$PPU_IMAGE_DIGEST" > .ppu-ci/image.txt
 printf '%s\n' "$PPU_TARGET_SHA" > .ppu-ci/commit.txt

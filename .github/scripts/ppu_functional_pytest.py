@@ -1,5 +1,6 @@
 """Collect unmodified upstream functional pytest outcomes for the CI integrity gate."""
 
+import hashlib
 import json
 import os
 import time
@@ -18,8 +19,22 @@ def pytest_configure(config):
     matches = [phase for filename, phase in phases.items() if filename in names]
     if len(matches) != 1:
         raise ValueError("Functional evidence plugin requires one upstream pipeline")
+    options = [
+        "model-config-path",
+        *(
+            ["golden-values-path", "actual-values-path"]
+            if matches[0] == "regular"
+            else ["actual-values-first-run-path", "actual-values-second-run-path"]
+        ),
+    ]
+    inputs = {
+        name: hashlib.sha256(Path(config.getoption("--" + name)).read_bytes()).hexdigest()
+        for name in options
+    }
     _REPORT = {
         "schema_version": 1,
+        "inputs": inputs,
+        "train_iters": config.getoption("--train-iters"),
         "phase": matches[0],
         "started": time.monotonic(),
         "identity": json.loads(os.environ["PPU_FUNCTIONAL_IDENTITY"]),

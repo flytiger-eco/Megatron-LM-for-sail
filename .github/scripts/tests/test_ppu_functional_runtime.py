@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 from test_ppu_functional import ROOT, SCRIPTS, functional
-from test_ppu_functional_results import envelope, evidence, results
+from test_ppu_functional_results import envelope, evidence, pytest_inputs, results
 
 runtime = functional.module_from_path(
     "ppu_functional_runtime", SCRIPTS / "ppu_functional_runtime.py"
@@ -84,6 +84,8 @@ class FakeRunner:
                         int(env["PPU_FUNCTIONAL_REPEAT"]),
                     ),
                     "phase": kind,
+                    "inputs": pytest_inputs(self.case, directory, kind),
+                    "train_iters": self.case["effective_train_iters"],
                     "approximate": self.case["approximate"],
                     "complete": True,
                     "exitstatus": 0,
@@ -108,7 +110,7 @@ def prepare_case(evidence, tmp_path):
     return manifest, case, tmp_path / "case-results"
 
 
-def test_runtime_runs_every_repeat_and_recomputes_original_comparator(evidence, tmp_path):
+def test_runtime_runs_every_repeat_and_checks_upstream_pytest_results(evidence, tmp_path):
     manifest, case, directory = prepare_case(evidence, tmp_path)
     original = functional.sha256(ROOT / case["config_path"])
     runner = FakeRunner(manifest, case)
@@ -116,7 +118,7 @@ def test_runtime_runs_every_repeat_and_recomputes_original_comparator(evidence, 
     assert record["success"] and record["attempts"] == 1
     assert len(runner.calls) == case["repeat"] == 2
     envelope(manifest, case, directory)
-    assert results.verify_case(manifest, ROOT, case, directory)["success"]
+    assert results.verify_case(manifest, case, directory)["success"]
     assert functional.sha256(ROOT / case["config_path"]) == original
     outputs = {env["OUTPUT_PATH"] for _, env, _ in runner.calls}
     assert len(outputs) == 2
@@ -147,7 +149,7 @@ def test_retry_restarts_all_repeats_with_one_shared_deadline(evidence, tmp_path)
     assert all(not Path(env["TMPDIR"]).exists() for _, env, _ in runner.calls)
     assert len({deadline for _, _, deadline in runner.calls}) == 1
     envelope(manifest, case, directory)
-    assert results.verify_case(manifest, ROOT, case, directory)["retried"]
+    assert results.verify_case(manifest, case, directory)["retried"]
 
 
 @pytest.mark.parametrize(

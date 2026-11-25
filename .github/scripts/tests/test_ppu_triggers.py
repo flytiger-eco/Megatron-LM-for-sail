@@ -119,14 +119,14 @@ def test_lightweight_summary_gates_on_execution_without_claiming_numerics(
     monkeypatch.setattr(
         results,
         "verify_case",
-        lambda _manifest, _root, case, _directory: {
+        lambda _manifest, case, _directory: {
             "name": case["name"],
             "observation": case["observation"],
             "success": outcome,
             "classification": "passed" if outcome else "training_failed",
         },
     )
-    summary = results.summarize(manifest, ROOT, tmp_path)
+    summary = results.summarize(manifest, tmp_path)
     assert summary["success"] is outcome and summary["numerical_validation"] is False
     assert summary["numeric_passed"] == summary["numeric_failed"] == 0
     assert len(summary["observations"]) == len(cases)

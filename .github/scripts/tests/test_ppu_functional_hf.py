@@ -366,23 +366,14 @@ def runtime_case(evidence, provisioned, tmp_path):
     return manifest, case, directory
 
 
-@pytest.mark.parametrize("mutation", ["missing", "digest", "report", "preflight", "manifest"])
-def test_forged_cache_or_preflight_evidence_cannot_pass(evidence, provisioned, tmp_path, mutation):
+@pytest.mark.parametrize("mutation", ["preflight", "manifest"])
+def test_invalid_preflight_evidence_cannot_pass(evidence, provisioned, tmp_path, mutation):
     manifest, case, directory = runtime_case(evidence, provisioned, tmp_path)
     runner = FakeRunner(manifest, case)
     assert runtime.run_case(manifest, ROOT, case["id"], directory, runner=runner)["success"]
     preflight = json.loads((directory / "assets-report.json").read_text())
     envelope(manifest, case, directory)
-    path = directory / "attempt-1/repeat-1"
-    name = next(iter(hf.cache_files(hf.sources_for(case["tokenizer_dependencies"]))))
-    cached = path / "cache/huggingface" / name
-    if mutation == "missing":
-        cached.rename(cached.with_name("missing"))
-    elif mutation == "digest":
-        cached.write_bytes(b"tampered")
-    elif mutation == "report":
-        (path / "tokenizer-cache.json").write_text("{}")
-    elif mutation == "preflight":
+    if mutation == "preflight":
         next(row for row in preflight["cases"][0]["assets"] if row.get("tokenizer_cache"))[
             "sha256"
         ] = ("0" * 64)
@@ -391,7 +382,7 @@ def test_forged_cache_or_preflight_evidence_cannot_pass(evidence, provisioned, t
         with pytest.raises(ValueError, match="asset requirements"):
             functional.validate_tokenizer_assets(case)
     (directory / "assets-report.json").write_bytes(encoded(preflight))
-    assert not results.verify_case(manifest, ROOT, case, directory)["success"]
+    assert not results.verify_case(manifest, case, directory)["success"]
 
 
 def offline_environment(cache):

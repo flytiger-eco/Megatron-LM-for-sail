@@ -6,7 +6,6 @@ import importlib.util
 import json
 import os
 import stat
-import struct
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location(
@@ -29,7 +28,7 @@ TEXT_SUFFIXES = {
     ".pth",
     ".ready",
 }
-OMITTED_DIRS = {"checkpoints", "initial-checkpoints"}
+OMITTED_DIRS = {"checkpoints", "initial-checkpoints", "cache", "tensorboard"}
 ARCHIVES = {
     "source.tar.gz",
     "environment.tar.gz",
@@ -62,7 +61,7 @@ BUNDLE_FILES = {
     "ppu-requirements.txt",
     "test-requirements.txt",
 }
-OVERLAY_FILES = {"action-timing.json", "checkpoint-omissions.json"}
+OVERLAY_FILES = {"action-timing.json"}
 ACTION_FIELDS = {
     "job_status",
     "duration_seconds",
@@ -75,14 +74,6 @@ FAILURE_CODES = {
     "Unsupported private binary field in structured evidence": "structured-private-binary",
     "Unsupported structured evidence collection": "structured-collection",
     "Redaction produced duplicate public JSON keys": "duplicate-public-keys",
-    "A scalar/event tag cannot be redacted": "tensorboard-private-tag",
-    "Corrupt TensorBoard record header": "tensorboard-header-crc",
-    "TensorBoard record exceeds export limit": "tensorboard-record-limit",
-    "Corrupt TensorBoard record payload": "tensorboard-payload-crc",
-    "TensorBoard export changed event identity": "tensorboard-event-identity",
-    "TensorBoard export changed scalar evidence": "tensorboard-scalar-changed",
-    "TensorBoard export changed numeric tensor evidence": "tensorboard-numeric-changed",
-    "Unsupported private text in TensorBoard record": "tensorboard-private-field",
     "Immutable numeric/configuration/cache evidence contains a private path": "immutable-private-path",
     "Public staging must be new and outside private evidence": "invalid-public-staging",
     "Private evidence is missing or is a symlink": "invalid-private-root",
@@ -185,87 +176,6 @@ class Redactor:
         return value
 
 
-def crc32c(data: bytes) -> int:
-    try:
-        import google_crc32c
-    except ImportError:
-        return slow_crc32c(data)
-    crc = google_crc32c.value(data)
-    return (((crc >> 15) | (crc << 17)) + 0xA282EAD8) & 0xFFFFFFFF
-
-
-def slow_crc32c(data: bytes) -> int:
-    crc = 0xFFFFFFFF
-    for value in data:
-        crc ^= value
-        for _ in range(8):
-            crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
-    crc ^= 0xFFFFFFFF
-    return (((crc >> 15) | (crc << 17)) + 0xA282EAD8) & 0xFFFFFFFF
-
-
-def redact_event(event, redactor: Redactor) -> None:
-    """Change only descriptive text; tags, steps, wall times and numeric tensors stay intact."""
-    if event.HasField("log_message"):
-        event.log_message.message = redactor.text(event.log_message.message)
-    if event.HasField("source_metadata"):
-        event.source_metadata.writer = redactor.text(event.source_metadata.writer)
-    for value in event.summary.value:
-        if redactor.text(value.tag) != value.tag:
-            raise ValueError("A scalar/event tag cannot be redacted")
-        value.metadata.display_name = redactor.text(value.metadata.display_name)
-        value.metadata.summary_description = redactor.text(value.metadata.summary_description)
-        if value.HasField("tensor") and value.tensor.dtype == 7:
-            for index, text in enumerate(value.tensor.string_val):
-                if redactor.contains(text):
-                    value.tensor.string_val[index] = redactor.text(text.decode("utf-8")).encode()
-
-
-def tensorboard(source: Path, destination: Path, redactor: Redactor) -> None:
-    from tensorboard.compat.proto.event_pb2 import Event
-
-    with source.open("rb") as stream, destination.open("xb") as output:
-        while header := stream.read(12):
-            if len(header) != 12 or crc32c(header[:8]) != struct.unpack("<I", header[8:])[0]:
-                raise ValueError("Corrupt TensorBoard record header")
-            length = struct.unpack("<Q", header[:8])[0]
-            if length > 64 * 1024 * 1024:
-                raise ValueError("TensorBoard record exceeds export limit")
-            data, checksum = stream.read(length), stream.read(4)
-            if (
-                len(data) != length
-                or len(checksum) != 4
-                or crc32c(data) != struct.unpack("<I", checksum)[0]
-            ):
-                raise ValueError("Corrupt TensorBoard record payload")
-            event = Event.FromString(data)
-            if redactor.contains(data):
-                before = Event()
-                before.CopyFrom(event)
-                redact_event(event, redactor)
-                # A second application must be idempotent; only approved descriptive fields change.
-                expected = Event()
-                expected.CopyFrom(before)
-                redact_event(expected, redactor)
-                if (
-                    event != expected
-                    or event.step != before.step
-                    or event.wall_time != before.wall_time
-                ):
-                    raise ValueError("TensorBoard export changed event identity")
-                for old, new in zip(before.summary.value, event.summary.value):
-                    if old.tag != new.tag or old.simple_value != new.simple_value:
-                        raise ValueError("TensorBoard export changed scalar evidence")
-                    if old.tensor.dtype != 7 and old.tensor != new.tensor:
-                        raise ValueError("TensorBoard export changed numeric tensor evidence")
-                data = event.SerializeToString()
-                if redactor.contains(data):
-                    raise ValueError("Unsupported private text in TensorBoard record")
-            length_bytes = struct.pack("<Q", len(data))
-            output.write(length_bytes + struct.pack("<I", crc32c(length_bytes)))
-            output.write(data + struct.pack("<I", crc32c(data)))
-
-
 def immutable(path: Path) -> bool:
     return (
         "huggingface" in path.parts
@@ -275,9 +185,7 @@ def immutable(path: Path) -> bool:
 
 
 def export_file(source: Path, destination: Path, redactor: Redactor) -> None:
-    if source.name.startswith("events.out.tfevents."):
-        tensorboard(source, destination, redactor)
-    elif source.suffix in {".json", ".jsonl", ".yaml", ".yml"}:
+    if source.suffix in {".json", ".jsonl", ".yaml", ".yml"}:
         content = source.read_bytes()
         if source.suffix == ".jsonl":
             value = [json.loads(row) for row in content.splitlines() if row.strip()]
@@ -322,20 +230,18 @@ def export_file(source: Path, destination: Path, redactor: Redactor) -> None:
         if public_value != safe:
             raise ValueError("Unsupported encoded private path in expanded model configuration")
         destination.write_bytes(public.encode("utf-8"))
-    elif source.suffix in TEXT_SUFFIXES and not immutable(source):
+    elif (
+        source.suffix in TEXT_SUFFIXES or source.name in {"node_0", ".complete"}
+    ) and not immutable(source):
         content = source.read_bytes()
         destination.write_bytes(redactor.text(content.decode("utf-8")).encode("utf-8"))
     else:
-        # Unknown binaries are copied only if they contain no known private directory bytes.
-        redactor.scan(source)
-        copy_bytes(source, destination)
+        raise ValueError("Unsupported public evidence file type")
     redactor.scan(destination)
 
 
 def export_checked_file(source: Path, destination: Path, redactor: Redactor) -> None:
-    if source.name.startswith("events.out.tfevents."):
-        category = "tensorboard"
-    elif immutable(source):
+    if immutable(source):
         category = "immutable-evidence"
     elif source.name == "model_config.yaml.tmp":
         category = "expanded-model-config"
@@ -363,11 +269,15 @@ def omitted(relative: Path, kind: str) -> bool:
     parts = relative.parts
     if any(part in OMITTED_DIRS for part in parts):
         return True
-    if "cache" in parts:
-        index = parts.index("cache")
-        if len(parts) <= index + 1 or parts[index + 1] != "huggingface":
-            return True
     if relative.name in ARCHIVES:
+        return True
+    if relative.name.startswith("events.out.tfevents."):
+        return True
+    if not (
+        relative.suffix in TEXT_SUFFIXES
+        or relative.name in {".complete", "model_config.yaml.tmp"}
+        or ("barriers" in parts and relative.name == "node_0")
+    ):
         return True
     if kind == "bundle" and not (
         relative.as_posix() in BUNDLE_FILES
