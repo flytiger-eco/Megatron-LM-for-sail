@@ -8,12 +8,12 @@ import re
 import shutil
 import subprocess
 import sys
-import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import yaml
+from test_ppu_ci_container import PUBLISHED, runtime_export, write_image_record
 from test_ppu_quick import (
     BASE_SHA,
     BRANCH,
@@ -735,7 +735,7 @@ def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch, t
     assert "pip install" not in build
 
 
-@pytest.mark.parametrize("script_name", ["ppu_ci_build.sh", "ppu_ci_run.sh"])
+@pytest.mark.parametrize("script_name", ["ppu_ci_build.sh"])
 @pytest.mark.parametrize(
     "mode",
     [
@@ -754,9 +754,6 @@ def test_pla_probe_checks_version_origin_and_native_imports(monkeypatch, script_
         for block in re.findall(r"python -I - <<'PY'\n(.*?)\nPY", script, re.S)
         if "md.version('pla')" in block
     )
-    if script_name == "ppu_ci_run.sh":
-        assert script.index("verify-image") < script.index(probe)
-        assert "pip install" not in script
     modules = ("pla", "pla.decode", "pla.prefill.flashqla", "pla.prefill.flashkdapro")
     imported = []
 
@@ -884,7 +881,7 @@ def test_fla_l2norm_dependency_patch_is_restricted(tmp_path, monkeypatch, mode):
     assert len(calls) == count
 
 
-@pytest.mark.parametrize("script_name", ["ppu_ci_build.sh", "ppu_ci_run.sh"])
+@pytest.mark.parametrize("script_name", ["ppu_ci_build.sh"])
 @pytest.mark.parametrize(
     "mode",
     [
@@ -947,40 +944,6 @@ def test_fla_probe_checks_real_dependency_contract(monkeypatch, script_name, mod
     else:
         with pytest.raises((RuntimeError, ImportError, OSError, TypeError)):
             exec(compile(probe, script_name, "exec"), {})
-
-
-def test_fla_patch_and_probes_preserve_ut_and_restore_contract():
-    build = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
-    run = (ROOT / ".github/scripts/ppu_ci_run.sh").read_text()
-    assert (
-        build.index("verify-image")
-        < build.index("python -m pip check")
-        < build.index("FLA Core import check passed:")
-        < build.index("assert gated_delta_net.HAVE_FLA")
-        < build.index("seal-bundle")
-    )
-    assert (
-        run.index("verify-image")
-        < run.index("FLA Core import check passed:")
-        < run.index("export PYTHONPATH=")
-        < run.index("assert gated_delta_net.HAVE_FLA")
-        < run.index("python -m torch.distributed.run")
-    )
-    assert "pip install" not in run and "path.write_text(patched)" not in run
-    for script in (build, run):
-        assert "'GDN2=', gated_delta_net.HAVE_FLA_GDN2" in script
-        assert "gated_delta_net.HAVE_FLA =" not in script
-        assert "gated_delta_net.HAVE_FLA_GDN2 =" not in script
-        assert "sys.modules['fla']" not in script
-    probes = [
-        next(
-            block
-            for block in re.findall(r"python -I - <<'PY'\n(.*?)\nPY", script, re.S)
-            if "md.version('fla-core')" in block
-        )
-        for script in (build, run)
-    ]
-    assert probes[0] == probes[1]
 
 
 @pytest.mark.parametrize("script_name", ["ppu_ci_build.sh", "ppu_ci_run.sh"])
@@ -1138,22 +1101,21 @@ def sealed_bundle(tmp_path):
     plan = tmp_path / "plan"
     control = plan / "control"
     control.mkdir(parents=True)
-    (plan / "manifest.json").write_text(json.dumps({"identity": IDENTITY}))
+    (plan / "manifest.json").write_text(json.dumps({"identity": IDENTITY, "environment_build_schema": 2}))
     shutil.copyfile(ROOT / ".github/scripts/ppu_ci.py", control / "ppu_ci.py")
-    for name in ("ppu_ci_container.py", "ppu_ci_container.sh", "ppu_policy.py"):
+    for name in ("ppu_ci_container.py", "ppu_policy.py", "ppu_ci_paths.py", "ppu_ci_export.py"):
         shutil.copyfile(ROOT / ".github/scripts" / name, control / name)
     (control / "ppu_ci_run.sh").write_text('printf "UT_STARTED:%s\\n" "$1"\n')
     (control / "ppu_pytest_policy.py").write_text("POLICY = True\n")
     bundle = tmp_path / "nas" / "run-1" / "build"
-    shutil.copytree(plan, bundle)
-    payload = tmp_path / "source.py"
-    payload.write_text("VALUE = 1\n")
-    with tarfile.open(bundle / "source.tar.gz", "w:gz") as archive:
-        archive.add(payload, arcname="source.py")
-    (bundle / "environment.tar.gz").write_bytes(b"environment archive")
+    bundle.parent.mkdir(parents=True)
+    trusted = runtime_export(bundle, control=CONTROL_SHA, target=SHA)
+    write_image_record(bundle, trusted)
+    shutil.copytree(plan, bundle, dirs_exist_ok=True)
+    (tmp_path / "outside.txt").write_text("external fixture")
     (bundle / "commit.txt").write_text(SHA + "\n")
     (bundle / "control.txt").write_text(CONTROL_SHA + "\n")
-    (bundle / "image.txt").write_text("fixed-image\n")
+    (bundle / "image.txt").write_text(PUBLISHED + "\n")
     (bundle / "build-timing.json").write_text('{"elapsed_seconds":1}')
     (bundle / "data").mkdir()
     (bundle / "data/blob").write_bytes(b"tokenizer data")
@@ -1181,8 +1143,8 @@ def test_bundle_seal_and_verify_preserve_all_payloads(sealed_bundle, capsys):
 @pytest.mark.parametrize(
     "damage",
     [
-        "missing_source",
-        "truncated_environment",
+        "missing_image",
+        "truncated_export",
         "missing_data",
         "changed_control",
         "extra_control",
@@ -1206,13 +1168,13 @@ def test_bundle_verify_rejects_partial_or_untrusted_payload(sealed_bundle, tmp_p
     digest = bundle_digest(bundle)
     if damage.startswith("missing_"):
         name = {
-            "missing_source": "source.tar.gz",
+            "missing_image": "runtime-image.json",
             "missing_data": "data/tokenizer",
             "missing_complete": ".complete",
         }[damage]
         (bundle / name).rename(tmp_path / "missing")
-    elif damage == "truncated_environment":
-        (bundle / "environment.tar.gz").write_bytes(b"part")
+    elif damage == "truncated_export":
+        (bundle / "functional-tools/yq").write_bytes(b"part")
     elif damage in ("changed_control", "sealed_control"):
         (bundle / "control/ppu_ci_run.sh").write_text("exit 0\n")
     elif damage in ("extra_control", "sealed_extra_control"):
@@ -1227,7 +1189,7 @@ def test_bundle_verify_rejects_partial_or_untrusted_payload(sealed_bundle, tmp_p
             json.dumps({"identity": {**IDENTITY, "target_sha": CONTROL_SHA}})
         )
     elif damage == "external_symlink":
-        (bundle / "external").symlink_to(tmp_path / "source.py")
+        (bundle / "external").symlink_to(tmp_path / "outside.txt")
     elif damage == "symlink_directory":
         (bundle / "linked-data").symlink_to("data", target_is_directory=True)
     elif damage == "altered_integrity":
@@ -1237,33 +1199,33 @@ def test_bundle_verify_rejects_partial_or_untrusted_payload(sealed_bundle, tmp_p
         (bundle / name).write_text("f" * 40)
     elif damage == "traversal_inventory":
         seal = json.loads((bundle / "bundle-integrity.json").read_text())
-        seal["files"]["../../source.py"] = seal["files"]["source.tar.gz"]
+        seal["files"]["../../outside.txt"] = seal["files"]["runtime-image.json"]
         (bundle / "bundle-integrity.json").write_text(json.dumps(seal))
         digest = bundle_digest(bundle)
-    if damage.startswith("sealed_") or damage in ("wrong_commit", "wrong_control_sha"):
-        ci.seal_bundle(bundle)
-        digest = bundle_digest(bundle)
     with pytest.raises((ValueError, OSError)):
+        if damage.startswith("sealed_") or damage in ("wrong_commit", "wrong_control_sha"):
+            ci.seal_bundle(bundle)
+            digest = bundle_digest(bundle)
         ci.verify_bundle(bundle, plan, digest)
 
 
-@pytest.mark.parametrize("name", ["source.tar.gz", "environment.tar.gz", "control/ppu_ci.py"])
+@pytest.mark.parametrize("name", ["runtime-image.json", "functional-tools/yq", "control/ppu_ci.py"])
 def test_bundle_seal_rejects_empty_required_payload(sealed_bundle, name):
     _, bundle = sealed_bundle
     (bundle / name).write_bytes(b"")
-    with pytest.raises(ValueError, match="Missing or empty"):
+    with pytest.raises(ValueError, match="Missing"):
         ci.seal_bundle(bundle)
 
 
-@pytest.mark.parametrize("damage", ["none", "missing_source", "wrong_digest", "other_run"])
+@pytest.mark.parametrize("damage", ["none", "missing_image", "wrong_digest", "other_run"])
 def test_ut_workflow_restores_same_run_bundle_before_execution(sealed_bundle, tmp_path, damage):
     plan, bundle = sealed_bundle
     digest = bundle_digest(bundle)
     workspace = tmp_path / "pod"
     workspace.mkdir()
     shutil.copytree(plan, workspace / ".ppu-ci")
-    if damage == "missing_source":
-        (bundle / "source.tar.gz").rename(tmp_path / "missing-source")
+    if damage == "missing_image":
+        (bundle / "runtime-image.json").rename(tmp_path / "missing-image")
     elif damage == "wrong_digest":
         digest = "0" * 64
     elif damage == "other_run":

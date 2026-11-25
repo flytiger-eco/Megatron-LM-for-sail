@@ -6,7 +6,6 @@ on:
       - '.github/docker/**'
       - '.github/actions/ppu-build-cache/**'
       - '.github/scripts/ppu_ci_container.py'
-      - '.github/scripts/ppu_ci_container.sh'
       - '.github/workflows/ppu-populate-build-cache.yml'
       - 'pyproject.toml'
   workflow_dispatch:
@@ -38,7 +37,7 @@ jobs:
       - name: Resolve dependency inputs and immutable base image
         id: identity
         run: >-
-          bash control/.github/scripts/ppu_ci_container.sh fingerprint --kind runtime
+          python3 -I control/.github/scripts/ppu_ci_container.py fingerprint --kind runtime
           --control-root control --control-sha '${{ github.sha }}'
           --source-root control --target-sha '${{ github.sha }}'
       - name: Login to GHCR
@@ -56,7 +55,7 @@ jobs:
           publish-target-cache: 'true'
       - name: Populate dependency layers on CPU
         run: >-
-          bash control/.github/scripts/ppu_ci_container.sh build-cache
+          python3 -I control/.github/scripts/ppu_ci_container.py build-cache
           --control-root control --control-sha '${{ github.sha }}'
           --source-root control --target-sha '${{ github.sha }}'
           --image-digest '${{ steps.identity.outputs.image_digest }}'

@@ -32,7 +32,7 @@ trap 'exit 143' TERM INT
 umask 022
 cd "$PPU_SOURCE_ROOT"
 : "${PPU_ENVIRONMENT_DIGEST:?Missing trusted Dockerfile build digest}"
-bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" verify-image \
+python3 -I "$PPU_CONTROL_DIR/ppu_ci_container.py" verify-image \
     --artifact "$PPU_ARTIFACT_DIR" --digest "$PPU_ENVIRONMENT_DIGEST" \
     --control-sha "$PPU_CONTROL_SHA" --target-sha "$PPU_TARGET_SHA" \
     --source-root "$PPU_SOURCE_ROOT" \
@@ -49,7 +49,7 @@ export GIT_SSL_CAINFO="$SSL_CERT_FILE"
 unset WORLD_SIZE RANK LOCAL_RANK
 python -m pip check
 make -q -C megatron/core/datasets
-python -I "$PPU_CONTROL_DIR/ppu_functional_environment.py" check \
+python -I "$PPU_CONTROL_DIR/ppu_functional_environment.py" \
     --bundle "$PPU_ARTIFACT_DIR" --output "$setup_dir"
 python -I "$PPU_CONTROL_DIR/ppu_functional_runtime.py" \
     --manifest "$PPU_ARTIFACT_DIR/manifest.json" --root "$PPU_SOURCE_ROOT" \

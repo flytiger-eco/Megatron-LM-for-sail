@@ -87,7 +87,7 @@ jobs:
           path: .ppu-control-export
       - name: Verify and restore isolated configuration environment
         run: >-
-          bash control/.github/scripts/ppu_ci_container.sh restore-control
+          python3 -I control/.github/scripts/ppu_ci_container.py restore-control
           --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
           --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - uses: actions/download-artifact@v4
@@ -129,8 +129,8 @@ jobs:
               echo 'test_kind=unit' >> "$GITHUB_OUTPUT"
             fi
           fi
-          cp control/.github/scripts/{ppu_ci.py,ppu_policy.py,ppu_ci_build.sh,ppu_ci_run.sh,ppu_pytest_policy.py,ppu_ci_paths.py,ppu_ci_export.py,ppu_ci_container.py,ppu_ci_container.sh,ppu_functional_environment.py} .ppu-ci/control/
-          bash control/.github/scripts/ppu_ci_container.sh mark-plan --artifact .ppu-ci
+          cp control/.github/scripts/{ppu_ci.py,ppu_policy.py,ppu_ci_build.sh,ppu_ci_run.sh,ppu_pytest_policy.py,ppu_ci_paths.py,ppu_ci_export.py,ppu_ci_container.py,ppu_functional_environment.py} .ppu-ci/control/
+          python3 -I control/.github/scripts/ppu_ci_container.py mark-plan --artifact .ppu-ci
       - name: Export checked public evidence
         id: public-configure-131
         env:
@@ -168,7 +168,7 @@ jobs:
           path: .ppu-control-export
       - name: Verify and restore trusted control interpreter
         run: >-
-          bash control/.github/scripts/ppu_ci_container.sh restore-control
+          python3 -I control/.github/scripts/ppu_ci_container.py restore-control
           --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
           --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - name: Read-only NAS asset preflight (no PPU requested)
@@ -275,7 +275,7 @@ jobs:
       - name: Check CPU builder and resolve immutable PPU base image
         id: identity
         run: >-
-          bash control/.github/scripts/ppu_ci_container.sh fingerprint --kind runtime
+          python3 -I control/.github/scripts/ppu_ci_container.py fingerprint --kind runtime
           --control-root control --control-sha '${{ inputs.control_sha }}'
           --source-root source --target-sha '${{ inputs.target_sha }}'
       - name: Login to GHCR for dependency cache and verified image publication
@@ -304,7 +304,7 @@ jobs:
       - name: Build and offline-verify the complete execution image on CPU
         id: runtime
         run: >-
-          bash control/.github/scripts/ppu_ci_container.sh build-image
+          python3 -I control/.github/scripts/ppu_ci_container.py build-image
           --local-image 'ppu-ci-runtime:run-${{ github.run_id }}-${{ github.run_attempt }}'
           --control-root control --control-sha '${{ inputs.control_sha }}'
           --source-root source --target-sha '${{ inputs.target_sha }}'
@@ -319,7 +319,7 @@ jobs:
       - name: Publish the verified local image without rebuilding source
         id: publish
         run: >-
-          bash control/.github/scripts/ppu_ci_container.sh publish-image
+          python3 -I control/.github/scripts/ppu_ci_container.py publish-image
           --artifact "$RUNNER_TEMP/ppu-runtime-export"
           --digest '${{ steps.runtime.outputs.environment_digest }}'
           --control-sha '${{ inputs.control_sha }}' --target-sha '${{ inputs.target_sha }}'
@@ -366,7 +366,7 @@ jobs:
           path: .ppu-control-export
       - name: Verify and restore trusted control interpreter
         run: >-
-          bash control/.github/scripts/ppu_ci_container.sh restore-control
+          python3 -I control/.github/scripts/ppu_ci_container.py restore-control
           --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
           --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - uses: actions/download-artifact@v4
@@ -379,7 +379,7 @@ jobs:
           path: ${{ runner.temp }}/ppu-runtime-export
       - name: Verify Dockerfile environment handoff before requesting PPU
         run: |
-          bash control/.github/scripts/ppu_ci_container.sh verify-image \
+          python3 -I control/.github/scripts/ppu_ci_container.py verify-image \
             --artifact "$RUNNER_TEMP/ppu-runtime-export" \
             --digest '${{ needs.runtime-environment.outputs.environment_digest }}' \
             --control-sha '${{ inputs.control_sha }}' --target-sha '${{ inputs.target_sha }}' \

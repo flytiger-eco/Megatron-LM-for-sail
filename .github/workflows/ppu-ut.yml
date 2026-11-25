@@ -77,7 +77,7 @@ jobs:
           path: .ppu-control-export
       - name: Verify and restore trusted control interpreter
         run: >-
-          bash control/.github/scripts/ppu_ci_container.sh restore-control
+          python3 -I control/.github/scripts/ppu_ci_container.py restore-control
           --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
           --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - uses: actions/download-artifact@v4
@@ -90,7 +90,7 @@ jobs:
           path: ${{ runner.temp }}/ppu-runtime-export
       - name: Verify execution image handoff before requesting PPU
         run: >-
-          bash control/.github/scripts/ppu_ci_container.sh verify-image
+          python3 -I control/.github/scripts/ppu_ci_container.py verify-image
           --artifact "$RUNNER_TEMP/ppu-runtime-export"
           --digest '${{ inputs.environment_digest }}'
           --control-sha '${{ inputs.control_sha }}' --target-sha '${{ inputs.target_sha }}'
@@ -173,7 +173,7 @@ jobs:
           path: .ppu-control-export
       - name: Verify and restore trusted control interpreter
         run: >-
-          bash control/.github/scripts/ppu_ci_container.sh restore-control
+          python3 -I control/.github/scripts/ppu_ci_container.py restore-control
           --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
           --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - uses: actions/download-artifact@v4

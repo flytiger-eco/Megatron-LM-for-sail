@@ -11,7 +11,7 @@ cd "$PPU_SOURCE_ROOT"
 ln -s "$PPU_ARTIFACT_DIR" .ppu-ci
 [[ -f .ppu-ci/manifest.json ]] || exit 1
 : "${PPU_ENVIRONMENT_DIGEST:?Missing trusted Dockerfile build digest}"
-bash "$PPU_CONTROL_DIR/ppu_ci_container.sh" verify-image \
+python3 -I "$PPU_CONTROL_DIR/ppu_ci_container.py" verify-image \
     --artifact "$PPU_ARTIFACT_DIR" --digest "$PPU_ENVIRONMENT_DIGEST" \
     --control-sha "$PPU_CONTROL_SHA" --target-sha "$PPU_TARGET_SHA" \
     --source-root "$PPU_SOURCE_ROOT" \
@@ -129,9 +129,8 @@ for dtype in (torch.float32, torch.bfloat16):
 PY
 make -q -C megatron/core/datasets
 if python -c 'import json; raise SystemExit(json.load(open(".ppu-ci/manifest.json")).get("test_kind") not in ("functional", "combined"))'; then
-    python -I "$PPU_CONTROL_DIR/ppu_functional_environment.py" prepare --bundle "$PPU_ARTIFACT_DIR"
+    python -I "$PPU_CONTROL_DIR/ppu_functional_environment.py" --bundle "$PPU_ARTIFACT_DIR"
 fi
-python -m pip check
 python -I - <<'PY'
 import sys
 from pathlib import Path

@@ -49,12 +49,8 @@ def archive(path, rows):
                 stream.addfile(member)
 
 
-def runtime_export(root, *, schema=1):
+def runtime_export(root, *, control=CONTROL, target=TARGET):
     root.mkdir(exist_ok=True)
-    if schema == 1:
-        archive(
-            root / 'environment.tar.gz', [('ppu-ci-venv/bin/python', b'python', tarfile.REGTYPE)]
-        )
     for name in (
         'functional-package-install.json',
         'constraints.txt',
@@ -75,16 +71,16 @@ def runtime_export(root, *, schema=1):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b'{}')
-    return seal(root, schema=schema)
+    return seal(root, control=control, target=target)
 
 
-def seal(root, *, schema=1):
+def seal(root, *, control=CONTROL, target=TARGET):
     metadata = dict(
-        schema_version=schema,
+        schema_version=2,
         kind='runtime',
         platform='linux/amd64',
-        control_sha=CONTROL,
-        target_sha=TARGET,
+        control_sha=control,
+        target_sha=target,
         image=container.PPU_IMAGE,
         image_digest=PINNED,
         inputs_sha256='d' * 64,
@@ -104,7 +100,7 @@ def write_image_record(root, trusted):
 @pytest.fixture
 def image_exported(tmp_path):
     root = tmp_path / 'image-export'
-    trusted = runtime_export(root, schema=2)
+    trusted = runtime_export(root)
     write_image_record(root, trusted)
     return root, trusted
 
@@ -169,7 +165,7 @@ def build_inputs(tmp_path, monkeypatch):
     source.mkdir()
     for name in container.DOCKER_FILES:
         shutil.copyfile(ROOT / '.github/docker' / name, docker / name)
-    for name in ('ppu_ci_container.py', 'ppu_ci_container.sh', 'ppu_functional_pytest.py'):
+    for name in ('ppu_ci_container.py', 'ppu_functional_pytest.py'):
         shutil.copyfile(SCRIPTS / name, scripts / name)
     shutil.copyfile(ROOT / 'pyproject.toml', source / 'pyproject.toml')
     monkeypatch.setattr(container, 'preflight', lambda root: None)
@@ -239,7 +235,10 @@ def test_image_handoff_checks_all_identities_without_restoring_software(
     elif damage == 'file':
         (root / 'constraints.txt').write_text('corrupt')
     elif damage == 'legacy':
-        args.digest = seal(root)
+        metadata = json.loads((root / 'docker-build.json').read_text())
+        metadata['schema_version'] = 1
+        (root / 'docker-build.json').write_text(json.dumps(metadata))
+        args.digest = container.digest(root / 'docker-build.json')
         write_image_record(root, args.digest)
     elif damage == 'software':
         (root / 'environment.tar.gz').write_bytes(b'unexpected')
@@ -276,7 +275,7 @@ def test_complete_image_build_loads_and_probes_exact_id_without_publication(
         if '--output' in argv:
             if stage == 'export':
                 raise container.ValidationError('export failed')
-            runtime_export(args.output, schema=2)
+            runtime_export(args.output)
         if '--load' in argv:
             assert '--push' not in argv
             metadata = Path(argv[-1]) / 'release/docker-build.json'
@@ -413,7 +412,8 @@ def test_schema_two_bundle_is_sealed_without_environment_archive(image_exported,
         'control/ppu_ci_run.sh',
         'control/ppu_pytest_policy.py',
         'control/ppu_ci_container.py',
-        'control/ppu_ci_container.sh',
+        'control/ppu_ci_paths.py',
+        'control/ppu_ci_export.py',
     ):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -464,11 +464,10 @@ def subprocess_bundle(tmp_path):
         )
     )
     root = tmp_path / 'bundle'
-    trusted = runtime_export(root, schema=2)
+    trusted = runtime_export(root)
     write_image_record(root, trusted)
     shutil.copytree(control, root / 'control')
     shutil.copyfile(plan / 'manifest.json', root / 'manifest.json')
-    archive(root / 'source.tar.gz', [('source.py', b'VALUE = 1\n', tarfile.REGTYPE)])
     for name, content in (
         ('commit.txt', TARGET),
         ('control.txt', CONTROL),
@@ -731,9 +730,7 @@ def test_installation_reports_reject_external_or_direct_sources(
         exporter.verify_reports([report])
 
 
-@pytest.mark.parametrize(
-    'filename', ['ppu_ci_container.py', 'ppu_ci_container.sh', 'ppu_functional_pytest.py']
-)
+@pytest.mark.parametrize('filename', ['ppu_ci_container.py', 'ppu_functional_pytest.py'])
 def test_orchestration_changes_do_not_invalidate_dependency_cache(build_inputs, filename):
     args = build_inputs
     before = container.build_identity(args)

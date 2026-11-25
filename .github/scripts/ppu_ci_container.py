@@ -79,9 +79,7 @@ def inventory(directory, exclude=('docker-build.json',)):
     return files
 
 
-def verify_export(
-    directory, trusted_digest, control_sha, target_sha=None, *, subset=False, schema=1
-):
+def verify_export(directory, trusted_digest, control_sha, target_sha=None, *, subset=False):
     directory = no_links(directory)
     require(DIGEST.fullmatch(trusted_digest or ''), 'Missing trusted environment digest')
     path = directory / 'docker-build.json'
@@ -91,11 +89,10 @@ def verify_export(
     )
     metadata = json.loads(path.read_text())
     kind = 'runtime' if target_sha is not None else 'control'
+    schema = 2 if kind == 'runtime' else 1
     require(
         type(metadata.get('schema_version')) is int
         and metadata['schema_version'] == schema
-        and schema in (1, 2)
-        and (schema == 1 or kind == 'runtime')
         and metadata.get('kind') == kind,
         'Unsupported environment build metadata',
     )
@@ -139,7 +136,6 @@ def verify_export(
         )
     required = (
         (
-            'environment.tar.gz',
             'functional-package-install.json',
             'constraints.txt',
             'installed-packages.json',
@@ -159,11 +155,7 @@ def verify_export(
         else ('control-runtime.tar.gz', 'control-package-install.json')
     )
     require(
-        all(
-            files.get(name, {}).get('size', 0) > 0
-            for name in required
-            if schema == 1 or name != 'environment.tar.gz'
-        ),
+        all(files.get(name, {}).get('size', 0) > 0 for name in required),
         'Incomplete Dockerfile environment export',
     )
     require(DIGEST.fullmatch(metadata.get('inputs_sha256', '')), 'Missing build inputs digest')
@@ -430,7 +422,6 @@ def build_identity(args):
         json.dumps(dependency_inputs, sort_keys=True).encode()
     ).hexdigest()
     inputs['ppu_ci_container.py'] = digest(no_links(root / '.github/scripts/ppu_ci_container.py'))
-    inputs['ppu_ci_container.sh'] = digest(no_links(root / '.github/scripts/ppu_ci_container.sh'))
     for path in trusted_controls(root):
         inputs[path.name] = digest(path)
     inputs['control_sha'] = args.control_sha
@@ -637,7 +628,7 @@ def build(args):
         }
         (output / 'docker-build.json').write_text(json.dumps(metadata, sort_keys=True) + '\n')
         sha = digest(output / 'docker-build.json')
-        verify_export(output, sha, args.control_sha, args.target_sha, schema=2 if image_mode else 1)
+        verify_export(output, sha, args.control_sha, args.target_sha)
         # BuildKit local exports may be owned by the runner with mode 0700.
         # A root container without DAC capabilities cannot read that bind mount.
         # Keep original evidence private and mount a readable temporary snapshot.
@@ -777,9 +768,7 @@ def image_record(metadata, environment_digest, runtime_image_digest):
 
 
 def publish_image(args):
-    metadata = verify_export(
-        args.artifact, args.digest, args.control_sha, args.target_sha, schema=2
-    )
+    metadata = verify_export(args.artifact, args.digest, args.control_sha, args.target_sha)
     require(args.base_image_digest == metadata['image_digest'], 'Publication base image mismatch')
     require(
         re.fullmatch(r'ppu-ci-runtime:run-([0-9]+)-([0-9]+)', args.local_image),
@@ -848,7 +837,7 @@ def verify_installed_image(args, metadata):
 
 def verify_image(args):
     metadata = verify_export(
-        args.artifact, args.digest, args.control_sha, args.target_sha, subset=True, schema=2
+        args.artifact, args.digest, args.control_sha, args.target_sha, subset=True
     )
     require(
         args.base_image_digest == metadata['image_digest'], 'Execution image base identity mismatch'
@@ -867,9 +856,7 @@ def verify_image(args):
 
 
 def image_probe(args):
-    metadata = verify_export(
-        args.artifact, args.digest, args.control_sha, args.target_sha, schema=2
-    )
+    metadata = verify_export(args.artifact, args.digest, args.control_sha, args.target_sha)
     args.source_root = SOURCE_ROOT
     verify_installed_image(args, metadata)
     portable_checks(SOURCE_ROOT, execution_image=True)

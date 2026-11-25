@@ -199,11 +199,24 @@ def tool_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("PPU_SOURCE_ROOT", str(ROOT))
     monkeypatch.setattr(environment, "check_postprocessing", lambda root: {"event_roundtrip": True})
     manifest = {
-        "environment_build_schema": 1,
+        "environment_build_schema": 2,
         "functional": {"case": {"launcher": "torchrun", "nvrx_checkpoint": []}},
         "identity": {"run_id": "123"},
         "config": {"image": "fixed"},
     }
+    delivery = {
+        "runtime_image_digest": "ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci@sha256:"
+        + "e" * 64,
+        "base_image_digest": functional.IMAGE.rsplit(":", 1)[0] + "@sha256:" + "f" * 64,
+        "environment_digest": "a" * 64,
+    }
+    (bundle / "runtime-image.json").write_text(json.dumps(delivery))
+    for name, field in (
+        ("PPU_IMAGE_DIGEST", "runtime_image_digest"),
+        ("PPU_BASE_IMAGE_DIGEST", "base_image_digest"),
+        ("PPU_ENVIRONMENT_DIGEST", "environment_digest"),
+    ):
+        monkeypatch.setenv(name, delivery[field])
     return bundle, site, manifest, calls, versions, cuda
 
 
@@ -369,26 +382,10 @@ def checkpoint_api(tool_environment, monkeypatch):
 
 @pytest.mark.parametrize("launcher", ["torchrun", "ft_launcher"])
 @pytest.mark.parametrize("checkpoint", [False, True])
-@pytest.mark.parametrize("schema", [1, 2])
 def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
-    tool_environment, checkpoint_api, launcher, checkpoint, schema, monkeypatch
+    tool_environment, checkpoint_api, launcher, checkpoint
 ):
     bundle, site, manifest, calls, _, _ = tool_environment
-    manifest["environment_build_schema"] = schema
-    delivery = {
-        "runtime_image_digest": "ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci@sha256:"
-        + "e" * 64,
-        "base_image_digest": functional.IMAGE.rsplit(":", 1)[0] + "@sha256:" + "f" * 64,
-        "environment_digest": "a" * 64,
-    }
-    if schema == 2:
-        (bundle / "runtime-image.json").write_text(json.dumps(delivery))
-        for name, field in (
-            ("PPU_IMAGE_DIGEST", "runtime_image_digest"),
-            ("PPU_BASE_IMAGE_DIGEST", "base_image_digest"),
-            ("PPU_ENVIRONMENT_DIGEST", "environment_digest"),
-        ):
-            monkeypatch.setenv(name, delivery[field])
     manifest["functional"]["case"]["launcher"] = launcher
     if checkpoint:
         manifest["functional"]["case"]["nvrx_checkpoint"] = [
@@ -405,10 +402,8 @@ def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
     assert report["postprocessing"] == {"event_roundtrip": True}
     assert "protobuf" in report["packages"]
     assert report["identity"] == manifest["identity"] and report["devices"] == 8
-    if schema == 2:
-        assert {field: report[field] for field in delivery} == delivery
-    else:
-        assert not any(field in report for field in delivery)
+    delivery = json.loads((bundle / "runtime-image.json").read_text())
+    assert {field: report[field] for field in delivery} == delivery
     assert report["training_dependencies"]["packages"] == environment.TRAINING_PACKAGES
     assert environment.TRAINING_PACKAGES.items() <= report["packages"].items()
     assert report["training_dependencies"]["emerging_optimizers_enabled"]
@@ -431,7 +426,6 @@ def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
 @pytest.mark.parametrize("damage", ["missing", "modified", "not_executable", "symlink"])
 def test_prepare_rejects_invalid_upstream_yq_without_repairing(tool_environment, damage):
     bundle, _, manifest, calls, _, _ = tool_environment
-    manifest["environment_build_schema"] = 2
     local = environment.Path("/usr/local/bin") / "yq"
     if damage == "missing":
         local.unlink()
@@ -459,7 +453,6 @@ def test_prepare_rejects_invalid_upstream_yq_without_repairing(tool_environment,
 )
 def test_functional_image_evidence_requires_job_identities(tool_environment, monkeypatch, variable):
     bundle, _, manifest, _, _, _ = tool_environment
-    manifest["environment_build_schema"] = 2
     values = {
         "runtime_image_digest": "execution",
         "base_image_digest": "base",
@@ -805,9 +798,7 @@ def test_invalid_runtime_environment_fails_before_training(tool_environment, mon
     bundle, _, manifest, _, versions, cuda = tool_environment
     environment.prepare(bundle, manifest)
     if damage in ("bash", "yq", "envsubst"):
-        versions[str(Path(environment.sys.prefix) / "bin/yq") if damage == "yq" else damage] = (
-            "Unsupported version"
-        )
+        versions["/usr/local/bin/yq" if damage == "yq" else damage] = "Unsupported version"
     elif damage == "devices":
         cuda.device_count = lambda: 4
     elif damage == "nodes":

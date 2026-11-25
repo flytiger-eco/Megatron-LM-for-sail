@@ -763,10 +763,14 @@ def bundle_inventory(directory: Path) -> dict:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
         inventory[name] = {"size": path.stat().st_size, "sha256": digest}
     manifest = json.loads((directory / "manifest.json").read_text())
-    image_schema = manifest.get("environment_build_schema") == 2
+    if (
+        type(manifest.get("environment_build_schema")) is not int
+        or manifest["environment_build_schema"] != 2
+    ):
+        raise ValueError("Build artifacts require the current execution image schema")
     for name in (
-        "runtime-image.json" if image_schema else "environment.tar.gz",
-        *(() if image_schema else ("source.tar.gz",)),
+        "runtime-image.json",
+        "docker-build.json",
         "manifest.json",
         "commit.txt",
         "control.txt",
@@ -775,74 +779,31 @@ def bundle_inventory(directory: Path) -> dict:
         "control/ppu_ci.py",
         "control/ppu_ci_run.sh",
         "control/ppu_pytest_policy.py",
+        "control/ppu_ci_container.py",
+        "control/ppu_ci_paths.py",
+        "control/ppu_ci_export.py",
     ):
-        if name not in inventory or inventory[name]["size"] == 0:
+        if inventory.get(name, {}).get("size", 0) == 0:
             raise ValueError(f"Missing or empty build artifact: {name}")
-    current_paths = manifest.get("runtime_path_schema") == 1 or (
-        manifest.get("test_kind") == "functional" and manifest.get("schema_version") == 2
+    spec = importlib.util.spec_from_file_location(
+        "ppu_container_inventory", Path(__file__).with_name("ppu_ci_container.py")
     )
-    if manifest.get("test_kind") == "combined":
-        sidecar = directory / "functional-manifest.json"
-        if sidecar.is_file():
-            current_paths = (
-                current_paths or json.loads(sidecar.read_text()).get("schema_version") == 2
-            )
-    if "environment_build_schema" in manifest:
-        if type(manifest["environment_build_schema"]) is not int or manifest[
-            "environment_build_schema"
-        ] not in (1, 2):
-            raise ValueError("Unsupported Dockerfile environment schema")
-        for name in (
-            "docker-build.json",
-            "compatibility-patches.json",
-            "base-packages.json",
-            "vendor-bytes.json",
-            "installed-packages.json",
-            "constraints.txt",
-            "functional-package-install.json",
-            "control/ppu_ci_container.py",
-            "control/ppu_ci_container.sh",
-        ):
-            if inventory.get(name, {}).get("size", 0) == 0:
-                raise ValueError("Missing Dockerfile environment build artifact")
-        spec = importlib.util.spec_from_file_location(
-            "ppu_container_inventory", Path(__file__).with_name("ppu_ci_container.py")
+    environment = importlib.util.module_from_spec(spec)
+    # Inventory validation must not add bytecode to the trusted control tree.
+    exec(compile(Path(spec.origin).read_bytes(), spec.origin, "exec"), environment.__dict__)
+    record = json.loads((directory / "runtime-image.json").read_text())
+    environment.verify_image(
+        SimpleNamespace(
+            artifact=directory,
+            digest=inventory["docker-build.json"]["sha256"],
+            control_sha=manifest["identity"]["control_sha"],
+            target_sha=manifest["identity"]["target_sha"],
+            base_image_digest=record["base_image_digest"],
+            image_digest=(directory / "image.txt").read_text().strip(),
+            source_root=None,
+            check_only=True,
         )
-        environment = importlib.util.module_from_spec(spec)
-        # Inventory validation must not add bytecode to the trusted control tree.
-        previous_dont_write_bytecode = sys.dont_write_bytecode
-        try:
-            sys.dont_write_bytecode = True
-            spec.loader.exec_module(environment)
-        finally:
-            sys.dont_write_bytecode = previous_dont_write_bytecode
-        environment.verify_export(
-            directory,
-            inventory["docker-build.json"]["sha256"],
-            manifest["identity"]["control_sha"],
-            manifest["identity"]["target_sha"],
-            subset=True,
-            schema=2 if image_schema else 1,
-        )
-        if image_schema:
-            record = json.loads((directory / "runtime-image.json").read_text())
-            image = (directory / "image.txt").read_text().strip()
-            environment.verify_image(
-                SimpleNamespace(
-                    artifact=directory,
-                    digest=inventory["docker-build.json"]["sha256"],
-                    control_sha=manifest["identity"]["control_sha"],
-                    target_sha=manifest["identity"]["target_sha"],
-                    base_image_digest=record["base_image_digest"],
-                    image_digest=image,
-                    source_root=None,
-                    check_only=True,
-                )
-            )
-    if current_paths:
-        for name in ("control/ppu_ci_paths.py", "control/ppu_ci_export.py"):
-            if name not in inventory or inventory[name]["size"] == 0:
-                raise ValueError("Missing or empty trusted path control helper")
+    )
     if manifest.get("test_kind") in ("functional", "combined"):
         required = [
             "functional-tools/yq",

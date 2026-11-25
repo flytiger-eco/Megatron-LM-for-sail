@@ -61,6 +61,8 @@ checkpoint 和 tokenizer 缓存保留在内部 NAS；不再改写 TensorBoard �
 `/opt/megatron-lm` 分开；Build/UT/FT 不再额外打包或解压源码。
 依赖来自被测 `pyproject.toml` 的 project/test/training 配置及 SAIL 原生包约束，
 当前不直接消费 NV `uv.lock`。安装与源码编译在镜像构建阶段完成，Pod 内不现场安装依赖。
+Build 统一检查依赖和 UT tokenizer 缓存；各 UT bucket 验证同一镜像、数据交付及设备可见性后运行。
+运行环境只接受镜像交付；CPU 控制解释器仍通过独立归档分发。
 
 `.github/actions/ppu-build-cache/action.yml` 选择 registry BuildKit 依赖缓存：
 PR 优先读自己的同指纹缓存，再读目标分支；PR/候选提交分别写独立缓存，main/dev 发布提交更新 baseline。
