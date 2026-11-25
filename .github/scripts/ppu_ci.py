@@ -753,11 +753,6 @@ def bundle_inventory(directory: Path) -> dict:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
         inventory[name] = {"size": path.stat().st_size, "sha256": digest}
     manifest = json.loads((directory / "manifest.json").read_text())
-    if (
-        type(manifest.get("environment_build_schema")) is not int
-        or manifest["environment_build_schema"] != 2
-    ):
-        raise ValueError("Build artifacts require the current execution image schema")
     for name in (
         "runtime-image.json",
         "docker-build.json",

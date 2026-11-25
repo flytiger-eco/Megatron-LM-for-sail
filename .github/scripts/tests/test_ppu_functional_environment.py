@@ -60,7 +60,9 @@ def tool_environment(tmp_path, monkeypatch):
         }
     (local / "yq").write_bytes(content)
     (local / "yq").chmod(0o755)
-    (bundle / "docker-build.json").write_text(json.dumps({"files": tool_files}))
+    (bundle / "docker-build.json").write_text(
+        json.dumps({"schema_version": 2, "files": tool_files})
+    )
     (site / "ppu_functional_pytest.py").write_bytes(
         (bundle / "control/ppu_functional_pytest.py").read_bytes()
     )
@@ -158,7 +160,6 @@ def tool_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("PPU_SOURCE_ROOT", str(ROOT))
     monkeypatch.setattr(environment, "check_postprocessing", lambda root: {"event_roundtrip": True})
     manifest = {
-        "environment_build_schema": 2,
         "functional": {"case": {"launcher": "torchrun"}},
         "identity": {"run_id": "123"},
         "config": {"image": "fixed"},
@@ -253,7 +254,7 @@ def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
 
     monkeypatch.setattr(environment, "command_output", command)
     manifest["functional"]["case"]["launcher"] = launcher
-    environment.prepare(bundle, manifest)
+    environment.prepare(bundle)
     assert (site / "ppu_functional_pytest.py").read_bytes() == (
         bundle / "control/ppu_functional_pytest.py"
     ).read_bytes()
@@ -308,7 +309,7 @@ def test_prepare_rejects_invalid_upstream_yq_without_repairing(tool_environment,
         local.symlink_to(bundle / "functional-tools/yq")
     before = (local.is_symlink(), local.exists(), local.read_bytes() if local.exists() else None)
     with pytest.raises(ValueError, match="Upstream yq path"):
-        environment.prepare(bundle, manifest)
+        environment.prepare(bundle)
     assert calls == []
     assert before == (
         local.is_symlink(),
@@ -344,7 +345,7 @@ def test_training_dependency_missing_or_wrong_version_fails(
     tool_environment, monkeypatch, name, damage
 ):
     bundle, _, manifest, _, _, _ = tool_environment
-    environment.prepare(bundle, manifest)
+    environment.prepare(bundle)
     version = environment.importlib.metadata.version
 
     def installed(package):
@@ -363,7 +364,7 @@ def test_training_dependency_missing_or_wrong_version_fails(
 @pytest.mark.parametrize("name", environment.TRAINING_IMPORTS)
 def test_training_native_import_failure_is_not_ignored(tool_environment, monkeypatch, name):
     bundle, _, manifest, _, _, _ = tool_environment
-    environment.prepare(bundle, manifest)
+    environment.prepare(bundle)
     original_import = environment.importlib.import_module
 
     def broken_import(module):
@@ -509,7 +510,7 @@ def test_real_cold_postprocessing_rejects_damaged_environment(
 )
 def test_invalid_runtime_environment_fails_before_training(tool_environment, monkeypatch, damage):
     bundle, _, manifest, _, versions, cuda = tool_environment
-    environment.prepare(bundle, manifest)
+    environment.prepare(bundle)
     if damage in ("bash", "yq", "envsubst"):
         versions["/usr/local/bin/yq" if damage == "yq" else damage] = "Unsupported version"
     elif damage == "devices":

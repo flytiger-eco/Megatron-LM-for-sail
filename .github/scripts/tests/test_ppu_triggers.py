@@ -2,10 +2,8 @@
 
 import copy
 import json
-from types import SimpleNamespace
 
 import pytest
-from test_ppu_ci_container import container
 from test_ppu_functional import ROOT, functional
 from test_ppu_functional_results import results
 from test_ppu_lifecycle import FakeGitHub, github
@@ -162,31 +160,6 @@ def test_combine_attaches_verified_functional_plan(tmp_path, monkeypatch):
     assert outputs["test_kind"] == "combined" and outputs["functional_mode"] == "regression"
     assert outputs["functional_label"] == "functional L1 lightweight x1"
     assert len(json.loads(outputs["functional_matrix"])["include"]) == len(plan["functional"])
-
-
-@pytest.mark.parametrize(
-    "trigger,labels", [("push", ()), ("merge_group", ()), ("pull_request_target", ("Run tests",))]
-)
-def test_docker_mark_plan_preserves_combined_policy_and_sidecar_digest(tmp_path, trigger, labels):
-    output = combined_output(tmp_path, trigger, labels)
-    plan = functional.combine(ROOT, ROOT, output)
-    top = json.loads((output / "manifest.json").read_text())
-    container.mark_plan(SimpleNamespace(artifact=output))
-    marked = json.loads((output / "manifest.json").read_text())
-    expected = {**plan, "environment_build_schema": 2}
-    assert functional.load_manifest(output / "manifest.json") == expected
-    assert marked["environment_build_schema"] == 2
-    assert marked["functional_plan"]["sha256"] == container.digest(
-        output / functional.FUNCTIONAL_MANIFEST
-    )
-    assert {
-        key: value
-        for key, value in marked.items()
-        if key not in ("environment_build_schema", "functional_plan")
-    } == {key: value for key, value in top.items() if key != "functional_plan"}
-    (output / functional.FUNCTIONAL_MANIFEST).write_text(json.dumps(plan))
-    with pytest.raises(ValueError):
-        functional.load_manifest(output / "manifest.json")
 
 
 @pytest.mark.parametrize(

@@ -33,7 +33,6 @@ BUNDLE_FILES = {
     "compatibility-patches.json",
     "base-packages.json",
     "vendor-bytes.json",
-    "export-files.json",
     "constraints.txt",
     "ppu-requirements.txt",
     "test-requirements.txt",

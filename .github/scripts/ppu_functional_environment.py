@@ -199,14 +199,11 @@ print(json.dumps({{
     return report
 
 
-def prepare(bundle: Path, manifest: dict):
+def prepare(bundle: Path):
     """Attest the existing Dockerfile environment; never acquire software here."""
-    if (
-        type(manifest.get("environment_build_schema")) is not int
-        or manifest["environment_build_schema"] != 2
-    ):
-        raise ValueError("Functional preparation requires the current execution image schema")
     metadata = json.loads((bundle / "docker-build.json").read_text())
+    if type(metadata.get("schema_version")) is not int or metadata["schema_version"] != 2:
+        raise ValueError("Functional preparation requires the current execution image schema")
     for name in ("yq", "envsubst"):
         path = bundle / "functional-tools" / name
         expected = metadata["files"][f"functional-tools/{name}"]
@@ -299,7 +296,7 @@ def check(bundle: Path, manifest: dict, output: Path):
     arch, expected = YQ[platform.machine()]
     if hashlib.sha256((tools / "yq").read_bytes()).hexdigest() != expected:
         raise ValueError("Functional yq binary digest mismatch")
-    prepare(bundle, manifest)
+    prepare(bundle)
     record = json.loads((bundle / "runtime-image.json").read_text())
     delivery = {}
     for field, variable in (

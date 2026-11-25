@@ -773,9 +773,7 @@ def sealed_bundle(tmp_path):
     plan = tmp_path / "plan"
     control = plan / "control"
     control.mkdir(parents=True)
-    (plan / "manifest.json").write_text(
-        json.dumps({"identity": IDENTITY, "environment_build_schema": 2})
-    )
+    (plan / "manifest.json").write_text(json.dumps({"identity": IDENTITY}))
     shutil.copyfile(ROOT / ".github/scripts/ppu_ci.py", control / "ppu_ci.py")
     for name in ("ppu_ci_container.py", "ppu_policy.py", "ppu_ci_paths.py", "ppu_ci_export.py"):
         shutil.copyfile(ROOT / ".github/scripts" / name, control / name)

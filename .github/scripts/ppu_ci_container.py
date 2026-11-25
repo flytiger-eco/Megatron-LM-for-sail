@@ -142,7 +142,6 @@ def verify_export(directory, trusted_digest, control_sha, target_sha=None, *, su
             'compatibility-patches.json',
             'base-packages.json',
             'vendor-bytes.json',
-            'export-files.json',
             'ppu-requirements.txt',
             'test-requirements.txt',
             'packaging-install.json',
@@ -859,7 +858,7 @@ def image_probe(args):
     metadata = verify_export(args.artifact, args.digest, args.control_sha, args.target_sha)
     args.source_root = SOURCE_ROOT
     verify_installed_image(args, metadata)
-    portable_checks(SOURCE_ROOT, execution_image=True)
+    execution_checks(SOURCE_ROOT)
 
 
 def restore_control(args):
@@ -883,7 +882,7 @@ def restore_control(args):
     )
 
 
-def portable_checks(source, *, execution_image=False):
+def execution_checks(source):
     environment = client_env()
     environment.update(
         {
@@ -912,43 +911,25 @@ def portable_checks(source, *, execution_image=False):
         ['/opt/ppu-ci-venv/bin/envsubst', '--version'],
         ['/opt/ppu-ci-venv/bin/yq', '--version'],
         ['/opt/ppu-ci-venv/bin/make', '-q', '-C', str(source / 'megatron/core/datasets')],
-    ]
-    if execution_image:
         # Verify the original training driver's absolute path, not just the venv tool in PATH.
-        checks.extend(
-            [
-                ['/usr/local/bin/yq', '--version'],
-                [
-                    '/opt/ppu-ci-venv/bin/python',
-                    '-I',
-                    '-c',
-                    'import os, pathlib, subprocess; tool = pathlib.Path("/usr/local/bin/yq"); '
-                    'assert tool.is_file() and not tool.is_symlink() and os.access(tool, os.X_OK); '
-                    'assert tool.read_bytes() == pathlib.Path("/opt/ppu-ci-venv/bin/yq").read_bytes(); '
-                    'assert subprocess.check_output([str(tool), ".TEST_TYPE"], '
-                    'input="TEST_TYPE: regular\\n", text=True, timeout=30).strip() == "regular"',
-                ],
-            ]
-        )
+        ['/usr/local/bin/yq', '--version'],
+        [
+            '/opt/ppu-ci-venv/bin/python',
+            '-I',
+            '-c',
+            'import os, pathlib, subprocess; tool = pathlib.Path("/usr/local/bin/yq"); '
+            'assert tool.is_file() and not tool.is_symlink() and os.access(tool, os.X_OK); '
+            'assert tool.read_bytes() == pathlib.Path("/opt/ppu-ci-venv/bin/yq").read_bytes(); '
+            'assert subprocess.check_output([str(tool), ".TEST_TYPE"], '
+            'input="TEST_TYPE: regular\\n", text=True, timeout=30).strip() == "regular"',
+        ],
+    ]
     for check in checks:
         result = subprocess.run(check, env=environment, capture_output=True, text=True)
         require(
             result.returncode == 0,
-            'Offline clean-base portability check failed; device checks remain required',
+            'Offline execution image check failed; device checks remain required',
         )
-
-
-def mark_plan(args):
-    path = no_links(Path(args.artifact) / 'manifest.json')
-    manifest = json.loads(path.read_text())
-    manifest['environment_build_schema'] = 2
-    if manifest.get('test_kind') == 'combined':
-        sidecar = no_links(path.with_name('functional-manifest.json'))
-        functional = json.loads(sidecar.read_text())
-        functional['environment_build_schema'] = 2
-        sidecar.write_text(json.dumps(functional, indent=2) + '\n')
-        manifest['functional_plan']['sha256'] = digest(sidecar)
-    path.write_text(json.dumps(manifest, indent=2) + '\n')
 
 
 def main():
@@ -997,8 +978,6 @@ def main():
             image.add_argument('--image-digest', required=True)
             image.add_argument('--source-root', type=Path)
             image.add_argument('--check-only', action='store_true')
-    mark = sub.add_parser('mark-plan')
-    mark.add_argument('--artifact', type=Path, required=True)
     args = parser.parse_args()
     {
         'build': build,
@@ -1009,7 +988,6 @@ def main():
         'image-probe': image_probe,
         'fingerprint': fingerprint,
         'restore-control': restore_control,
-        'mark-plan': mark_plan,
     }[args.mode](args)
 
 

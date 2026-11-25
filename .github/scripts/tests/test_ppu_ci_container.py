@@ -58,7 +58,6 @@ def runtime_export(root, *, control=CONTROL, target=TARGET):
         'compatibility-patches.json',
         'base-packages.json',
         'vendor-bytes.json',
-        'export-files.json',
         'ppu-requirements.txt',
         'test-requirements.txt',
         'packaging-install.json',
@@ -66,7 +65,6 @@ def runtime_export(root, *, control=CONTROL, target=TARGET):
         'source-package-install.json',
         'functional-tools/yq',
         'functional-tools/envsubst',
-        'wheels/megatron.whl',
     ):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -420,17 +418,17 @@ def test_schema_two_bundle_is_sealed_without_environment_archive(image_exported,
         path.write_bytes(b'fixture')
     (root / 'image.txt').write_text(PUBLISHED + '\n')
     (root / 'manifest.json').write_text(
-        json.dumps(
-            {
-                'environment_build_schema': 1 if damage == 'legacy' else 2,
-                'identity': {'control_sha': CONTROL, 'target_sha': TARGET},
-            }
-        )
+        json.dumps({'identity': {'control_sha': CONTROL, 'target_sha': TARGET}})
     )
     if damage == 'image':
         (root / 'image.txt').write_text(PINNED)
     elif damage == 'record':
         (root / 'runtime-image.json').write_text('{}')
+    elif damage == 'legacy':
+        metadata = json.loads((root / 'docker-build.json').read_text())
+        metadata['schema_version'] = 1
+        (root / 'docker-build.json').write_text(json.dumps(metadata))
+        write_image_record(root, container.digest(root / 'docker-build.json'))
     elif damage == 'missing_report':
         (root / 'packaging-install.json').unlink()
     if damage == 'none':
@@ -458,7 +456,6 @@ def subprocess_bundle(tmp_path):
                 'schema_version': 2,
                 'test_kind': 'functional',
                 'runtime_path_schema': 1,
-                'environment_build_schema': 2,
                 'identity': {'control_sha': CONTROL, 'target_sha': TARGET},
             }
         )
@@ -579,7 +576,7 @@ def test_execution_yq_probe_executes_parse_and_rejects_invalid_copy(tmp_path, mo
         'run',
         lambda argv, **kwargs: calls.append(argv) or SimpleNamespace(returncode=0),
     )
-    container.portable_checks(tmp_path, execution_image=True)
+    container.execution_checks(tmp_path)
     code = next(argv[-1] for argv in calls if 'input="TEST_TYPE: regular' in argv[-1])
     local, baked = tmp_path / 'yq', tmp_path / 'baked-yq'
     payload = '#!/bin/sh\ncat >/dev/null\nprintf "regular\\n"\n'

@@ -261,18 +261,9 @@ def runtime():
             sort_keys=True,
         )
     )
-    copy('/build/wheels', EXPORT / 'wheels')
     tools = EXPORT / 'functional-tools'
     for name in ('yq', 'envsubst'):
         copy(VENV / 'bin' / name, tools / name)
-    files = {}
-    for path in sorted(EXPORT.rglob('*')):
-        if path.is_file():
-            files[path.relative_to(EXPORT).as_posix()] = {
-                'size': path.stat().st_size,
-                'sha256': sha256(path),
-            }
-    (EXPORT / 'export-files.json').write_text(json.dumps(files, sort_keys=True))
 
 
 if __name__ == '__main__':
