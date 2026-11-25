@@ -203,7 +203,8 @@ def unit_cases(config: dict) -> dict:
                 ROOT / "tests/unit_tests"
             ):
                 raise ValueError(f"UT path does not exist: {target}")
-            if positive(spec["nodes"], "nodes") != 1 or positive(spec["gpus"], "gpus") != 8:
+            cards = positive(spec["gpus"], "gpus")
+            if positive(spec["nodes"], "nodes") != 1 or cards not in (1, 2, 4, 8):
                 raise ValueError(f"UT topology requires explicit adaptation: {bucket}")
             files = {
                 path.relative_to(ROOT).as_posix() for path in ROOT.glob(bucket) if path.is_file()
@@ -230,7 +231,7 @@ def unit_cases(config: dict) -> dict:
                 "id": case_id,
                 "bucket": bucket,
                 "environment": environment,
-                "cards": 8,
+                "cards": cards,
                 "minutes": minutes,
                 "action_minutes": minutes + 15,
                 "job_minutes": minutes + 30,
