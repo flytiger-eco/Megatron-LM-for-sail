@@ -156,7 +156,7 @@ class ShellRunner(runtime.ProcessRunner):
 
 
 @pytest.fixture
-def shell_case(tmp_path):
+def shell_case(tmp_path, monkeypatch):
     def prepare(name, **overrides):
         config = functional.select_config(
             {"functional_mode": "regression", "functional_repeat": 1, "functional_cases": name}
@@ -177,10 +177,10 @@ def shell_case(tmp_path):
             else:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("Mock input")
-        config["data_path"] = str(assets)
+        monkeypatch.setenv("PPU_POD_ASSETS_ROOT", str(assets))
         manifest = {
             **catalogue,
-            "schema_version": 1,
+            "schema_version": 2,
             "test_kind": "functional",
             "source_files": {},
             "config": config,
@@ -262,8 +262,10 @@ def test_original_shell_tensorboard_extraction_and_comparison(shell_case, kind, 
         assert not results.verify_case(manifest, case, directory)["success"]
 
 
-def test_original_shell_preserves_synthetic_reshard_configuration(tmp_path, provisioned):
-    config = functional.select_config({"functional_repeat": 1})
+def test_original_shell_preserves_synthetic_reshard_configuration(
+    tmp_path, provisioned, monkeypatch
+):
+    config = functional.select_config({"functional_mode": "regression", "functional_repeat": 1})
     catalogue = functional.catalogue(ROOT, ROOT, config)
     case = next(
         row
@@ -278,8 +280,8 @@ def test_original_shell_preserves_synthetic_reshard_configuration(tmp_path, prov
     }
     synthetic = tmp_path / "synthetic-reshard.yaml"
     synthetic.write_text(yaml.safe_dump(original))
-    config["data_path"] = str(provisioned[0])
-    manifest = {"identity": {}, "config": config}
+    monkeypatch.setenv("PPU_POD_ASSETS_ROOT", str(provisioned[0]))
+    manifest = {"schema_version": 2, "test_kind": "functional", "identity": {}, "config": config}
     repeat = tmp_path / "repeat"
     repeat.mkdir()
     case = {**case, "config_path": str(synthetic)}

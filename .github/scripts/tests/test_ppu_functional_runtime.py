@@ -39,7 +39,7 @@ class FakeRunner:
             str(ROOT / "tests/functional_tests/shell_test_utils/run_ci_test.sh"),
         ]
         assert cwd == ROOT
-        assert env["DATA_PATH"] == self.manifest["config"]["data_path"]
+        assert env["DATA_PATH"] == str(functional.paths.asset_root(self.manifest, "pod"))
         assert env["N_REPEAT"] == "1" and env["RECORD_CHECKPOINTS"] == "false"
         assert env["PYTHONNOUSERSITE"] == "1"
         assert env["GPUS_PER_NODE"] == "8" and env["NUM_NODES"] == "1"
@@ -72,7 +72,6 @@ def prepare_case(evidence, tmp_path):
         path = assets / asset["relative_path"]
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("fixture")
-    manifest["config"]["data_path"] = str(assets)
     return manifest, case, tmp_path / "case-results"
 
 
@@ -157,6 +156,15 @@ def test_assets_mode_never_launches_training(evidence, tmp_path):
     with pytest.raises(ValueError, match="explicit functional regression"):
         runtime.run_case(manifest, ROOT, case["id"], directory)
     assert not directory.exists()
+
+
+def test_missing_compiler_policy_fails_without_launch(evidence, tmp_path):
+    manifest, case, directory = prepare_case(evidence, tmp_path)
+    manifest["config"].pop("compiler_environment")
+    runner = FakeRunner(manifest, case)
+    record = runtime.run_case(manifest, ROOT, case["id"], directory, runner=runner)
+    assert not record["success"] and record["attempts"] == 1
+    assert not runner.calls
 
 
 def test_process_runner_preserves_actual_subprocess_exit_and_log(tmp_path):
@@ -365,17 +373,13 @@ def test_m890_runtime_passes_the_preserved_launcher_to_upstream(evidence, tmp_pa
     assert source.read_bytes() == original
 
 
-@pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.parametrize("inherited", [None, "0", "1"])
 def test_compiler_environment_is_scoped_without_rewriting_model(
-    evidence, tmp_path, monkeypatch, legacy, inherited
+    evidence, tmp_path, monkeypatch, inherited
 ):
     manifest, case, _ = evidence
     key = "TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"
     monkeypatch.delenv("TORCHINDUCTOR_COMPILE_THREADS", raising=False)
-    if legacy:
-        manifest["config"].pop("compiler_environment")
-        monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", "1")
     if inherited is None:
         monkeypatch.delenv(key, raising=False)
     else:
@@ -387,8 +391,8 @@ def test_compiler_environment_is_scoped_without_rewriting_model(
     expected.pop("LAUNCHER", None)  # This fixture is a M890 torchrun case.
     expected.setdefault("ENV_VARS", {})["N_REPEAT"] = 1
     with runtime.repeat_environment(manifest, ROOT, case, directory, 1, 1) as env:
-        assert env.get(key) == (inherited if legacy else "0")
-        assert ("TORCHINDUCTOR_COMPILE_THREADS" in env) is legacy
+        assert env[key] == "0"
+        assert "TORCHINDUCTOR_COMPILE_THREADS" not in env
         assert yaml.safe_load((directory / "model_config.yaml").read_text()) == expected
         observed = subprocess.check_output(
             [
@@ -400,7 +404,7 @@ def test_compiler_environment_is_scoped_without_rewriting_model(
             text=True,
             timeout=10,
         ).strip()
-        assert observed == str(inherited if legacy else "0")
+        assert observed == "0"
     assert os.environ.get(key) == inherited
     assert (ROOT / case["config_path"]).read_bytes() == original
 

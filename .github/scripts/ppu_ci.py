@@ -401,7 +401,6 @@ def generate(config: dict, output: Path, identity: dict | None = None) -> dict:
     }
     manifest = {
         "schema_version": 3,
-        "runtime_path_schema": 1,
         "config": config,
         "identity": identity or {},
         "provenance": provenance,

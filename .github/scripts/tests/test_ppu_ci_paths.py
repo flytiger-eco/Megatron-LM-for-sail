@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 from test_ppu_functional import ROOT, SCRIPTS, functional
-from test_ppu_functional_results import evidence
 
 paths = functional.paths
 hf = functional.hf
@@ -133,25 +132,3 @@ def test_normal_runtime_rejects_old_manifest_before_process_start(tmp_path):
     )
     assert process.returncode != 0 and "logical-path functional manifest" in process.stderr
     assert not (tmp_path / "result").exists()
-
-
-def test_asset_cli_cannot_override_the_trusted_root(evidence, tmp_path, monkeypatch):
-    manifest, _, directory = evidence
-    manifest["schema_version"] = 2
-    manifest["config"].update(data_path="ppu://assets/pod", cpu_data_path="ppu://assets/cpu")
-    (directory / "manifest.json").write_text(json.dumps(manifest))
-    monkeypatch.setenv("PPU_CPU_ASSETS_ROOT", str(tmp_path / "trusted"))
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "assets",
-            "assets",
-            "--output",
-            str(directory),
-            "--assets-root",
-            str(tmp_path / "unapproved"),
-        ],
-    )
-    with pytest.raises(ValueError, match="differs from trusted"):
-        functional.main()

@@ -164,10 +164,12 @@ def tool_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("PPU_SOURCE_ROOT", str(ROOT))
     monkeypatch.setattr(environment, "check_postprocessing", lambda root: {"event_roundtrip": True})
     manifest = {
+        **compiler_manifest(),
         "functional": {"case": {"launcher": "torchrun"}},
         "identity": {"run_id": "123"},
-        "config": {"image": "fixed"},
     }
+    manifest["config"]["image"] = "fixed"
+    monkeypatch.setattr(environment, "check_compiler", lambda manifest: compiler_report())
     delivery = {
         "runtime_image_digest": "ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci@sha256:"
         + "e" * 64,

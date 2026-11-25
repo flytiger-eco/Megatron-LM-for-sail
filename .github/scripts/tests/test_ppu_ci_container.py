@@ -400,7 +400,6 @@ def subprocess_bundle(tmp_path):
             {
                 'schema_version': 2,
                 'test_kind': 'functional',
-                'runtime_path_schema': 1,
                 'identity': {'control_sha': CONTROL, 'target_sha': TARGET},
             }
         )

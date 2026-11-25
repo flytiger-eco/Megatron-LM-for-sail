@@ -73,7 +73,7 @@ def write_json(path, value):
 
 
 @pytest.fixture
-def evidence(tmp_path):
+def evidence(tmp_path, monkeypatch):
     config = functional.select_config(
         {
             "functional_mode": "regression",
@@ -81,8 +81,7 @@ def evidence(tmp_path):
             "functional_cases": "bert/bert_mcore_tp1_pp2",
         }
     )
-    # Historical offline fixtures retain fictional physical roots; new public-view tests use schema 2.
-    config.update(data_path="/fictional-pod/assets", cpu_data_path="/fictional-host/assets")
+    monkeypatch.setenv("PPU_POD_ASSETS_ROOT", str(tmp_path / "assets"))
     catalogue = functional.catalogue(ROOT, ROOT, config)
     case = next(iter(catalogue["functional"].values()))
     # This fixture produces synthetic training/comparison evidence without a tokenizer; real
@@ -91,7 +90,7 @@ def evidence(tmp_path):
     case["assets"] = [asset for asset in case["assets"] if not asset.get("tokenizer_cache")]
     manifest = {
         **catalogue,
-        "schema_version": 1,
+        "schema_version": 2,
         "test_kind": "functional",
         "config": config,
         "source_files": {},
@@ -183,9 +182,8 @@ def successful_repeat(manifest, case, directory, attempt, repeat):
         "cancelled": False,
         "timed_out": False,
         "runtime_config_sha256": functional.sha256(path / "model_config.yaml"),
+        "compiler_environment": dict(manifest["config"]["compiler_environment"]),
     }
-    if "compiler_environment" in manifest["config"]:
-        execution["compiler_environment"] = dict(manifest["config"]["compiler_environment"])
     write_json(path / "execution.json", execution)
     return path
 
@@ -194,17 +192,28 @@ def envelope(manifest, case, directory):
     write_json(
         directory / "assets-report.json",
         {
+            "schema_version": 2,
             "identity": manifest["identity"],
             "ok": True,
             "location": "pod",
             "numerical_validation": False,
             "pod_data_path": manifest["config"]["data_path"],
-            "root": {"ok": True},
+            "root": {"ok": True, "checked_path": functional.POD_ASSETS},
             "cases": [
                 {
                     "id": case["id"],
                     "name": case["name"],
-                    "assets": [{**asset, "ok": True} for asset in case["assets"]],
+                    "assets": [
+                        {
+                            **asset,
+                            "ok": True,
+                            "checked_path": functional.POD_ASSETS + "/" + asset["relative_path"],
+                            "exists": True,
+                            "readable": True,
+                            "size": 1,
+                        }
+                        for asset in case["assets"]
+                    ],
                 }
             ],
         },
@@ -221,18 +230,12 @@ def envelope(manifest, case, directory):
             "yq": "Mike Farah v4",
             "envsubst": "GNU gettext",
             "uv": "fixture",
-            **(
-                {
-                    "compiler": {
-                        "environment": dict(manifest["config"]["compiler_environment"]),
-                        "quiesce_async_compile_pool": False,
-                        "compile_threads": 8,
-                        "compile_threads_override": None,
-                    }
-                }
-                if "compiler_environment" in manifest["config"]
-                else {}
-            ),
+            "compiler": {
+                "environment": dict(manifest["config"]["compiler_environment"]),
+                "quiesce_async_compile_pool": False,
+                "compile_threads": 8,
+                "compile_threads_override": None,
+            },
         },
     )
     write_json(

@@ -184,8 +184,6 @@ def test_public_evidence_preserves_upstream_results_and_rejects_tampering(
     evidence, tmp_path, damage
 ):
     manifest, case, directory = evidence
-    manifest["schema_version"] = 2
-    manifest["config"].update(data_path="ppu://assets/pod", cpu_data_path="ppu://assets/cpu")
     for repeat in (1, 2):
         successful_repeat(manifest, case, directory, 1, repeat)
     completion(manifest, case, directory)

@@ -357,7 +357,7 @@ def test_asset_preflight_reads_fixed_digests_without_downloading(
 def runtime_case(evidence, provisioned, tmp_path):
     manifest, case, directory = prepare_case(evidence, tmp_path)
     source = provisioned[1]
-    target = Path(manifest["config"]["data_path"]) / hf.CACHE_RELATIVE
+    target = functional.paths.asset_root(manifest, "pod") / hf.CACHE_RELATIVE
     for name in hf.cache_files(provisioned[2]["repositories"]):
         path = target / name
         path.parent.mkdir(parents=True, exist_ok=True)

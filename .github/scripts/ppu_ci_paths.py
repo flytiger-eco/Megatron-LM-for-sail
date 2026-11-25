@@ -5,12 +5,7 @@ import os
 import re
 from pathlib import Path, PurePosixPath
 
-ROOT_NAMES = (
-    "PPU_CPU_RUN_ROOT",
-    "PPU_POD_RUN_ROOT",
-    "PPU_CPU_ASSETS_ROOT",
-    "PPU_POD_ASSETS_ROOT",
-)
+ROOT_NAMES = ("PPU_CPU_RUN_ROOT", "PPU_POD_RUN_ROOT", "PPU_CPU_ASSETS_ROOT", "PPU_POD_ASSETS_ROOT")
 LOGICAL = {"cpu": "ppu://assets/cpu", "pod": "ppu://assets/pod"}
 
 
@@ -75,16 +70,10 @@ def validate(route: str, env=None) -> None:
 
 
 def asset_root(manifest: dict, location: str, env=None) -> Path:
+    require_current(manifest)
     if location not in LOGICAL:
         raise ValueError("Unknown asset location")
-    key = "cpu_data_path" if location == "cpu" else "data_path"
-    if manifest.get("schema_version", 1) == 2:
-        if manifest["config"].get(key) != LOGICAL[location]:
-            raise ValueError("Invalid logical asset reference")
-        return root(f"PPU_{location.upper()}_ASSETS_ROOT", env)
-    if manifest.get("schema_version", 1) != 1:
-        raise ValueError("Unsupported functional manifest schema")
-    return absolute(manifest["config"][key], "historical asset root")
+    return root(f"PPU_{location.upper()}_ASSETS_ROOT", env)
 
 
 def require_current(manifest: dict) -> None:

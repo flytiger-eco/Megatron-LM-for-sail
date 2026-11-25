@@ -144,16 +144,12 @@ def select_config(inputs: dict, policy: dict | None = None) -> dict:
 
 
 def compiler_environment(manifest: dict) -> dict:
-    """New regressions bind adaptations explicitly; historical manifests with
-    missing fields are not reinterpreted.
-    """
+    """Require the compiler adaptation bound into every regression plan."""
     config = manifest["config"]
-    if "compiler_environment" not in config:
-        return {}
     if (
         manifest.get("test_kind") != "functional"
         or config.get("functional_mode") != "regression"
-        or config["compiler_environment"] != COMPILER_ENVIRONMENT
+        or config.get("compiler_environment") != COMPILER_ENVIRONMENT
     ):
         raise ValueError("Invalid functional compiler environment policy")
     return dict(COMPILER_ENVIRONMENT)
@@ -609,7 +605,6 @@ def build_manifest(root: Path, control: Path, config: dict, identity: dict) -> d
     positive(identity.get("run_attempt"), "run_attempt", 10**9)
     manifest = {
         "schema_version": 2,
-        "runtime_path_schema": 1,
         "test_kind": "functional",
         "config": config,
         "identity": identity,
@@ -723,10 +718,7 @@ def load_manifest(path: Path) -> dict:
     """Return the functional plan of a functional or combined manifest after verification."""
     manifest = json.loads(path.read_text())
     if manifest.get("test_kind") == "functional":
-        if manifest.get("schema_version") not in (1, 2):
-            raise ValueError("Unsupported functional manifest schema")
-        if manifest["schema_version"] == 2:
-            paths.require_current(manifest)
+        paths.require_current(manifest)
         return manifest
     plan = manifest.get("functional_plan")
     if (
@@ -744,17 +736,10 @@ def load_manifest(path: Path) -> dict:
     if hashlib.sha256(content).hexdigest() != plan["sha256"]:
         raise ValueError("Functional plan does not match the combined manifest digest")
     functional = json.loads(content)
-    if (
-        functional.get("schema_version") not in (1, 2)
-        or functional.get("test_kind") != "functional"
-    ):
+    if functional.get("test_kind") != "functional":
         raise ValueError("Invalid functional plan structure")
-    if functional["schema_version"] == 2:
-        paths.require_current(functional)
-    keys = ("target_sha", "control_sha")
-    if functional["schema_version"] == 2:
-        keys += ("run_id", "run_attempt")
-    for key in keys:
+    paths.require_current(functional)
+    for key in ("target_sha", "control_sha", "run_id", "run_attempt"):
         if functional["identity"][key] != manifest["identity"].get(key):
             raise ValueError(f"Functional plan identity mismatch: {key}")
     return functional
@@ -849,7 +834,7 @@ def asset_report(
         for case in cases
     )
     return {
-        "schema_version": manifest.get("schema_version", 1),
+        "schema_version": 2,
         "identity": manifest["identity"],
         "location": location,
         "root": root_check,
@@ -876,9 +861,6 @@ def asset_report(
 
 def public_asset_report(report: dict) -> dict:
     """Publish checked facts without disclosing the physical asset root."""
-    if report.get("schema_version") != 2:
-        return report
-    report = json.loads(json.dumps(report))
     root = report["root"]["checked_path"]
     reference = paths.LOGICAL[report["location"]]
 
@@ -960,7 +942,6 @@ def main() -> None:
         default=Path(os.environ.get("PPU_CONTROL_ROOT", Path(__file__).resolve().parents[2])),
     )
     parser.add_argument("--output", type=Path, default=Path(".ppu-ci"))
-    parser.add_argument("--assets-root", type=Path)
     parser.add_argument("--location", choices=("cpu", "pod"), default="cpu")
     parser.add_argument("--case-id")
     args = parser.parse_args()
@@ -969,10 +950,7 @@ def main() -> None:
         return
     if args.command == "assets":
         manifest = load_manifest(args.output / "manifest.json")
-        paths.require_current(manifest)
         trusted_root = paths.asset_root(manifest, args.location)
-        if args.assets_root is not None and args.assets_root != trusted_root:
-            raise ValueError("Asset CLI root differs from trusted configuration")
         report = asset_report(manifest, trusted_root, location=args.location, case_id=args.case_id)
         write_asset_report(report, args.output)
         raise SystemExit(0 if report["ok"] else 1)

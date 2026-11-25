@@ -256,9 +256,7 @@ def check_compiler(manifest: dict) -> dict:
     """Import the config in a fresh interpreter to verify the environment switch takes
     effect; no kernels or compile pools.
     """
-    if "compiler_environment" not in manifest["config"]:
-        return {}
-    settings = manifest["config"]["compiler_environment"]
+    settings = manifest["config"].get("compiler_environment")
     if (
         manifest.get("test_kind") != "functional"
         or manifest["config"].get("functional_mode") != "regression"
