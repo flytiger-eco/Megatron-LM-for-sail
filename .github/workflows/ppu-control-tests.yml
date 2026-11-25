@@ -33,3 +33,74 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r .github/docker/control-requirements.txt transformers==4.57.3 tokenizers==0.22.2 uv==0.13.0
       - run: python -m pytest -q -o addopts= .github/scripts/tests
+  # Temporary validation on the existing development branch; removed after the run.
+  control-image:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/davidsophus/ppu-ci-thin-adapter'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci-control@${{ steps.control.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: control
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: control
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f
+        with:
+          context: control/.github/docker
+          file: control/.github/docker/Dockerfile.ppu-control
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci-control:cpu-check-${{ github.run_id }}-${{ github.run_attempt }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/flytiger-eco/Megatron-LM-for-sail
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=ppu-control
+          cache-to: type=gha,scope=ppu-control,mode=max
+  control-container:
+    needs: control-image
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, k8s-runner-group-cpu-flytiger]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ${{ needs.control-image.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Exercise existing configuration and report paths
+        run: |
+          python3 -m pip check
+          python3 -m pytest -q -o addopts= .github/scripts/tests/test_ppu_functional.py .github/scripts/tests/test_ppu_ci_export.py .github/scripts/tests/test_ppu_triggers.py
+      - name: Check SAIL orchestration prerequisites without launching workers
+        if: matrix.runner == 'k8s-runner-group-cpu-flytiger'
+        run: |
+          for tool in bash curl file git jq tar gzip ps timeout flock; do command -v "$tool"; done
+          /opt/bin/kubectl version --client
+          /opt/bin/kubectl auth can-i get pods --namespace '${{ vars.PPU_NAMESPACE || 'ppu-sched' }}'
+          test -w /wl_nas/devops
+          probe=$(mktemp -d /wl_nas/devops/ppu-control-${GITHUB_RUN_ID}.XXXXXX)
+          rmdir "$probe"
