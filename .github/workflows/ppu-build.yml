@@ -111,6 +111,7 @@ jobs:
     if: >-
       vars.PPU_CI_ENABLED == 'true' &&
       (contains(fromJSON('["refs/heads/main","refs/heads/dev"]'), github.ref) ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/davidsophus/ppu-ci-thin-adapter') ||
        (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
        (github.event_name == 'merge_group' && contains(fromJSON('["refs/heads/main","refs/heads/dev"]'), github.event.merge_group.base_ref))) &&
       !(github.event_name == 'pull_request_target' && github.event.action == 'edited' && !github.event.changes.base) &&
