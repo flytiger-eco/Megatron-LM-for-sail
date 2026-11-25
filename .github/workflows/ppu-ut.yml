@@ -29,7 +29,7 @@ on:
       control_sha:
         type: string
         required: true
-      control_digest:
+      control_image:
         type: string
         required: true
       environment_digest:
@@ -52,6 +52,10 @@ on:
         required: true
 permissions:
   contents: read
+  packages: read
+defaults:
+  run:
+    shell: bash
 jobs:
   test:
     if: ${{ !inputs.manual_pr || github.run_attempt == 1 }}
@@ -59,7 +63,10 @@ jobs:
     runs-on: k8s-runner-group-cpu-flytiger
     environment: ppu-ci
     container:
-      image: ghcr.io/actions/actions-runner:latest
+      image: ${{ inputs.control_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
     timeout-minutes: ${{ matrix.job_minutes }}
     strategy:
       fail-fast: false
@@ -71,15 +78,6 @@ jobs:
           ref: ${{ inputs.control_sha }}
           path: control
           persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          name: ${{ inputs.artifact_prefix }}ppu-control-environment
-          path: .ppu-control-export
-      - name: Verify and restore trusted control interpreter
-        run: >-
-          python3 -I control/.github/scripts/ppu_ci_container.py restore-control
-          --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
-          --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.artifact_prefix }}ppu-plan
@@ -139,7 +137,7 @@ jobs:
           PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
           PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
           EXPORT_SOURCE: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/unit/${{ matrix.id }}/
-        run: '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/test-100 --kind evidence'
+        run: 'python3 -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/test-100 --kind evidence'
       - name: Upload actual results, logs, and coverage for each rank
         uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-test-100.outcome == 'success' }}
@@ -161,21 +159,17 @@ jobs:
     needs: test
     if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.control_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.control_sha }}
           path: control
           persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          name: ${{ inputs.artifact_prefix }}ppu-control-environment
-          path: .ppu-control-export
-      - name: Verify and restore trusted control interpreter
-        run: >-
-          python3 -I control/.github/scripts/ppu_ci_container.py restore-control
-          --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
-          --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.artifact_prefix }}ppu-plan
@@ -188,13 +182,13 @@ jobs:
         env:
           PPU_ARTIFACT_PREFIX: ${{ inputs.artifact_prefix }}
           PPU_MATRIX_RESULT: ${{ needs.test.result }}
-        run: '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci.py summarize --results results'
+        run: 'python3 -I .ppu-ci/control/ppu_ci.py summarize --results results'
       - name: Export checked public evidence
         id: public-result-132
         if: ${{ always() && !cancelled() }}
         env:
           EXPORT_SOURCE: results/summary.json
-        run: '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/result-132 --kind evidence'
+        run: 'python3 -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/result-132 --kind evidence'
       - uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-result-132.outcome == 'success' }}
         with:

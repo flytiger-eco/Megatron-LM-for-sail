@@ -1,26 +1,5 @@
 # syntax=docker/dockerfile:1.7
-ARG CONTROL_IMAGE=python:3.12-slim-bookworm
 ARG PPU_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
-
-FROM ${CONTROL_IMAGE} AS control
-USER root
-SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
-ENV PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
-    PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL="" PIP_FIND_LINKS="" \
-    PIP_NO_INPUT=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
-    DEBIAN_FRONTEND=noninteractive
-COPY docker/control-requirements.txt /build/control-requirements.txt
-COPY docker/export_environment.py /build/export_environment.py
-# The slim base retains _tkinter but excludes its Tcl/Tk runtime dependency closure.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libtk8.6 \
-    && python -c 'import _tkinter' \
-    && python -m pip install --index-url "$PIP_INDEX_URL" --report /build/control-install.json \
-        -r /build/control-requirements.txt \
-    && python -m pip check \
-    && python /build/export_environment.py control
-FROM scratch AS control-export
-COPY --from=control /exports/ /
 
 FROM ${PPU_IMAGE} AS dependencies
 USER root

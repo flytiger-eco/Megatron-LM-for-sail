@@ -62,7 +62,8 @@ flowchart TD
 依赖来自被测 `pyproject.toml` 的 project/test/training 配置及 SAIL 原生包约束，
 当前不直接消费 NV `uv.lock`。安装与源码编译在镜像构建阶段完成，Pod 内不现场安装依赖。
 Build 统一检查依赖和 UT tokenizer 缓存；各 UT bucket 验证同一镜像、数据交付及设备可见性后运行。
-运行环境只接受镜像交付；CPU 控制解释器仍通过独立归档分发。
+CPU 控制环境由 `Dockerfile.ppu-control` 构建，经 Docker 官方 build-push action 发布；
+配置、调度和汇总 jobs 按 digest 使用同一控制镜像，不再分发或解压解释器归档。
 预检查确认依赖版本、导入、launcher 和平台后端；checkpoint、Apex 等上游内部 API 的
 调用兼容性由原始 UT/FT 验证，适配层不再解析其内部方法签名或维护实现位置映射。
 

@@ -29,7 +29,7 @@ on:
       control_sha:
         type: string
         required: true
-      control_digest:
+      control_image:
         type: string
         required: true
       environment_digest:
@@ -43,6 +43,10 @@ on:
         required: true
 permissions:
   contents: read
+  packages: read
+defaults:
+  run:
+    shell: bash
 jobs:
   test:
     name: ${{ matrix.name }}
@@ -52,8 +56,12 @@ jobs:
       contents: read
       pull-requests: read
       actions: read
+      packages: read
     container:
-      image: ghcr.io/actions/actions-runner:latest
+      image: ${{ inputs.control_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
     timeout-minutes: ${{ matrix.job_minutes }}
     strategy:
       fail-fast: false
@@ -65,15 +73,6 @@ jobs:
           ref: ${{ inputs.control_sha }}
           path: control
           persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          name: ${{ inputs.artifact_prefix }}ppu-control-environment
-          path: .ppu-control-export
-      - name: Verify and restore isolated public evidence exporter
-        run: >-
-          python3 -I control/.github/scripts/ppu_ci_container.py restore-control
-          --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
-          --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.artifact_prefix }}ppu-plan
@@ -146,7 +145,7 @@ jobs:
           RESULT_DIR: .ppu-action
         run: |
           mkdir -p "$RESULT_DIR"
-          ACTION_OUTPUTS=$("$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --action-outputs)
+          ACTION_OUTPUTS=$(python3 -I .ppu-ci/control/ppu_ci_export.py --action-outputs)
           printf '{"requested_at":%s,"completed_at":%s,"action_outcome":"%s","action_status":"%s","outputs":%s}\n' \
             "${REQUESTED_AT:-0}" "$(date +%s)" "$ACTION_OUTCOME" "$ACTION_STATUS" "$ACTION_OUTPUTS" > "$RESULT_DIR/action-timing.json"
       - name: Export checked public evidence
@@ -160,7 +159,7 @@ jobs:
           PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
           EXPORT_SOURCE: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
         run: >-
-          "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py
+          python3 -I .ppu-ci/control/ppu_ci_export.py
           --source "$EXPORT_SOURCE" --destination .ppu-public/test-152 --kind evidence --overlay .ppu-action
       - name: Upload declared reports, actual values and text logs
         uses: actions/upload-artifact@v4
@@ -183,6 +182,11 @@ jobs:
     needs: test
     if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.control_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -190,15 +194,6 @@ jobs:
           ref: ${{ inputs.control_sha }}
           path: control
           persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          name: ${{ inputs.artifact_prefix }}ppu-control-environment
-          path: .ppu-control-export
-      - name: Restore the result summary environment
-        run: >-
-          python3 -I control/.github/scripts/ppu_ci_container.py restore-control
-          --artifact .ppu-control-export --digest '${{ inputs.control_digest }}'
-          --control-sha '${{ inputs.control_sha }}' --destination "$RUNNER_TEMP/ppu-control-runtime"
       - uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.artifact_prefix }}ppu-plan
@@ -211,7 +206,7 @@ jobs:
         env:
           PPU_ARTIFACT_PREFIX: ${{ inputs.artifact_prefix }}
         run: |
-          "$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_functional_results.py \
+          python3 -I .ppu-ci/control/ppu_functional_results.py \
             --manifest .ppu-ci/manifest.json --results results
       - name: Require successful execution and artifact upload for every matrix job
         if: ${{ always() && !cancelled() }}
@@ -223,7 +218,7 @@ jobs:
         if: ${{ always() && !cancelled() }}
         env:
           EXPORT_SOURCE: results/summary.json
-        run: '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/result-208 --kind evidence'
+        run: 'python3 -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/result-208 --kind evidence'
       - uses: actions/upload-artifact@v4
         if: ${{ always() && steps.public-result-208.outcome == 'success' }}
         with:

@@ -944,8 +944,7 @@ def test_bundle_workflow_digest_and_run_scoping():
         if step.get("uses") == "actions/download-artifact@v4"
     ]
     assert downloads == [
-        "${{ inputs.artifact_prefix }}" + name
-        for name in ["ppu-control-environment", "ppu-plan", "ppu-runtime-environment"]
+        "${{ inputs.artifact_prefix }}" + name for name in ["ppu-plan", "ppu-runtime-environment"]
     ]
     action = next(step for step in ut["jobs"]["test"]["steps"] if step.get("id") == "ppu")
     assert (

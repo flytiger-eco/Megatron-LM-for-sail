@@ -3,7 +3,9 @@ on:
   push:
     branches: [main, dev]
     paths:
-      - '.github/docker/**'
+      - '.github/docker/Dockerfile.ppu-ci'
+      - '.github/docker/Dockerfile.ppu-ci.dockerignore'
+      - '.github/docker/export_environment.py'
       - '.github/actions/ppu-build-cache/**'
       - '.github/scripts/ppu_ci_container.py'
       - '.github/workflows/ppu-populate-build-cache.yml'
@@ -37,7 +39,7 @@ jobs:
       - name: Resolve dependency inputs and immutable base image
         id: identity
         run: >-
-          python3 -I control/.github/scripts/ppu_ci_container.py fingerprint --kind runtime
+          python3 -I control/.github/scripts/ppu_ci_container.py fingerprint
           --control-root control --control-sha '${{ github.sha }}'
           --source-root control --target-sha '${{ github.sha }}'
       - name: Login to GHCR

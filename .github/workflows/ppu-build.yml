@@ -212,8 +212,9 @@ jobs:
       contents: read
       pull-requests: read
       actions: read
+      packages: write
     outputs:
-      control_digest: ${{ steps.control.outputs.environment_digest }}
+      control_image: ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci-control@${{ steps.control.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -230,32 +231,27 @@ jobs:
         run: python3 -I control/.github/scripts/ppu_pr_authorize.py guard
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
-      - name: Check CPU builder and resolve immutable control image
-        id: identity
-        run: >-
-          python3 -I control/.github/scripts/ppu_ci_container.py fingerprint --kind control
-          --control-root control --control-sha '${{ needs.authorize.outputs.control_sha }}'
-      - uses: actions/cache/restore@v4
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
-          path: ${{ runner.temp }}/ppu-control-cache
-          key: ppu-control-linux-amd64-${{ steps.identity.outputs.cache_key }}
-      - name: Build control environment from trusted Dockerfile
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build the trusted CPU control image
         id: control
-        run: >-
-          python3 -I control/.github/scripts/ppu_ci_container.py build --kind control
-          --control-root control --control-sha '${{ needs.authorize.outputs.control_sha }}'
-          --image-digest '${{ steps.identity.outputs.image_digest }}'
-          --output "$RUNNER_TEMP/ppu-control-export" --cache-root "$RUNNER_TEMP/ppu-control-cache"
-      - uses: actions/cache/save@v4
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0, matching upstream
         with:
-          path: ${{ runner.temp }}/ppu-control-cache
-          key: ppu-control-linux-amd64-${{ steps.identity.outputs.cache_key }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ inputs.artifact_prefix }}ppu-control-environment
-          path: ${{ runner.temp }}/ppu-control-export/
-          if-no-files-found: error
-          retention-days: 7
+          context: control/.github/docker
+          file: control/.github/docker/Dockerfile.ppu-control
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci-control:run-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.authorize.outputs.control_sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/flytiger-eco/Megatron-LM-for-sail
+            org.opencontainers.image.revision=${{ needs.authorize.outputs.control_sha }}
+          cache-from: type=gha,scope=ppu-control
+          cache-to: type=gha,scope=ppu-control,mode=max
   execute:
     needs: [authorize, pr-pending, control-environment]
     if: >-
@@ -286,7 +282,7 @@ jobs:
       control_sha: ${{ needs.authorize.outputs.control_sha }}
       manual_pr: ${{ needs.authorize.outputs.manual_pr == 'true' }}
       request_inputs: ${{ toJSON(inputs) }}
-      control_digest: ${{ needs.control-environment.outputs.control_digest }}
+      control_image: ${{ needs.control-environment.outputs.control_image }}
   pr-result:
     needs: [authorize, pr-pending, execute]
     if: >-

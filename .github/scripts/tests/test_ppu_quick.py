@@ -799,10 +799,7 @@ def test_workflow_trust_and_resource_boundaries():
                     assert step["with"]["persist-credentials"] is False
     text = (ROOT / ".github/workflows/ppu-ut.yml").read_text()
     assert 'bash "$PPU_CONTROL_DIR/ppu_ci_run.sh"' in text
-    assert (
-        '"$RUNNER_TEMP/ppu-control-runtime/bin/python" -I .ppu-ci/control/ppu_ci.py summarize'
-        in text
-    )
+    assert 'python3 -I .ppu-ci/control/ppu_ci.py summarize' in text
     build_script = (SCRIPTS / "ppu_ci_build.sh").read_text()
     dockerfile = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
     assert 'install -m 0644 /build/control/ppu_pytest_policy.py' in dockerfile

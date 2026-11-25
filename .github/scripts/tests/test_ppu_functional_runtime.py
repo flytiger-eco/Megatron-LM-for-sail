@@ -565,7 +565,6 @@ chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
             for name in ("ppu_ci_export.py", "ppu_ci_paths.py"):
                 (local_control / name).write_bytes((SCRIPTS / name).read_bytes())
             local_result = tmp_path / ".ppu-action"
-            (tmp_path / "ppu-control-runtime").symlink_to(Path(sys.executable).parent.parent)
             subprocess.run(
                 ["bash", "-euo", "pipefail", "-c", step["run"]],
                 cwd=tmp_path,

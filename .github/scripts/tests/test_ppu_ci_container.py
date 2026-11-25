@@ -1,13 +1,11 @@
-"""CPU-only regression gates for Dockerfile construction and authenticated restoration."""
+"""CPU regression gates for Dockerfile construction and image handoff."""
 
 import importlib.util
-import io
 import json
 import os
 import shutil
 import subprocess
 import sys
-import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,20 +31,6 @@ TARGET = 'b' * 40
 PINNED = container.PPU_IMAGE.rsplit(':', 1)[0] + '@sha256:' + 'c' * 64
 PUBLISHED = container.GHCR_IMAGE + '@sha256:' + 'e' * 64
 LOCAL_ID = 'sha256:' + 'f' * 64
-
-
-def archive(path, rows):
-    with tarfile.open(path, 'w:gz') as stream:
-        for name, content, kind in rows:
-            member = tarfile.TarInfo(name)
-            member.mode, member.mtime = 0o6755, 1
-            member.type = kind
-            if kind == tarfile.REGTYPE:
-                member.size = len(content)
-                stream.addfile(member, io.BytesIO(content))
-            else:
-                member.linkname = content.decode()
-                stream.addfile(member)
 
 
 def runtime_export(root, *, control=CONTROL, target=TARGET):
@@ -116,43 +100,6 @@ def image_args(root, trusted, tmp_path):
     )
 
 
-@pytest.mark.parametrize(
-    'name,kind,content',
-    [
-        ('../escape', tarfile.REGTYPE, b'x'),
-        ('/absolute', tarfile.REGTYPE, b'x'),
-        ('a/../../escape', tarfile.REGTYPE, b'x'),
-        ('a\\escape', tarfile.REGTYPE, b'x'),
-        ('a\nfile', tarfile.REGTYPE, b'x'),
-        ('a', tarfile.SYMTYPE, b'../escape'),
-        ('a', tarfile.LNKTYPE, b'../escape'),
-        ('a', tarfile.CHRTYPE, b''),
-        ('a', tarfile.FIFOTYPE, b''),
-    ],
-)
-def test_archive_rejects_escaping_and_special_members(tmp_path, name, kind, content):
-    path, destination = tmp_path / 'bad.tar.gz', tmp_path / 'restore'
-    archive(path, [(name, content, kind)])
-    with pytest.raises(container.ValidationError):
-        container.extract_archive(path, destination)
-    assert not destination.exists()
-
-
-@pytest.mark.parametrize(
-    'rows',
-    [
-        [('a', b'one', tarfile.REGTYPE), ('a', b'two', tarfile.REGTYPE)],
-        [('a/b', b'x', tarfile.REGTYPE), ('a', b'x', tarfile.REGTYPE)],
-    ],
-)
-def test_archive_validates_all_members_before_writes(tmp_path, rows):
-    path, destination = tmp_path / 'bad.tar.gz', tmp_path / 'restore'
-    archive(path, rows)
-    with pytest.raises(container.ValidationError):
-        container.extract_archive(path, destination)
-    assert not destination.exists()
-
-
 @pytest.fixture
 def build_inputs(tmp_path, monkeypatch):
     control, source = tmp_path / 'control', tmp_path / 'source'
@@ -171,7 +118,6 @@ def build_inputs(tmp_path, monkeypatch):
     tracked = ''.join(f'.github/scripts/{path.name}\0' for path in scripts.glob('*.py'))
     monkeypatch.setattr(container, 'command', lambda *args, **kwargs: tracked)
     return SimpleNamespace(
-        kind='runtime',
         mode='build-image',
         local_image='ppu-ci-runtime:run-12-1',
         control_root=control,
@@ -180,7 +126,6 @@ def build_inputs(tmp_path, monkeypatch):
         target_sha=TARGET,
         image_digest=PINNED,
         output=tmp_path / 'export',
-        cache_root=tmp_path / 'cache',
     )
 
 
@@ -205,7 +150,7 @@ def test_cache_is_dependency_based_but_build_inputs_bind_full_identities(build_i
 
 def assert_build_arguments(argv, args):
     expected = [
-        f'{"PPU_IMAGE" if args.kind == "runtime" else "CONTROL_IMAGE"}={args.image_digest}',
+        f'PPU_IMAGE={args.image_digest}',
         f'TARGET_SHA={args.target_sha or ""}',
         f'CONTROL_SHA={args.control_sha}',
     ]
@@ -742,14 +687,14 @@ def test_control_requirements_do_not_invalidate_runtime_dependencies(build_input
     args = build_inputs
     before = container.build_identity(args)
     requirements = args.control_root / '.github/docker/control-requirements.txt'
-    requirements.write_text(requirements.read_text() + '\n# control-only change\n')
+    requirements.write_text('# control-only change\n')
     after = container.build_identity(args)
-    assert before[2] == after[2] and before[3] != after[3]
+    assert before == after
 
 
 def test_cache_population_never_compiles_or_executes_target_source(build_inputs, monkeypatch):
     args = build_inputs
-    args.mode, args.cache_root = 'build-cache', None
+    args.mode = 'build-cache'
     args.cache_from = container.GHCR_IMAGE + ':cache-main-runtime-amd64-baseline'
     args.cache_to = container.GHCR_IMAGE + ':cache-main-runtime-amd64-build-' + 'a' * 64
     calls = []
@@ -789,7 +734,7 @@ def test_cache_population_never_compiles_or_executes_target_source(build_inputs,
 )
 def test_registry_cache_rejects_invalid_destinations_before_build(build_inputs, monkeypatch, ref):
     args = build_inputs
-    args.cache_root, args.cache_to = None, ref
+    args.cache_to = ref
     monkeypatch.setattr(
         container, 'build_identity', lambda *a: pytest.fail('invalid cache reached build')
     )

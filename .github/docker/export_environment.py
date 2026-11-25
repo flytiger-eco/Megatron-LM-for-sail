@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import sys
 import sysconfig
-import tarfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -151,16 +150,6 @@ def libraries(files, directory):
         pending = unresolved
 
 
-def archive(root, name, paths):
-    EXPORT.mkdir(exist_ok=True)
-    with tarfile.open(EXPORT / name, 'w:gz') as stream:
-        for path in paths:
-            for item in sorted([path, *path.rglob('*')]) if path.is_dir() else [path]:
-                if item.is_symlink() or not (item.is_file() or item.is_dir()):
-                    raise RuntimeError('Export requires materialized files and directories')
-                stream.add(item, arcname=item.relative_to(root).as_posix(), recursive=False)
-
-
 def isolate():
     base = Path(sysconfig.get_path('purelib'))
     packages = {item.metadata['Name']: item.version for item in md.distributions()}
@@ -193,26 +182,6 @@ def isolate():
             )
             script.chmod(0o755)
     Path('/build/base-packages.json').write_text(json.dumps(packages, sort_keys=True))
-
-
-def control():
-    verify_reports(['/build/control-install.json'])
-    root = Path('/build/control-runtime')
-    copy('/usr/local', root)
-    lib = root / 'lib/ppu-system'
-    libraries([root / 'bin/python3.12', *root.rglob('*.so'), *root.rglob('*.so.*')], lib)
-    launcher = root / 'bin/python'
-    if launcher.exists():
-        launcher.unlink()
-    launcher.write_text('''#!/bin/bash
-set -euo pipefail
-prefix="$(cd -- "$(dirname -- "$0")/.." && pwd)"
-export LD_LIBRARY_PATH="$prefix/lib/ppu-system:$prefix/lib"
-exec "$prefix/lib/ppu-system/ld-linux-x86-64.so.2" --library-path "$LD_LIBRARY_PATH" "$prefix/bin/python3.12" "$@"
-''')
-    launcher.chmod(0o755)
-    archive(root, 'control-runtime.tar.gz', list(root.iterdir()))
-    copy('/build/control-install.json', EXPORT / 'control-package-install.json')
 
 
 def runtime():
@@ -267,4 +236,8 @@ def runtime():
 
 
 if __name__ == '__main__':
-    {'isolate': isolate, 'control': control, 'runtime-image': runtime}[sys.argv[1]]()
+    {
+        'isolate': isolate,
+        'control': lambda: verify_reports(['/build/control-install.json']),
+        'runtime-image': runtime,
+    }[sys.argv[1]]()

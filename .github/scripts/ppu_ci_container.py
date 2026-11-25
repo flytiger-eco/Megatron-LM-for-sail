@@ -1,4 +1,4 @@
-"""Trusted Dockerfile build orchestration and fail-closed environment restoration."""
+"""Build, publish and verify the PPU execution image."""
 
 import argparse
 import hashlib
@@ -9,7 +9,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 from pathlib import Path, PurePosixPath
@@ -17,15 +16,9 @@ from pathlib import Path, PurePosixPath
 GHCR_IMAGE = 'ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci'
 PPU_IMAGE = 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001'
 SOURCE_ROOT = Path('/opt/ppu-ci-source')
-CONTROL_IMAGE = 'python:3.12-slim-bookworm'
 SHA = re.compile(r'[0-9a-f]{40}')
 DIGEST = re.compile(r'[0-9a-f]{64}')
-DOCKER_FILES = (
-    'Dockerfile.ppu-ci',
-    'Dockerfile.ppu-ci.dockerignore',
-    'control-requirements.txt',
-    'export_environment.py',
-)
+DOCKER_FILES = ('Dockerfile.ppu-ci', 'Dockerfile.ppu-ci.dockerignore', 'export_environment.py')
 
 
 class ValidationError(ValueError):
@@ -79,7 +72,7 @@ def inventory(directory, exclude=('docker-build.json',)):
     return files
 
 
-def verify_export(directory, trusted_digest, control_sha, target_sha=None, *, subset=False):
+def verify_export(directory, trusted_digest, control_sha, target_sha, *, subset=False):
     directory = no_links(directory)
     require(DIGEST.fullmatch(trusted_digest or ''), 'Missing trusted environment digest')
     path = directory / 'docker-build.json'
@@ -88,12 +81,10 @@ def verify_export(directory, trusted_digest, control_sha, target_sha=None, *, su
         'Environment metadata does not match the trusted job digest',
     )
     metadata = json.loads(path.read_text())
-    kind = 'runtime' if target_sha is not None else 'control'
-    schema = 2 if kind == 'runtime' else 1
     require(
         type(metadata.get('schema_version')) is int
-        and metadata['schema_version'] == schema
-        and metadata.get('kind') == kind,
+        and metadata['schema_version'] == 2
+        and metadata.get('kind') == 'runtime',
         'Unsupported environment build metadata',
     )
     require(
@@ -101,10 +92,10 @@ def verify_export(directory, trusted_digest, control_sha, target_sha=None, *, su
         'Environment control identity mismatch',
     )
     require(
-        (target_sha is None or SHA.fullmatch(target_sha)) and metadata['target_sha'] == target_sha,
+        SHA.fullmatch(target_sha or '') and metadata['target_sha'] == target_sha,
         'Environment target identity mismatch',
     )
-    image = PPU_IMAGE if kind == 'runtime' else CONTROL_IMAGE
+    image = PPU_IMAGE
     repository = image.rsplit(':', 1)[0]
     require(
         metadata['image'] == image
@@ -121,37 +112,30 @@ def verify_export(directory, trusted_digest, control_sha, target_sha=None, *, su
             path.is_file() and expected == {'size': path.stat().st_size, 'sha256': digest(path)},
             'Missing or corrupted environment member',
         )
-    if schema == 2:
-        require(
-            'environment.tar.gz' not in files
-            and not no_links(directory / 'environment.tar.gz').exists(),
-            'Image evidence must not contain a software environment archive',
-        )
+    require(
+        'environment.tar.gz' not in files
+        and not no_links(directory / 'environment.tar.gz').exists(),
+        'Image evidence must not contain a software environment archive',
+    )
     if not subset:
-        exclude = (
-            ('docker-build.json', 'runtime-image.json') if schema == 2 else ('docker-build.json',)
-        )
+        exclude = ('docker-build.json', 'runtime-image.json')
         require(
             inventory(directory, exclude=exclude) == files, 'Unexpected environment export members'
         )
     required = (
-        (
-            'functional-package-install.json',
-            'constraints.txt',
-            'installed-packages.json',
-            'compatibility-patches.json',
-            'base-packages.json',
-            'vendor-bytes.json',
-            'ppu-requirements.txt',
-            'test-requirements.txt',
-            'packaging-install.json',
-            'build-tools-install.json',
-            'source-package-install.json',
-            'functional-tools/yq',
-            'functional-tools/envsubst',
-        )
-        if kind == 'runtime'
-        else ('control-runtime.tar.gz', 'control-package-install.json')
+        'functional-package-install.json',
+        'constraints.txt',
+        'installed-packages.json',
+        'compatibility-patches.json',
+        'base-packages.json',
+        'vendor-bytes.json',
+        'ppu-requirements.txt',
+        'test-requirements.txt',
+        'packaging-install.json',
+        'build-tools-install.json',
+        'source-package-install.json',
+        'functional-tools/yq',
+        'functional-tools/envsubst',
     )
     require(
         all(files.get(name, {}).get('size', 0) > 0 for name in required),
@@ -159,58 +143,6 @@ def verify_export(directory, trusted_digest, control_sha, target_sha=None, *, su
     )
     require(DIGEST.fullmatch(metadata.get('inputs_sha256', '')), 'Missing build inputs digest')
     return metadata
-
-
-def extract_archive(archive, destination):
-    destination = no_links(destination)
-    archive = no_links(archive)
-    with tarfile.open(archive, 'r:gz') as stream:
-        members = stream.getmembers()
-        require(0 < len(members) <= 500000, 'Invalid environment archive size')
-        names, regular, total = set(), set(), 0
-        for member in members:
-            name = relative(member.name).as_posix()
-            require(
-                name not in names and (member.isdir() or member.isfile()) and not member.issparse(),
-                'Unsupported or repeated archive member',
-            )
-            names.add(name)
-            if member.isfile():
-                regular.add(name)
-            require(member.size >= 0, 'Invalid archive member size')
-            target = no_links(destination / name)
-            require(target.is_relative_to(destination), 'Archive member escapes the restore root')
-            if target.exists():
-                require(
-                    target.is_dir() and member.isdir(),
-                    'Refusing to overwrite an environment member',
-                )
-            total += member.size
-        require(
-            not any(
-                str(parent) in regular for name in names for parent in PurePosixPath(name).parents
-            ),
-            'Archive file conflicts with a parent directory',
-        )
-        require(total <= 64 * 1024**3, 'Environment archive exceeds the size limit')
-        ancestor = destination
-        while not ancestor.exists():
-            ancestor = ancestor.parent
-        require(
-            shutil.disk_usage(ancestor).free > total + 256 * 1024**2,
-            'Insufficient environment restore space',
-        )
-        destination.mkdir(parents=True, exist_ok=True)
-        for member in members:
-            target = destination / member.name
-            if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
-            else:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with stream.extractfile(member) as source, target.open('xb') as output:
-                    shutil.copyfileobj(source, output)
-                target.chmod(member.mode & 0o755)
-                os.utime(target, (member.mtime, member.mtime))
 
 
 def client_env():
@@ -388,7 +320,7 @@ def build_identity(args):
     root = no_links(args.control_root)
     checked_git(root, args.control_sha)
     preflight(root)
-    image = PPU_IMAGE if args.kind == 'runtime' else CONTROL_IMAGE
+    image = PPU_IMAGE
     pinned = getattr(args, 'image_digest', None)
     if not pinned:
         command(
@@ -408,18 +340,12 @@ def build_identity(args):
         path = no_links(root / '.github/docker' / name)
         require(path.is_file(), 'Trusted Dockerfile build input is missing')
         inputs[name] = digest(path)
-    if args.kind == 'runtime':
-        source = no_links(args.source_root)
-        checked_git(source, args.target_sha)
-        inputs['pyproject.toml'] = digest(no_links(source / 'pyproject.toml'))
+    source = no_links(args.source_root)
+    checked_git(source, args.target_sha)
+    inputs['pyproject.toml'] = digest(no_links(source / 'pyproject.toml'))
     # Only inputs consumed by the dependency stage belong in its cache key.
     # Source/control SHAs and orchestration helpers still bind the final export.
-    dependency_inputs = dict(inputs)
-    if args.kind == 'runtime':
-        dependency_inputs.pop('control-requirements.txt')
-    dependency_key = hashlib.sha256(
-        json.dumps(dependency_inputs, sort_keys=True).encode()
-    ).hexdigest()
+    dependency_key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
     inputs['ppu_ci_container.py'] = digest(no_links(root / '.github/scripts/ppu_ci_container.py'))
     for path in trusted_controls(root):
         inputs[path.name] = digest(path)
@@ -504,11 +430,7 @@ def readable_probe_export(output, context):
 
 
 def build(args):
-    image_mode = getattr(args, 'mode', '') == 'build-image'
     cache_only = getattr(args, 'mode', '') == 'build-cache'
-    require(
-        args.kind == 'control' or image_mode or cache_only, 'Runtime builds require build-image'
-    )
     cache_from, cache_to = getattr(args, 'cache_from', ''), getattr(args, 'cache_to', '')
     for ref in (cache_from, cache_to):
         require(
@@ -516,10 +438,6 @@ def build(args):
             or re.fullmatch(re.escape(GHCR_IMAGE) + r':cache-[a-z0-9][a-z0-9_.-]{0,121}', ref),
             'Invalid dependency cache registry reference',
         )
-    require(
-        not (args.cache_root and (cache_from or cache_to)),
-        'Choose local or registry dependency cache',
-    )
     require(not cache_only or cache_to, 'Cache population requires a registry destination')
     root = no_links(args.control_root)
     image, pinned, _, inputs = build_identity(args)
@@ -534,12 +452,11 @@ def build(args):
             require(source.is_file(), 'Trusted Dockerfile build input is missing')
             shutil.copyfile(source, docker / name)
             inputs[name] = digest(source)
-        if args.kind == 'runtime':
-            source = no_links(args.source_root)
-            checked_git(source, args.target_sha)
-            shutil.copyfile(source / 'pyproject.toml', context / 'pyproject.toml')
-            inputs['pyproject.toml'] = digest(context / 'pyproject.toml')
-        if args.kind == 'runtime' and not cache_only:
+        source = no_links(args.source_root)
+        checked_git(source, args.target_sha)
+        shutil.copyfile(source / 'pyproject.toml', context / 'pyproject.toml')
+        inputs['pyproject.toml'] = digest(context / 'pyproject.toml')
+        if not cache_only:
             (context / 'source').mkdir()
             names = command(
                 ['git', '-C', str(source), 'ls-files', '-z'],
@@ -552,7 +469,6 @@ def build(args):
                 shutil.copyfile(original, control / original.name)
                 inputs[original.name] = digest(original)
         key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
-        cache = no_links(args.cache_root) if args.cache_root else None
         common = [
             'docker',
             'buildx',
@@ -564,58 +480,44 @@ def build(args):
             '--file',
             str(docker / 'Dockerfile.ppu-ci'),
             '--build-arg',
-            f'{"PPU_IMAGE" if args.kind == "runtime" else "CONTROL_IMAGE"}={pinned}',
+            f'PPU_IMAGE={pinned}',
             '--build-arg',
-            f'TARGET_SHA={args.target_sha or ""}',
+            f'TARGET_SHA={args.target_sha}',
             '--build-arg',
             f'CONTROL_SHA={args.control_sha}',
         ]
-        if image_mode:
+        if not cache_only:
             require(
                 re.fullmatch(r'ppu-ci-runtime:run-[0-9]+-[0-9]+', args.local_image),
                 'Invalid local execution image tag',
             )
-        if cache and (cache / 'index.json').is_file():
-            common += ['--cache-from', f'type=local,src={cache}']
         if cache_from:
             common += ['--cache-from', f'type=registry,ref={cache_from}']
-        if cache or cache_to:
-            dependency = 'dependencies' if args.kind == 'runtime' else 'control'
-            destination = (
-                f'type=registry,ref={cache_to},mode=max'
-                if cache_to
-                else f'type=local,dest={cache},mode=max'
-            )
-            print(
-                f'Building {args.kind} dependency cache (source compilation is a separate stage)',
-                flush=True,
-            )
+        if cache_to:
             command(
-                common + ['--target', dependency, '--cache-to', destination, str(context)],
-                failure=f'Dockerfile {args.kind} dependency/cache build failed',
+                common
+                + [
+                    '--target',
+                    'dependencies',
+                    '--cache-to',
+                    f'type=registry,ref={cache_to},mode=max',
+                    str(context),
+                ],
+                failure='Dockerfile runtime dependency/cache build failed',
                 diagnostics=True,
             )
-            print(f'Published {args.kind} dependency cache', flush=True)
             if cache_only:
                 return
-            if cache:
-                common += ['--cache-from', f'type=local,src={cache}']
         started = time.time()
         command(
             common
-            + [
-                '--target',
-                args.kind + '-export',
-                '--output',
-                f'type=local,dest={output}',
-                str(context),
-            ],
-            failure=f'Dockerfile {args.kind} environment export build failed',
+            + ['--target', 'runtime-export', '--output', f'type=local,dest={output}', str(context)],
+            failure='Dockerfile runtime environment export build failed',
             diagnostics=True,
         )
         metadata = {
-            'schema_version': 2 if image_mode else 1,
-            'kind': args.kind,
+            'schema_version': 2,
+            'kind': 'runtime',
             'platform': 'linux/amd64',
             'control_sha': args.control_sha,
             'target_sha': args.target_sha,
@@ -632,78 +534,16 @@ def build(args):
         # A root container without DAC capabilities cannot read that bind mount.
         # Keep original evidence private and mount a readable temporary snapshot.
         probe_export = readable_probe_export(output, context)
-        if image_mode:
-            release = context / 'release'
-            release.mkdir()
-            shutil.copyfile(output / 'docker-build.json', release / 'docker-build.json')
-            command(
-                common
-                + ['--target', 'execution', '--load', '--tag', args.local_image, str(context)],
-                failure='Dockerfile execution image build failed',
-                diagnostics=True,
-            )
-            local_id = command(
-                ['docker', 'image', 'inspect', '--format', '{{.Id}}', args.local_image]
-            )
-            require(
-                re.fullmatch(r'sha256:[0-9a-f]{64}', local_id), 'Invalid local execution image ID'
-            )
-            command(
-                [
-                    'docker',
-                    'run',
-                    '--rm',
-                    '--network=none',
-                    '--platform',
-                    'linux/amd64',
-                    '--cap-drop=ALL',
-                    '--security-opt=no-new-privileges',
-                    '--mount',
-                    f'type=bind,source={probe_export},target=/exports,readonly',
-                    '--mount',
-                    f'type=bind,source={root / ".github/scripts"},target=/trusted,readonly',
-                    local_id,
-                    'python3',
-                    '-I',
-                    '/trusted/ppu_ci_container.py',
-                    'image-probe',
-                    '--artifact',
-                    '/exports',
-                    '--digest',
-                    sha,
-                    '--control-sha',
-                    args.control_sha,
-                    '--target-sha',
-                    args.target_sha,
-                    '--base-image-digest',
-                    pinned,
-                ],
-                failure='Dockerfile execution image offline probe failed',
-                diagnostics=True,
-            )
-            emit_outputs(environment_digest=sha, local_image_id=local_id, base_image_digest=pinned)
-            return
-        mounts = [
-            '--mount',
-            f'type=bind,source={probe_export},target=/exports,readonly',
-            '--mount',
-            f'type=bind,source={root / ".github/scripts"},target=/trusted,readonly',
-        ]
-        probe = [
-            'python3',
-            '-I',
-            '/trusted/ppu_ci_container.py',
-            'restore-control',
-            '--artifact',
-            '/exports',
-            '--digest',
-            sha,
-            '--control-sha',
-            args.control_sha,
-            '--destination',
-            '/tmp/ppu-control-runtime',
-        ]
-        started = time.monotonic()
+        release = context / 'release'
+        release.mkdir()
+        shutil.copyfile(output / 'docker-build.json', release / 'docker-build.json')
+        command(
+            common + ['--target', 'execution', '--load', '--tag', args.local_image, str(context)],
+            failure='Dockerfile execution image build failed',
+            diagnostics=True,
+        )
+        local_id = command(['docker', 'image', 'inspect', '--format', '{{.Id}}', args.local_image])
+        require(re.fullmatch(r'sha256:[0-9a-f]{64}', local_id), 'Invalid local execution image ID')
         command(
             [
                 'docker',
@@ -714,33 +554,30 @@ def build(args):
                 'linux/amd64',
                 '--cap-drop=ALL',
                 '--security-opt=no-new-privileges',
-                *mounts,
+                '--mount',
+                f'type=bind,source={probe_export},target=/exports,readonly',
+                '--mount',
+                f'type=bind,source={root / ".github/scripts"},target=/trusted,readonly',
+                local_id,
+                'python3',
+                '-I',
+                '/trusted/ppu_ci_container.py',
+                'image-probe',
+                '--artifact',
+                '/exports',
+                '--digest',
+                sha,
+                '--control-sha',
+                args.control_sha,
+                '--target-sha',
+                args.target_sha,
+                '--base-image-digest',
                 pinned,
-                *probe,
             ],
-            failure=f'Dockerfile {args.kind} fresh-base offline probe failed',
+            failure='Dockerfile execution image offline probe failed',
             diagnostics=True,
         )
-        metadata['offline_verification'] = {
-            'passed': True,
-            'network': 'none',
-            'device_validation': False,
-            'elapsed_seconds': round(time.monotonic() - started, 3),
-        }
-        (output / 'docker-build.json').write_text(json.dumps(metadata, sort_keys=True) + '\n')
-        sha = digest(output / 'docker-build.json')
-        print(
-            json.dumps(
-                {
-                    'kind': args.kind,
-                    'environment_digest': sha,
-                    'environment_bytes': sum(item['size'] for item in metadata['files'].values()),
-                }
-            )
-        )
-        if os.environ.get('GITHUB_OUTPUT'):
-            with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
-                stream.write(f'environment_digest={sha}\n')
+        emit_outputs(environment_digest=sha, local_image_id=local_id, base_image_digest=pinned)
 
 
 def emit_outputs(**values):
@@ -861,27 +698,6 @@ def image_probe(args):
     execution_checks(SOURCE_ROOT)
 
 
-def restore_control(args):
-    verify_export(args.artifact, args.digest, args.control_sha)
-    destination = no_links(args.destination)
-    require(not destination.exists(), 'Refusing to overwrite the control interpreter')
-    extract_archive(Path(args.artifact) / 'control-runtime.tar.gz', destination)
-    interpreter = destination / 'bin/python'
-    command(
-        [
-            str(interpreter),
-            '-I',
-            '-c',
-            'import sys, _tkinter, click, yaml, numpy, pydantic, pytest, google_crc32c; '
-            'from tensorboard.compat.proto.event_pb2 import Event; '
-            'assert sys.version_info[:2] == (3, 12); '
-            'assert Event.FromString(Event(step=1).SerializeToString()).step == 1',
-        ],
-        failure='Restored control interpreter import check failed',
-        diagnostics=True,
-    )
-
-
 def execution_checks(source):
     environment = client_env()
     environment.update(
@@ -936,33 +752,19 @@ def main():
     require(sys.version_info >= (3, 11), 'Environment bootstrap requires Python 3.11 or newer')
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='mode', required=True)
-    for mode in ('build', 'fingerprint', 'build-image', 'build-cache'):
+    for mode in ('fingerprint', 'build-image', 'build-cache'):
         create = sub.add_parser(mode)
-        if mode in ('build-image', 'build-cache'):
-            create.set_defaults(kind='runtime')
         if mode == 'build-image':
             create.add_argument('--local-image', required=True)
-        elif mode != 'build-cache':
-            create.add_argument(
-                '--kind',
-                choices=('control',) if mode == 'build' else ('control', 'runtime'),
-                required=True,
-            )
         create.add_argument('--control-root', type=Path, required=True)
         create.add_argument('--control-sha', required=True)
-        create.add_argument('--source-root', type=Path)
-        create.add_argument('--target-sha')
+        create.add_argument('--source-root', type=Path, required=True)
+        create.add_argument('--target-sha', required=True)
         create.add_argument('--image-digest')
-        if mode in ('build', 'build-image', 'build-cache'):
+        if mode in ('build-image', 'build-cache'):
             create.add_argument('--output', type=Path, required=mode != 'build-cache')
-            create.add_argument('--cache-root', type=Path)
             create.add_argument('--cache-from', default='')
             create.add_argument('--cache-to', default='')
-    restore = sub.add_parser('restore-control')
-    restore.add_argument('--artifact', type=Path, required=True)
-    restore.add_argument('--digest', required=True)
-    restore.add_argument('--control-sha', required=True)
-    restore.add_argument('--destination', type=Path, required=True)
     for mode in ('publish-image', 'verify-image', 'image-probe'):
         image = sub.add_parser(mode)
         image.add_argument('--artifact', type=Path, required=True)
@@ -980,14 +782,12 @@ def main():
             image.add_argument('--check-only', action='store_true')
     args = parser.parse_args()
     {
-        'build': build,
         'build-image': build,
         'build-cache': build,
         'publish-image': publish_image,
         'verify-image': verify_image,
         'image-probe': image_probe,
         'fingerprint': fingerprint,
-        'restore-control': restore_control,
     }[args.mode](args)
 
 
