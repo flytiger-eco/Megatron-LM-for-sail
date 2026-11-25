@@ -8,18 +8,10 @@ import pytest
 from test_ppu_ci_container import container
 from test_ppu_functional import ROOT, functional
 from test_ppu_functional_results import results
-from test_ppu_lifecycle import FakeGitHub
+from test_ppu_lifecycle import FakeGitHub, github
 from test_ppu_quick import BASE_SHA, CONTROL_SHA, MERGE_SHA, REPOSITORY, SHA, auth, context
 
 WORKFLOWS = ROOT / ".github/workflows"
-
-
-@pytest.fixture
-def github(monkeypatch):
-    monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
-    monkeypatch.setenv("GITHUB_RUN_ID", "123")
-    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
-    return FakeGitHub()
 
 
 def pr_event(github, action="opened", label=None):

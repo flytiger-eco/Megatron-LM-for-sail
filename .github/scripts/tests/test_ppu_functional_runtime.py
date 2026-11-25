@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 from test_ppu_functional import ROOT, SCRIPTS, functional
-from test_ppu_functional_results import envelope, evidence, pytest_inputs, results
+from test_ppu_functional_results import envelope, evidence, results, training_outputs
 
 runtime = functional.module_from_path(
     "ppu_functional_runtime", SCRIPTS / "ppu_functional_runtime.py"
@@ -53,48 +53,14 @@ class FakeRunner:
         config["MODEL_ARGS"]["--exit-interval"] = self.case["effective_train_iters"]
         (directory / "model_config.yaml").write_text(yaml.safe_dump(config))
         log.write_text(self.message if code else "Training completed")
-        first = directory / Path(self.case["golden_path"]).name
-        first.write_bytes((ROOT / self.case["golden_path"]).read_bytes())
-        for phase in range(1, results.phase_count(self.case) + 1):
-            tensorboard = directory / "1/tensorboard"
-            if results.phase_count(self.case) == 2:
-                tensorboard /= f"run_{phase}"
-            tensorboard.mkdir(parents=True)
-            (tensorboard / "events.out.tfevents.fixture").write_text("Mock event evidence")
-            barrier = directory / "barriers" / f"repeat_1_run_{phase}_status"
-            barrier.mkdir(parents=True)
-            (barrier / "node_0").write_text(str(code))
-            for rank in range(8):
-                logs = directory / "logs" / f"run-{phase}" / "attempt_0" / str(rank)
-                logs.mkdir(parents=True)
-                (logs / "stdout.log").write_text("Training")
-                (logs / "stderr.log").write_text("")
-            kind = "regular" if phase == 1 else "resume"
-            node = "test_regular_pipeline" if phase == 1 else "test_resume_checkpoint_pipeline"
-            node = f"test_pretraining_{kind}_pipeline.py::{node}"
-            if phase == 2:
-                first.with_name(first.stem + "_2nd.json").write_bytes(first.read_bytes())
-            runtime.write_json(
-                directory / f"pytest-{kind}.json",
-                {
-                    **results.identity_fields(
-                        self.manifest,
-                        self.case,
-                        int(env["PPU_FUNCTIONAL_ATTEMPT"]),
-                        int(env["PPU_FUNCTIONAL_REPEAT"]),
-                    ),
-                    "phase": kind,
-                    "inputs": pytest_inputs(self.case, directory, kind),
-                    "train_iters": self.case["effective_train_iters"],
-                    "approximate": self.case["approximate"],
-                    "complete": True,
-                    "exitstatus": 0,
-                    "duration_seconds": 0.01,
-                    "collection_errors": [],
-                    "collected": [node],
-                    "tests": {node: {stage: "passed" for stage in ("setup", "call", "teardown")}},
-                },
-            )
+        training_outputs(
+            self.manifest,
+            self.case,
+            directory,
+            int(env["PPU_FUNCTIONAL_ATTEMPT"]),
+            int(env["PPU_FUNCTIONAL_REPEAT"]),
+            code,
+        )
         return code
 
 

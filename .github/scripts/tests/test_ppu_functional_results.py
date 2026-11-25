@@ -124,16 +124,9 @@ def pytest_inputs(case, directory, phase):
     return {key: functional.sha256(path) for key, path in paths.items()}
 
 
-def successful_repeat(manifest, case, directory, attempt, repeat):
-    path = directory / f"attempt-{attempt}" / f"repeat-{repeat}"
-    path.mkdir(parents=True)
-    config = yaml.safe_load((ROOT / case["config_path"]).read_text())
-    config.pop("LAUNCHER", None)  # The synthetic BERT evidence uses M890 torchrun.
-    config.setdefault("ENV_VARS", {})["N_REPEAT"] = 1
-    config["MODEL_ARGS"]["--exit-interval"] = case["effective_train_iters"]
-    (path / "model_config.yaml").write_text(yaml.safe_dump(config))
+def training_outputs(manifest, case, path, attempt, repeat, exit_code=0):
+    """Shared mock training outputs; execution/status records are written by the caller."""
     (path / Path(case["golden_path"]).name).write_bytes((ROOT / case["golden_path"]).read_bytes())
-    (path / "driver.log").write_text("Training finished\n")
     for phase in range(1, results.phase_count(case) + 1):
         tensorboard = path / "1/tensorboard"
         if results.phase_count(case) == 2:
@@ -142,7 +135,7 @@ def successful_repeat(manifest, case, directory, attempt, repeat):
         (tensorboard / "events.out.tfevents.fixture").write_text("Mock event evidence")
         barrier = path / "barriers" / f"repeat_1_run_{phase}_status"
         barrier.mkdir(parents=True)
-        (barrier / "node_0").write_text("0\n")
+        (barrier / "node_0").write_text(str(exit_code))
         for rank in range(8):
             logs = path / "logs" / f"run-{phase}" / "attempt_0" / str(rank)
             logs.mkdir(parents=True)
@@ -152,17 +145,6 @@ def successful_repeat(manifest, case, directory, attempt, repeat):
         first = path / Path(case["golden_path"]).name
         first.with_name(f"{first.stem}_2nd.json").write_bytes(first.read_bytes())
     identity = results.identity_fields(manifest, case, attempt, repeat)
-    execution = {
-        **identity,
-        "duration_seconds": 1.0,
-        "exit_code": 0,
-        "cancelled": False,
-        "timed_out": False,
-        "runtime_config_sha256": functional.sha256(path / "model_config.yaml"),
-    }
-    if "compiler_environment" in manifest["config"]:
-        execution["compiler_environment"] = dict(manifest["config"]["compiler_environment"])
-    write_json(path / "execution.json", execution)
     phases = ["regular", "resume"] if results.phase_count(case) == 2 else ["regular"]
     for phase in phases:
         name = "test_regular_pipeline" if phase == "regular" else "test_resume_checkpoint_pipeline"
@@ -181,6 +163,30 @@ def successful_repeat(manifest, case, directory, attempt, repeat):
             "tests": {node: {"setup": "passed", "call": "passed", "teardown": "passed"}},
         }
         write_json(path / f"pytest-{phase}.json", report)
+
+
+def successful_repeat(manifest, case, directory, attempt, repeat):
+    path = directory / f"attempt-{attempt}" / f"repeat-{repeat}"
+    path.mkdir(parents=True)
+    config = yaml.safe_load((ROOT / case["config_path"]).read_text())
+    config.pop("LAUNCHER", None)  # The synthetic BERT evidence uses M890 torchrun.
+    config.setdefault("ENV_VARS", {})["N_REPEAT"] = 1
+    config["MODEL_ARGS"]["--exit-interval"] = case["effective_train_iters"]
+    (path / "model_config.yaml").write_text(yaml.safe_dump(config))
+    (path / "driver.log").write_text("Training finished\n")
+    training_outputs(manifest, case, path, attempt, repeat)
+    identity = results.identity_fields(manifest, case, attempt, repeat)
+    execution = {
+        **identity,
+        "duration_seconds": 1.0,
+        "exit_code": 0,
+        "cancelled": False,
+        "timed_out": False,
+        "runtime_config_sha256": functional.sha256(path / "model_config.yaml"),
+    }
+    if "compiler_environment" in manifest["config"]:
+        execution["compiler_environment"] = dict(manifest["config"]["compiler_environment"])
+    write_json(path / "execution.json", execution)
     return path
 
 

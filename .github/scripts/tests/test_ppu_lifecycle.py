@@ -466,3 +466,50 @@ def test_base_invalidation_requires_new_full_sha_dispatch(github, monkeypatch):
     monkeypatch.setenv("GITHUB_RUN_ID", "125")
     assert auth.execution_guard(current, github)
     assert auth.publish_status(previous, "success", "Late success", github) == "stale"
+
+
+@pytest.mark.parametrize("state", ["pending", "success", "failure"])
+def test_status_cli_updates_the_pr_head(github, tmp_path, monkeypatch, state):
+    result = pending(github)
+    (tmp_path / "authorization.json").write_text(json.dumps(result))
+    monkeypatch.setattr(auth, "github_api", github)
+    monkeypatch.setattr(
+        sys, "argv", ["ppu_pr_authorize.py", "status", "--output", str(tmp_path), "--state", state]
+    )
+    auth.main()
+    # FakeGitHub rejects writes to anything other than the current PR head.
+    assert github.statuses[0]["state"] == state
+    assert github.statuses[0]["target_url"] == auth.run_url("123")
+
+
+@pytest.mark.parametrize("decision", ["run", "cpu_only"])
+def test_status_rechecks_snapshot_immediately_before_write(github, decision):
+    result = pending(github)
+    result["decision"] = decision
+    reads = 0
+
+    def mutate(path):
+        nonlocal reads
+        if path == "pulls/7":
+            reads += 1
+            if reads == 2:
+                github.pull["draft"] = True
+
+    github.mutate = mutate
+    count = len(github.writes)
+    assert auth.publish_status(result, "success", "completed", github) == "stale"
+    assert reads == 2 and len(github.writes) == count
+
+
+@pytest.mark.parametrize("mode", ["old", "fresh", "newer", "stale_push"])
+def test_base_invalidation_preserves_fresh_checks(github, monkeypatch, mode):
+    pending(github)
+    status = github.statuses[0]
+    status["description"] = f"base={BASE_SHA if mode == 'fresh' else SHA}"
+    status["target_url"] = auth.run_url("201" if mode == "newer" else "100")
+    if mode == "stale_push":
+        github.base_ref_sha = SHA
+    monkeypatch.setenv("GITHUB_RUN_ID", "200")
+    count = len(github.writes)
+    auth.invalidate_base(BASE_SHA, github)
+    assert len(github.writes) == count + (mode == "old")

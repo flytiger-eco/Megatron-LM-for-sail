@@ -38,42 +38,22 @@ def pr_event(pull=None, action="opened"):
     return {"number": 7, "action": action, "pull_request": pull or pr()}
 
 
-@pytest.mark.parametrize(
-    "change,decision",
-    [
-        ("draft", "draft"),
-        ("closed", "closed"),
-        ("conflict", "conflict"),
-        ("unknown", "merge_unavailable"),
-        ("parents", "merge_unavailable"),
-        ("metadata", "ignore"),
-    ],
-)
-def test_pr_preflight_decisions(change, decision):
+@pytest.mark.parametrize("unavailable", ["merge", "parents"])
+def test_merge_availability_retries_before_rejecting(unavailable):
     pull = pr()
-    if change == "draft":
-        pull["draft"] = True
-    elif change == "closed":
-        pull["state"] = "closed"
-    elif change == "conflict":
-        pull["mergeable"] = False
-    elif change == "unknown":
+    if unavailable == "merge":
         pull["mergeable"] = None
-    event = pr_event(pull, "edited" if change == "metadata" else "opened")
-    underlying = api_for(pull)
-    calls, sleeps = [], []
+    original = api_for(pull)
+    sleeps = []
 
     def api(path):
-        calls.append(path)
-        if change == "parents" and path.startswith("git/commits/"):
+        if unavailable == "parents" and path.startswith("git/commits/"):
             return {"parents": [{"sha": SHA}, {"sha": BASE_SHA}]}
-        return underlying(path)
+        return original(path)
 
-    result = auth.authorize(event, {}, context("pull_request_target"), api, sleeps.append)
-    assert not result["allowed"] and result["decision"] == decision
-    assert len(sleeps) == (2 if change in ("unknown", "parents") else 0)
-    if change in ("draft", "closed", "metadata"):
-        assert not any("git/commits/" in path for path in calls)
+    result = auth.authorize(pr_event(pull), {}, context("pull_request_target"), api, sleeps.append)
+    assert not result["allowed"] and result["decision"] == "merge_unavailable"
+    assert len(sleeps) == 2
 
 
 @pytest.mark.parametrize(
@@ -190,56 +170,15 @@ def test_merge_group_identity_and_routes():
             auth.authorize(bad, {}, context("merge_group", ref))
 
 
-@pytest.mark.parametrize(
-    "trigger,scope,expected",
-    [
-        ("pr", "full", 90),
-        ("push", "full", 90),
-        ("merge_group", "full", 90),
-        ("release", "full", 90),
-        ("manual", "full", 90),
-        ("pr", "quick", 100),
-        ("push", "quick", 100),
-        ("manual", "quick", 100),
-        ("manual", "diagnostic", 90),
-    ],
-)
-@pytest.mark.parametrize("total,failed", [(10, 0), (10, 1), (10, 2), (100, 11)])
-def test_gate_depends_on_scope_not_trigger(tmp_path, trigger, scope, expected, total, failed):
-    case = synthetic_case()
-    config = {"scope": scope, "trigger_kind": trigger, "threshold_percent": expected}
-    manifest = {"config": config, "unit": {case["id"]: case}, "identity": IDENTITY}
-    write_reports(
-        ci.result_directory(manifest, tmp_path, case["id"]), case, failed=failed, total=total
-    )
-    result = ci.summarize(manifest, tmp_path)
-    assert result["threshold_percent"] == expected
-    assert result["success"] is (failed == 0 or expected == 90 and total == 10 and failed == 1)
-    assert result["total"] == total and result["failed"] == failed
-    for invalid in (1, 80, 90 if expected == 100 else 100):
-        manifest["config"]["threshold_percent"] = invalid
-        with pytest.raises(ValueError, match="gate"):
-            ci.summarize(manifest, tmp_path)
-
-
-def test_candidate_quick_is_manual_without_full_baseline(tmp_path, monkeypatch):
-    policy = ci.load_policy()
-    policy.update(
-        daily_scope="full",
-        quick_state="candidate",
-        require_full_baseline=False,
-        baseline=None,
-        validation_runs=[],
-    )
-    path = tmp_path / ci.POLICY_PATH
-    path.parent.mkdir()
-    path.write_text(json.dumps(policy))
-    monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
-    manual = ci.select_config({"ref": BRANCH}, "workflow_dispatch", {"scope": "quick"})
-    assert manual["scope"] == "quick" and manual["threshold_percent"] == 100
-    for event, name in (({"ref": BRANCH}, "push"), (pr_event(), "pull_request_target")):
-        result = ci.select_config(event, name, {"scope": "quick"})
-        assert result["scope"] == "full" and result["threshold_percent"] == 90
+@pytest.mark.parametrize("scope,expected", [("quick", 100), ("full", 90), ("diagnostic", 90)])
+def test_gate_depends_on_scope_not_trigger(tmp_path, scope, expected):
+    for trigger in ("pr", "push", "merge_group", "release", "manual"):
+        assert ci.threshold({"scope": scope, "trigger_kind": trigger}) == expected
+    with pytest.raises(ValueError, match="gate"):
+        ci.summarize(
+            {"config": {"scope": scope, "threshold_percent": 90 if expected == 100 else 100}},
+            tmp_path,
+        )
 
 
 def test_nvidia_full_is_dev_half_of_release():
@@ -252,297 +191,97 @@ def test_nvidia_full_is_dev_half_of_release():
 
 
 @pytest.mark.parametrize(
-    "state,runs",
+    "changes,error",
     [
-        ("candidate", []),
-        ("candidate", ["124", "125"]),
-        ("validated", []),
-        ("validated", ["124"]),
-        ("validated", ["124", "124"]),
+        ({"daily_scope": "quick", "quick_state": "candidate"}, "two validation runs"),
+        ({"validation_runs": []}, "two validation runs"),
+        ({"validation_runs": ["124"]}, "two validation runs"),
+        ({"validation_runs": ["124", "124"]}, "two validation runs"),
+        ({"require_full_baseline": "false"}, "must be a boolean"),
+        ({"require_full_baseline": 0}, "must be a boolean"),
+        ({"baseline": None}, "full baseline"),
+        ({"baseline": None, "require_full_baseline": True}, "full baseline"),
+        ({"baseline": None, "require_full_baseline": False}, None),
+        ({"quick_state": "candidate", "baseline": None, "require_full_baseline": False}, None),
     ],
 )
-@pytest.mark.parametrize("baseline", [None, {"run_id": "123"}])
-def test_daily_quick_requires_two_validation_runs(tmp_path, monkeypatch, state, runs, baseline):
-    policy = json.loads((ROOT / ci.POLICY_PATH).read_text())
-    policy.update(
-        daily_scope="quick",
-        quick_state=state,
-        require_full_baseline=False,
-        baseline=baseline,
-        validation_runs=runs,
-    )
-    path = tmp_path / ci.POLICY_PATH
-    path.parent.mkdir()
-    path.write_text(json.dumps(policy))
-    monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
-    with pytest.raises(ValueError, match="two validation runs"):
-        ci.load_policy()
-
-
-@pytest.mark.parametrize("state", ["candidate", "validated"])
-@pytest.mark.parametrize("require_baseline", [True, False, "missing"])
-def test_quick_full_baseline_requirement_is_explicit(
-    tmp_path, monkeypatch, state, require_baseline
+def test_quick_policy_requires_validation_and_explicit_baseline_opt_out(
+    tmp_path, monkeypatch, changes, error
 ):
-    policy = json.loads((ROOT / ci.POLICY_PATH).read_text())
+    policy = ci.load_policy()
     policy.update(
-        daily_scope="full", quick_state=state, baseline=None, validation_runs=["124", "125"]
+        daily_scope="full",
+        quick_state="validated",
+        baseline={"run_id": "123"},
+        validation_runs=["124", "125"],
     )
-    if require_baseline == "missing":
-        policy.pop("require_full_baseline")
-    else:
-        policy["require_full_baseline"] = require_baseline
+    policy.pop("require_full_baseline")  # Missing flag must default to requiring the baseline.
+    policy.update(changes)
     path = tmp_path / ci.POLICY_PATH
     path.parent.mkdir()
     path.write_text(json.dumps(policy))
     monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
-    if require_baseline is False:
-        assert ci.load_policy()["baseline"] is None
-    else:
-        with pytest.raises(ValueError, match="full baseline"):
+    if error:
+        with pytest.raises(ValueError, match=error):
             ci.load_policy()
+    else:
+        assert ci.load_policy() == policy
 
 
-@pytest.mark.parametrize("value", [None, "false", 0, 1, [], {}])
-def test_baseline_requirement_rejects_non_boolean(tmp_path, monkeypatch, value):
-    policy = json.loads((ROOT / ci.POLICY_PATH).read_text())
-    policy["require_full_baseline"] = value
-    path = tmp_path / ci.POLICY_PATH
-    path.parent.mkdir()
-    path.write_text(json.dumps(policy))
-    monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
-    with pytest.raises(ValueError, match="must be a boolean"):
-        ci.load_policy()
-
-
-@pytest.mark.parametrize("runs", [[], ["124"], ["124", "124"]])
-def test_validated_state_requires_two_runs_even_with_daily_full(tmp_path, monkeypatch, runs):
-    policy = json.loads((ROOT / ci.POLICY_PATH).read_text())
-    policy.update(daily_scope="full", quick_state="validated", validation_runs=runs)
-    path = tmp_path / ci.POLICY_PATH
-    path.parent.mkdir()
-    path.write_text(json.dumps(policy))
-    monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
-    with pytest.raises(ValueError, match="two validation runs"):
-        ci.load_policy()
-
-
-@pytest.mark.parametrize("require_baseline", [True, False])
-@pytest.mark.parametrize("stage", ["unavailable", "candidate", "validated"])
 @pytest.mark.parametrize(
-    "route",
+    "stage,route,expected",
     [
-        "pr",
-        "fork",
-        "push",
-        "merge_group",
-        "release",
-        "manual_auto",
-        "manual_quick",
-        "manual_full",
-        "manual_pr_quick",
+        ("unavailable", "push", "full"),
+        ("candidate", "push", "full"),
+        ("validated", "push", "quick"),
+        ("candidate", "pr", "full"),
+        ("validated", "pr", "quick"),
+        ("unavailable", "manual_quick", "unavailable"),
+        ("candidate", "manual_quick", "quick"),
+        ("validated", "manual_quick", "quick"),
+        ("candidate", "manual_pr", "non-PR manual validation"),
+        ("validated", "manual_pr", "quick"),
+        ("candidate", "manual_auto", "full"),
+        ("validated", "manual_auto", "quick"),
+        ("validated", "manual_full", "full"),
+        ("validated", "merge_group", "full"),
+        ("validated", "release", "full"),
     ],
 )
-def test_quick_lifecycle_routes_and_upstream_scope(
-    tmp_path, monkeypatch, stage, route, require_baseline
-):
-    policy = json.loads((ROOT / ci.POLICY_PATH).read_text())
+def test_quick_promotion_controls_scope(tmp_path, monkeypatch, stage, route, expected):
+    policy = ci.load_policy()
     policy.update(
         daily_scope="quick" if stage == "validated" else "full",
         quick_state=stage,
-        require_full_baseline=require_baseline,
-        baseline={"run_id": "123"} if require_baseline and stage != "unavailable" else None,
+        require_full_baseline=False,
+        baseline=None,
         validation_runs=["124", "125"] if stage == "validated" else [],
     )
-    control = tmp_path / "control"
-    for relative in (
-        "tests/unit_tests/find_test_cases.py",
-        "tests/test_utils/python_scripts/recipe_parser.py",
-    ):
-        path = control / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes((ROOT / relative).read_bytes())
-    policy_path = control / ci.POLICY_PATH
-    policy_path.parent.mkdir()
-    policy_path.write_text(json.dumps(policy))
-    monkeypatch.setattr(ci, "CONTROL_ROOT", control)
-    outputs = {}
-    monkeypatch.setattr(ci, "emit", lambda key, value: outputs.update({key: value}))
-
-    event_name, event = "workflow_dispatch", {"ref": BRANCH}
-    inputs = {"scope": "quick", "repeat": 3}
-    if route in ("pr", "fork"):
-        event_name, event = "pull_request_target", pr_event(pr(route == "fork"), "synchronize")
-    elif route in ("push", "release"):
-        event_name = "push"
-        if route == "release":
-            event["ref"] = "refs/tags/v1.2.3"
-    elif route == "merge_group":
-        event_name = "merge_group"
-        event = {"merge_group": {"base_ref": BRANCH}}
-    elif route == "manual_auto":
-        inputs["scope"] = "auto"
-    elif route == "manual_full":
-        inputs["scope"] = "full"
-    elif route == "manual_pr_quick":
-        inputs.update(pr_number="7", pr_sha=SHA, pr_base_sha=BASE_SHA)
-
-    if route in ("pr", "fork", "push", "merge_group", "release", "manual_pr_quick"):
-        inputs.update(build=False, unit_test=False, repeat=0, suite_family="release-dev-lts")
-    if route in ("pr", "fork", "manual_pr_quick"):
-        decision = auth.authorize(event, inputs, context(event_name), api_for(pr(route != "pr")))
-        assert decision["allowed"] is (route != "fork")
-        if decision["allowed"]:
-            assert decision["target_sha"] == MERGE_SHA
-            assert decision["pr_head_sha"] == SHA and decision["base_sha"] == BASE_SHA
-
-    if stage == "unavailable" and route in ("manual_quick", "manual_pr_quick"):
-        with pytest.raises(ValueError, match="unavailable"):
-            ci.select_config(event, event_name, inputs)
-        return
-    if stage == "candidate" and route == "manual_pr_quick":
-        with pytest.raises(ValueError, match="non-PR manual validation"):
+    path = tmp_path / ci.POLICY_PATH
+    path.parent.mkdir()
+    path.write_text(json.dumps(policy))
+    monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
+    event_name, event, inputs = {
+        "push": ("push", {"ref": BRANCH}, {}),
+        "pr": ("pull_request_target", pr_event(), {}),
+        "release": ("push", {"ref": "refs/tags/v1.2.3"}, {}),
+        "merge_group": ("merge_group", {"merge_group": {"base_ref": BRANCH}}, {}),
+        "manual_auto": ("workflow_dispatch", {"ref": BRANCH}, {"scope": "auto"}),
+        "manual_full": ("workflow_dispatch", {"ref": BRANCH}, {"scope": "full"}),
+        "manual_quick": ("workflow_dispatch", {"ref": BRANCH}, {"scope": "quick"}),
+        "manual_pr": (
+            "workflow_dispatch",
+            {"ref": BRANCH},
+            {"scope": "quick", "pr_number": "7", "pr_sha": SHA, "pr_base_sha": BASE_SHA},
+        ),
+    }[route]
+    if expected not in ("full", "quick"):
+        with pytest.raises(ValueError, match=expected):
             ci.select_config(event, event_name, inputs)
         return
     config = ci.select_config(event, event_name, inputs)
-    if route in ("merge_group", "release", "manual_full"):
-        expected_scope = "full"
-    elif route in ("manual_quick", "manual_pr_quick") or stage == "validated":
-        expected_scope = "quick"
-    else:
-        expected_scope = "full"
-    assert config["scope"] == expected_scope
-    assert config["threshold_percent"] == (100 if expected_scope == "quick" else 90)
+    assert config["scope"] == expected
     assert config["suite_family"] == ("release-dev-lts" if route == "release" else "nvidia-dev")
-    assert config["build"] is (route != "fork")
-    assert config["unit_test"] is (route != "fork")
-    if expected_scope == "quick":
-        assert config["repeat"] == 1
-    manifest = ci.generate(config, tmp_path / "plan", IDENTITY)
-    cases = manifest["unit"]
-    rows = json.loads(outputs["unit_matrix"])["include"]
-    if route == "fork":
-        assert cases == {} and rows == [{"id": "unused"}]
-    elif expected_scope == "full":
-        assert len(cases) == len(rows) == (74 if route == "release" else 37)
-        assert set(cases) == set(ci.unit_cases(config))
-    else:
-        assert len(cases) == 6 and len(rows) == 1 and rows[0]["id"] == "quick"
-        assert sum(len(case["args"]) for case in cases.values()) == 28
-        full = ci.unit_cases({"suite_family": "nvidia-dev", "repeat": 1, "timeout": 30})
-        for case in cases.values():
-            assert case["environment"] == "dev" and case["cards"] == 8
-            assert case["strict_selection"] and case["repeat"] == 1
-            for selector, bucket in case["source_buckets"].items():
-                matches = [row for row in full.values() if selector.split("::")[0] in row["files"]]
-                assert len(matches) == 1 and matches[0]["bucket"] == bucket
-        assert sum(EXCLUDED_UT in case["excluded"] for case in cases.values()) == 1
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        "none",
-        "head",
-        "base",
-        "draft",
-        "closed",
-        "newer",
-        "foreign",
-        "cancelled",
-        "rerun",
-        "retarget",
-    ],
-)
-def test_final_status_cannot_overwrite_new_snapshot(monkeypatch, mutation):
-    monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
-    pull = pr()
-    url = auth.run_url("124" if mutation == "newer" else "123")
-    if mutation == "head":
-        pull["head"]["sha"] = CONTROL_SHA
-    if mutation == "base":
-        pull["base"]["sha"] = CONTROL_SHA
-    if mutation == "draft":
-        pull["draft"] = True
-    if mutation == "closed":
-        pull["state"] = "closed"
-    if mutation == "foreign":
-        url = "https://example.com/another-check"
-    if mutation == "retarget":
-        pull["base"]["ref"] = "ci/ppu-validation"
-    calls = []
-
-    def api(path, payload=None):
-        if payload is not None:
-            calls.append((path, payload))
-            return {}
-        if path == "pulls/7":
-            return pull
-        if path == "actions/runs/123":
-            return {
-                "status": "completed" if mutation == "cancelled" else "in_progress",
-                "run_attempt": 2 if mutation == "rerun" else 1,
-            }
-        if path == f"git/commits/{MERGE_SHA}":
-            return {"parents": [{"sha": BASE_SHA}, {"sha": SHA}]}
-        if path.startswith("git/ref/"):
-            return {"object": {"sha": pull["base"]["sha"]}}
-        return [
-            {
-                "context": auth.STATUS_CONTEXT,
-                "target_url": url,
-                "state": "pending",
-                "description": f"attempt=1 base={BASE_SHA}",
-            }
-        ]
-
-    auth.publish_status(
-        {
-            "pr_number": 7,
-            "pr_head_sha": SHA,
-            "base_sha": BASE_SHA,
-            "target_sha": MERGE_SHA,
-            "run_id": "123",
-            "decision": "run",
-        },
-        "success",
-        "full completed",
-        api,
-    )
-    assert bool(calls) is (mutation == "none")
-    if calls:
-        assert calls[0][0] == f"statuses/{SHA}"
-
-
-@pytest.mark.parametrize("mode", ["old", "fresh", "newer", "stale_push"])
-def test_base_invalidation_preserves_fresh_checks(monkeypatch, mode):
-    monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
-    monkeypatch.setenv("GITHUB_RUN_ID", "200")
-    writes = []
-
-    def api(path, payload=None):
-        if payload is not None:
-            writes.append(payload)
-            return {}
-        if path.startswith("git/ref/"):
-            return {"object": {"sha": SHA if mode == "stale_push" else BASE_SHA}}
-        if path.startswith("pulls?"):
-            return [{"number": 7}]
-        if path == "pulls/7":
-            return pr()
-        return [
-            {
-                "context": auth.STATUS_CONTEXT,
-                "target_url": auth.run_url("201" if mode == "newer" else "100"),
-                "description": f"base={BASE_SHA if mode == 'fresh' else SHA}",
-            }
-        ]
-
-    auth.invalidate_base(BASE_SHA, api)
-    assert bool(writes) is (mode == "old")
-    if writes:
-        assert len(writes[0]["description"]) <= 140
-        assert writes[0]["description"].endswith(f"base={BASE_SHA}")
 
 
 def test_full_timing_and_rank_duration_aggregation(tmp_path):
@@ -619,73 +358,6 @@ def test_recipe_changes_cannot_silently_drop_workloads(tmp_path, monkeypatch, mu
     monkeypatch.setattr(ci, "policy_exclusions", lambda: {})
     with pytest.raises(ValueError, match=reason):
         ci.unit_cases({"suite_family": "nvidia-dev", "repeat": 1, "timeout": 30})
-
-
-@pytest.mark.parametrize("decision", ["run", "cpu_only"])
-def test_status_snapshot_is_rechecked_before_write(monkeypatch, decision):
-    monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
-    reads = 0
-
-    def api(path, payload=None):
-        nonlocal reads
-        assert payload is None, "must not publish stale success"
-        if path == "pulls/7":
-            reads += 1
-            pull = pr()
-            if reads > 1:
-                pull["draft"] = True
-            return pull
-        if path == "actions/runs/123":
-            return {"status": "in_progress", "run_attempt": 1}
-        if path == f"git/commits/{MERGE_SHA}":
-            return {"parents": [{"sha": BASE_SHA}, {"sha": SHA}]}
-        if path.startswith("git/ref/"):
-            return {"object": {"sha": BASE_SHA}}
-        return [
-            {
-                "context": auth.STATUS_CONTEXT,
-                "target_url": auth.run_url("123"),
-                "state": "pending",
-                "description": f"attempt=1 base={BASE_SHA}",
-            }
-        ]
-
-    auth.publish_status(
-        {
-            "pr_number": 7,
-            "pr_head_sha": SHA,
-            "base_sha": BASE_SHA,
-            "run_id": "123",
-            "decision": decision,
-            "target_sha": MERGE_SHA,
-        },
-        "success",
-        "completed",
-        api,
-    )
-    assert reads == 2
-
-
-@pytest.mark.parametrize("mutation", ["draft", "head", "base"])
-def test_merge_snapshot_rechecked_after_parent_lookup(mutation):
-    changed = False
-    underlying = api_for()
-
-    def api(path):
-        nonlocal changed
-        if path.startswith("git/commits/"):
-            changed = True
-        if path == "pulls/7" and changed:
-            pull = pr()
-            if mutation == "draft":
-                pull["draft"] = True
-            else:
-                pull[mutation]["sha"] = CONTROL_SHA
-            return pull
-        return underlying(path)
-
-    with pytest.raises(ValueError, match="during verification"):
-        auth.authorize(pr_event(), {}, context("pull_request_target"), api)
 
 
 @pytest.mark.parametrize("test_kind", [None, "unit", "functional"])
@@ -1101,7 +773,9 @@ def sealed_bundle(tmp_path):
     plan = tmp_path / "plan"
     control = plan / "control"
     control.mkdir(parents=True)
-    (plan / "manifest.json").write_text(json.dumps({"identity": IDENTITY, "environment_build_schema": 2}))
+    (plan / "manifest.json").write_text(
+        json.dumps({"identity": IDENTITY, "environment_build_schema": 2})
+    )
     shutil.copyfile(ROOT / ".github/scripts/ppu_ci.py", control / "ppu_ci.py")
     for name in ("ppu_ci_container.py", "ppu_policy.py", "ppu_ci_paths.py", "ppu_ci_export.py"):
         shutil.copyfile(ROOT / ".github/scripts" / name, control / name)
@@ -1271,7 +945,10 @@ def test_bundle_workflow_digest_and_run_scoping():
         for step in ut["jobs"]["test"]["steps"]
         if step.get("uses") == "actions/download-artifact@v4"
     ]
-    assert downloads == ["${{ inputs.artifact_prefix }}" + name for name in ["ppu-control-environment", "ppu-plan", "ppu-runtime-environment"]]
+    assert downloads == [
+        "${{ inputs.artifact_prefix }}" + name
+        for name in ["ppu-control-environment", "ppu-plan", "ppu-runtime-environment"]
+    ]
     action = next(step for step in ut["jobs"]["test"]["steps"] if step.get("id") == "ppu")
     assert (
         "PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build"

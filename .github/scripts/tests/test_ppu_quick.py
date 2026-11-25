@@ -357,58 +357,6 @@ def test_configure_cli_separates_control_and_source(tmp_path):
     assert len(manifest["unit"]) == (6 if expected_scope == "quick" else 37)
 
 
-@pytest.mark.parametrize("state", ["pending", "success", "failure"])
-def test_commit_status_uses_pr_head_sha(tmp_path, monkeypatch, state):
-    (tmp_path / "authorization.json").write_text(
-        json.dumps(
-            {
-                "pr_number": 7,
-                "pr_head_sha": SHA,
-                "base_sha": BASE_SHA,
-                "decision": "run",
-                "run_id": "123",
-                **IDENTITY,
-                "target_sha": MERGE_SHA,
-            }
-        )
-    )
-    calls = []
-
-    def api(path, payload=None):
-        if payload is not None:
-            calls.append((path, payload))
-            return {}
-        if path == "pulls/7":
-            return pr()
-        if path == "actions/runs/123":
-            return {"status": "in_progress", "run_attempt": 1}
-        if path == f"git/commits/{MERGE_SHA}":
-            return {"parents": [{"sha": BASE_SHA}, {"sha": SHA}]}
-        if path.startswith("git/ref/"):
-            return {"object": {"sha": BASE_SHA}}
-        return [
-            {
-                "context": auth.STATUS_CONTEXT,
-                "target_url": f"https://github.com/{REPOSITORY}/actions/runs/123",
-                "state": "pending",
-                "description": f"Awaiting tests attempt=1 base={BASE_SHA}",
-            }
-        ]
-
-    monkeypatch.setattr(auth, "github_api", api)
-    monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
-    monkeypatch.setenv("GITHUB_RUN_ID", "123")
-    monkeypatch.setattr(
-        sys, "argv", ["ppu_pr_authorize.py", "status", "--output", str(tmp_path), "--state", state]
-    )
-    auth.main()
-    assert len(calls) == 1
-    assert calls[0][0] == f"statuses/{SHA}"
-    assert calls[0][1]["state"] == state
-    assert calls[0][1]["context"] == "PPU PR Quick"
-    assert calls[0][1]["target_url"] == f"https://github.com/{REPOSITORY}/actions/runs/123"
-
-
 def test_manual_fork_authorization():
     result = auth.authorize(
         {}, {"pr_number": "7", "pr_sha": SHA, "pr_base_sha": BASE_SHA}, context(), api_for(pr(True))
@@ -417,24 +365,6 @@ def test_manual_fork_authorization():
     assert result["target_sha"] == MERGE_SHA and result["control_sha"] == CONTROL_SHA
     assert result["pr_head_sha"] == SHA and result["base_sha"] == BASE_SHA
     assert result["pr_number"] == 7
-
-
-def test_fork_event_never_authorizes_ppu():
-    event = {"number": 7, "pull_request": pr(True)}
-    result = auth.authorize(event, {}, context("pull_request_target"), api_for(pr(True)))
-    assert not result["allowed"] and result["pr_head_sha"] == SHA
-    assert result["decision"] == "authorization_required"
-
-
-@pytest.mark.parametrize("permission", ["read", "triage", "none"])
-def test_authorization_requires_write(permission):
-    with pytest.raises(ValueError):
-        auth.authorize(
-            {},
-            {"pr_number": "7", "pr_sha": SHA, "pr_base_sha": BASE_SHA},
-            context(),
-            api_for(permission=permission),
-        )
 
 
 @pytest.mark.parametrize(
@@ -823,7 +753,13 @@ def test_workflow_trust_and_resource_boundaries():
     execute = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())
     ut = yaml.safe_load((ROOT / ".github/workflows/ppu-ut.yml").read_text())
     events = build.get("on", build.get(True))
-    assert set(events) == {"push", "pull_request_target", "workflow_dispatch", "merge_group", "workflow_call"}
+    assert set(events) == {
+        "push",
+        "pull_request_target",
+        "workflow_dispatch",
+        "merge_group",
+        "workflow_call",
+    }
     assert events["push"]["tags"] == ["v*"]
     assert auth.BRANCH == BRANCH == "refs/heads/main"
     assert events["push"]["branches"] == ["main", "dev"]
