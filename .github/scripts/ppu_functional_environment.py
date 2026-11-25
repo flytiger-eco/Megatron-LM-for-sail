@@ -207,7 +207,7 @@ def prepare(bundle: Path):
     for name in ("yq", "envsubst"):
         path = bundle / "functional-tools" / name
         expected = metadata["files"][f"functional-tools/{name}"]
-        installed = Path(sys.prefix) / "bin" / name
+        installed = Path(sys.prefix) / "bin/yq" if name == "yq" else Path("/usr/bin/envsubst")
         if (
             path.is_symlink()
             or path.stat().st_size != expected["size"]

@@ -514,14 +514,20 @@ def test_real_bundle_verification_still_rejects_added_bytecode(subprocess_bundle
     'damage', ['none', 'missing', 'modified', 'not_executable', 'symlink', 'wrong_output']
 )
 def test_execution_yq_probe_executes_parse_and_rejects_invalid_copy(tmp_path, monkeypatch, damage):
-    calls = []
+    calls, environments = [], []
     real_run = subprocess.run
     monkeypatch.setattr(
         container.subprocess,
         'run',
-        lambda argv, **kwargs: calls.append(argv) or SimpleNamespace(returncode=0),
+        lambda argv, **kwargs: (
+            calls.append(argv)
+            or environments.append(kwargs['env'])
+            or SimpleNamespace(returncode=0)
+        ),
     )
+    monkeypatch.setenv('LD_LIBRARY_PATH', '/vendor/sdk/lib')
     container.execution_checks(tmp_path)
+    assert all(env['LD_LIBRARY_PATH'] == '/vendor/sdk/lib' for env in environments)
     code = next(argv[-1] for argv in calls if 'input="TEST_TYPE: regular' in argv[-1])
     local, baked = tmp_path / 'yq', tmp_path / 'baked-yq'
     payload = '#!/bin/sh\ncat >/dev/null\nprintf "regular\\n"\n'
@@ -544,99 +550,6 @@ def test_execution_yq_probe_executes_parse_and_rejects_invalid_copy(tmp_path, mo
     )
     result = real_run([sys.executable, '-I', '-c', code], capture_output=True, text=True)
     assert (result.returncode == 0) == (damage == 'none')
-
-
-@pytest.mark.parametrize('dependent_first', [True, False])
-def test_native_closure_resolves_bundled_transitive_libraries(
-    tmp_path, monkeypatch, dependent_first
-):
-    extension = tmp_path / 'extension.so'
-    bundled = tmp_path / 'numpy.libs'
-    bundled.mkdir()
-    fortran = bundled / 'libgfortran-040039e1.so.5.0.0'
-    quadmath = bundled / 'libquadmath-96973f99.so.0.0.0'
-    for path in (extension, fortran, quadmath):
-        path.write_bytes(b'\x7fELF' + path.name.encode())
-    directory = tmp_path / 'ppu-system'
-    calls = []
-    monkeypatch.setenv('LD_LIBRARY_PATH', '/private/unrelated')
-    monkeypatch.setenv('LC_ALL', 'private-locale')
-
-    def run(argv, **kwargs):
-        path = Path(argv[1])
-        calls.append(path)
-        assert argv[0] == 'ldd'
-        assert kwargs['env']['LD_LIBRARY_PATH'] == str(directory)
-        assert kwargs['env']['LC_ALL'] == 'C'
-        if path == extension:
-            output = f'{fortran.name} => {fortran} (0x1234)\n'
-            output += f'{quadmath.name} => {quadmath} (0x1234)\n'
-        elif path == fortran:
-            saved = directory / quadmath.name
-            output = (
-                f'{quadmath.name} => {saved} (0x1234)\n'
-                if saved.exists()
-                else f'{quadmath.name} => not found\n'
-            )
-        else:
-            output = ''
-        return SimpleNamespace(returncode=0, stdout=output, stderr='private-warning')
-
-    monkeypatch.setattr(exporter.subprocess, 'run', run)
-    files = [fortran, quadmath, extension] if dependent_first else [extension, fortran, quadmath]
-    original = {path: path.read_bytes() for path in files}
-    exporter.libraries(files, directory)
-    assert calls.count(fortran) == (2 if dependent_first else 1)
-    assert (directory / fortran.name).read_bytes() == original[fortran]
-    assert (directory / quadmath.name).read_bytes() == original[quadmath]
-    assert {path: path.read_bytes() for path in files} == original
-
-
-def test_native_closure_still_rejects_missing_dependencies_after_progress(tmp_path, monkeypatch):
-    extension, missing, library = [
-        tmp_path / name for name in ('extension.so', 'missing.so', 'lib.so')
-    ]
-    for path in (extension, missing, library):
-        path.write_bytes(b'\x7fELF' + path.name.encode())
-    calls = []
-
-    def run(argv, **kwargs):
-        path = Path(argv[1])
-        calls.append(path)
-        output = (
-            f'lib.so => {library} (0x1234)\n'
-            if path == extension
-            else 'libgcc_s.so.1 => not found\nprivate-library.so => not found\n'
-        )
-        return SimpleNamespace(returncode=0, stdout=output, stderr='private-token')
-
-    monkeypatch.setattr(exporter.subprocess, 'run', run)
-    with pytest.raises(RuntimeError) as error:
-        exporter.libraries([missing, extension], tmp_path / 'ppu-system')
-    assert str(error.value) == (
-        'A native dependency is missing in the build container; '
-        'missing-native-libgcc,missing-native-object-other,missing-native-unknown'
-    )
-    assert calls == [missing, extension, missing]
-
-
-def test_native_closure_rejects_conflicting_sonames(tmp_path, monkeypatch):
-    files = []
-    for name in ('first', 'second'):
-        root = tmp_path / name
-        root.mkdir()
-        extension, library = root / 'extension.so', root / 'lib.so'
-        extension.write_bytes(b'\x7fELF')
-        library.write_bytes(name.encode())
-        files.append(extension)
-
-    def run(argv, **kwargs):
-        library = Path(argv[1]).parent / 'lib.so'
-        return SimpleNamespace(returncode=0, stdout=f'lib.so => {library} (0x1234)\n', stderr='')
-
-    monkeypatch.setattr(exporter.subprocess, 'run', run)
-    with pytest.raises(RuntimeError, match='^Conflicting native dependency SONAMEs$'):
-        exporter.libraries(files, tmp_path / 'ppu-system')
 
 
 @pytest.mark.parametrize(

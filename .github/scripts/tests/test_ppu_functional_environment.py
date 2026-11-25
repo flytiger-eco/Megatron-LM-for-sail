@@ -151,7 +151,11 @@ def tool_environment(tmp_path, monkeypatch):
         lambda value: (
             local
             if value == "/usr/local/bin"
-            else tmp_path / "empty-load" if value == "/tmp/checkpoints" else Path(value)
+            else (
+                prefix / "bin/envsubst"
+                if value == "/usr/bin/envsubst"
+                else tmp_path / "empty-load" if value == "/tmp/checkpoints" else Path(value)
+            )
         ),
     )
     monkeypatch.setenv("PIP_INDEX_URL", "https://packages.invalid/simple")

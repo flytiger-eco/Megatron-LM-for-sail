@@ -197,10 +197,6 @@ RUN --network=none install -m 0755 /opt/ppu-ci-venv/bin/yq /usr/local/bin/yq \
     && test "$(printf 'TEST_TYPE: regular\n' | /usr/local/bin/yq '.TEST_TYPE')" = regular \
     && mv /build/source /opt/ppu-ci-source \
     && python -c 'import shutil; shutil.rmtree("/build"); shutil.rmtree("/exports")'
-ENV LD_LIBRARY_PATH="/opt/ppu-ci-venv/lib/ppu-system:${LD_LIBRARY_PATH}" \
-    GIT_EXEC_PATH=/opt/ppu-ci-venv/libexec/git-core \
-    SSL_CERT_FILE=/opt/ppu-ci-venv/etc/ssl/certs/ca-certificates.crt \
-    GIT_SSL_CAINFO=/opt/ppu-ci-venv/etc/ssl/certs/ca-certificates.crt
 WORKDIR /opt/megatron-lm
 ENTRYPOINT []
 CMD ["/bin/bash"]

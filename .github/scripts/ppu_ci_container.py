@@ -185,41 +185,6 @@ def failure_markers(stdout, stderr):
             'export-package-source',
             r'package download bypassed the fixed package index|transitive dependency url bypasses the fixed package index',
         ),
-        ('export-native-missing', r'a native dependency is missing in the build container'),
-        ('native-libstdcxx', r'\bmissing-native-libstdcxx\b'),
-        ('native-libgcc', r'\bmissing-native-libgcc\b'),
-        ('native-libgomp', r'\bmissing-native-libgomp\b'),
-        ('native-libatomic', r'\bmissing-native-libatomic\b'),
-        ('native-libgfortran', r'\bmissing-native-libgfortran\b'),
-        ('native-libquadmath', r'\bmissing-native-libquadmath\b'),
-        ('native-libssl', r'\bmissing-native-libssl\b'),
-        ('native-libcrypto', r'\bmissing-native-libcrypto\b'),
-        ('native-unknown', r'\bmissing-native-unknown\b'),
-        ('native-libpython', r'\bmissing-native-libpython\b'),
-        ('native-libtk', r'\bmissing-native-libtk\b'),
-        ('native-libtcl', r'\bmissing-native-libtcl\b'),
-        ('native-version', r'\bmissing-native-version\b'),
-        ('native-unparsed', r'\bmissing-native-unparsed\b'),
-        ('native-object-python', r'\bmissing-native-object-python\b'),
-        ('native-object-numpy', r'\bmissing-native-object-numpy\b'),
-        ('native-object-crc32c', r'\bmissing-native-object-crc32c\b'),
-        ('native-object-grpc', r'\bmissing-native-object-grpc\b'),
-        ('native-object-pydantic', r'\bmissing-native-object-pydantic\b'),
-        ('native-object-stdlib', r'\bmissing-native-object-stdlib\b'),
-        ('native-object-other', r'\bmissing-native-object-other\b'),
-        ('export-native-inventory', r'unable to inventory native dependencies'),
-        ('export-native-conflict', r'conflicting native dependency sonames'),
-        ('export-file-type', r'export requires materialized files and directories'),
-        ('offline-control-import', r'restored control interpreter import check failed'),
-        (
-            'restore-archive-invalid',
-            r'invalid environment member path|invalid environment archive size|unsupported or repeated archive member|invalid archive member size|archive file conflicts with a parent directory|environment archive exceeds the size limit',
-        ),
-        (
-            'restore-path-invalid',
-            r'environment path contains a symlink|archive member escapes the restore root|refusing to overwrite an environment member|refusing to overwrite the control interpreter',
-        ),
-        ('restore-space', r'insufficient environment restore space'),
         (
             'restore-integrity',
             r'environment metadata does not match the trusted job digest|missing or corrupted environment member|unexpected environment export members',
@@ -229,7 +194,6 @@ def failure_markers(stdout, stderr):
         ('probe-type-error', r'ppu environment operation failed: typeerror;'),
         ('probe-attribute-error', r'ppu environment operation failed: attributeerror;'),
         ('probe-os-error', r'ppu environment operation failed: oserror;'),
-        ('probe-tar-error', r'ppu environment operation failed: (?:readerror|compressionerror);'),
         ('probe-json-error', r'ppu environment operation failed: jsondecodeerror;'),
     )
     return ','.join(label for label, pattern in patterns if re.search(pattern, text)) or 'unknown'
@@ -706,10 +670,7 @@ def execution_checks(source):
             'PYTHONNOUSERSITE': '1',
             'UV_NO_SYNC': '1',
             'UV_PYTHON_DOWNLOADS': 'never',
-            'LD_LIBRARY_PATH': '/opt/ppu-ci-venv/lib/ppu-system:'
-            + os.environ.get('LD_LIBRARY_PATH', ''),
-            'GIT_EXEC_PATH': '/opt/ppu-ci-venv/libexec/git-core',
-            'SSL_CERT_FILE': '/opt/ppu-ci-venv/etc/ssl/certs/ca-certificates.crt',
+            'LD_LIBRARY_PATH': os.environ.get('LD_LIBRARY_PATH', ''),
         }
     )
     checks = [
@@ -722,11 +683,11 @@ def execution_checks(source):
             'assert pathlib.Path(google.protobuf.__file__).resolve().is_relative_to(sys.prefix); '
             'assert "include-system-site-packages = false" in pathlib.Path(sys.prefix, "pyvenv.cfg").read_text()',
         ],
-        ['/opt/ppu-ci-venv/bin/git', '--version'],
-        ['/opt/ppu-ci-venv/bin/wget', '--version'],
-        ['/opt/ppu-ci-venv/bin/envsubst', '--version'],
+        ['/usr/bin/git', '--version'],
+        ['/usr/bin/wget', '--version'],
+        ['/usr/bin/envsubst', '--version'],
         ['/opt/ppu-ci-venv/bin/yq', '--version'],
-        ['/opt/ppu-ci-venv/bin/make', '-q', '-C', str(source / 'megatron/core/datasets')],
+        ['/usr/bin/make', '-q', '-C', str(source / 'megatron/core/datasets')],
         # Verify the original training driver's absolute path, not just the venv tool in PATH.
         ['/usr/local/bin/yq', '--version'],
         [

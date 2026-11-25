@@ -1,9 +1,8 @@
-"""Build-only exporters; archives contain materialized regular files, never host links."""
+"""Isolate vendor packages and export build evidence for PPU images."""
 
 import hashlib
 import importlib.metadata as md
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -63,93 +62,6 @@ def vendor_bytes(base):
     }
 
 
-def libraries(files, directory):
-    directory.mkdir(parents=True, exist_ok=True)
-    pending = []
-    for path in files:
-        if not path.is_file():
-            continue
-        with path.open('rb') as stream:
-            if stream.read(4) == b'\x7fELF':
-                pending.append(path)
-    # A wheel's secondary libraries can rely on the extension's inherited RPATH.
-    # Seed only dependencies from successful ldd closures, then retry pending ELFs
-    # against those materialized libraries. Never ignore an unresolved dependency.
-    env = dict(os.environ, LD_LIBRARY_PATH=str(directory), LC_ALL='C')
-    known = {
-        'libstdc++.so.6': 'missing-native-libstdcxx',
-        'libgcc_s.so.1': 'missing-native-libgcc',
-        'libgomp.so.1': 'missing-native-libgomp',
-        'libatomic.so.1': 'missing-native-libatomic',
-        'libgfortran.so.5': 'missing-native-libgfortran',
-        'libquadmath.so.0': 'missing-native-libquadmath',
-        'libgfortran-040039e1.so.5.0.0': 'missing-native-libgfortran',
-        'libquadmath-96973f99.so.0.0.0': 'missing-native-libquadmath',
-        'libssl.so.3': 'missing-native-libssl',
-        'libcrypto.so.3': 'missing-native-libcrypto',
-        'libpython3.12.so.1.0': 'missing-native-libpython',
-        'libpython3.so': 'missing-native-libpython',
-        'libtk8.6.so': 'missing-native-libtk',
-        'libtcl8.6.so': 'missing-native-libtcl',
-    }
-    while pending:
-        unresolved, markers = [], set()
-        progress = False
-        for path in pending:
-            result = subprocess.run(
-                ['ldd', str(path)], env=env, capture_output=True, text=True, check=False
-            )
-            if 'not found' in result.stdout:
-                unresolved.append(path)
-                names = re.findall(
-                    r'^\s*([^\s/]+)\s+=>\s+not found\s*$', result.stdout, re.MULTILINE
-                )
-                markers.update(known.get(name, 'missing-native-unknown') for name in names)
-                if not names:
-                    markers.add('missing-native-unknown')
-                    markers.add(
-                        'missing-native-version'
-                        if re.search(r"version\s+[^\n]+not found", result.stdout)
-                        else 'missing-native-unparsed'
-                    )
-                continue
-            if (
-                result.returncode
-                and 'not a dynamic executable' not in result.stderr + result.stdout
-            ):
-                raise RuntimeError('Unable to inventory native dependencies')
-            for name in re.findall(r'(/[^\s()]+)', result.stdout):
-                source = Path(name).resolve(strict=True)
-                target = directory / Path(name).name
-                if target.exists():
-                    if sha256(target) != sha256(source):
-                        raise RuntimeError('Conflicting native dependency SONAMEs')
-                else:
-                    copy(source, target)
-                    progress = True
-        if unresolved and not progress:
-            # Emit only fixed component labels, never ELF names, paths or ldd output.
-            owners = {
-                'numpy': 'numpy',
-                'numpy.libs': 'numpy',
-                'google_crc32c': 'crc32c',
-                'google_crc32c.libs': 'crc32c',
-                'grpc': 'grpc',
-                'pydantic_core': 'pydantic',
-                'lib-dynload': 'stdlib',
-            }
-            for path in unresolved:
-                owner = next((owners[part] for part in path.parts if part in owners), 'other')
-                if path.name in ('python3.12', 'libpython3.12.so.1.0', 'libpython3.so'):
-                    owner = 'python'
-                markers.add('missing-native-object-' + owner)
-            raise RuntimeError(
-                'A native dependency is missing in the build container; '
-                + ','.join(sorted(markers))
-            )
-        pending = unresolved
-
-
 def isolate():
     base = Path(sysconfig.get_path('purelib'))
     packages = {item.metadata['Name']: item.version for item in md.distributions()}
@@ -196,18 +108,6 @@ def runtime():
     site = Path(sysconfig.get_path('purelib'))
     if vendor_bytes(site) != json.loads(Path('/build/vendor-bytes.json').read_text()):
         raise RuntimeError('Dockerfile build changed vendor Torch or Triton bytes')
-    for name in ('git', 'wget', 'envsubst', 'make'):
-        path = shutil.which(name)
-        if not path:
-            raise RuntimeError('Required runtime tool is missing')
-        copy(path, VENV / 'bin' / name)
-    copy('/usr/lib/git-core', VENV / 'libexec/git-core')
-    copy('/etc/ssl/certs/ca-certificates.crt', VENV / 'etc/ssl/certs/ca-certificates.crt')
-    libraries(
-        [VENV / 'bin' / name for name in ('git', 'wget', 'envsubst', 'make', 'yq')]
-        + list((VENV / 'libexec/git-core').iterdir()),
-        VENV / 'lib/ppu-system',
-    )
     for name in (
         'constraints.txt',
         'ppu-requirements.txt',
@@ -231,8 +131,8 @@ def runtime():
         )
     )
     tools = EXPORT / 'functional-tools'
-    for name in ('yq', 'envsubst'):
-        copy(VENV / 'bin' / name, tools / name)
+    for source in (VENV / 'bin/yq', Path('/usr/bin/envsubst')):
+        copy(source, tools / source.name)
 
 
 if __name__ == '__main__':

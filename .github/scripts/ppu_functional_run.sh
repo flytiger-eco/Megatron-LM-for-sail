@@ -42,10 +42,6 @@ export PATH="/opt/ppu-ci-venv/bin:$PATH"
 export VIRTUAL_ENV=/opt/ppu-ci-venv UV_PROJECT_ENVIRONMENT=/opt/ppu-ci-venv
 export PYTHONSAFEPATH=1 PYTHONPATH="$PPU_SOURCE_ROOT"
 export PYTHONNOUSERSITE=1 UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never
-export LD_LIBRARY_PATH="/opt/ppu-ci-venv/lib/ppu-system:${LD_LIBRARY_PATH:-}"
-export GIT_EXEC_PATH=/opt/ppu-ci-venv/libexec/git-core
-export SSL_CERT_FILE=/opt/ppu-ci-venv/etc/ssl/certs/ca-certificates.crt
-export GIT_SSL_CAINFO="$SSL_CERT_FILE"
 unset WORLD_SIZE RANK LOCAL_RANK
 python -m pip check
 make -q -C megatron/core/datasets
