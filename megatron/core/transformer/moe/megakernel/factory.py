@@ -28,7 +28,7 @@ def megakernel_fuses_shared_expert(config: TransformerConfig) -> bool:
     """Resolve shared execution from structural compatibility, independently of activation."""
     if config.moe_megakernel_backend in (None, "te_ppu_rtc"):
         return False
-    if config.moe_megakernel_backend != "mok":
+    if config.moe_megakernel_backend not in ("mok", "cutemok"):
         raise ValueError(f"Unsupported MoE megakernel backend: {config.moe_megakernel_backend!r}")
     mode, _ = split_megakernel_backend_config(config)
     compatible = (
@@ -65,7 +65,7 @@ def build_megakernel_backend(
         from megatron.core.transformer.moe.megakernel.te_ppu import TEPPUMegaMoE
 
         return TEPPUMegaMoE(config, ep_group, routed_experts, num_local_experts)
-    if backend == "mok":
+    if backend in ("mok", "cutemok"):
         from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
 
         return MoKMegakernel(
@@ -83,7 +83,7 @@ def prepare_megakernel_shared_expert_config(config: TransformerConfig) -> Transf
     backend = config.moe_megakernel_backend
     if not megakernel_fuses_shared_expert(config):
         return config
-    if backend == "mok":
+    if backend in ("mok", "cutemok"):
         from megatron.core.transformer.moe.megakernel.mok.weights import (
             prepare_shared_expert_config,
         )
@@ -97,7 +97,7 @@ def megakernel_shared_expert_init_context(config: TransformerConfig):
     backend = config.moe_megakernel_backend
     if not megakernel_fuses_shared_expert(config):
         return nullcontext()
-    if backend == "mok":
+    if backend in ("mok", "cutemok"):
         from megatron.core.fp8_utils import get_fp8_disabled_context
 
         # MOK consumes native BF16 shared weights. Disable any model-wide TE
