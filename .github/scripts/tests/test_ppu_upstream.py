@@ -574,6 +574,47 @@ def test_each_rank_requires_complete_timing(tmp_path, field):
     assert not ci.case_results(case, tmp_path, IDENTITY, require_timing=True)["complete"]
 
 
+@pytest.mark.parametrize("scope", ["quick", "full"])
+def test_new_two_card_bucket_preserves_quick_and_full_plans(tmp_path, monkeypatch, capsys, scope):
+    # PR #27 adds this two-replica bucket outside the representative Quick suite.
+    bucket = "tests/unit_tests/inference/engines/test_batch_invariant_coordinator.py"
+    recipe = yaml.safe_load((ROOT / ci.RECIPE_PATH).read_text())
+    product = copy.deepcopy(recipe["products"][0])
+    product["test_case"] = [bucket]
+    for variant in product["products"]:
+        variant["gpus"] = [2]
+    recipe["products"].append(product)
+    for path in [*(p.relative_to(ROOT) for p in (ROOT / "tests/unit_tests").rglob("*.py")), bucket]:
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("raise RuntimeError('configure must not import source')\n")
+    target = tmp_path / ci.RECIPE_PATH
+    target.parent.mkdir(parents=True)
+    target.write_text(yaml.safe_dump(recipe))
+    monkeypatch.setattr(ci, "ROOT", tmp_path)
+    manifest = ci.generate(
+        {
+            "scope": scope,
+            "suite_family": "nvidia-dev",
+            "repeat": 1,
+            "timeout": 30,
+            "unit_test": True,
+        },
+        tmp_path / "plan",
+    )
+    rows = json.loads(capsys.readouterr().out.removeprefix("unit_matrix="))["include"]
+    if scope == "quick":
+        assert len(manifest["unit"]) == len(ci.load_policy()["groups"])
+        assert len(rows) == 1 and rows[0]["cards"] == 8
+        assert all(
+            bucket not in case["source_buckets"].values() for case in manifest["unit"].values()
+        )
+    else:
+        case = next(case for case in manifest["unit"].values() if case["bucket"] == bucket)
+        assert case["cards"] == 2 and case["files"] == [bucket]
+        assert next(row for row in rows if row["id"] == case["id"])["cards"] == 2
+
+
 @pytest.mark.parametrize(
     "mutation,reason",
     [
