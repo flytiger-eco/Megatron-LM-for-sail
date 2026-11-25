@@ -339,50 +339,6 @@ def finite(value) -> bool:
     return type(value) in (int, float) and math.isfinite(value)
 
 
-def comparison_steps(name: str, values: dict) -> list:
-    """Mirror only the upstream comparison region, never its numeric tolerances."""
-    if name != "iteration-time":
-        return sorted(values)
-    steps = sorted(step for step, value in values.items() if finite(value))
-    if not steps:
-        raise ValueError("iteration-time has no finite samples")
-    window = range(5, 21) if steps[-1] <= 25 else range(30, 46)
-    selected = [step for step in steps if step in window]
-    selected = selected or [step for step in steps if step >= window.start][:4]
-    if not selected:
-        raise ValueError("iteration-time has no samples after warmup")
-    return selected
-
-
-def validate_region(reference: dict, actual: dict, metrics: list, *, after: int = 0) -> dict:
-    regions = {}
-    for name in metrics:
-        if name not in reference or name not in actual:
-            raise ValueError(f"Required metric missing: {name}")
-        values = {step: value for step, value in reference[name]["values"].items() if step > after}
-        steps = comparison_steps(name, values)
-        if not steps:
-            raise ValueError(f"Empty comparison region: {name}")
-        for step in steps:
-            if not finite(values[step]) or not finite(actual[name]["values"].get(step)):
-                raise ValueError(f"Missing or non-finite comparison sample: {name}/{step}")
-        regions[name] = steps
-    return regions
-
-
-def supported_metrics(control: Path) -> set:
-    path = control / "tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py"
-    tree = ast.parse(path.read_text())
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "CHECK_THRESHOLDS"
-            for target in node.targets
-        ):
-            if isinstance(node.value, ast.Dict):
-                return {ast.literal_eval(key) for key in node.value.keys}
-    raise ValueError("Unable to read upstream CHECK_THRESHOLDS metric names")
-
-
 def model_config_path(name: str) -> Path:
     return BASELINES / name / MODEL_CONFIG_OVERRIDES.get(name, "model_config.yaml")
 
@@ -468,7 +424,8 @@ def describe_case(root: Path, name: str, specs: list, config: dict) -> dict:
         raise ValueError(f"Invalid metric selection: {name}")
     golden_path = safe_file(root, directory / f"golden_values_dev_{PLATFORM}.json")
     golden = read_metrics(golden_path)
-    regions = {} if observation else validate_region(golden, golden, metrics)
+    if not observation and set(metrics) - golden.keys():
+        raise ValueError(f"Required metrics missing from golden: {name}")
     if not observation and any(
         golden[metric]["end_step"] < iters for metric in metrics if metric != "iteration-time"
     ):
@@ -514,10 +471,6 @@ def describe_case(root: Path, name: str, specs: list, config: dict) -> dict:
         "requested_repeat": config["repeat"],
         "observation": observation,
         "metrics": metrics,
-        "comparison_regions": regions,
-        "value_precision": {
-            metric: golden[metric]["value_precision"] for metric in metrics if metric in golden
-        },
         "approximate": enabled(env.get("NVTE_ALLOW_NONDETERMINISTIC_ALGO", 0))
         or enabled(env.get("NON_DETERMINSTIC_RESULTS", 0)),
         "launcher": launcher,
@@ -543,7 +496,6 @@ def catalogue(root: Path, control: Path, config: dict) -> dict:
     if unknown:
         raise ValueError(f"PPU goldens have no DEV recipe match: {sorted(unknown)}")
     selected, disabled, ignored, outside, skipped = {}, [], [], [], []
-    metric_names = supported_metrics(control)
     requested = config["requested_cases"]
     if requested != ["all"] and set(requested) - by_name.keys():
         raise ValueError(f"Unknown requested cases: {sorted(set(requested) - by_name.keys())}")
@@ -598,8 +550,6 @@ def catalogue(root: Path, control: Path, config: dict) -> dict:
                 dependency.update(source=source, status="fixed_source")
         fixed = [item for item in row["tokenizer_dependencies"] if item.get("source")]
         row["assets"].extend(hf.asset_requirements(fixed))
-        if set(row["metrics"]) - metric_names:
-            raise ValueError(f"Unsupported upstream metrics for {name}")
         row["id"] = f"functional-{len(selected):03d}"
         selected[row["id"]] = row
     if requested != ["all"]:
@@ -998,7 +948,7 @@ def write_asset_report(report: dict, output: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("configure", "catalogue", "assets", "combine"))
+    parser.add_argument("command", choices=("configure", "assets", "combine"))
     parser.add_argument(
         "--root",
         type=Path,
@@ -1028,29 +978,6 @@ def main() -> None:
         raise SystemExit(0 if report["ok"] else 1)
     inputs = json.loads(os.environ.get("PPU_INPUTS", "{}"))
     config = select_config(inputs)
-    if args.command == "catalogue":
-        result = catalogue(args.root, args.control, config)
-        print(
-            json.dumps(
-                {
-                    "cases": len(result["functional"]),
-                    "models": sorted({row["model"] for row in result["functional"].values()}),
-                    "observations": [
-                        row["name"] for row in result["functional"].values() if row["observation"]
-                    ],
-                    "asset_requirements": sorted(
-                        {
-                            asset["relative_path"]
-                            for row in result["functional"].values()
-                            for asset in row["assets"]
-                        }
-                    ),
-                    "coverage": result["coverage"],
-                },
-                indent=2,
-            )
-        )
-        return
     validate_route(os.environ["GITHUB_EVENT_NAME"], os.environ["GITHUB_REF"], inputs)
     authorization = json.loads((args.output / "authorization.json").read_text())
     if not authorization["allowed"] or authorization["pr_number"] or authorization["manual_pr"]:

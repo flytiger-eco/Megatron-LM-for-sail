@@ -491,16 +491,21 @@ def test_summary_rejects_missing_case_artifact(evidence):
     assert result["numeric_failed"] == 1
 
 
+@pytest.mark.parametrize("metric", ["lm loss", "iteration-time"])
 @pytest.mark.parametrize("bad_numeric", [False, True])
 def test_plugin_collects_real_upstream_pytest_without_changing_assertions(
-    evidence, tmp_path, bad_numeric
+    evidence, tmp_path, bad_numeric, metric
 ):
     manifest, case, directory = evidence
     path = directory / "plugin-test"
     path.mkdir()
+    model_config = yaml.safe_load((ROOT / case["config_path"]).read_text())
+    model_config["METRICS"] = [metric]
+    model_path = path / "model_config.yaml"
+    model_path.write_text(yaml.safe_dump(model_config))
     actual = json.loads((ROOT / case["golden_path"]).read_text())
     if bad_numeric:
-        actual["lm loss"]["values"]["10"] = 999
+        actual[metric]["values"] = dict.fromkeys(actual[metric]["values"], 999)
     actual_path = path / "actual.json"
     write_json(actual_path, actual)
     env = {
@@ -528,7 +533,7 @@ def test_plugin_collects_real_upstream_pytest_without_changing_assertions(
         "--actual-values-path",
         str(actual_path),
         "--model-config-path",
-        str(ROOT / case["config_path"]),
+        str(model_path),
     ]
     run = subprocess.run(command, env=env, cwd=ROOT, capture_output=True, text=True, timeout=30)
     assert run.returncode == (1 if bad_numeric else 0), run.stdout + run.stderr

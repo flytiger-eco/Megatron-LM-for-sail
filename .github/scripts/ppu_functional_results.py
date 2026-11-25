@@ -306,10 +306,6 @@ def verify_envelope(manifest: dict, case: dict, directory: Path) -> dict:
     current = manifest.get("schema_version") == 2
     if current:
         control.paths.require_current(manifest)
-        exporter = control.module_from_path(
-            "ppu_results_export", Path(__file__).with_name("ppu_ci_export.py")
-        )
-        exporter.verify_public(directory)
     assets = json.loads((directory / "assets-report.json").read_text())
     if (
         assets.get("identity") != manifest["identity"]

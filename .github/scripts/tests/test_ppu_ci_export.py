@@ -1,16 +1,14 @@
 """Public evidence export preserves numeric evidence and blocks unsafe path disclosures."""
 
-import hashlib
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
-from string import Template
 
 import pytest
 from test_ppu_ci_paths import path_env
-from test_ppu_functional import ROOT, SCRIPTS, functional
+from test_ppu_functional import SCRIPTS, functional
 from test_ppu_functional_results import completion, evidence, results, successful_repeat
 
 exporter = functional.module_from_path("public_export_tests", SCRIPTS / "ppu_ci_export.py")
@@ -41,57 +39,17 @@ def test_json_escapes_are_redacted_structurally(tmp_path, path_env, encoding):
     report = json.loads((destination / "report.json").read_text())
     assert report == {"path": "ppu://runs/cpu/run.log", "actual": [1.25, 0, -4.0]}
     assert snapshot(source) == before
-    exporter.verify_public(destination)
 
 
-def test_text_yaml_jsonl_and_failure_stack_are_redacted(tmp_path, path_env):
-    source = tmp_path / "private"
-    source.mkdir()
+def test_failure_stack_is_redacted(tmp_path, path_env):
+    source = tmp_path / "stack.log"
     private = path_env["PPU_POD_ASSETS_ROOT"]
-    (source / "stack.log").write_text(f"FileNotFoundError: {private}/missing\nexit=23\n")
-    (source / "report.yaml").write_text(
-        'path: "' + private.replace("/", "\\u002f") + '"\nactual: 1.25\n'
-    )
-    (source / "report.jsonl").write_text(json.dumps({"path": private}) + "\n")
+    source.write_text(f"FileNotFoundError: {private}/missing\nexit=23\n")
     destination = tmp_path / "public"
     exporter.export(source, destination, env=path_env)
-    assert "ppu://assets/pod/missing" in (destination / "stack.log").read_text()
-    for content in snapshot(destination).values():
-        assert private.encode() not in content
-
-
-def test_upstream_expanded_model_config_is_public_text_not_unknown_binary(tmp_path, path_env):
-    source = tmp_path / "private/attempt-1/repeat-1"
-    source.mkdir(parents=True)
-    recipe = ROOT / (
-        "tests/functional_tests/test_cases/gpt/gpt3_mcore_te_tp2_pp2_cp2/model_config.yaml"
+    assert (destination / "stack.log").read_text() == (
+        "FileNotFoundError: ppu://assets/pod/missing\nexit=23\n"
     )
-    original = recipe.read_bytes()
-    (source / "model_config.yaml").write_bytes(original)
-    run_root = path_env["PPU_POD_RUN_ROOT"] + "/single-case/attempt-1/repeat-1"
-    env = {
-        "DATA_PATH": path_env["PPU_POD_ASSETS_ROOT"],
-        "DATA_CACHE_PATH": run_root + "/cache",
-        "TENSORBOARD_PATH": run_root + "/tensorboard",
-        "CHECKPOINT_SAVE_PATH": run_root + "/checkpoints",
-        "CHECKPOINT_LOAD_PATH": run_root + "/initial-checkpoints",
-    }
-    expanded = Template(original.decode()).substitute(env).encode()
-    temporary = source / "model_config.yaml.tmp"
-    temporary.write_bytes(expanded)
-    before = snapshot(source)
-    destination = tmp_path / "public"
-    report = exporter.export(source, destination, env=path_env)
-    public = (destination / temporary.name).read_bytes()
-    assert public == exporter.Redactor(path_env).text(expanded.decode()).encode()
-    assert b"--train-iters: 50" in public and b"--lr: 0.00015" in public
-    assert (destination / "model_config.yaml").read_bytes() == original
-    assert report["files"][temporary.name]["sha256"] == hashlib.sha256(public).hexdigest()
-    assert snapshot(source) == before
-    exporter.verify_public(destination)
-    upstream = (ROOT / "tests/functional_tests/shell_test_utils/_run_training.sh").read_text()
-    assert '>$TRAINING_PARAMS_PATH.tmp' in upstream
-    assert 'TRAINING_PARAMS_PATH="$TRAINING_PARAMS_PATH.tmp"' in upstream
 
 
 @pytest.mark.parametrize(
@@ -103,9 +61,8 @@ def test_immutable_config_and_actual_bytes_never_change(tmp_path, path_env, file
     path.parent.mkdir(parents=True)
     content = b'{"metric":{"values":{"1":1.25,"2":0}},"revision":"fixed"}\n'
     path.write_bytes(content)
-    report = exporter.export(source, tmp_path / "public", env=path_env)
+    exporter.export(source, tmp_path / "public", env=path_env)
     assert (tmp_path / "public" / filename).read_bytes() == content
-    assert report["files"][filename]["sha256"] == hashlib.sha256(content).hexdigest()
 
 
 @pytest.mark.parametrize("filename", ["model_config.yaml", "observation.json"])
@@ -154,8 +111,9 @@ def test_private_archives_and_checkpoint_cache_payloads_are_not_public(tmp_path,
     }
     (source / "runtime-image.json").write_text(json.dumps(record, indent=2) + "\n")
     before = snapshot(source)
-    report = exporter.export(source, tmp_path / "public", kind="bundle", env=path_env)
-    assert set(report["files"]) == {
+    count = exporter.export(source, tmp_path / "public", kind="bundle", env=path_env)
+    assert count == 4
+    assert set(snapshot(tmp_path / "public")) == {
         "control/ppu_ci_paths.py",
         "manifest.json",
         "build-timing.json",
@@ -164,16 +122,6 @@ def test_private_archives_and_checkpoint_cache_payloads_are_not_public(tmp_path,
     assert (tmp_path / "public/runtime-image.json").read_bytes() == (
         source / "runtime-image.json"
     ).read_bytes()
-    assert {
-        "source.tar.gz",
-        "environment.tar.gz",
-        "compiled-source.tar.gz",
-        "control-runtime.tar.gz",
-        "wheels/megatron.whl",
-        "functional-tools/yq",
-        "data/private.bin",
-    } <= set(report["omitted"])
-    assert report["original_digest_applies_to"] == "private NAS originals only"
     assert snapshot(source) == before
 
 
@@ -231,29 +179,6 @@ def test_local_overlay_replaces_only_public_placeholder_and_retains_partial_fail
         exporter.export(source, tmp_path / "unapproved", overlay=overlay, env=path_env)
 
 
-@pytest.mark.parametrize("damage", ["modified", "removed", "extra", "symlink", "inventory"])
-def test_independent_public_inventory_verification_rejects_tampering(tmp_path, path_env, damage):
-    source = tmp_path / "private"
-    source.mkdir()
-    (source / "evidence.txt").write_text("Original")
-    destination = tmp_path / "public"
-    exporter.export(source, destination, env=path_env)
-    if damage == "modified":
-        (destination / "evidence.txt").write_text("Modified")
-    elif damage == "removed":
-        (destination / "evidence.txt").rename(tmp_path / "removed")
-    elif damage == "extra":
-        (destination / "extra.txt").write_text("Uninventoried")
-    elif damage == "symlink":
-        (destination / "link").symlink_to(source / "evidence.txt")
-    else:
-        report = json.loads((destination / "public-export.json").read_text())
-        report["files"]["../private/evidence.txt"] = report["files"].pop("evidence.txt")
-        (destination / "public-export.json").write_text(json.dumps(report))
-    with pytest.raises(ValueError):
-        exporter.verify_public(destination)
-
-
 @pytest.mark.parametrize("damage", [None, "actual", "model", "identity", "repeat", "asset-root"])
 def test_public_evidence_preserves_upstream_results_and_rejects_tampering(
     evidence, tmp_path, damage
@@ -302,11 +227,7 @@ def test_public_evidence_preserves_upstream_results_and_rejects_tampering(
         report = json.loads((public / "assets-report.json").read_text())
         report["root"]["checked_path"] = "ppu://unapproved/assets"
         (public / "assets-report.json").write_text(json.dumps(report))
-    if damage:
-        # Rehash the public view to prove the original numeric/identity/configuration gates still fail.
-        checked = tmp_path / "rehash"
-        exporter.export(public, checked, env=env)
-        public = checked
+    assert not (public / "public-export.json").exists()
     report = results.verify_case(manifest, case, public)
     assert report["success"] is (damage is None), report
     if damage != "model":
@@ -376,12 +297,15 @@ def test_public_export_omits_raw_binary_and_cache_without_modifying_them(tmp_pat
         "tensorboard/events.raw",
         "cache/huggingface/config.json",
         "unknown.bin",
+        "model_config.yaml.tmp",
+        "unused.yaml",
+        "unused.jsonl",
+        "helper.py",
     ):
         path = source / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"private binary:" + path_env["PPU_POD_RUN_ROOT"].encode())
     before = snapshot(source)
-    report = exporter.export(source, tmp_path / "public", env=path_env)
-    assert set(report["files"]) == {"summary.json"}
-    assert len(report["omitted"]) == 4
+    assert exporter.export(source, tmp_path / "public", env=path_env) == 1
+    assert set(snapshot(tmp_path / "public")) == {"summary.json"}
     assert snapshot(source) == before

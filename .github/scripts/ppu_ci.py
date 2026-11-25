@@ -615,16 +615,6 @@ def summarize(manifest: dict, directory: Path) -> dict:
             require_timing=manifest.get("schema_version", 2) >= 3,
         )
         group_errors = result["errors"]
-        if manifest.get("runtime_path_schema") == 1:
-            try:
-                spec = importlib.util.spec_from_file_location(
-                    "ppu_ci_public_export", Path(__file__).with_name("ppu_ci_export.py")
-                )
-                exporter = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(exporter)
-                exporter.verify_public(result_dir)
-            except (OSError, ValueError, KeyError, TypeError) as exc:
-                group_errors.append(f"Public evidence inventory: {exc}")
         timing_path = result_dir / "timing.json"
         timing = (
             read_timing(timing_path, group_errors)

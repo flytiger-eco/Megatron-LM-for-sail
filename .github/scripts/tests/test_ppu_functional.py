@@ -1,4 +1,4 @@
-"""CPU-only coverage for functional selection, assets and upstream numeric parity."""
+"""CPU-only coverage for functional selection and assets."""
 
 import copy
 import importlib.util
@@ -38,19 +38,6 @@ def read_metric(tmp_path, values=None, **kwargs):
 @pytest.fixture(scope="module")
 def catalogue():
     return functional.catalogue(ROOT, ROOT, functional.select_config({}))
-
-
-@pytest.fixture
-def upstream(monkeypatch):
-    monkeypatch.syspath_prepend(str(ROOT))
-    return tuple(
-        importlib.import_module(f"tests.functional_tests.python_test_utils.{name}")
-        for name in (
-            "common",
-            "test_pretraining_regular_pipeline",
-            "test_pretraining_resume_checkpoint_pipeline",
-        )
-    )
 
 
 @pytest.mark.parametrize(
@@ -527,15 +514,6 @@ def test_corrupt_golden_is_a_hard_error(tmp_path, text):
 def test_missing_golden_sampling_point_fails(tmp_path):
     with pytest.raises(ValueError, match="sampling grid"):
         read_metric(tmp_path, {"1": 1.0, "3": 1.0, "4": 1.0})
-
-
-@pytest.mark.parametrize("bad", ["nan", "inf", float("nan"), float("inf"), None])
-def test_missing_and_nonfinite_actual_are_hard_errors(tmp_path, bad):
-    reference = read_metric(tmp_path)
-    actual = copy.deepcopy(reference)
-    actual["lm loss"]["values"][3] = bad
-    with pytest.raises(ValueError, match="non-finite"):
-        functional.validate_region(reference, actual, ["lm loss"])
 
 
 def test_route_import_does_not_require_yaml_on_hosted_authorization_runner():

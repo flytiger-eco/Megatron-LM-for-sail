@@ -1,11 +1,9 @@
-"""Export a fail-closed, path-redacted public view without changing private evidence."""
+"""Collect CI reports and text logs, redacting private mount paths before upload."""
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import os
-import stat
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location(
@@ -13,28 +11,7 @@ spec = importlib.util.spec_from_file_location(
 )
 paths = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(paths)
-TEXT_SUFFIXES = {
-    ".json",
-    ".jsonl",
-    ".yaml",
-    ".yml",
-    ".log",
-    ".txt",
-    ".xml",
-    ".csv",
-    ".md",
-    ".py",
-    ".sh",
-    ".pth",
-    ".ready",
-}
 OMITTED_DIRS = {"checkpoints", "initial-checkpoints", "cache", "tensorboard"}
-ARCHIVES = {
-    "source.tar.gz",
-    "environment.tar.gz",
-    "compiled-source.tar.gz",
-    "control-runtime.tar.gz",
-}
 BUNDLE_FILES = {
     ".complete",
     "manifest.json",
@@ -61,7 +38,6 @@ BUNDLE_FILES = {
     "ppu-requirements.txt",
     "test-requirements.txt",
 }
-OVERLAY_FILES = {"action-timing.json"}
 ACTION_FIELDS = {
     "job_status",
     "duration_seconds",
@@ -69,57 +45,6 @@ ACTION_FIELDS = {
     "occupied_ppu_card_hours",
     "execution_ppu_card_hours",
 }
-FAILURE_CODES = {
-    "Private directory remained in public evidence": "private-path-bytes",
-    "Unsupported private binary field in structured evidence": "structured-private-binary",
-    "Unsupported structured evidence collection": "structured-collection",
-    "Redaction produced duplicate public JSON keys": "duplicate-public-keys",
-    "Immutable numeric/configuration/cache evidence contains a private path": "immutable-private-path",
-    "Public staging must be new and outside private evidence": "invalid-public-staging",
-    "Private evidence is missing or is a symlink": "invalid-private-root",
-    "Evidence roots must not have symlink ancestors": "linked-evidence-ancestor",
-    "Local envelope overlay must be a regular directory": "invalid-overlay-root",
-    "Unapproved local envelope overlay": "unapproved-overlay",
-    "Unsupported encoded private path in expanded model configuration": "expanded-config-encoded-path",
-    "Symlinks are not allowed in public evidence": "public-evidence-symlink",
-    "Private directory in public evidence filename": "private-evidence-filename",
-    "Special files are not allowed in public evidence": "public-special-file",
-    "No public evidence files were exported": "empty-public-evidence",
-    "Reserved public export filename": "reserved-public-filename",
-    "Public evidence root or inventory is not a regular, unlinked path": "invalid-public-root",
-    "Invalid public evidence inventory": "invalid-public-inventory",
-    "Public evidence contains an escaping link": "public-escaping-link",
-    "Public evidence contains a special file": "public-special-file",
-    "Public evidence file inventory mismatch": "public-inventory-mismatch",
-    "Malformed public evidence file metadata": "invalid-public-metadata",
-    "Public evidence failed size or digest verification": "public-digest-mismatch",
-}
-
-
-class ExportFileError(ValueError):
-    """Retain the original error internally, with only an allowlisted public file category."""
-
-    def __init__(self, category: str, error: Exception):
-        super().__init__(str(error))
-        self.category = category
-        self.error = error
-
-
-def failure_summary(error: Exception) -> str:
-    """Never expose exception messages, filenames, paths or traceback locals."""
-    category = "export-root"
-    if isinstance(error, ExportFileError):
-        category, error = error.category, error.error
-    code = FAILURE_CODES.get(str(error), "export-failed")
-    if isinstance(error, json.JSONDecodeError):
-        code = "invalid-json"
-    elif isinstance(error, UnicodeDecodeError):
-        code = "invalid-utf8"
-    elif isinstance(error, OSError):
-        code = "evidence-io-error"
-    return (
-        f"Public evidence export failed ({type(error).__name__}; code={code}; evidence={category})"
-    )
 
 
 def action_outputs(value: str) -> str:
@@ -132,173 +57,77 @@ def action_outputs(value: str) -> str:
 class Redactor:
     def __init__(self, env=None):
         self.mapping = paths.replacements(env)
-        self.needles = tuple(
-            value.encode(encoding)
-            for value in self.mapping
-            for encoding in ("utf-8", "utf-16-le", "utf-16-be")
-        )
 
     def text(self, value: str) -> str:
         for private, public in self.mapping.items():
             value = value.replace(private, public)
         return value
 
-    def contains(self, value: bytes) -> bool:
-        return any(needle in value for needle in self.needles)
-
-    def scan(self, path: Path) -> None:
-        overlap = max(map(len, self.needles), default=1)
-        tail = b""
-        with path.open("rb") as stream:
-            while block := stream.read(1024 * 1024):
-                combined = tail + block
-                if self.contains(combined):
-                    raise ValueError("Private directory remained in public evidence")
-                tail = combined[-overlap:]
-
     def structure(self, value):
-        if isinstance(value, bytes) and self.contains(value):
-            raise ValueError("Unsupported private binary field in structured evidence")
-        if isinstance(value, (set, tuple)):
-            raise ValueError("Unsupported structured evidence collection")
         if isinstance(value, str):
             return self.text(value)
         if isinstance(value, list):
             return [self.structure(item) for item in value]
         if isinstance(value, dict):
-            result = {}
-            for key, item in value.items():
-                safe = self.structure(key)
-                if safe in result:
-                    raise ValueError("Redaction produced duplicate public JSON keys")
-                result[safe] = self.structure(item)
+            result = {self.structure(key): self.structure(item) for key, item in value.items()}
+            if len(result) != len(value):
+                raise ValueError("Redaction produced duplicate public keys")
             return result
+        if value is not None and not isinstance(value, (bool, int, float)):
+            raise ValueError("Unsupported structured report value")
         return value
 
 
-def immutable(path: Path) -> bool:
+def selected(relative: Path, kind: str) -> bool:
+    if any(part in OMITTED_DIRS for part in relative.parts):
+        return False
+    if kind == "bundle":
+        return relative.as_posix() in BUNDLE_FILES or (
+            len(relative.parts) == 2
+            and relative.parts[0] == "control"
+            and relative.suffix in {".py", ".sh"}
+        )
     return (
-        "huggingface" in path.parts
-        or path.name == "model_config.yaml"
-        or (path.name.startswith(("golden_values", "observation")) and path.suffix == ".json")
+        relative.suffix in {".json", ".log", ".txt", ".xml", ".md"}
+        or relative.name in {"model_config.yaml", ".complete"}
+        or ("barriers" in relative.parts and relative.name == "node_0")
+        or (
+            len(relative.parts) == 2
+            and relative.parts[0] == "control"
+            and relative.suffix in {".py", ".sh"}
+        )
     )
 
 
 def export_file(source: Path, destination: Path, redactor: Redactor) -> None:
-    if source.suffix in {".json", ".jsonl", ".yaml", ".yml"}:
-        content = source.read_bytes()
-        if source.suffix == ".jsonl":
-            value = [json.loads(row) for row in content.splitlines() if row.strip()]
-        elif source.suffix == ".json":
+    raw = source.read_bytes()
+    content = raw.decode("utf-8")
+    if "\0" in content:
+        raise ValueError("Public reports must be UTF-8 text")
+    public = redactor.text(content)
+    if source.suffix == ".json" or source.name == "model_config.yaml":
+        if source.suffix == ".json":
             value = json.loads(content)
         else:
             import yaml
 
             value = yaml.safe_load(content)
         safe = redactor.structure(value)
-        if immutable(source):
-            redactor.scan(source)
-            if safe != value:
-                raise ValueError(
-                    "Immutable numeric/configuration/cache evidence contains a private path"
-                )
-            copy_bytes(source, destination)
-        elif safe == value and not redactor.contains(content):
-            copy_bytes(source, destination)
-        elif source.suffix == ".jsonl":
-            destination.write_text(
-                "".join(json.dumps(row) + "\n" for row in safe), encoding="utf-8"
-            )
-        elif source.suffix == ".json":
-            destination.write_text(json.dumps(safe, indent=2) + "\n", encoding="utf-8")
-        else:
-            destination.write_text(yaml.safe_dump(safe), encoding="utf-8")
-    elif source.name == "model_config.yaml.tmp" and not immutable(source):
-        import yaml
-
-        # Upstream envsubst leaves this descriptive expanded copy beside the immutable config.
-        # Preserve every non-path byte; reject encodings that would bypass structural redaction.
-        content = source.read_bytes().decode("utf-8")
-        safe = redactor.structure(yaml.safe_load(content))
-        public = redactor.text(content)
-        try:
-            public_value = yaml.safe_load(public)
-        except yaml.YAMLError as error:
-            raise ValueError(
-                "Unsupported encoded private path in expanded model configuration"
-            ) from error
-        if public_value != safe:
-            raise ValueError("Unsupported encoded private path in expanded model configuration")
-        destination.write_bytes(public.encode("utf-8"))
-    elif (
-        source.suffix in TEXT_SUFFIXES or source.name in {"node_0", ".complete"}
-    ) and not immutable(source):
-        content = source.read_bytes()
-        destination.write_bytes(redactor.text(content.decode("utf-8")).encode("utf-8"))
-    else:
-        raise ValueError("Unsupported public evidence file type")
-    redactor.scan(destination)
+        immutable = source.name == "model_config.yaml" or source.name.startswith(
+            ("golden_values", "observation")
+        )
+        if immutable:
+            if safe != value or public != content:
+                raise ValueError("Immutable metric/configuration evidence contains a private path")
+        elif safe != value:
+            public = json.dumps(safe, indent=2) + "\n"
+    # Keep comparison inputs byte-for-byte: their hashes bind them to upstream pytest results.
+    destination.write_bytes(raw if public == content else public.encode("utf-8"))
 
 
-def export_checked_file(source: Path, destination: Path, redactor: Redactor) -> None:
-    if immutable(source):
-        category = "immutable-evidence"
-    elif source.name == "model_config.yaml.tmp":
-        category = "expanded-model-config"
-    elif source.suffix in {".json", ".jsonl", ".yaml", ".yml"}:
-        category = "structured-evidence"
-    elif source.suffix in TEXT_SUFFIXES:
-        category = "text-evidence"
-    else:
-        category = "unknown-binary"
-    try:
-        export_file(source, destination, redactor)
-    except Exception as error:
-        raise ExportFileError(category, error) from error
-
-
-def copy_bytes(source: Path, destination: Path) -> None:
-    with source.open("rb") as stream, destination.open("xb") as output:
-        while block := stream.read(1024 * 1024):
-            output.write(block)
-
-
-def omitted(relative: Path, kind: str) -> bool:
-    if relative.name == "public-export.json":
-        return True
-    parts = relative.parts
-    if any(part in OMITTED_DIRS for part in parts):
-        return True
-    if relative.name in ARCHIVES:
-        return True
-    if relative.name.startswith("events.out.tfevents."):
-        return True
-    if not (
-        relative.suffix in TEXT_SUFFIXES
-        or relative.name in {".complete", "model_config.yaml.tmp"}
-        or ("barriers" in parts and relative.name == "node_0")
-    ):
-        return True
-    if kind == "bundle" and not (
-        relative.as_posix() in BUNDLE_FILES
-        or (len(parts) == 2 and parts[0] == "control" and relative.suffix in {".py", ".sh"})
-    ):
-        return True
-    return False
-
-
-def digest_file(path: Path) -> str:
-    sha = hashlib.sha256()
-    with path.open("rb") as stream:
-        while data := stream.read(1024 * 1024):
-            sha.update(data)
-    return sha.hexdigest()
-
-
-def export(source: Path, destination: Path, *, kind="evidence", env=None, overlay=None) -> dict:
+def export(source: Path, destination: Path, *, kind="evidence", env=None, overlay=None) -> int:
     redactor = Redactor(env)
-    source = source.absolute()
-    destination = destination.absolute()
+    source, destination = source.absolute(), destination.absolute()
     if (
         destination.exists()
         or destination.is_symlink()
@@ -307,114 +136,41 @@ def export(source: Path, destination: Path, *, kind="evidence", env=None, overla
         raise ValueError("Public staging must be new and outside private evidence")
     if source.is_symlink() or (not source.exists() and overlay is None):
         raise ValueError("Private evidence is missing or is a symlink")
-    if any(parent.is_symlink() for parent in tuple(source.parents) + tuple(destination.parents)):
+    if any(parent.is_symlink() for parent in (*source.parents, *destination.parents)):
         raise ValueError("Evidence roots must not have symlink ancestors")
-    destination.mkdir(parents=True, exist_ok=False)
-    files, omissions = {}, []
-    candidates = [source] if source.is_file() else sorted(source.rglob("*"))
-    overlay_paths = {}
+    candidates = (
+        {Path(source.name): source}
+        if source.is_file()
+        else {path.relative_to(source): path for path in source.rglob("*")}
+    )
     if overlay is not None:
         overlay = Path(overlay).absolute()
-        if (
-            not overlay.is_dir()
-            or overlay.is_symlink()
-            or any(p.is_symlink() for p in overlay.parents)
-        ):
-            raise ValueError("Local envelope overlay must be a regular directory")
+        if not overlay.is_dir() or any(p.is_symlink() for p in (overlay, *overlay.parents)):
+            raise ValueError("Local action report must be an unlinked directory")
         for path in overlay.iterdir():
-            if path.name not in OVERLAY_FILES or path.is_symlink() or not path.is_file():
-                raise ValueError("Unapproved local envelope overlay")
-            overlay_paths[path.name] = path
-    for path in candidates:
-        relative = Path(path.name) if source.is_file() else path.relative_to(source)
-        if path.is_symlink() and not omitted(relative, kind):
-            raise ValueError("Symlinks are not allowed in public evidence")
-        if relative.as_posix() in overlay_paths:
+            if path.name != "action-timing.json" or path.is_symlink() or not path.is_file():
+                raise ValueError("Unapproved local action report")
+            candidates[Path(path.name)] = path
+    destination.mkdir(parents=True, exist_ok=False)
+    count = 0
+    for relative, path in sorted(candidates.items()):
+        if not selected(relative, kind):
             continue
+        if path.is_symlink():
+            raise ValueError("Symlinks are not allowed in public evidence")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError("Special files are not allowed in public evidence")
         if redactor.text("/" + relative.as_posix()) != "/" + relative.as_posix():
             raise ValueError("Private directory in public evidence filename")
-        if omitted(relative, kind):
-            # Excluded links are neither exported nor followed, including dangling links.
-            if not path.is_symlink() and path.is_file():
-                omissions.append(relative.as_posix())
-            continue
-        mode = path.stat().st_mode
-        if stat.S_ISDIR(mode):
-            continue
-        if not stat.S_ISREG(mode):
-            raise ValueError("Special files are not allowed in public evidence")
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        export_checked_file(path, target, redactor)
-        files[relative.as_posix()] = {"sha256": digest_file(target), "size": target.stat().st_size}
-    for name, path in overlay_paths.items():
-        target = destination / name
-        export_checked_file(path, target, redactor)
-        files[name] = {"sha256": digest_file(target), "size": target.stat().st_size}
-    if not files:
+        export_file(path, target, redactor)
+        count += 1
+    if not count:
         raise ValueError("No public evidence files were exported")
-    report = {
-        "schema_version": 1,
-        "view": "path-redacted-public-evidence",
-        "original_digest_applies_to": "private NAS originals only",
-        "files": files,
-        "omitted": omissions,
-    }
-    report_path = destination / "public-export.json"
-    if report_path.exists():
-        raise ValueError("Reserved public export filename")
-    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    redactor.scan(report_path)
-    verify_public(destination)
-    return report
-
-
-def verify_public(directory: Path) -> dict:
-    """Verify the public view's own inventory; it never replaces the private Build digest."""
-    report_path = directory / "public-export.json"
-    if (
-        directory.is_symlink()
-        or any(parent.is_symlink() for parent in directory.parents)
-        or report_path.is_symlink()
-        or not report_path.is_file()
-    ):
-        raise ValueError("Public evidence root or inventory is not a regular, unlinked path")
-    report = json.loads(report_path.read_text())
-    if (
-        not isinstance(report, dict)
-        or type(report.get("schema_version")) is not int
-        or report.get("schema_version") != 1
-        or report.get("view") != "path-redacted-public-evidence"
-        or report.get("original_digest_applies_to") != "private NAS originals only"
-        or not isinstance(report.get("files"), dict)
-        or not report["files"]
-    ):
-        raise ValueError("Invalid public evidence inventory")
-    actual = set()
-    for path in directory.rglob("*"):
-        if path.is_symlink() or not path.resolve().is_relative_to(directory.resolve()):
-            raise ValueError("Public evidence contains an escaping link")
-        if path.is_file() and path.relative_to(directory).as_posix() != "public-export.json":
-            actual.add(path.relative_to(directory).as_posix())
-        elif not path.is_dir() and path.relative_to(directory).as_posix() != "public-export.json":
-            raise ValueError("Public evidence contains a special file")
-    if actual != set(report["files"]):
-        raise ValueError("Public evidence file inventory mismatch")
-    for name, expected in report["files"].items():
-        if (
-            not isinstance(expected, dict)
-            or set(expected) != {"size", "sha256"}
-            or type(expected.get("size")) is not int
-            or expected["size"] < 0
-            or not isinstance(expected.get("sha256"), str)
-        ):
-            raise ValueError("Malformed public evidence file metadata")
-        path = directory / name
-        if path.stat().st_size != expected.get("size") or digest_file(path) != expected.get(
-            "sha256"
-        ):
-            raise ValueError("Public evidence failed size or digest verification")
-    return report
+    return count
 
 
 def main() -> None:
@@ -425,18 +181,18 @@ def main() -> None:
     parser.add_argument("--action-outputs", action="store_true")
     parser.add_argument("--overlay", type=Path)
     args = parser.parse_args()
-    if args.action_outputs:
-        print(paths.redact(action_outputs(os.environ.get("ACTION_OUTPUTS", "{}"))))
-        return
-    paths.register_masks()
-    if args.source is None or args.destination is None:
-        parser.error("--source and --destination are required")
     try:
-        report = export(args.source, args.destination, kind=args.kind, overlay=args.overlay)
+        if args.action_outputs:
+            print(paths.redact(action_outputs(os.environ.get("ACTION_OUTPUTS", "{}"))))
+            return
+        paths.register_masks()
+        if args.source is None or args.destination is None:
+            parser.error("--source and --destination are required")
+        count = export(args.source, args.destination, kind=args.kind, overlay=args.overlay)
     except Exception as error:
-        # Only fixed failure codes and file categories reach the public log.
-        raise SystemExit(failure_summary(error)) from None
-    print(f"Public evidence export checked: {len(report['files'])} files")
+        # Parser/IO exceptions can contain private paths; do not print their values or tracebacks.
+        raise SystemExit(f"Public evidence export failed ({type(error).__name__})") from None
+    print(f"Public evidence exported: {count} files")
 
 
 if __name__ == "__main__":

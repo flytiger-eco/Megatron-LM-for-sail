@@ -51,8 +51,8 @@ flowchart TD
 仓库变量 `PPU_CI_ENABLED=true` 开启设备流程；environment 使用 `ppu-ci`。
 存储接线使用 secrets：`PPU_HOST_VOLUMES`、`PPU_CPU_RUN_ROOT`、`PPU_POD_RUN_ROOT`、
 `PPU_CPU_ASSETS_ROOT`、`PPU_POD_ASSETS_ROOT`。CPU 与 Pod 路径必须映射到同一共享数据。
-公共 artifacts 只导出声明的文本和结构化结果，不包含私有路径。TensorBoard 原始二进制、
-checkpoint 和 tokenizer 缓存保留在内部 NAS；不再改写 TensorBoard 文件。
+公共 artifacts 只导出 JSON 报告/指标、原始模型配置、文本日志及必要的控制脚本，并脱敏路径。
+其余文件（含展开配置、TensorBoard、checkpoint 和缓存）保留 NAS；不另建上传文件清单协议。
 
 ## 镜像与缓存
 
@@ -81,7 +81,7 @@ Git 管理 golden 版本，无需中央 baselines JSON 或 snapshot 脚本。
 `m890_model_config()` 集中适配 launcher：默认 torchrun，已有五个 FT launcher case 保持原样。
 历史 `_2nd.json` 只保留采样记录；ckpt-resume 比较本次两阶段输出，不等于验证故障注入恢复。
 轻量观察、缺资产跳过均不计作数值通过；缺 golden 或比较失败不能静默通过。
-数值比较只由上游 pytest 执行。适配层记录比较输入摘要与通过/失败/跳过结果，
+数值比较（含性能 warmup 窗口和指标支持）只由上游 pytest 执行。适配层记录比较输入摘要与结果，
 汇总检查结果绑定、重复次数和执行完整性，不再重新执行数值比较，也不需要 checkout 被测源码。
 
 ## 最小验证
