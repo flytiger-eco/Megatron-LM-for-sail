@@ -8,17 +8,16 @@ import inspect
 import json
 import os
 import platform
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-NVRX_VERSION = "0.6.0"
 NAMESPACE_PTH = "00-ppu-functional-google-namespace.pth"
 # Build a complete PEP 420 namespace first so inherited nspkg startup hooks cannot pin
 # google to the system directory.
 NAMESPACE_BOOTSTRAP = "import importlib; importlib.invalidate_caches(); import google\n"
 TRAINING_PACKAGES = {
+    "nvidia-resiliency-ext": "0.6.0",
     "pla": "1.0.0+v0.1.0.ppu2.2.0",
     "mamba-ssm": "2.3.1+v0.1.0.ppu2.2.0",
     "causal-conv1d": "1.7.0+v0.1.0.ppu2.2.0",
@@ -28,6 +27,7 @@ TRAINING_PACKAGES = {
     "apex": "24.4.1+v0.1.0.ppu2.2.0",
 }
 TRAINING_IMPORTS = {
+    "nvidia_resiliency_ext": (),
     "pla": (),
     "pla.decode": (),
     "pla.prefill.flashqla": (),
@@ -63,130 +63,8 @@ def command_output(command):
     return subprocess.check_output(command, text=True, stderr=subprocess.STDOUT, timeout=30).strip()
 
 
-def nvrx_requirements(manifest: dict) -> dict:
-    """Build and the execution Pod share one inventory; dependencies cannot be
-    judged from the launcher alone.
-    """
-    return {
-        case_id: {"launcher": case["launcher"], "checkpoint": case["nvrx_checkpoint"]}
-        for case_id, case in manifest["functional"].items()
-        if case["nvrx_checkpoint"] or case["launcher"] == "ft_launcher"
-    }
-
-
-def check_nvrx(requirements: dict) -> dict:
-    """Only import and verify the original APIs; never start workers,
-    process groups or checkpoint writes.
-    """
-    if not requirements:
-        return {}
-    version = importlib.metadata.version("nvidia-resiliency-ext")
-    if version != NVRX_VERSION:
-        raise ValueError(f"Functional NVRx version mismatch: {version} != {NVRX_VERSION}")
-    stages = [stage for case in requirements.values() for stage in case["checkpoint"]]
-    signatures = {}
-    source_api = "launcher_only"
-    if stages:
-        upstream = importlib.import_module("megatron.core.dist_checkpointing.strategies.torch")
-        get_strategy = getattr(upstream, "get_async_strategy", None)
-        if callable(get_strategy):
-            source_api = "get_async_strategy"
-            strategy, modules = get_strategy("nvrx")
-            if strategy != "nvrx":
-                raise ValueError("Original async checkpoint strategy must remain nvrx")
-        elif callable(getattr(upstream, "has_nvrx_async_support", None)):
-            # Current DEV uses NVRx directly and no longer exposes the strategy getter.
-            # Keep its capability check, then inspect the same original NVRx interfaces.
-            source_api = "direct_nvrx"
-            if not getattr(upstream, "HAVE_NVRX", False) or not upstream.has_nvrx_async_support():
-                raise ModuleNotFoundError("Upstream requires compatible nvidia-resiliency-ext")
-            core = importlib.import_module("nvidia_resiliency_ext.checkpointing.async_ckpt.core")
-            filesystem = importlib.import_module(
-                "nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async"
-            )
-            modules = {
-                "AsyncCallsQueue": core.AsyncCallsQueue,
-                "AsyncRequest": core.AsyncRequest,
-                "FileSystemWriterAsync": filesystem.FileSystemWriterAsync,
-                "get_write_results_queue": filesystem.get_write_results_queue,
-            }
-        else:
-            raise ValueError(
-                "Unsupported upstream NVRx checkpoint API; explicit adaptation required"
-            )
-        queue = modules["AsyncCallsQueue"]
-        request = inspect.signature(modules["AsyncRequest"])
-        request.bind(None, (), [], async_fn_kwargs={}, preload_fn=None)
-        signatures["AsyncRequest"] = str(request)
-        init = inspect.signature(queue.__init__)
-        init.bind(None, persistent=any(stage["persistent_worker"] for stage in stages))
-        signatures["AsyncCallsQueue.__init__"] = str(init)
-        if any(stage["cpu_shm"] for stage in stages):
-            # The writer flag is use_cpu_shm_for_gpu_tensors; cpu_shm_mode belongs to the queue and warmup.
-            writer = inspect.signature(modules["FileSystemWriterAsync"].__init__)
-            if "use_cpu_shm_for_gpu_tensors" not in writer.parameters:
-                raise ValueError(
-                    "NVRx FileSystemWriterAsync requires use_cpu_shm_for_gpu_tensors support"
-                )
-            signatures["FileSystemWriterAsync.__init__"] = str(writer)
-        if any(stage["persistent_worker"] for stage in stages):
-            warmup = inspect.signature(queue.warmup_persistent_caller)
-            kwargs = {"cpu_priority": 10, "io_priority": 3}
-            if any(stage["cpu_shm"] and stage["persistent_worker"] for stage in stages):
-                if "cpu_shm_mode" not in warmup.parameters:
-                    raise ValueError("NVRx persistent worker requires cpu_shm_mode support")
-                kwargs["cpu_shm_mode"] = True
-            warmup.bind(0, **kwargs)
-            results_queue = inspect.signature(modules["get_write_results_queue"])
-            if "mp_mode" not in results_queue.parameters:
-                raise ValueError("NVRx get_write_results_queue requires mp_mode support")
-            results_queue.bind(mp_mode="fork")
-            signatures["AsyncCallsQueue.warmup_persistent_caller"] = str(warmup)
-            signatures["get_write_results_queue"] = str(results_queue)
-    if any(case["launcher"] == "ft_launcher" for case in requirements.values()):
-        if not shutil.which("ft_launcher"):
-            raise ValueError("Selected case requires the original ft_launcher")
-        command_output(["ft_launcher", "--help"])
-    return {
-        "version": version,
-        "source_api": source_api,
-        "requirements": requirements,
-        "signatures": signatures,
-    }
-
-
-def check_inference_dependencies() -> dict:
-    """Check the communication backend used by the public engine without starting it."""
-    public = importlib.import_module("megatron.core.inference.engines.dynamic_engine")
-    engine_module = public.DynamicInferenceEngine.__module__
-    communication_modules = {
-        "megatron.core.inference.engines.dynamic_engine": (
-            "megatron.core.inference.engines.dynamic_engine"
-        ),
-        "megatron.core.inference.engines.dynamic.engine": (
-            "megatron.core.inference.engines.dynamic.coordinator"
-        ),
-    }
-    if engine_module not in communication_modules:
-        raise ValueError(f"Unsupported upstream dynamic inference engine: {engine_module}")
-    communication = importlib.import_module(communication_modules[engine_module])
-    for capability in ("HAVE_ZMQ", "HAVE_MSGPACK"):
-        if getattr(communication, capability, False) is not True:
-            raise ValueError(
-                f"Inference engine communication dependency is unavailable: {capability}"
-            )
-    return {
-        "engine_module": engine_module,
-        "communication_module": communication_modules[engine_module],
-        "zmq_enabled": True,
-        "msgpack_enabled": True,
-    }
-
-
 def check_apex_layer_norm() -> dict:
-    """Verify the original LayerNorm call interface and backend selection
-    without running training kernels.
-    """
+    """Verify Apex backend selection without running training kernels."""
     fused = importlib.import_module("megatron.core.fusions.fused_layer_norm")
     if not fused.HAVE_FUSED_LAYER_NORM or not fused.HAVE_PERSIST_LAYER_NORM:
         raise ValueError("Megatron did not enable Apex fused and persistent LayerNorm")
@@ -194,28 +72,10 @@ def check_apex_layer_norm() -> dict:
     selected = backends.LocalSpecProvider().layer_norm(rms_norm=False)
     if selected is not fused.FusedLayerNorm:
         raise ValueError("Original local LayerNorm backend did not select Apex FusedLayerNorm")
-    signatures = {}
-    for name, module_name, arguments in (
-        (
-            "FusedLayerNormAffineFunction",
-            "apex.normalization.fused_layer_norm",
-            (None, None, None, None, (1024,), 1e-5),
-        ),
-        ("FastLayerNormFN", "apex.contrib.layer_norm.layer_norm", (None, None, None, None, 1e-5)),
-    ):
-        api = getattr(importlib.import_module(module_name), name)
-        if getattr(fused, name, None) is not api or not callable(getattr(api, "apply", None)):
-            raise ValueError(f"Original Apex LayerNorm API mismatch: {name}")
-        forward = inspect.signature(api.forward)
-        if "memory_efficient" in inspect.getfullargspec(api.forward).args:
-            arguments += (False,)
-        forward.bind(*arguments)
-        signatures[name] = str(forward)
     return {
         "backend": f"{selected.__module__}.{selected.__qualname__}",
         "fused_enabled": True,
         "persistent_enabled": True,
-        "signatures": signatures,
     }
 
 
@@ -475,9 +335,9 @@ def check(bundle: Path, manifest: dict, output: Path):
     postprocessing = check_postprocessing(Path(os.environ["PPU_SOURCE_ROOT"]).resolve())
     for name in ("tensorboard", "yaml", "click", "ppu_functional_pytest"):
         importlib.import_module(name)
-    nvrx = check_nvrx(nvrx_requirements(manifest))
-    if nvrx:
-        packages["nvidia-resiliency-ext"] = nvrx["version"]
+    launchers = sorted({case["launcher"] for case in manifest["functional"].values()})
+    if "ft_launcher" in launchers:
+        command_output(["ft_launcher", "--help"])
     training_dependencies = check_training_dependencies(bundle)
     packages.update(training_dependencies["packages"])
     import torch
@@ -499,7 +359,7 @@ def check(bundle: Path, manifest: dict, output: Path):
                 **delivery,
                 "python": sys.version,
                 "packages": packages,
-                "nvrx": nvrx,
+                "launchers": launchers,
                 "training_dependencies": training_dependencies,
                 "postprocessing": postprocessing,
                 "compiler": compiler,

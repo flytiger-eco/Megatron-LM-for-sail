@@ -286,37 +286,6 @@ def tokenizer_dependencies(root: Path, config: dict, entrypoint: str) -> list:
     return requirements
 
 
-def nvrx_checkpoint_requirements(config: dict) -> list:
-    """Describe only external checkpoint dependencies of the phases the original config actually
-    runs; never rewrite training arguments.
-    """
-    sections = ["MODEL_ARGS"]
-    if config["TEST_TYPE"] == "ckpt-resume" and "MODEL_ARGS_2" in config:
-        # The original shell replaces the second-phase arguments wholesale instead of
-        # merging them with the first phase.
-        sections.append("MODEL_ARGS_2")
-    requirements = []
-    for section in sections:
-        arguments = config[section]
-        if not isinstance(arguments, dict):
-            raise ValueError(f"{section} must be a mapping")
-        strategy = arguments.get("--async-strategy", "nvrx")
-        if strategy not in ("nvrx", "mcore"):
-            raise ValueError(f"Unsupported async checkpoint strategy: {section}/{strategy}")
-        # Upstream selects mcore when async-save is disabled, so NVRx is not required.
-        if enabled(arguments.get("--async-save", False)) and strategy == "nvrx":
-            requirements.append(
-                {
-                    "section": section,
-                    "persistent_worker": enabled(
-                        arguments.get("--use-persistent-ckpt-worker", False)
-                    ),
-                    "cpu_shm": enabled(arguments.get("--async-ckpt-use-cpu-shm", False)),
-                }
-            )
-    return requirements
-
-
 def read_metrics(path: Path) -> dict:
     def unique(pairs):
         result = {}
@@ -553,7 +522,6 @@ def describe_case(root: Path, name: str, specs: list, config: dict) -> dict:
         or enabled(env.get("NON_DETERMINSTIC_RESULTS", 0)),
         "launcher": launcher,
         "launcher_internal_max_restarts": 3 if launcher == "ft_launcher" else 0,
-        "nvrx_checkpoint": nvrx_checkpoint_requirements(model_config),
         "tokenizer_dependencies": tokenizer_dependencies(root, model_config, entries[0]),
         "budget_seconds": seconds,
         "action_minutes": math.ceil(seconds / 60) + 30,

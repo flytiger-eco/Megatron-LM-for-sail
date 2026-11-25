@@ -18,18 +18,6 @@ from test_ppu_functional import ROOT, SCRIPTS, functional
 environment = functional.module_from_path(
     "ppu_functional_environment", SCRIPTS / "ppu_functional_environment.py"
 )
-FUNCTIONAL_PAYLOADS = [
-    "functional-tools/yq",
-    "functional-tools/envsubst",
-    "functional-environment.json",
-    "functional-package-install.json",
-    "installed-packages.json",
-    "control/ppu_functional_run.sh",
-    *[
-        f"control/ppu_functional{suffix}.py"
-        for suffix in ("", "_results", "_runtime", "_environment", "_pytest", "_hf")
-    ],
-]
 
 
 @pytest.fixture
@@ -82,11 +70,6 @@ def tool_environment(tmp_path, monkeypatch):
         "sys",
         SimpleNamespace(executable=sys.executable, prefix=str(prefix), version=sys.version),
     )
-    monkeypatch.setattr(
-        environment.shutil,
-        "which",
-        lambda name: str(envsubst) if name == "envsubst" else str(local / name),
-    )
     calls = []
     monkeypatch.setattr(environment.subprocess, "run", lambda args, **kwargs: calls.append(args))
     versions = {
@@ -105,11 +88,7 @@ def tool_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(
         environment.importlib.metadata,
         "version",
-        lambda name: (
-            "0.6.0"
-            if name == "nvidia-resiliency-ext"
-            else environment.TRAINING_PACKAGES.get(name, "fixture")
-        ),
+        lambda name: environment.TRAINING_PACKAGES.get(name, "fixture"),
     )
     training_modules = {
         name: SimpleNamespace(
@@ -128,30 +107,10 @@ def tool_environment(tmp_path, monkeypatch):
         HAVE_EMERGING_OPTIMIZERS=True
     )
 
-    class AffineFunction:
-        @staticmethod
-        def forward(ctx, x, weight, bias, normalized_shape, eps, memory_efficient=False):
-            pytest.fail("Preflight must not run LayerNorm kernels")
-
-        @staticmethod
-        def apply(*args):
-            pytest.fail("Preflight must not run LayerNorm autograd")
-
-    class FastFunction(AffineFunction):
-        @staticmethod
-        def forward(ctx, x, weight, bias, eps, memory_efficient=False):
-            pytest.fail("Preflight must not run persistent LayerNorm kernels")
-
-    training_modules["apex.normalization.fused_layer_norm"].FusedLayerNormAffineFunction = (
-        AffineFunction
-    )
-    training_modules["apex.contrib.layer_norm.layer_norm"].FastLayerNormFN = FastFunction
     fused = SimpleNamespace(
         HAVE_FUSED_LAYER_NORM=True,
         HAVE_PERSIST_LAYER_NORM=True,
         FusedLayerNorm=type("FusedLayerNorm", (), {}),
-        FusedLayerNormAffineFunction=AffineFunction,
-        FastLayerNormFN=FastFunction,
     )
     fused_name = "megatron.core.fusions.fused_layer_norm"
     training_modules[fused_name] = fused
@@ -200,7 +159,7 @@ def tool_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(environment, "check_postprocessing", lambda root: {"event_roundtrip": True})
     manifest = {
         "environment_build_schema": 2,
-        "functional": {"case": {"launcher": "torchrun", "nvrx_checkpoint": []}},
+        "functional": {"case": {"launcher": "torchrun"}},
         "identity": {"run_id": "123"},
         "config": {"image": "fixed"},
     }
@@ -237,41 +196,6 @@ def compiler_report():
         "compile_threads": 8,
         "compile_threads_override": None,
     }
-
-
-@pytest.mark.parametrize("layout", ["legacy", "split"])
-@pytest.mark.parametrize("capability", ["available", "HAVE_ZMQ", "HAVE_MSGPACK", "missing"])
-def test_inference_check_follows_actual_engine_and_rejects_missing_dependencies(
-    monkeypatch, layout, capability
-):
-    public_name = "megatron.core.inference.engines.dynamic_engine"
-    engine_name = (
-        public_name if layout == "legacy" else "megatron.core.inference.engines.dynamic.engine"
-    )
-    communication_name = (
-        public_name if layout == "legacy" else "megatron.core.inference.engines.dynamic.coordinator"
-    )
-
-    class Engine:
-        def __init__(self):
-            pytest.fail("Dependency checks must not start the engine")
-
-    Engine.__module__ = engine_name
-    public = SimpleNamespace(DynamicInferenceEngine=Engine)
-    communication = public if layout == "legacy" else SimpleNamespace()
-    if capability != "missing":
-        communication.HAVE_ZMQ = capability != "HAVE_ZMQ"
-        communication.HAVE_MSGPACK = capability != "HAVE_MSGPACK"
-    modules = {public_name: public, communication_name: communication}
-    monkeypatch.setattr(environment.importlib, "import_module", modules.__getitem__)
-    if capability == "available":
-        report = environment.check_inference_dependencies()
-        assert report["engine_module"] == engine_name
-        assert report["communication_module"] == communication_name
-        assert report["zmq_enabled"] and report["msgpack_enabled"]
-    else:
-        with pytest.raises(ValueError, match="communication dependency is unavailable"):
-            environment.check_inference_dependencies()
 
 
 @pytest.mark.parametrize("value", ["", "1", "8"])
@@ -315,82 +239,20 @@ def test_compiler_probe_uses_real_isolated_cpu_interpreter(tmp_path, monkeypatch
     assert os.environ["TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"] == "1"
 
 
-@pytest.fixture
-def checkpoint_api(tool_environment, monkeypatch):
-    class Queue:
-        def __init__(self, persistent=True, cpu_shm_mode=False):
-            pytest.fail("Preflight must not create checkpoint queues")
-
-        @classmethod
-        def warmup_persistent_caller(cls, rank, cpu_priority=10, io_priority=3, cpu_shm_mode=False):
-            pytest.fail("Preflight must not start checkpoint worker")
-
-    class Writer:
-        def __init__(self, path, use_cpu_shm_for_gpu_tensors=False):
-            pytest.fail("Preflight must not create checkpoint writer")
-
-    def request(async_fn, async_fn_args, finalize_fns, async_fn_kwargs=None, preload_fn=None):
-        pytest.fail("Preflight must not run async request")
-
-    def results_queue(mp_mode="spawn"):
-        pytest.fail("Preflight must not create multiprocessing resources")
-
-    modules = {
-        "core": SimpleNamespace(AsyncCallsQueue=Queue, AsyncRequest=request),
-        "cached_metadata_filesystem_reader": SimpleNamespace(CachedMetadataFileSystemReader=object),
-        "filesystem_async": SimpleNamespace(
-            FileSystemWriterAsync=Writer, _results_queue=None, get_write_results_queue=results_queue
-        ),
-        "state_dict_saver": SimpleNamespace(
-            CheckpointMetadataCache=object,
-            save_state_dict_async_finalize=object,
-            save_state_dict_async_plan=object,
-        ),
-    }
-    for name, module in modules.items():
-        monkeypatch.setitem(
-            sys.modules, f"nvidia_resiliency_ext.checkpointing.async_ckpt.{name}", module
-        )
-    # Run the original import function from current sources so the mock cannot
-    # define an incomplete API list.
-    path = ROOT / "megatron/core/dist_checkpointing/strategies/torch.py"
-    getter = next(
-        node
-        for node in ast.parse(path.read_text()).body
-        if isinstance(node, ast.FunctionDef) and node.name == "get_async_strategy"
-    )
-    namespace = {}
-    exec(compile(ast.Module(body=[getter], type_ignores=[]), str(path), "exec"), namespace)
-    requested = []
-
-    def get_strategy(strategy):
-        requested.append(strategy)
-        return namespace["get_async_strategy"](strategy)
-
-    original_import = environment.importlib.import_module
-    monkeypatch.setattr(
-        environment.importlib,
-        "import_module",
-        lambda name: (
-            SimpleNamespace(get_async_strategy=get_strategy)
-            if name == "megatron.core.dist_checkpointing.strategies.torch"
-            else original_import(name)
-        ),
-    )
-    return modules, requested
-
-
 @pytest.mark.parametrize("launcher", ["torchrun", "ft_launcher"])
-@pytest.mark.parametrize("checkpoint", [False, True])
 def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
-    tool_environment, checkpoint_api, launcher, checkpoint
+    tool_environment, launcher, monkeypatch
 ):
     bundle, site, manifest, calls, _, _ = tool_environment
+    invoked = []
+    command_output = environment.command_output
+
+    def command(args):
+        invoked.append(args)
+        return command_output(args)
+
+    monkeypatch.setattr(environment, "command_output", command)
     manifest["functional"]["case"]["launcher"] = launcher
-    if checkpoint:
-        manifest["functional"]["case"]["nvrx_checkpoint"] = [
-            {"section": "MODEL_ARGS", "persistent_worker": True, "cpu_shm": False}
-        ]
     environment.prepare(bundle, manifest)
     assert (site / "ppu_functional_pytest.py").read_bytes() == (
         bundle / "control/ppu_functional_pytest.py"
@@ -410,17 +272,25 @@ def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
     layer_norm = report["training_dependencies"]["apex_layer_norm"]
     assert layer_norm["fused_enabled"] and layer_norm["persistent_enabled"]
     assert layer_norm["backend"].endswith(".FusedLayerNorm")
-    assert set(layer_norm["signatures"]) == {"FusedLayerNormAffineFunction", "FastLayerNormFN"}
-    assert ("nvidia-resiliency-ext" in report["packages"]) == (
-        launcher == "ft_launcher" or checkpoint
-    )
-    assert checkpoint_api[1] == (["nvrx"] if checkpoint else [])
-    if checkpoint:
-        assert (
-            report["nvrx"]["requirements"]["case"]["checkpoint"]
-            == manifest["functional"]["case"]["nvrx_checkpoint"]
-        )
-        assert "mp_mode" in report["nvrx"]["signatures"]["get_write_results_queue"]
+    assert report["packages"]["nvidia-resiliency-ext"] == "0.6.0"
+    assert report["launchers"] == [launcher]
+    assert (["ft_launcher", "--help"] in invoked) == (launcher == "ft_launcher")
+
+
+def test_missing_ft_launcher_fails_before_training(tool_environment, monkeypatch):
+    bundle, _, manifest, _, _, _ = tool_environment
+    manifest["functional"]["case"]["launcher"] = "ft_launcher"
+    command_output = environment.command_output
+
+    def command(args):
+        if args == ["ft_launcher", "--help"]:
+            raise FileNotFoundError("ft_launcher")
+        return command_output(args)
+
+    monkeypatch.setattr(environment, "command_output", command)
+    with pytest.raises(FileNotFoundError, match="ft_launcher"):
+        environment.check(bundle, manifest, bundle / "reports")
+    assert not (bundle / "reports/functional-environment.json").exists()
 
 
 @pytest.mark.parametrize("damage", ["missing", "modified", "not_executable", "symlink"])
@@ -468,141 +338,6 @@ def test_functional_image_evidence_requires_job_identities(tool_environment, mon
     assert not (bundle / "reports/functional-environment.json").exists()
 
 
-@pytest.mark.parametrize(
-    "module,symbol",
-    [
-        ("core", "AsyncCallsQueue"),
-        ("core", "AsyncRequest"),
-        ("cached_metadata_filesystem_reader", "CachedMetadataFileSystemReader"),
-        ("filesystem_async", "FileSystemWriterAsync"),
-        ("filesystem_async", "_results_queue"),
-        ("filesystem_async", "get_write_results_queue"),
-        ("state_dict_saver", "CheckpointMetadataCache"),
-        ("state_dict_saver", "save_state_dict_async_finalize"),
-        ("state_dict_saver", "save_state_dict_async_plan"),
-    ],
-)
-def test_missing_original_checkpoint_import_fails_preflight(
-    tool_environment, checkpoint_api, monkeypatch, module, symbol
-):
-    bundle, _, manifest, _, _, _ = tool_environment
-    manifest["functional"]["case"]["nvrx_checkpoint"] = [
-        {"section": "MODEL_ARGS_2", "persistent_worker": True, "cpu_shm": False}
-    ]
-    environment.prepare(bundle, manifest)
-    monkeypatch.delattr(checkpoint_api[0][module], symbol)
-    with pytest.raises(ModuleNotFoundError, match="compatible.*nvidia-resiliency-ext"):
-        environment.check(bundle, manifest, bundle / "reports")
-    assert not (bundle / "reports/functional-environment.json").exists()
-
-
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "version",
-        "request",
-        "queue",
-        "warmup",
-        "mp_mode",
-        "cpu_shm",
-        "writer",
-        "writer_cpu_shm_mode",
-        "launcher",
-    ],
-)
-def test_incompatible_checkpoint_api_fails_before_training(
-    tool_environment, checkpoint_api, monkeypatch, damage
-):
-    bundle, _, manifest, _, _, _ = tool_environment
-    manifest["functional"]["case"]["nvrx_checkpoint"] = [
-        {
-            "section": "MODEL_ARGS",
-            "persistent_worker": True,
-            "cpu_shm": damage in ("cpu_shm", "writer", "writer_cpu_shm_mode"),
-        }
-    ]
-    environment.prepare(bundle, manifest)
-    modules, _ = checkpoint_api
-    if damage == "version":
-        monkeypatch.setattr(environment.importlib.metadata, "version", lambda name: "0.5.0")
-    elif damage == "request":
-        modules["core"].AsyncRequest = lambda async_fn, async_fn_args, finalize_fns: None
-    elif damage == "queue":
-        monkeypatch.setattr(modules["core"].AsyncCallsQueue, "__init__", lambda self: None)
-    elif damage == "warmup":
-        monkeypatch.setattr(
-            modules["core"].AsyncCallsQueue, "warmup_persistent_caller", lambda rank: None
-        )
-    elif damage == "mp_mode":
-        modules["filesystem_async"].get_write_results_queue = lambda: None
-    elif damage == "cpu_shm":
-        monkeypatch.setattr(
-            modules["core"].AsyncCallsQueue,
-            "warmup_persistent_caller",
-            lambda rank, cpu_priority=10, io_priority=3: None,
-        )
-    elif damage == "writer":
-        monkeypatch.setattr(
-            modules["filesystem_async"].FileSystemWriterAsync, "__init__", lambda self, path: None
-        )
-    elif damage == "writer_cpu_shm_mode":
-        # nvidia-resiliency-ext 0.6.0 names the writer flag use_cpu_shm_for_gpu_tensors;
-        # a writer exposing only cpu_shm_mode must be rejected.
-        monkeypatch.setattr(
-            modules["filesystem_async"].FileSystemWriterAsync,
-            "__init__",
-            lambda self, path, cpu_shm_mode=False: None,
-        )
-    else:
-        manifest["functional"]["case"]["launcher"] = "ft_launcher"
-        monkeypatch.setattr(environment.shutil, "which", lambda name: None)
-    with pytest.raises((ValueError, TypeError)):
-        environment.check(bundle, manifest, bundle / "reports")
-    assert not (bundle / "reports/functional-environment.json").exists()
-
-
-@pytest.mark.parametrize("capability", ["available", "disabled", "missing", "signature_changed"])
-def test_current_dev_direct_nvrx_api_keeps_capability_and_signature_checks(
-    tool_environment, checkpoint_api, monkeypatch, capability
-):
-    modules, requested = checkpoint_api
-    original_import = environment.importlib.import_module
-    upstream = SimpleNamespace(
-        HAVE_NVRX=capability != "disabled", has_nvrx_async_support=lambda: capability != "missing"
-    )
-    monkeypatch.setattr(
-        environment.importlib,
-        "import_module",
-        lambda name: (
-            upstream
-            if name == "megatron.core.dist_checkpointing.strategies.torch"
-            else original_import(name)
-        ),
-    )
-    if capability == "signature_changed":
-        modules["filesystem_async"].get_write_results_queue = lambda: None
-    requirements = {
-        "case": {
-            "launcher": "torchrun",
-            "checkpoint": [{"persistent_worker": True, "cpu_shm": True}],
-        }
-    }
-    if capability == "available":
-        report = environment.check_nvrx(requirements)
-        assert report["source_api"] == "direct_nvrx"
-        assert "mp_mode" in report["signatures"]["get_write_results_queue"]
-        assert (
-            "use_cpu_shm_for_gpu_tensors" in report["signatures"]["FileSystemWriterAsync.__init__"]
-        )
-    elif capability == "signature_changed":
-        with pytest.raises(ValueError, match="mp_mode"):
-            environment.check_nvrx(requirements)
-    else:
-        with pytest.raises(ModuleNotFoundError, match="compatible nvidia-resiliency-ext"):
-            environment.check_nvrx(requirements)
-    assert requested == []  # DEV never calls the removed legacy getter.
-
-
 @pytest.mark.parametrize("name", environment.TRAINING_PACKAGES)
 @pytest.mark.parametrize("damage", ["missing", "version"])
 def test_training_dependency_missing_or_wrong_version_fails(
@@ -640,28 +375,6 @@ def test_training_native_import_failure_is_not_ignored(tool_environment, monkeyp
     with pytest.raises(ImportError, match="Missing native dependency"):
         environment.check(bundle, manifest, bundle / "reports")
     assert not (bundle / "reports/functional-environment.json").exists()
-
-
-@pytest.mark.parametrize("memory_efficient", [False, True])
-def test_apex_forward_signature_matches_original_call(
-    tool_environment, monkeypatch, memory_efficient
-):
-    bundle, _, _, _, _, _ = tool_environment
-    fused = environment.importlib.import_module("megatron.core.fusions.fused_layer_norm")
-    if not memory_efficient:
-        monkeypatch.setattr(
-            fused.FusedLayerNormAffineFunction,
-            "forward",
-            lambda ctx, x, weight, bias, normalized_shape, eps: None,
-        )
-        monkeypatch.setattr(
-            fused.FastLayerNormFN, "forward", lambda ctx, x, weight, bias, eps: None
-        )
-    report = environment.check_training_dependencies(bundle)["apex_layer_norm"]
-    assert all(
-        ("memory_efficient" in signature) == memory_efficient
-        for signature in report["signatures"].values()
-    )
 
 
 @pytest.fixture

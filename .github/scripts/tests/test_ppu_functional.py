@@ -218,26 +218,6 @@ def test_explicit_policy_selection_is_skipped_not_silently_green(
     assert [row["name"] for row in result["coverage"]["skipped_by_policy"]] == [skipped_name]
 
 
-@pytest.mark.parametrize("test_type", ["regular", "ckpt-resume"])
-@pytest.mark.parametrize("first_async", [True, False])
-@pytest.mark.parametrize("second_async", [True, False])
-def test_checkpoint_dependencies_cover_reshard_without_merging(
-    test_type, first_async, second_async
-):
-    config = {
-        "TEST_TYPE": test_type,
-        "MODEL_ARGS": {"--async-save": first_async, "--use-persistent-ckpt-worker": True},
-        "MODEL_ARGS_2": {"--async-save": second_async, "--async-ckpt-use-cpu-shm": True},
-    }
-    result = functional.nvrx_checkpoint_requirements(config)
-    expected = []
-    if first_async:
-        expected.append({"section": "MODEL_ARGS", "persistent_worker": True, "cpu_shm": False})
-    if test_type == "ckpt-resume" and second_async:
-        expected.append({"section": "MODEL_ARGS_2", "persistent_worker": False, "cpu_shm": True})
-    assert result == expected
-
-
 @pytest.mark.parametrize("tier", functional.TIERS)
 def test_tiers_are_exact_not_cumulative(tier, catalogue):
     expected = {row["name"] for row in catalogue["functional"].values() if tier in row["scopes"]}

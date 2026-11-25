@@ -63,6 +63,8 @@ checkpoint 和 tokenizer 缓存保留在内部 NAS；不再改写 TensorBoard �
 当前不直接消费 NV `uv.lock`。安装与源码编译在镜像构建阶段完成，Pod 内不现场安装依赖。
 Build 统一检查依赖和 UT tokenizer 缓存；各 UT bucket 验证同一镜像、数据交付及设备可见性后运行。
 运行环境只接受镜像交付；CPU 控制解释器仍通过独立归档分发。
+预检查确认依赖版本、导入、launcher 和平台后端；checkpoint、Apex 等上游内部 API 的
+调用兼容性由原始 UT/FT 验证，适配层不再解析其内部方法签名或维护实现位置映射。
 
 `.github/actions/ppu-build-cache/action.yml` 选择 registry BuildKit 依赖缓存：
 PR 优先读自己的同指纹缓存，再读目标分支；PR/候选提交分别写独立缓存，main/dev 发布提交更新 baseline。
