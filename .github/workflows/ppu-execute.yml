@@ -273,7 +273,7 @@ jobs:
           python3 -I control/.github/scripts/ppu_ci_container.py fingerprint
           --control-root control --control-sha '${{ inputs.control_sha }}'
           --source-root source --target-sha '${{ inputs.target_sha }}'
-      - name: Login to GHCR for dependency cache and verified image publication
+      - name: Login to GHCR for the dependency cache
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io

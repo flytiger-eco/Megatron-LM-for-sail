@@ -777,7 +777,8 @@ def test_workflow_trust_and_resource_boundaries():
         assert ref in authorize_if
     assert 'github.event.merge_group.base_ref)' in authorize_if
     assert "github.event_name == 'push'" in build["jobs"]["invalidate-base"]["if"]
-    assert "ci/ppu-validation" not in (ROOT / ".github/workflows/ppu-build.yml").read_text()
+    assert auth.policy.BRANCHES == ("main", "dev")
+    assert "github.event_name == 'workflow_dispatch'" not in authorize_if
     assert build["jobs"]["authorize"]["runs-on"] == "ubuntu-latest"
     assert execute["jobs"]["configure"]["if"] == "inputs.allowed"
     for name in ("build", "unit-tests"):

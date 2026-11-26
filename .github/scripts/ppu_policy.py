@@ -5,14 +5,7 @@ import re
 
 MANUAL_RUN_PERMISSIONS = ("write", "maintain", "admin")
 
-# Temporary, single-case device acceptance on the existing working branch.
-VALIDATION_BRANCH = "davidsophus/ppu-ci-thin-adapter"
-VALIDATION_REF = f"refs/heads/{VALIDATION_BRANCH}"
-VALIDATION_CASES = (
-    "gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files",
-    "gpt/gpt3_mcore_te_tp2_pp2_resume_torch_dist",
-)
-BRANCHES = ("main", "dev", VALIDATION_BRANCH)
+BRANCHES = ("main", "dev")
 REFS = tuple(f"refs/heads/{branch}" for branch in BRANCHES)
 
 
@@ -80,25 +73,6 @@ def positive(value, name: str, maximum: int) -> int:
 
 def validate_route(event_name: str, ref: str, inputs: dict) -> str:
     kind = inputs.get("test_kind", "unit")
-    if ref == VALIDATION_REF:
-        if event_name != "workflow_dispatch" or any(
-            inputs.get(key) for key in ("pr_number", "pr_sha", "pr_base_sha")
-        ):
-            raise ValueError("Device acceptance only permits manual dispatch without PR status")
-        if kind == "unit" and (
-            inputs.get("scope") != "full"
-            or inputs.get("suite_family", "nvidia-dev") != "nvidia-dev"
-            or inputs.get("unit_bucket") != "tests/unit_tests/test_model_configs.py"
-            or str(inputs.get("repeat", "1")) != "1"
-        ):
-            raise ValueError("Device acceptance requires one model-config UT bucket")
-        if kind == "functional" and (
-            inputs.get("functional_cases") not in VALIDATION_CASES
-            or str(inputs.get("functional_repeat", "1")) != "1"
-        ):
-            raise ValueError("Device acceptance requires one selected FT case, repeated once")
-        budget = "functional_timeout" if kind == "functional" else "timeout"
-        positive(inputs.get(budget, 30), budget, 15)
     if kind not in ("unit", "functional"):
         raise ValueError("test_kind must be unit or functional")
     if {"compiler_diagnostic", "compiler_diagnostic_context"} & inputs.keys():
