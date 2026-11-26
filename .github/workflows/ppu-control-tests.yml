@@ -1,6 +1,10 @@
 name: PPU control tests
 on:
   workflow_dispatch:
+    inputs:
+      inspect_worker:
+        type: boolean
+        default: false
   pull_request:
     branches: [main, dev]
     paths:
@@ -21,6 +25,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   test:
+    if: inputs.inspect_worker != true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -33,3 +38,59 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r .github/docker/control-requirements.txt transformers==4.57.3 tokenizers==0.22.2 uv==0.13.0
       - run: python -m pytest -q -o addopts= .github/scripts/tests
+  inspect-worker:
+    if: inputs.inspect_worker == true && github.ref == 'refs/heads/davidsophus/ppu-ci-thin-adapter'
+    runs-on: k8s-runner-group-cpu-flytiger
+    environment: ppu-ci
+    timeout-minutes: 12
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - name: Read the acceptance worker events from the in-cluster API
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ipaddress, json, os, ssl, urllib.error, urllib.parse, urllib.request
+          from pathlib import Path
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+
+          pod = 'ppu-flytiger-eco-45835972164-1-build-19c7c6-worker-0'
+          account = Path('/var/run/secrets/kubernetes.io/serviceaccount')
+          token = (account / 'token').read_text().strip()
+          context = ssl.create_default_context(cafile=str(account / 'ca.crt'))
+          opener = urllib.request.build_opener(
+              urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context), NoRedirect()
+          )
+          query = urllib.parse.urlencode({'fieldSelector': f'involvedObject.name={pod}'})
+          ip = ipaddress.ip_address(os.environ['KUBERNETES_SERVICE_HOST'])
+          ip_host = f'[{ip}]' if ip.version == 6 else str(ip)
+          port = int(os.environ.get('KUBERNETES_SERVICE_PORT_HTTPS') or '443')
+          markers = ('failed to pull', 'failed to unpack', 'imagepullbackoff', 'mount',
+                     'no space left', 'context deadline exceeded', 'unauthorized',
+                     'connection refused', 'sandbox', 'allocate', 'ghcr.io')
+          for endpoint, label in ((ip_host, 'service IP'), ('kubernetes.default.svc', 'service DNS')):
+              url = f'https://{endpoint}:{port}/api/v1/namespaces/ppu-sched/events?{query}'
+              request = urllib.request.Request(url, headers={'Authorization': f'Bearer {token}'})
+              try:
+                  with opener.open(request, timeout=10) as response:
+                      events = json.load(response)['items']
+              except urllib.error.HTTPError as error:
+                  print(f'{label}: Kubernetes API HTTP {error.code}')
+                  continue
+              except (urllib.error.URLError, TimeoutError) as error:
+                  reason = getattr(error, 'reason', error)
+                  print(f'{label}: {type(reason).__name__}')
+                  continue
+              print(json.dumps([
+                  {'type': event.get('type'), 'reason': event.get('reason'), 'count': event.get('count'),
+                   'time': event.get('lastTimestamp') or event.get('eventTime'),
+                   'markers': [marker for marker in markers if marker in event.get('message', '').lower()]}
+                  for event in events if event.get('involvedObject', {}).get('name') == pod
+              ]))
+              break
+          else:
+              raise SystemExit('Could not read events using the existing in-cluster identity')
+          PY
