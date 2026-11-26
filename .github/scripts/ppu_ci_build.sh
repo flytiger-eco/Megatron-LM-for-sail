@@ -19,10 +19,16 @@ export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 PIP_NO_CACHE_DIR=1
 export DEBIAN_FRONTEND=noninteractive TORCH_CPP_LOG_LEVEL=ERROR
 export MAX_JOBS="${MAX_JOBS:-16}"
 python3 -m pip uninstall --yes megatron-core cloud-tpu-client protobuf
-python3 -m venv --system-site-packages /opt/ppu-ci-venv
 export PATH="/opt/ppu-ci-venv/bin:$PATH"
 export VIRTUAL_ENV=/opt/ppu-ci-venv
+export PIP_CONSTRAINT="$PWD/.ppu-ci/constraints.txt"
 
+if [[ -n "${PPU_DEPENDENCY_CACHE:-}" && -s "$PPU_DEPENDENCY_CACHE/environment.tar.gz" ]]; then
+    tar -xzf "$PPU_DEPENDENCY_CACHE/environment.tar.gz" -C /opt
+    cp "$PPU_DEPENDENCY_CACHE"/{constraints.txt,ppu-requirements.txt,test-requirements.txt} .ppu-ci/
+    echo 'Reusing PPU dependency environment; current Megatron source will still be built.'
+else
+python3 -m venv --system-site-packages /opt/ppu-ci-venv
 python - <<'PY'
 import importlib.metadata as md
 from pathlib import Path
@@ -47,7 +53,6 @@ Path('.ppu-ci/constraints.txt').write_text(
     '\n'.join(lines + native_requirements + ['numpy==1.26.4', 'pyarrow==21.0.0']) + '\n'
 )
 PY
-export PIP_CONSTRAINT="$PWD/.ppu-ci/constraints.txt"
 python -m pip install --index-url "$PIP_INDEX_URL" --upgrade 'packaging>=24.2'
 python -m pip install --index-url "$PIP_INDEX_URL" 'setuptools>=80' wheel pybind11 ninja click pyyaml numpy
 python - <<'PY'
@@ -178,6 +183,8 @@ compile(patched, str(path), 'exec')
 path.write_text(patched)
 print('TE CP graph-capture zero-padding fix:', path, 'sha256:', hashlib.sha256(patched.encode()).hexdigest())
 PY
+fi
+python -m pip check
 cat > .ppu-ci/import_diagnostics.py <<'PY'
 import sys
 
@@ -310,6 +317,12 @@ for dtype in (torch.float32, torch.bfloat16):
             torch.testing.assert_close(gradient, expected, rtol=0, atol=0, equal_nan=True)
         print('TE CP zero-padding graph capture and dynamic-boundary replay checks passed:', dtype, 'noncontiguous=', noncontiguous)
 PY
+# Snapshot only dependencies, before installing the policy plugin or current Megatron wheel.
+if [[ "${PPU_CACHE_SAVE:-false}" == true && ! -s "$PPU_DEPENDENCY_CACHE/environment.tar.gz" ]]; then
+    mkdir -p "$PPU_DEPENDENCY_CACHE"
+    tar -czf "$PPU_DEPENDENCY_CACHE/environment.tar.gz" -C /opt ppu-ci-venv
+    cp .ppu-ci/{constraints.txt,ppu-requirements.txt,test-requirements.txt} "$PPU_DEPENDENCY_CACHE/"
+fi
 install -m 0644 "$PPU_CONTROL_DIR/ppu_pytest_policy.py" \
     "$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/ppu_pytest_policy.py"
 python -m pip wheel --index-url "$PIP_INDEX_URL" --no-build-isolation --no-deps --wheel-dir dist .

@@ -203,7 +203,8 @@ jobs:
     container:
       image: ghcr.io/actions/actions-runner:latest
     env:
-      PPU_IMAGE: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+      PPU_IMAGE: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001@sha256:cfecb7a38dd83afc6a302f72ad05423863bb892e0ab7b1cc6173ca3b871a133c
+      PPU_DEPENDENCY_CACHE: /wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/dependencies
       MAX_JOBS: '16'
     steps:
       - name: Check out source under test
@@ -233,13 +234,34 @@ jobs:
         with:
           name: ppu-plan
           path: .ppu-ci
-      - name: Build shared DEV/LTS artifacts in an eight-card 890P Pod
+      - name: Identify the dependency environment
+        id: dependency-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          key=$({ printf '%s\n' "$PPU_IMAGE"; sha256sum source/pyproject.toml .ppu-ci/control/ppu_ci_build.sh; } | sha256sum)
+          printf 'key=ppu-deps-v1-%s\n' "${key%% *}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: dependencies
+        with:
+          path: /tmp/ppu-dependency-cache
+          key: ${{ steps.dependency-key.outputs.key }}
+      - name: Stage cached dependencies for the build Pod
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.dependencies.outputs.cache-hit }}
+        run: |
+          mkdir -p "$PPU_DEPENDENCY_CACHE"
+          if [[ "$CACHE_HIT" == true ]]; then
+            cp -a /tmp/ppu-dependency-cache/. "$PPU_DEPENDENCY_CACHE/"
+          fi
+      - name: Build shared DEV/LTS artifacts in a single-card 890P Pod
         id: ppu-build
         uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
-          image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+          image: ${{ env.PPU_IMAGE }}
           nnodes: 0
-          nproc_per_node: 8
+          nproc_per_node: 1
           namespace: ${{ vars.PPU_NAMESPACE || 'ppu-sched' }}
           node_selector: "board-type=ZW-M890P"
           host_volumes: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
@@ -250,7 +272,7 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ needs.configure.outputs.target_sha }},PPU_CONTROL_SHA=${{ needs.configure.outputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_BUNDLE_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build
+          extra_env: PPU_TARGET_SHA=${{ needs.configure.outputs.target_sha }},PPU_CONTROL_SHA=${{ needs.configure.outputs.control_sha }},PPU_SOURCE_ROOT=/opt/megatron-lm/source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-ci,PPU_BUNDLE_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_DEPENDENCY_CACHE=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/dependencies,PPU_CACHE_SAVE=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           command: |
             set -euo pipefail
             umask 022
@@ -298,6 +320,17 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 7
+      - name: Collect validated dependency environment
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.dependencies.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p /tmp/ppu-dependency-cache
+          cp -a "$PPU_DEPENDENCY_CACHE/." /tmp/ppu-dependency-cache/
+      - uses: actions/cache/save@v4
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.dependencies.outputs.cache-hit != 'true'
+        with:
+          path: /tmp/ppu-dependency-cache
+          key: ${{ steps.dependency-key.outputs.key }}
   unit-tests:
     needs: [configure, build]
     if: needs.configure.outputs.unit_test == 'true' && (needs.configure.outputs.manual_pr != 'true' || github.run_attempt == 1)
