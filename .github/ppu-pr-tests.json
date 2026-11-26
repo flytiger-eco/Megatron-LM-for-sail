@@ -53,7 +53,7 @@
     {
       "id": "dev-pr-04",
       "name": "parallel-determinism",
-      "minutes": 6,
+      "minutes": 4,
       "coverage": "GPT/Llama forward/backward determinism across two iterations, TP/EP/FSDP/PP/VPP",
       "selectors": [
         "tests/unit_tests/determinism/correctness/test_gpt_model.py"
@@ -62,7 +62,7 @@
     {
       "id": "dev-pr-05",
       "name": "inference-ssm",
-      "minutes": 5,
+      "minutes": 7,
       "coverage": "GPT/Hybrid token generation, CUDA Graph, Mamba forward, and inference cache",
       "selectors": [
         "tests/unit_tests/inference/engines/test_dynamic_engine.py::TestDynamicInferenceEngine::test_simple",

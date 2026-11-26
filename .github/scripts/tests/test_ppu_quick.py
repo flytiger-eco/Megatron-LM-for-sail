@@ -944,9 +944,11 @@ def test_suite_runner_with_fake_hardware(tmp_path, failure):
         "NPROC_PER_NODE": "8",
         "NNODES": "1",
     }
-    run = subprocess.run(
-        ["bash", str(SCRIPTS / "ppu_ci_run.sh"), "quick"], env=env, capture_output=True, text=True
+    runner = tmp_path / "ppu_ci_run.sh"
+    runner.write_text(
+        (SCRIPTS / "ppu_ci_run.sh").read_text().replace("/usr/local/pccl/envsetup.sh", "/dev/null")
     )
+    run = subprocess.run(["bash", str(runner), "quick"], env=env, capture_output=True, text=True)
     assert run.returncode == (0 if failure == "none" else 1), run.stdout + run.stderr
     commands = [json.loads(line) for line in (tmp_path / "commands.jsonl").read_text().splitlines()]
     restores = [
