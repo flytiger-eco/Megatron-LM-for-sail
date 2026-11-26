@@ -223,6 +223,7 @@ class MegatronFSDP(torch.nn.Module):
         fine_grained_recurse_module_types: Optional[Tuple[Type[nn.Module], ...]] = None,
         report_nan_in_param_grad: bool = False,
         fsdp_buffer_count: int = 2,
+        grad_usage_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__()
         # If device is not specified, use the current device.
@@ -270,6 +271,17 @@ class MegatronFSDP(torch.nn.Module):
             )
         else:
             self.ddp_config = ddp_config
+        self.track_grad_usage = getattr(self.ddp_config, "megatron_fsdp_track_grad_usage", False)
+        self.grad_usage_group = grad_usage_group
+        if self.track_grad_usage:
+            if grad_usage_group is None:
+                raise ValueError(
+                    "Gradient usage tracking requires an explicit fixed model-replica group."
+                )
+            if self.ddp_config.megatron_fsdp_cuda_graph_mode:
+                raise ValueError("Gradient usage tracking does not support FSDP CUDA graph mode.")
+            if self.ddp_config.fsdp_double_buffer:
+                raise ValueError("Gradient usage tracking requires unpooled gradient buffers.")
         # Non-expert sharding strategy. Expert parameters may be sharded differently, so
         # decisions that cover the whole model must consult both strategies instead: see
         # any_sharding_strategy_in / all_sharding_strategies_in.
@@ -701,6 +713,18 @@ class MegatronFSDP(torch.nn.Module):
             group = self.param_and_grad_buffer.parameter_groups[group_id]
             if not group.requires_grad:
                 return
+            if self.track_grad_usage and (param.grad_added_to_main_grad or param.grad is not None):
+                # Zero gradients count as usage; skipped branches must not fabricate gradients.
+                param._fsdp_local_grad_used = True
+            if (
+                param.grad_added_to_main_grad
+                and getattr(param, "zero_out_wgrad", False)
+                and param.grad is not None
+            ):
+                # Shared embedding/output weights have both fused and autograd contributions.
+                param.main_grad = param.get_main_grad()
+                param.main_grad.add_(to_local_if_dtensor(param.grad))
+                del param.grad
 
             # Sharded Gradient Buffer
             gbuf = group.hfsdp_helper_gbuf if group.hfsdp_helper_gbuf else group.main_grad_buffer
@@ -827,7 +851,7 @@ class MegatronFSDP(torch.nn.Module):
             else:
                 params_to_reduce = [p for p in param_list if self._reduces_grad_every_backward(p)]
 
-            if params_to_reduce:
+            if params_to_reduce and not self.track_grad_usage:
                 # Launch asynchronous reduce-scatter of gradients before the optimizer
                 # step. This requires a later call to finish_grad_sync() to wait for
                 # completion.
@@ -927,6 +951,22 @@ class MegatronFSDP(torch.nn.Module):
             )
             for param in ordered_params:
                 _grad_acc(param)
+
+            if self.track_grad_usage:
+                # Hooks may arrive in different orders on different ranks. Defer all
+                # collectives until this backward is complete, then include every
+                # bucket (unused parameters were zero-filled above) in fixed order.
+                # Do not accumulate processed parameters again: their full buckets
+                # already hold this microbatch's fused and autograd contributions.
+                ordered_params = sorted(
+                    [
+                        p
+                        for group in self.param_and_grad_buffer.parameter_groups
+                        if group.requires_grad
+                        for p in group.params
+                    ],
+                    key=lambda p: self.param_to_name[p],
+                )
 
             # Reduce the remaining gradients. Parameter classes that shard gradients reduce
             # on every backward pass; the rest accumulate locally and are only reduced once
@@ -1448,6 +1488,29 @@ class MegatronFSDP(torch.nn.Module):
             # Synchronous gradient reduction when sharding optimizer state or not sharding.
             self.start_grad_sync()
 
+    def _apply_global_grad_usage(self):
+        """Keep globally unused gradients as None with pack-independent fixed-pool collectives."""
+        parameters = sorted(
+            [
+                param
+                for group in self.param_and_grad_buffer.parameter_groups
+                if group.requires_grad
+                for param in group.params
+            ],
+            key=lambda param: self.param_and_grad_buffer.param_to_name[param],
+        )
+        flags = torch.tensor(
+            [int(getattr(param, "_fsdp_local_grad_used", False)) for param in parameters],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        torch.distributed.all_reduce(flags, group=self.grad_usage_group)
+        used = dict(zip(parameters, flags.cpu().tolist()))
+        for _, master in self.param_and_grad_buffer.optimizer_named_parameters:
+            original = master.orig_param
+            original._fsdp_has_global_grad = bool(used.get(original, False))
+        self.param_and_grad_buffer.update_main_grads()
+
     def attach_grad_to_optimizer_state(self):
         """
         Attach gradients to optimizer named parameters
@@ -1474,6 +1537,8 @@ class MegatronFSDP(torch.nn.Module):
         # Once the gradients have been reduced and scattered into main_grad_buffer,
         # update the gradients for all buffered weights in optimizer_named_parameters.
         self.attach_grad_to_optimizer_state()
+        if self.track_grad_usage:
+            self._apply_global_grad_usage()
 
         # Synchronize parameter all-gather operations for all model parameters,
         # which are triggered during the backward pass for FSDP.
@@ -1571,6 +1636,11 @@ class MegatronFSDP(torch.nn.Module):
             if param.requires_grad:
                 param.grad_added_to_main_grad = False
         self.param_and_grad_buffer.zero_grad()
+        if self.track_grad_usage:
+            for group in self.param_and_grad_buffer.parameter_groups:
+                for param in group.params:
+                    param._fsdp_local_grad_used = False
+                    param._fsdp_has_global_grad = True
 
     def install_optimized_model_weights(self):
         """

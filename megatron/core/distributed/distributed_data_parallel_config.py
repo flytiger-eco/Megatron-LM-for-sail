@@ -125,6 +125,15 @@ class DistributedDataParallelConfig:
     megatron_fsdp_version: int = 1
     """Megatron-FSDP implementation version. Valid values are 1 and 2."""
 
+    megatron_fsdp_track_grad_usage: bool = False
+    """Track conditional parameter usage in V1 to skip globally unused masters and moments.
+
+    Currently requires a caller-owned fixed DPxCP pool and ZeRO2 with TP1/PP1/EP1.
+    Reductions run in fixed bucket order at each backward's root callback, retaining
+    full gradient buckets until then and disabling backward/communication overlap.
+    Persistent communication-buffer pools and CUDA graph mode are not supported.
+    """
+
     overlap_outer_communication: bool = False
     """Overlap MFSDP v2's last-microbatch outer-DP gradient reduction with inner-DP
     reductions on a separate CUDA stream."""
@@ -440,6 +449,22 @@ class DistributedDataParallelConfig:
                 )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
+        if self.megatron_fsdp_track_grad_usage and (
+            not self.use_megatron_fsdp
+            or self.megatron_fsdp_version != 1
+            or self.data_parallel_sharding_strategy != "optim_grads"
+        ):
+            raise ValueError(
+                "Gradient usage tracking requires Megatron-FSDP V1 ZeRO2 (optim_grads)."
+            )
+        if self.megatron_fsdp_track_grad_usage:
+            if self.megatron_fsdp_cuda_graph_mode:
+                raise ValueError("Gradient usage tracking does not support FSDP CUDA graph mode.")
+            if self.fsdp_double_buffer:
+                raise ValueError(
+                    "Gradient usage tracking requires unpooled gradient buffers; "
+                    "disable persistent communication-buffer pooling (including nccl_ub)."
+                )
         if self.overlap_outer_communication:
             if not self.use_megatron_fsdp:
                 raise ValueError("overlap_outer_communication requires Megatron-FSDP.")

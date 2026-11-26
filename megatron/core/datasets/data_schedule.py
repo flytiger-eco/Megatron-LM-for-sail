@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
 
 import enum
+from collections import Counter
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Dict, Optional, Sequence, Type
 
@@ -527,32 +529,94 @@ def _get_scheduler_max_real_num_seqs(config) -> Optional[int]:
     return max_num_seqs
 
 
-def wrap_data_iterator(
-    data_iterator, config, num_microbatches, pg_collection: ProcessGroupCollection
-):
-    """
-    A wrapper function that wraps around an existing data_iterator
-    and return the num_micro_batches for sequence packing.
+@dataclass(frozen=True)
+class SequencePackingPlan:
+    """Payload-independent packing plan ordered by rank in the fixed DPxCP pool.
 
     Args:
-        data_iterator: The original data_iterator to wrap around
-        config: The config object containing the max_seqlen_per_dp_cp_rank
-        pg_collection: Caller-owned process groups; must define dp_cp, dp, tp, and pp.
+        assignments: Sample IDs per round and rank. CP replicas reference the same pack.
+        dynamic_cp: Whether to use the caller's pre-created runtime CP groups.
     """
 
-    # GTP_remat peers consume distinct samples, so packing must span them like the rest of DP.
-    dp_cp_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
-    dp_group = pg_collection.dp_gtp_remat or pg_collection.dp
-    tp_group = pg_collection.tp
-    pp_group = pg_collection.pp
-    assert (
-        dp_cp_group is not None
-        and dp_group is not None
-        and tp_group is not None
-        and pp_group is not None
-    ), "dp_cp, dp, tp, and pp must be defined in pg_collection for sequence packing"
+    assignments: tuple[tuple[tuple[int, ...], ...], ...]
+    dynamic_cp: bool
 
-    dev = torch.cuda.current_device()
+    def cp_group(
+        self, round_index: int, pg_collection: ProcessGroupCollection
+    ) -> torch.distributed.ProcessGroup:
+        """Return the pack's compute group without changing static model or FSDP groups."""
+        if not self.dynamic_cp:
+            return pg_collection.cp
+        stage = self.assignments[round_index]
+        pool = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
+        ids = stage[pool.rank()]
+        groups = pg_collection.dynamic_cp or {}
+        if not groups:
+            raise ValueError("Dynamic packing requires caller-provided pre-created CP groups.")
+        size = sum(other == ids for other in stage) if ids else min(groups)
+        group = _get_dynamic_cp_group(size, groups, "dynamic_cp")
+        pool_ranks = torch.distributed.get_process_group_ranks(pool)
+        members = torch.distributed.get_process_group_ranks(group)
+        if any(stage[pool_ranks.index(member)] != ids for member in members):
+            raise ValueError("Sample assignments do not match the runtime CP group.")
+        return group
+
+
+def build_sequence_packing_plan(
+    sample_id_seqlens: Sequence[tuple[int, int]],
+    config: Any,
+    *,
+    pg_collection: ProcessGroupCollection,
+) -> SequencePackingPlan:
+    """Build a length-only plan; callers route arbitrary tensor payloads by sample ID.
+
+    Args:
+        sample_id_seqlens: Globally unique sample IDs and physical packing lengths.
+        config: Scheduler, capacity, and dynamic CP configuration.
+        pg_collection: Caller-owned fixed pools and pre-created compute groups.
+
+    Returns:
+        An immutable plan that neither reads nor transfers sample payloads.
+    """
+    # The text wrapper permits this legacy combination, but its variable-size
+    # assignments cannot be consumed by the generic plan's fixed static CP group.
+    if (
+        config.sequence_packing_scheduler.lower() == "default_dynamic_cp"
+        and not getattr(config, "dynamic_context_parallel", True)
+    ):
+        raise ValueError("Dynamic packing plans require dynamic context parallelism.")
+    if not sample_id_seqlens:
+        raise ValueError("The global candidate sample pool must not be empty.")
+    ids, lengths = zip(*sample_id_seqlens)
+    if len(set(ids)) != len(ids) or any(length <= 0 for length in lengths):
+        raise ValueError("Packing sample IDs must be unique and lengths must be positive.")
+    scheduler = _create_packing_scheduler(config, pg_collection)
+    stages = scheduler.get_groups_and_subsamples(list(enumerate(lengths)))
+    assignments = tuple(
+        tuple(tuple(ids[index] for index in pack) for pack in stage) for stage in stages
+    )
+    pool = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
+    counts = Counter()
+    for stage in assignments:
+        if len(stage) != pool.size():
+            raise ValueError("The packing plan must cover every rank in the fixed DPxCP pool.")
+        for pack in set(stage):
+            if pack:
+                counts.update(pack)
+    if counts != Counter(ids):
+        raise ValueError("The packing plan dropped or duplicated input samples.")
+    # Preserve the existing use of default_dynamic_cp with static CP.
+    dynamic_cp = scheduler.is_dynamic_cp and getattr(config, "dynamic_context_parallel", True)
+    return SequencePackingPlan(assignments, dynamic_cp)
+
+
+def _create_packing_scheduler(
+    config: Any, pg_collection: ProcessGroupCollection
+) -> BasePackingScheduler:
+    """Share capacity, padding, and THD limits so model adapters need not rebuild schedulers."""
+    dp_group = pg_collection.dp_gtp_remat or pg_collection.dp
+    dp_cp_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
+    tp_group = pg_collection.tp
     dp_size = dp_group.size()
     cp_size = dp_cp_group.size() // dp_size
 
@@ -610,7 +674,22 @@ def wrap_data_iterator(
         ),
         **scheduler_kwargs,
     )
+    return scheduler
 
+
+def wrap_data_iterator(
+    data_iterator, config, num_microbatches, pg_collection: ProcessGroupCollection
+):
+    """Wrap a text iterator using the scheduler configuration shared with prepared payloads."""
+    dp_cp_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
+    dp_group = pg_collection.dp_gtp_remat or pg_collection.dp
+    tp_group = pg_collection.tp
+    pp_group = pg_collection.pp
+    assert all(
+        group is not None for group in (dp_cp_group, dp_group, tp_group, pp_group)
+    ), "dp_cp, dp, tp, and pp must be defined in pg_collection for sequence packing"
+    dev = torch.cuda.current_device()
+    scheduler = _create_packing_scheduler(config, pg_collection)
     (
         new_data_iterator,
         num_micro_batches,

@@ -3645,6 +3645,14 @@ class ParamAndGradBuffer:
         """
         for name, param in self.optimizer_named_parameters:
             orig_param = param.orig_param
+            if getattr(self.ddp_config, "megatron_fsdp_track_grad_usage", False) and not getattr(
+                orig_param, "_fsdp_has_global_grad", True
+            ):
+                # Scaling or rebinding must not turn globally unused None gradients into zeros.
+                param.grad = None
+                if hasattr(param, "decoupled_grad"):
+                    param.decoupled_grad = None
+                continue
             group = self.parameter_groups[self.param_to_param_group[orig_param]]
             gbuf = group.main_grad_buffer
             if gbuf is None:

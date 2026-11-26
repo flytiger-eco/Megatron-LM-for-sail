@@ -1,20 +1,30 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
+import os
+from copy import deepcopy
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.src.megatron_fsdp import param_and_grad_buffer
+from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import (
+    MegatronFSDP,
+    MixedPrecisionPolicy,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
     AllGatherPipeline,
     BucketingPolicy,
     FixedPoolAllocator,
     MaxPoolAllocator,
+    ParamAndGradBuffer,
     ParameterGroup,
     _get_parameter_groups,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import FSDPDistributedIndex
 
 
 class _ExpertTestModule(torch.nn.Module):
@@ -168,6 +178,246 @@ def test_grouped_expert_weights_split_when_chunk_size_factors_differ():
             "params": [("layer.experts.linear_fc2", shapes["linear_fc2"])],
         },
     ]
+
+
+@pytest.mark.parametrize("use_decoupled_grad", [False, True])
+def test_unused_gradient_survives_scaling_and_rebinding(use_decoupled_grad):
+    """Skip unused Adam updates and rebind gradients when the parameter is used again."""
+    original = torch.nn.Parameter(torch.ones(2))
+    master = torch.nn.Parameter(torch.ones(2))
+    master.orig_param = original
+    master.grad = torch.ones_like(master)
+    master.decoupled_grad = torch.ones_like(master)
+    optimizer = torch.optim.AdamW([master], lr=0.1, weight_decay=0.1)
+    optimizer.step()
+    saved_weight = master.detach().clone()
+    saved_state = {key: value.clone() for key, value in optimizer.state[master].items()}
+
+    data = torch.zeros_like(master)
+    grad_buffer = SimpleNamespace(data=data, param_idx={original: 0}, get_item=lambda *a, **k: data)
+    buffer = ParamAndGradBuffer.__new__(ParamAndGradBuffer)
+    buffer.ddp_config = SimpleNamespace(megatron_fsdp_track_grad_usage=True)
+    buffer.optimizer_named_parameters = [("conditional", master)]
+    buffer.parameter_groups = [
+        SimpleNamespace(
+            main_grad_buffer=grad_buffer, main_weight_buffer=None, sharding_strategy="no_shard"
+        )
+    ]
+    buffer.param_to_param_group = {original: 0}
+    buffer.dist_main_grad = {"conditional": data}
+    buffer.use_decoupled_grad = use_decoupled_grad
+    original._fsdp_has_global_grad = False
+
+    buffer.update_main_grads()
+    buffer.scale_gradients(0.5)
+    buffer.update_main_grads()
+    assert master.grad is None
+    assert master.decoupled_grad is None
+    optimizer.step()
+    torch.testing.assert_close(master, saved_weight, rtol=0, atol=0)
+    for key, value in saved_state.items():
+        torch.testing.assert_close(optimizer.state[master][key], value, rtol=0, atol=0)
+
+    original._fsdp_has_global_grad = True
+    buffer.update_main_grads()
+    gradient = master.decoupled_grad if use_decoupled_grad else master.grad
+    assert gradient is not None
+    torch.testing.assert_close(gradient, torch.zeros_like(master), rtol=0, atol=0)
+
+
+def test_global_gradient_usage_includes_remote_only_parameters(monkeypatch):
+    """Reduce flags in stable name order and retain gradients for remote-only usage."""
+    parameters = [torch.nn.Parameter(torch.ones(1)) for _ in range(3)]
+    local, remote, unused = parameters
+    local._fsdp_local_grad_used = True
+    remote._fsdp_local_grad_used = False
+    unused._fsdp_local_grad_used = False
+    masters = [SimpleNamespace(orig_param=param) for param in parameters]
+    pool = object()
+
+    def all_reduce(flags, *, group):
+        assert group is pool
+        assert flags.tolist() == [1, 0, 0]
+        flags.add_(torch.tensor([0, 1, 0], dtype=flags.dtype))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    buffer = SimpleNamespace(
+        parameter_groups=[SimpleNamespace(requires_grad=True, params=[unused, remote, local])],
+        param_to_name=dict(zip(parameters, ["a", "b", "c"])),
+        optimizer_named_parameters=list(zip(["a", "b", "c"], masters)),
+        update_main_grads=lambda: None,
+    )
+    state = SimpleNamespace(param_and_grad_buffer=buffer, device="cpu", grad_usage_group=pool)
+    MegatronFSDP._apply_global_grad_usage(state)
+    assert local._fsdp_has_global_grad is True
+    assert remote._fsdp_has_global_grad is True
+    assert unused._fsdp_has_global_grad is False
+
+
+class _ConditionalBranch(torch.nn.Module):
+    """Distinct FSDP units with equal-size buffers expose mismatched collective order."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.arange(1, 9, dtype=torch.float32))
+
+    def forward(self, x):
+        return (self.weight * x).sum()
+
+
+class _ConditionalModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = _ConditionalBranch()
+        self.b = _ConditionalBranch()
+        self.c = _ConditionalBranch()
+
+    def forward(self, x, branch, use_c):
+        value = (self.a if branch == 0 else self.b)(x)
+        return value + self.c(x * 0.25) if use_c else value
+
+
+class _FusedWeightContribution(torch.autograd.Function):
+    """Emulate fused output wgrad plus a dummy zero_out_wgrad autograd gradient."""
+
+    @staticmethod
+    def forward(ctx, weight, x):
+        ctx.weight = weight
+        ctx.save_for_backward(x)
+        return (weight * x).sum()
+
+    @staticmethod
+    def backward(ctx, gradient):
+        (x,) = ctx.saved_tensors
+        weight = ctx.weight
+        weight.main_grad = weight.get_main_grad()
+        weight.main_grad.copy_(x * gradient)
+        weight.grad_added_to_main_grad = True
+        return torch.zeros_like(weight), None
+
+
+class _TiedWeightModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.arange(1, 9, dtype=torch.float32))
+        self.weight.zero_out_wgrad = True
+        self.output = torch.nn.Module()
+        self.output.register_parameter("weight", self.weight)
+
+    def forward(self, x):
+        # The ordinary embedding path contributes in addition to fused output wgrad.
+        return _FusedWeightContribution.apply(self.output.weight, x) + (self.weight * x * 2).sum()
+
+
+def _grad_usage_test_wrapper(model, mesh, tracking):
+    ddp = DistributedDataParallelConfig(
+        use_megatron_fsdp=True,
+        data_parallel_sharding_strategy="optim_grads",
+        overlap_grad_reduce=True,
+        overlap_param_gather=False,
+        megatron_fsdp_track_grad_usage=tracking,
+        bucket_size=8,
+    )
+    ddp.finalize()
+    return MegatronFSDP(
+        model,
+        ddp_config=ddp,
+        mixed_precision_policy=MixedPrecisionPolicy(),
+        fsdp_unit_modules=[_ConditionalBranch],
+        device=torch.device("cuda", torch.cuda.current_device()),
+        dist_index=FSDPDistributedIndex(mesh, dp_shard_dim="dp", tp_dim="tp"),
+        grad_usage_group=mesh["dp"].get_group() if tracking else None,
+        calculate_per_token_loss=True,
+        sync_model_each_microbatch=False,
+    )
+
+
+@pytest.fixture(scope="module")
+def grad_usage_process_group():
+    """Reuse the suite group, or clean up a group owned by a focused torchrun invocation."""
+    dist = torch.distributed
+    owned = False
+    if "RANK" in os.environ and torch.cuda.is_available() and not dist.is_initialized():
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        dist.init_process_group("nccl", timeout=timedelta(seconds=90))
+        owned = True
+    yield
+    if owned:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("tracking", [False, True])
+def test_grad_usage_distributed_numerics(grad_usage_process_group, distributed_setup, tracking):
+    """Check conditional buckets, tied fused weights, accumulation, and AdamW numerically."""
+    dist = torch.distributed
+    if not torch.cuda.is_available() or distributed_setup.world_size < 2:
+        pytest.skip("Requires at least two CUDA ranks under torchrun.")
+    from torch.distributed.device_mesh import init_device_mesh
+
+    size = dist.get_world_size()
+    rank = dist.get_rank()
+    device = distributed_setup.device
+    mesh = init_device_mesh("cuda", (size, 1), mesh_dim_names=("dp", "tp"))
+    models = [_TiedWeightModel()]
+    if tracking:
+        models.append(_ConditionalModel())
+    for model in models:
+        model = model.to(device)
+        reference = deepcopy(model)
+        wrapped = _grad_usage_test_wrapper(model, mesh, tracking)
+        masters = dict(wrapped.param_and_grad_buffer.optimizer_named_parameters)
+        optimizer = torch.optim.AdamW(list(masters.values()), lr=0.01, weight_decay=0.1)
+        ref_optimizer = torch.optim.AdamW(reference.parameters(), lr=0.01, weight_decay=0.1)
+        is_conditional = isinstance(reference, _ConditionalModel)
+        if is_conditional:
+            buckets = wrapped.param_and_grad_buffer
+            assert (
+                len({tuple(buckets.bucket_to_bucket_group[i]) for i in range(buckets.num_buckets)})
+                >= 3
+            )
+        for step in range(3):
+            wrapped.zero_grad_buffer()
+            ref_optimizer.zero_grad(set_to_none=True)
+            wrapped.start_param_sync(force_sync=True)
+            for microbatch in range(2):
+                base = torch.arange(1, 9, device=device, dtype=torch.float32) * (microbatch + 1)
+                x = base * (rank + 1)
+                if is_conditional:
+                    wrapped(x, (rank + microbatch + step) % 2, step != 1).div(size).backward()
+                    # Independent unsharded global-batch reference, including absent branches.
+                    for peer in range(size):
+                        reference(base * (peer + 1), (peer + microbatch + step) % 2, step != 1).div(
+                            size
+                        ).backward()
+                else:
+                    wrapped(x).div(size).backward()
+                    for peer in range(size):
+                        (reference.weight * base * (peer + 1) * 3).sum().div(size).backward()
+            wrapped.finish_grad_sync()
+            for name, param in reference.named_parameters():
+                master = masters[name]
+                if param.grad is None:
+                    assert master.grad is None
+                else:
+                    torch.testing.assert_close(
+                        master.grad.full_tensor(), param.grad, rtol=1e-5, atol=1e-6
+                    )
+            optimizer.step()
+            ref_optimizer.step()
+            wrapped.install_optimized_model_weights()
+            for name, param in reference.named_parameters():
+                master = masters[name]
+                torch.testing.assert_close(master.full_tensor(), param, rtol=1e-5, atol=1e-6)
+                for key in ("exp_avg", "exp_avg_sq", "step"):
+                    actual = optimizer.state[master][key]
+                    if hasattr(actual, "full_tensor"):
+                        actual = actual.full_tensor()
+                    torch.testing.assert_close(
+                        actual, ref_optimizer.state[param][key], rtol=1e-5, atol=1e-6
+                    )
+        wrapped.grad_reduce_pipeline.reset()
+        wrapped.all_gather_pipeline.reset(preserve_non_fsdp_units=False)
+    dist.barrier()
 
 
 def test_per_expert_2d_weights_avoid_lcm_padding():
