@@ -578,6 +578,13 @@ def build_sequence_packing_plan(
     Returns:
         An immutable plan that neither reads nor transfers sample payloads.
     """
+    # The text wrapper permits this legacy combination, but its variable-size
+    # assignments cannot be consumed by the generic plan's fixed static CP group.
+    if (
+        config.sequence_packing_scheduler.lower() == "default_dynamic_cp"
+        and not getattr(config, "dynamic_context_parallel", True)
+    ):
+        raise ValueError("Dynamic packing plans require dynamic context parallelism.")
     if not sample_id_seqlens:
         raise ValueError("The global candidate sample pool must not be empty.")
     ids, lengths = zip(*sample_id_seqlens)

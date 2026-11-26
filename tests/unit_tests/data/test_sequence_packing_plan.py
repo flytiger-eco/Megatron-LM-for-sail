@@ -84,6 +84,16 @@ def test_plan_rejects_oversized_sequence():
         build_sequence_packing_plan([(1, 1024)], config(True), pg_collection=groups())
 
 
+def test_dynamic_scheduler_plan_rejects_static_cp():
+    """Variable-size assignments must not be consumed by a fixed static CP group."""
+    cfg = config(True)
+    cfg.dynamic_context_parallel = False
+    with pytest.raises(ValueError, match="require dynamic context parallelism"):
+        build_sequence_packing_plan(
+            [(100, 64), (101, 64), (102, 64), (103, 64)], cfg, pg_collection=groups()
+        )
+
+
 def test_empty_pack_uses_a_precreated_group_when_cp1_is_unavailable(monkeypatch):
     pg = groups(rank=2)
     pg.dynamic_cp = {size: group for size, group in pg.dynamic_cp.items() if size >= 2}
