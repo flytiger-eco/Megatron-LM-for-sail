@@ -1,6 +1,10 @@
 name: PPU control tests
 on:
   workflow_dispatch:
+    inputs:
+      diagnose:
+        type: boolean
+        default: false
   pull_request:
     branches: [main, dev]
     paths:
@@ -21,6 +25,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   test:
+    if: inputs.diagnose != true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -33,3 +38,22 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r .github/docker/control-requirements.txt transformers==4.57.3 tokenizers==0.22.2 uv==0.13.0
       - run: python -m pytest -q -o addopts= .github/scripts/tests
+  inspect-worker-events:
+    if: inputs.diagnose == true && github.ref == 'refs/heads/davidsophus/ppu-ci-thin-adapter'
+    runs-on: k8s-runner-group-cpu-flytiger
+    timeout-minutes: 12
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - name: Read events for the stopped acceptance worker only
+        shell: bash
+        run: |
+          /opt/bin/kubectl --request-timeout=30s get events -n ppu-sched \
+            --field-selector involvedObject.name=ppu-flytiger-eco-45819370409-2-build-f94c0a-worker-0 \
+            -o json > "$RUNNER_TEMP/worker-events.json"
+          python3 - "$RUNNER_TEMP/worker-events.json" <<'PY'
+          import json, sys
+          events = json.load(open(sys.argv[1]))['items']
+          print(json.dumps([{k: e.get(k) for k in ('reason', 'message', 'count', 'lastTimestamp')}
+                            for e in events]))
+          PY
