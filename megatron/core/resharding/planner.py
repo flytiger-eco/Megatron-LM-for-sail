@@ -1,16 +1,21 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
+import os
 import warnings
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 
+from megatron.core.utils import unwrap_model
+
 from .shard_planner import plan_sharded_transfer
 from .utils import (
+    _EXPERT_PARAM_RE,
     ParameterMetadata,
     ReshardPlan,
     ShardingDescriptor,
@@ -24,6 +29,14 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Default number of logical parameters per lockstep execution batch, for copy
+# services that support multiple runs per plan (currently NCCL). Submitting the
+# whole model as one ncclGroup deadlocks NCCL once the group is large enough to
+# be split into several kernel plans (https://github.com/pytorch/pytorch/issues/174288),
+# so the transfer is issued in small, globally agreed batches instead. Override
+# with MEGATRON_REFIT_MAX_PARAMS_PER_BATCH; 0 disables the cap.
+DEFAULT_MAX_PARAMS_PER_BATCH = 32
 
 
 @dataclass(frozen=True)
@@ -41,7 +54,9 @@ def _find_source_metadata(
     """Find source metadata, including the tied-output embedding alias."""
     src_meta_list = src_param_metadata.get(resolved_name)
     if not src_meta_list and resolved_name.endswith("output_layer.weight"):
-        for embedding_name in ("embedding.word_embeddings.weight", "word_embeddings.weight"):
+        prefix = resolved_name.removesuffix("output_layer.weight")
+        for suffix in ("embedding.word_embeddings.weight", "word_embeddings.weight"):
+            embedding_name = prefix + suffix
             src_meta_list = src_param_metadata.get(embedding_name)
             if src_meta_list:
                 break
@@ -391,8 +406,10 @@ def _build_execution_batch_ids(
     without another collective. Source and destination bytes are accumulated per
     rank; starting a new batch when any rank would cross the soft limit bounds
     both sender-side dequantization and receiver-side staging. All replicas and
-    shards of one resolved parameter stay in one batch. ``None`` assigns every
-    parameter to one model-wide batch, preserving the uncapped behavior.
+    shards of one resolved parameter stay in one batch. ``None`` disables the byte
+    limit; batches are then bounded only by the per-batch parameter cap
+    (``DEFAULT_MAX_PARAMS_PER_BATCH`` / ``MEGATRON_REFIT_MAX_PARAMS_PER_BATCH``), which
+    keeps every rank's NCCL P2P group small enough to stay in a single kernel plan.
     """
     parameter_order: list[str] = []
     destination_bytes: dict[str, dict[int, int]] = {}
@@ -410,10 +427,24 @@ def _build_execution_batch_ids(
                 destination_bytes[resolved_name].get(metadata.owner_rank, 0), tensor_bytes
             )
 
-    if max_batch_bytes is None:
+    # Cap on logical parameters per batch. A byte budget alone can still pack
+    # thousands of small tensors (norm weights, biases, router expert_bias) into
+    # one batch_isend_irecv; NCCL splits such large groups into kernel plans at
+    # rank-dependent points, and matching sends/recvs that land in different plans
+    # deadlock (https://github.com/pytorch/pytorch/issues/174288). Every rank
+    # evaluates this from the same roster and environment, so batches agree.
+    max_batch_params_env = os.environ.get("MEGATRON_REFIT_MAX_PARAMS_PER_BATCH")
+    max_batch_params: int | None = (
+        int(max_batch_params_env) if max_batch_params_env else DEFAULT_MAX_PARAMS_PER_BATCH
+    )
+    if max_batch_params <= 0:
+        max_batch_params = None
+
+    if max_batch_bytes is None and max_batch_params is None:
         return {resolved_name: 0 for resolved_name in parameter_order}, 1
-    if max_batch_bytes <= 0:
+    if max_batch_bytes is not None and max_batch_bytes <= 0:
         raise ValueError("max_batch_bytes must be positive or None")
+    byte_limit = float("inf") if max_batch_bytes is None else max_batch_bytes
 
     source_bytes: dict[str, dict[int, int]] = {}
     for resolved_name in parameter_order:
@@ -428,19 +459,24 @@ def _build_execution_batch_ids(
     batch_ids: dict[str, int] = {}
     batch_id = 0
     current_rank_bytes: dict[int, int] = {}
+    current_params = 0
     for resolved_name in parameter_order:
         parameter_rank_bytes = dict(source_bytes[resolved_name])
         for rank, tensor_bytes in destination_bytes[resolved_name].items():
             parameter_rank_bytes[rank] = parameter_rank_bytes.get(rank, 0) + tensor_bytes
 
-        if current_rank_bytes and any(
-            current_rank_bytes.get(rank, 0) + tensor_bytes > max_batch_bytes
+        over_bytes = any(
+            current_rank_bytes.get(rank, 0) + tensor_bytes > byte_limit
             for rank, tensor_bytes in parameter_rank_bytes.items()
-        ):
+        )
+        over_params = max_batch_params is not None and current_params >= max_batch_params
+        if current_rank_bytes and (over_bytes or over_params):
             batch_id += 1
             current_rank_bytes.clear()
+            current_params = 0
 
         batch_ids[resolved_name] = batch_id
+        current_params += 1
         for rank, tensor_bytes in parameter_rank_bytes.items():
             current_rank_bytes[rank] = current_rank_bytes.get(rank, 0) + tensor_bytes
 
@@ -458,6 +494,25 @@ def _global_shape_for_mesh(metadata: ParameterMetadata, mesh: tuple[int, ...]) -
     if metadata.is_tp:
         shape[metadata.partition_dim] *= len(mesh)
     return tuple(shape)
+
+
+def _strided_as_packed(metadata: ParameterMetadata) -> ParameterMetadata:
+    """Describe a strided TP shard (e.g. GLU fc1, stride 2) as equal packed components.
+
+    With ``partition_stride=s`` each TP rank stores ``s`` equal blocks along the
+    partition dim, block ``j`` being the rank's shard of global component ``j``
+    (for GLU: ``[gate_i; up_i]``). That is exactly the packed layout described by
+    ``partition_sizes=[local/s] * s``, which native resharding already handles.
+    """
+    stride = metadata.partition_stride
+    if stride <= 1 or metadata.partition_sizes is not None:
+        return metadata
+    local = metadata.shape[metadata.partition_dim]
+    if local % stride:
+        return metadata
+    return dataclasses.replace(
+        metadata, partition_stride=1, partition_sizes=[local // stride] * stride
+    )
 
 
 def _validate_native_mesh_metadata(
@@ -603,6 +658,135 @@ def _native_parameter_parts(
     return parts, None
 
 
+_STACK_EXPERTS_ENV = "MEGATRON_NCCL_M2N_STACK_EXPERTS"
+
+
+def _expert_family(resolved_name: str) -> str:
+    """``...experts.linear_fc1.weight17`` -> ``...experts.linear_fc1.weight``."""
+    head, _, tail = resolved_name.rpartition('.')
+    m = _EXPERT_PARAM_RE.match(tail)
+    if m is None:
+        return resolved_name
+    return f"{head}.{m.group(1)}" if head else m.group(1)
+
+
+def _is_stackable_expert(metadata: ParameterMetadata) -> bool:
+    """A per-expert, non-TP-sharded (ETP=1), unpacked, unstrided EP parameter."""
+    return (
+        metadata.is_ep
+        and metadata.global_expert_index is not None
+        and bool(metadata.expert_parallel_group_ranks)
+        and _tensor_mesh(metadata) == (metadata.owner_rank,)
+        and metadata.partition_sizes is None
+        and metadata.partition_stride == 1
+        and not metadata.is_gtp
+    )
+
+
+def _local_stack_names(
+    ep_ranks: tuple[int, ...],
+    by_expert: dict[int, ParameterMetadata],
+    experts_per_rank: int,
+    rank: int,
+) -> tuple[str, ...] | None:
+    """Local parameter names of ``rank``'s experts in one family, in expert order."""
+    if rank not in ep_ranks:
+        return None
+    first = ep_ranks.index(rank) * experts_per_rank
+    return tuple(by_expert[e].name for e in range(first, first + experts_per_rank))
+
+
+def _build_stacked_expert_specs(
+    dst_groups: dict[tuple[str, tuple[int, ...]], dict[int, ParameterMetadata]],
+    src_param_metadata: dict[str, list[ParameterMetadata]],
+    my_global_rank: int,
+) -> tuple[list[TensorReshardSpec], set[tuple[str, tuple[int, ...]]]]:
+    """Describe each expert family as one EP-sharded tensor per destination EP group.
+
+    Megatron assigns experts to EP ranks in contiguous blocks
+    (EP rank ``i`` owns global experts ``[i*k, (i+1)*k)``), so the experts of one
+    layer projection form a regular ``[E, *shape]`` tensor sharded on dim 0
+    over the EP mesh on both sides. One native call then replaces ``E``
+    single-rank copies. Families that do not satisfy every condition keep the
+    per-expert path. Returns the specs and the consumed ``dst_groups`` keys.
+    """
+    families: dict[tuple[str, tuple[int, ...]], dict[int, ParameterMetadata]] = {}
+    keys_by_family: dict[tuple[str, tuple[int, ...]], list] = {}
+    for key, dst_by_rank in dst_groups.items():
+        resolved_name, dst_mesh = key
+        if len(dst_mesh) != 1:
+            continue
+        meta = dst_by_rank[dst_mesh[0]]
+        if not _is_stackable_expert(meta):
+            continue
+        fam = (_expert_family(resolved_name), tuple(meta.expert_parallel_group_ranks))
+        families.setdefault(fam, {})[meta.global_expert_index] = meta
+        keys_by_family.setdefault(fam, []).append(key)
+
+    # Spread destination EP groups over source EP replicas round-robin.
+    dst_groups_by_family_name: dict[str, list[tuple[int, ...]]] = {}
+    for family_name, dst_ep in sorted(families):
+        dst_groups_by_family_name.setdefault(family_name, []).append(dst_ep)
+
+    specs: list[TensorReshardSpec] = []
+    consumed: set = set()
+    for (family_name, dst_ep), dst_by_expert in sorted(families.items()):
+        any_meta = next(iter(dst_by_expert.values()))
+        num_experts = any_meta.num_experts
+        if not num_experts or num_experts % len(dst_ep):
+            continue
+        kd = num_experts // len(dst_ep)
+        shape = tuple(any_meta.shape)
+        if set(dst_by_expert) != set(range(num_experts)) or any(
+            tuple(m.shape) != shape or m.dtype != any_meta.dtype or m.owner_rank != dst_ep[e // kd]
+            for e, m in dst_by_expert.items()
+        ):
+            continue
+        # Source EP replicas that hold every expert of this family whole.
+        src_by_group: dict[tuple[int, ...], dict[int, ParameterMetadata]] = {}
+        for e in range(num_experts):
+            for m in src_param_metadata.get(f"{family_name}{e}", ()) or ():
+                if _is_stackable_expert(m) and m.global_expert_index == e:
+                    src_by_group.setdefault(tuple(m.expert_parallel_group_ranks), {})[e] = m
+        candidates = []
+        for src_ep, by_e in sorted(src_by_group.items()):
+            if num_experts % len(src_ep) or set(by_e) != set(range(num_experts)):
+                continue
+            ks = num_experts // len(src_ep)
+            if all(
+                tuple(m.shape) == shape
+                and m.dtype == any_meta.dtype
+                and m.owner_rank == src_ep[e // ks]
+                for e, m in by_e.items()
+            ) and not set(src_ep) & set(dst_ep):
+                candidates.append((src_ep, by_e))
+        if not candidates:
+            continue
+        order = dst_groups_by_family_name[family_name].index(dst_ep)
+        src_ep, src_by_expert = candidates[order % len(candidates)]
+        ks = num_experts // len(src_ep)
+
+        specs.append(
+            TensorReshardSpec(
+                resolved_name=f"{family_name}[experts]",
+                src_ranks=src_ep,
+                dst_ranks=dst_ep,
+                global_shape=(num_experts,) + shape,
+                src_local_shape=(ks,) + shape,
+                dst_local_shape=(kd,) + shape,
+                dtype=any_meta.dtype,
+                src_shard_dim=0,
+                dst_shard_dim=0,
+                src_param_shape=(ks,) + shape,
+                dst_param_shape=(kd,) + shape,
+                src_stack_names=_local_stack_names(src_ep, src_by_expert, ks, my_global_rank),
+                dst_stack_names=_local_stack_names(dst_ep, dst_by_expert, kd, my_global_rank),
+            )
+        )
+        consumed.update(keys_by_family[(family_name, dst_ep)])
+    return specs, consumed
+
+
 def _build_tensor_reshard_specs(
     dst_param_metadata_by_rank: dict[int, dict[str, ParameterMetadata]],
     src_param_metadata: dict[str, list[ParameterMetadata]],
@@ -616,7 +800,14 @@ def _build_tensor_reshard_specs(
             dst_groups.setdefault((resolved_name, mesh), {})[metadata.owner_rank] = metadata
 
     specs: list[TensorReshardSpec] = []
+    consumed: set = set()
+    if os.environ.get(_STACK_EXPERTS_ENV, "1") != "0":
+        specs, consumed = _build_stacked_expert_specs(
+            dst_groups, src_param_metadata, my_global_rank
+        )
     for (resolved_name, dst_mesh), dst_by_rank in dst_groups.items():
+        if (resolved_name, dst_mesh) in consumed:
+            continue
         src_meta_list = _find_source_metadata(src_param_metadata, resolved_name)
         if not src_meta_list:
             # The generic schedule raises the authoritative missing-weight
@@ -632,14 +823,36 @@ def _build_tensor_reshard_specs(
         for metadata in src_meta_list:
             mesh = _tensor_mesh(metadata)
             src_groups.setdefault(mesh, {})[metadata.owner_rank] = metadata
+        # Validate the same packed representation used for native transfers;
+        # validating raw destination metadata rejects supported GLU strides.
+        packed_dst_by_rank = {r: _strided_as_packed(m) for r, m in dst_by_rank.items()}
+        error = _validate_native_mesh_metadata(
+            resolved_name, "destination", dst_mesh, packed_dst_by_rank
+        )
+        if error is not None:
+            return None, error
         dst_metadata = dst_by_rank[dst_mesh[0]]
         selected_src = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_mesh[0])
         src_mesh = _tensor_mesh(selected_src)
-        src_by_rank = src_groups[src_mesh]
+        # A plain multi-rank shard is contiguous in the global tensor, not in
+        # each GLU component. Inferring packed sizes would silently reorder it.
+        src_stride = selected_src.partition_stride
+        dst_stride = dst_metadata.partition_stride
+        if (
+            selected_src.partition_sizes is None
+            and dst_metadata.partition_sizes is None
+            and src_stride != dst_stride
+            and (
+                (selected_src.is_tp and len(src_mesh) > 1 and src_stride == 1)
+                or (dst_metadata.is_tp and len(dst_mesh) > 1 and dst_stride == 1)
+            )
+        ):
+            return None, f"{resolved_name}: mixed strided/plain TP layouts are unsupported"
+        src_by_rank = {r: _strided_as_packed(m) for r, m in src_groups[src_mesh].items()}
+        dst_by_rank = packed_dst_by_rank
+        dst_metadata = dst_by_rank[dst_mesh[0]]
 
-        error = _validate_native_mesh_metadata(
-            resolved_name, "source", src_mesh, src_by_rank
-        ) or _validate_native_mesh_metadata(resolved_name, "destination", dst_mesh, dst_by_rank)
+        error = _validate_native_mesh_metadata(resolved_name, "source", src_mesh, src_by_rank)
         if error is not None:
             return None, error
         if set(src_mesh) & set(dst_mesh):
@@ -701,30 +914,51 @@ def _build_tensor_reshard_specs(
 def _extract_module_metadata(
     module, owner_rank, num_experts, rank_offset, rank_list_cache
 ) -> list[ParameterMetadata]:
-    """Metadata for a module's params and persistent buffers, or [] if None.
-
-    Persistent buffers travel too so training state (e.g. MoE router expert_bias)
-    refits with the weights.
-    """
+    """Extract metadata with native or model-declared names and ownership."""
     if module is None:
         return []
-    pg = getattr(module, "pg_collection", None)
-    if pg is None:
-        raise ValueError("Module must have pg_collection")
-    layer_prefix_map = _build_layer_module_prefix_map(module)
-    return [
-        extract_param_metadata(
-            p,
-            name,
-            owner_rank,
-            pg,
-            num_experts=num_experts,
-            layer_module_prefix_map=layer_prefix_map,
-            rank_offset=rank_offset,
-            _rank_list_cache=rank_list_cache,
-        )
-        for name, p in named_refit_tensors(module)
-    ]
+    provider = getattr(module, "refit_modules", None)
+    components = provider() if provider else [("", module, getattr(module, "pg_collection", None))]
+    paths = {id(child): name for name, child in module.named_modules()} if provider else {}
+    metadata = []
+    for label, child, pg in components:
+        storage_prefix = ""
+        if provider:
+            child = unwrap_model(child)
+            path = paths.get(id(child))
+            if path is None:
+                raise ValueError("Refit modules must belong to the original model")
+            storage_prefix = path + "." if path else ""
+            experts = getattr(getattr(child, "config", None), "num_moe_experts", None)
+        else:
+            experts = num_experts
+        if pg is None:
+            raise ValueError("Module must have pg_collection")
+        layer_prefix_map = _build_layer_module_prefix_map(child)
+        for name, tensor in named_refit_tensors(child):
+            entry = extract_param_metadata(
+                tensor,
+                name,
+                owner_rank,
+                pg,
+                num_experts=experts,
+                layer_module_prefix_map=layer_prefix_map,
+                rank_offset=rank_offset,
+                _rank_list_cache=rank_list_cache,
+            )
+            if label:
+                entry.resolved_name = label + "." + (entry.resolved_name or entry.name)
+            entry.name = storage_prefix + entry.name
+            metadata.append(entry)
+    if provider:
+        names = {entry.name for entry in metadata}
+        if len(names) != len(metadata) or names != {
+            name for name, _ in named_refit_tensors(module)
+        }:
+            raise ValueError("Refit metadata must cover every parameter and persistent buffer once")
+        if len({entry.resolved_name for entry in metadata}) != len(metadata):
+            raise ValueError("Refit metadata contains duplicate matching tensor names")
+    return metadata
 
 
 def index_metadata_rosters(gathered_pairs: list):
@@ -762,6 +996,7 @@ def build_plan_from_rosters(
     my_plan = ReshardPlan(
         [], [], num_batches=num_batches, execution_batch_bytes=execution_batch_bytes
     )
+    total_tasks = 0
     for (
         task_id,
         dst_rank,
@@ -771,6 +1006,7 @@ def build_plan_from_rosters(
         src_metadata,
         dst_metadata,
     ) in _iter_global_transfer_ops(dst_param_metadata_by_rank, src_param_metadata):
+        total_tasks = task_id + 1
         if dst_rank == my_global_rank:
             my_plan.recv_ops.append(
                 TransferOp(
@@ -796,6 +1032,7 @@ def build_plan_from_rosters(
                 )
             )
 
+    my_plan.total_tasks = total_tasks
     logger.info(
         f"Rank {my_global_rank}: Built plan locally - {len(my_plan.recv_ops)} recvs, "
         f"{len(my_plan.send_ops)} sends"
