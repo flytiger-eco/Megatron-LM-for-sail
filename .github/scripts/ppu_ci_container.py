@@ -1,4 +1,4 @@
-"""Build, publish and verify the PPU execution image."""
+"""Build and verify the software bundle used with the fixed SAIL SDK image."""
 
 import argparse
 import hashlib
@@ -9,6 +9,8 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
+import tarfile
 import tempfile
 import time
 from pathlib import Path, PurePosixPath
@@ -16,6 +18,9 @@ from pathlib import Path, PurePosixPath
 GHCR_IMAGE = 'ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci'
 PPU_IMAGE = 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001'
 SOURCE_ROOT = Path('/opt/ppu-ci-source')
+VENV_ROOT = Path('/opt/ppu-ci-venv')
+TOOL_BIN = Path('/usr/local/bin')
+ARCHIVE = 'environment.tar.gz'
 SHA = re.compile(r'[0-9a-f]{40}')
 DIGEST = re.compile(r'[0-9a-f]{64}')
 DOCKER_FILES = ('Dockerfile.ppu-ci', 'Dockerfile.ppu-ci.dockerignore', 'export_environment.py')
@@ -33,6 +38,10 @@ def require(value, message):
 def digest(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def file_identity(path):
+    return {'size': path.stat().st_size, 'sha256': digest(path)}
 
 
 def relative(name):
@@ -68,7 +77,7 @@ def inventory(directory, exclude=('docker-build.json',)):
         require(path.is_file(), 'Environment inventory contains a special file')
         name = path.relative_to(directory).as_posix()
         if name not in exclude:
-            files[name] = {'size': path.stat().st_size, 'sha256': digest(path)}
+            files[name] = file_identity(path)
     return files
 
 
@@ -83,7 +92,7 @@ def verify_export(directory, trusted_digest, control_sha, target_sha, *, subset=
     metadata = json.loads(path.read_text())
     require(
         type(metadata.get('schema_version')) is int
-        and metadata['schema_version'] == 2
+        and metadata['schema_version'] == 3
         and metadata.get('kind') == 'runtime',
         'Unsupported environment build metadata',
     )
@@ -109,16 +118,18 @@ def verify_export(directory, trusted_digest, control_sha, target_sha, *, subset=
         relative(name)
         path = no_links(directory / name)
         require(
-            path.is_file() and expected == {'size': path.stat().st_size, 'sha256': digest(path)},
+            path.is_file() and expected == file_identity(path),
             'Missing or corrupted environment member',
         )
+    archive = metadata.get('archive', {})
     require(
-        'environment.tar.gz' not in files
-        and not no_links(directory / 'environment.tar.gz').exists(),
-        'Image evidence must not contain a software environment archive',
+        isinstance(archive, dict) and type(archive.get('size')) is int and archive['size'] > 0
+        and isinstance(archive.get('sha256'), str) and DIGEST.fullmatch(archive['sha256'])
+        and ARCHIVE not in files,
+        'Missing trusted runtime archive identity',
     )
     if not subset:
-        exclude = ('docker-build.json', 'runtime-image.json')
+        exclude = ('docker-build.json', 'runtime-image.json', ARCHIVE)
         require(
             inventory(directory, exclude=exclude) == files, 'Unexpected environment export members'
         )
@@ -385,7 +396,7 @@ def materialize_tracked_source(source, destination, names):
 def readable_probe_export(output, context):
     """Prepare a readable bind root inside the private, temporary build context."""
     snapshot = context / 'probe-exports'
-    shutil.copytree(no_links(output), snapshot)
+    shutil.copytree(no_links(output), snapshot, symlinks=True, copy_function=os.link)
     for path in (snapshot, *snapshot.rglob('*')):
         no_links(path)
         require(path.is_dir() or path.is_file(), 'Invalid offline probe export member')
@@ -450,11 +461,6 @@ def build(args):
             '--build-arg',
             f'CONTROL_SHA={args.control_sha}',
         ]
-        if not cache_only:
-            require(
-                re.fullmatch(r'ppu-ci-runtime:run-[0-9]+-[0-9]+', args.local_image),
-                'Invalid local execution image tag',
-            )
         if cache_from:
             common += ['--cache-from', f'type=registry,ref={cache_from}']
         if cache_to:
@@ -480,7 +486,7 @@ def build(args):
             diagnostics=True,
         )
         metadata = {
-            'schema_version': 2,
+            'schema_version': 3,
             'kind': 'runtime',
             'platform': 'linux/amd64',
             'control_sha': args.control_sha,
@@ -489,25 +495,19 @@ def build(args):
             'image_digest': pinned,
             'inputs_sha256': key,
             'elapsed_seconds': round(time.time() - started, 3),
-            'files': inventory(output),
+            'files': inventory(output, exclude=('docker-build.json', ARCHIVE)),
+            'archive': file_identity(no_links(output / ARCHIVE)),
         }
         (output / 'docker-build.json').write_text(json.dumps(metadata, sort_keys=True) + '\n')
         sha = digest(output / 'docker-build.json')
         verify_export(output, sha, args.control_sha, args.target_sha)
+        (output / 'runtime-image.json').write_text(
+            json.dumps(image_record(metadata, sha, pinned), sort_keys=True) + '\n'
+        )
         # BuildKit local exports may be owned by the runner with mode 0700.
         # A root container without DAC capabilities cannot read that bind mount.
         # Keep original evidence private and mount a readable temporary snapshot.
         probe_export = readable_probe_export(output, context)
-        release = context / 'release'
-        release.mkdir()
-        shutil.copyfile(output / 'docker-build.json', release / 'docker-build.json')
-        command(
-            common + ['--target', 'execution', '--load', '--tag', args.local_image, str(context)],
-            failure='Dockerfile execution image build failed',
-            diagnostics=True,
-        )
-        local_id = command(['docker', 'image', 'inspect', '--format', '{{.Id}}', args.local_image])
-        require(re.fullmatch(r'sha256:[0-9a-f]{64}', local_id), 'Invalid local execution image ID')
         command(
             [
                 'docker',
@@ -522,11 +522,13 @@ def build(args):
                 f'type=bind,source={probe_export},target=/exports,readonly',
                 '--mount',
                 f'type=bind,source={root / ".github/scripts"},target=/trusted,readonly',
-                local_id,
+                '--entrypoint',
+                '/usr/bin/env',
+                pinned,
                 'python3',
                 '-I',
                 '/trusted/ppu_ci_container.py',
-                'image-probe',
+                'runtime-probe',
                 '--artifact',
                 '/exports',
                 '--digest',
@@ -538,10 +540,12 @@ def build(args):
                 '--base-image-digest',
                 pinned,
             ],
-            failure='Dockerfile execution image offline probe failed',
+            failure='SDK runtime bundle offline probe failed',
             diagnostics=True,
         )
-        emit_outputs(environment_digest=sha, local_image_id=local_id, base_image_digest=pinned)
+        emit_outputs(
+            environment_digest=sha, runtime_image_digest=pinned, base_image_digest=pinned
+        )
 
 
 def emit_outputs(**values):
@@ -554,8 +558,8 @@ def emit_outputs(**values):
 
 def image_record(metadata, environment_digest, runtime_image_digest):
     require(
-        re.fullmatch(re.escape(GHCR_IMAGE) + r'@sha256:[0-9a-f]{64}', runtime_image_digest or ''),
-        'Invalid published execution image digest',
+        runtime_image_digest == metadata['image_digest'],
+        'Execution must use the SDK digest used to build the runtime bundle',
     )
     return {
         'schema_version': 1,
@@ -567,72 +571,52 @@ def image_record(metadata, environment_digest, runtime_image_digest):
     }
 
 
-def publish_image(args):
-    metadata = verify_export(args.artifact, args.digest, args.control_sha, args.target_sha)
-    require(args.base_image_digest == metadata['image_digest'], 'Publication base image mismatch')
+def verify_archive(path, metadata):
+    archive = no_links(path)
     require(
-        re.fullmatch(r'ppu-ci-runtime:run-([0-9]+)-([0-9]+)', args.local_image),
-        'Invalid local execution image tag',
-    )
-    run = args.local_image.split(':', 1)[1]
-    require(
-        args.image_tag == f'{GHCR_IMAGE}:{run}-{args.target_sha}', 'Invalid publication image tag'
-    )
-    require(
-        re.fullmatch(r'sha256:[0-9a-f]{64}', args.local_image_id), 'Invalid trusted local image ID'
-    )
-    require(
-        command(['docker', 'image', 'inspect', '--format', '{{.Id}}', args.local_image])
-        == args.local_image_id,
-        'Execution image changed after offline validation',
-    )
-    record_path = no_links(Path(args.artifact) / 'runtime-image.json')
-    require(not record_path.exists(), 'Refusing to overwrite an image publication record')
-    command(['docker', 'tag', args.local_image_id, args.image_tag])
-    command(
-        ['docker', 'push', args.image_tag],
-        failure='GHCR execution image push failed',
-        diagnostics=True,
-    )
-    refs = json.loads(
-        command(['docker', 'image', 'inspect', '--format', '{{json .RepoDigests}}', args.image_tag])
-    )
-    require(
-        isinstance(refs, list) and all(isinstance(ref, str) for ref in refs),
-        'Invalid pushed repository digest inventory',
-    )
-    matches = [
-        ref for ref in refs if re.fullmatch(re.escape(GHCR_IMAGE) + r'@sha256:[0-9a-f]{64}', ref)
-    ]
-    require(len(matches) == 1, 'Unable to resolve pushed execution image digest')
-    published = matches[0]
-    # Read the immutable registry reference, not the mutable tag or push log.
-    command(
-        ['docker', 'buildx', 'imagetools', 'inspect', published],
-        failure='GHCR immutable image lookup failed',
-    )
-    record_path.write_text(
-        json.dumps(image_record(metadata, args.digest, published), sort_keys=True) + '\n'
-    )
-    emit_outputs(
-        runtime_image_digest=published,
-        environment_digest=args.digest,
-        base_image_digest=args.base_image_digest,
+        archive.is_file() and file_identity(archive) == metadata['archive'],
+        'Runtime archive does not match the trusted build export',
     )
 
 
-def verify_installed_image(args, metadata):
+def restore_runtime(directory, path, metadata):
+    """Restore the approved environment and compiled source into a fresh SDK worker."""
+    root = no_links(SOURCE_ROOT.parent)
+    destinations = (VENV_ROOT, SOURCE_ROOT)
     require(
-        args.base_image_digest == metadata['image_digest'], 'Execution image base identity mismatch'
+        all(not os.path.lexists(location) for location in destinations),
+        'SDK worker already has a CI runtime',
     )
-    venv = no_links('/opt/ppu-ci-venv')
-    require((venv / 'bin/python').is_file(), 'Missing baked execution environment')
-    embedded = no_links('/opt/ppu-ci-image/docker-build.json')
-    require(embedded.is_file() and digest(embedded) == args.digest, 'Baked image metadata mismatch')
-    require(
-        args.source_root == SOURCE_ROOT and no_links(SOURCE_ROOT).is_dir(),
-        'Execution source must come from the immutable image',
-    )
+    allowed = {location.name for location in destinations}
+
+    def members(member, target):
+        require(relative(member.name).parts[0] in allowed, 'Unexpected runtime archive member')
+        return tarfile.data_filter(member, target)
+
+    with tempfile.TemporaryDirectory(prefix='ppu-runtime-', dir=root) as temporary:
+        staged = Path(temporary)
+        local = staged / ARCHIVE
+        shutil.copyfile(no_links(path), local)
+        verify_archive(local, metadata)
+        try:
+            with tarfile.open(local, 'r:gz') as bundle:
+                bundle.extractall(staged, filter=members)
+        except tarfile.TarError as error:
+            raise ValidationError('Unsafe or invalid runtime archive') from error
+        for destination in destinations:
+            require(no_links(staged / destination.name).is_dir(), 'Runtime archive is incomplete')
+        # These trees are byte-identical to the SDK in the CPU build and need not be transferred.
+        vendor = Path(sysconfig.get_path('purelib'))
+        site = no_links(staged / VENV_ROOT.name / 'lib/python3.12/site-packages')
+        require(site.is_dir(), 'Runtime archive is missing the Python environment')
+        for name in ('torch', 'triton'):
+            shutil.copytree(vendor / name, site / name, symlinks=False)
+        for destination in destinations:
+            (staged / destination.name).rename(destination)
+    for name in ('yq', 'envsubst'):
+        tool = no_links(TOOL_BIN / name)
+        shutil.copyfile(directory / 'functional-tools' / name, tool)
+        tool.chmod(0o755)
 
 
 def verify_image(args):
@@ -648,17 +632,23 @@ def verify_image(args):
         isinstance(published, dict)
         and type(published.get('schema_version')) is int
         and published == image_record(metadata, args.digest, args.image_digest),
-        'Execution image publication record mismatch',
+        'SDK execution record mismatch',
     )
     if args.check_only:
+        if getattr(args, 'archive', None):
+            verify_archive(args.archive, metadata)
         return
-    verify_installed_image(args, metadata)
+    require(args.source_root == SOURCE_ROOT, 'Invalid runtime source directory')
+    require(args.archive is not None, 'Missing verified runtime archive')
+    restore_runtime(Path(args.artifact), args.archive, metadata)
 
 
-def image_probe(args):
-    metadata = verify_export(args.artifact, args.digest, args.control_sha, args.target_sha)
+def runtime_probe(args):
     args.source_root = SOURCE_ROOT
-    verify_installed_image(args, metadata)
+    args.image_digest = args.base_image_digest
+    args.archive = args.artifact / ARCHIVE
+    args.check_only = False
+    verify_image(args)
     execution_checks(SOURCE_ROOT)
 
 
@@ -685,7 +675,7 @@ def execution_checks(source):
         ],
         ['/usr/bin/git', '--version'],
         ['/usr/bin/wget', '--version'],
-        ['/usr/bin/envsubst', '--version'],
+        ['/usr/local/bin/envsubst', '--version'],
         ['/opt/ppu-ci-venv/bin/yq', '--version'],
         ['/usr/bin/make', '-q', '-C', str(source / 'megatron/core/datasets')],
         # Verify the original training driver's absolute path, not just the venv tool in PATH.
@@ -705,7 +695,7 @@ def execution_checks(source):
         result = subprocess.run(check, env=environment, capture_output=True, text=True)
         require(
             result.returncode == 0,
-            'Offline execution image check failed; device checks remain required',
+            'Offline SDK runtime check failed; device checks remain required',
         )
 
 
@@ -713,41 +703,35 @@ def main():
     require(sys.version_info >= (3, 11), 'Environment bootstrap requires Python 3.11 or newer')
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='mode', required=True)
-    for mode in ('fingerprint', 'build-image', 'build-cache'):
+    for mode in ('fingerprint', 'build-runtime', 'build-cache'):
         create = sub.add_parser(mode)
-        if mode == 'build-image':
-            create.add_argument('--local-image', required=True)
         create.add_argument('--control-root', type=Path, required=True)
         create.add_argument('--control-sha', required=True)
         create.add_argument('--source-root', type=Path, required=True)
         create.add_argument('--target-sha', required=True)
         create.add_argument('--image-digest')
-        if mode in ('build-image', 'build-cache'):
+        if mode in ('build-runtime', 'build-cache'):
             create.add_argument('--output', type=Path, required=mode != 'build-cache')
             create.add_argument('--cache-from', default='')
             create.add_argument('--cache-to', default='')
-    for mode in ('publish-image', 'verify-image', 'image-probe'):
+    for mode in ('verify-image', 'runtime-probe'):
         image = sub.add_parser(mode)
         image.add_argument('--artifact', type=Path, required=True)
         image.add_argument('--digest', required=True)
         image.add_argument('--control-sha', required=True)
         image.add_argument('--target-sha', required=True)
         image.add_argument('--base-image-digest', required=True)
-        if mode == 'publish-image':
-            image.add_argument('--local-image', required=True)
-            image.add_argument('--local-image-id', required=True)
-            image.add_argument('--image-tag', required=True)
         if mode == 'verify-image':
             image.add_argument('--image-digest', required=True)
+            image.add_argument('--archive', type=Path)
             image.add_argument('--source-root', type=Path)
             image.add_argument('--check-only', action='store_true')
     args = parser.parse_args()
     {
-        'build-image': build,
+        'build-runtime': build,
         'build-cache': build,
-        'publish-image': publish_image,
         'verify-image': verify_image,
-        'image-probe': image_probe,
+        'runtime-probe': runtime_probe,
         'fingerprint': fingerprint,
     }[args.mode](args)
 

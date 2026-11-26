@@ -202,12 +202,12 @@ print(json.dumps({{
 def prepare(bundle: Path):
     """Attest the existing Dockerfile environment; never acquire software here."""
     metadata = json.loads((bundle / "docker-build.json").read_text())
-    if type(metadata.get("schema_version")) is not int or metadata["schema_version"] != 2:
+    if type(metadata.get("schema_version")) is not int or metadata["schema_version"] != 3:
         raise ValueError("Functional preparation requires the current execution image schema")
     for name in ("yq", "envsubst"):
         path = bundle / "functional-tools" / name
         expected = metadata["files"][f"functional-tools/{name}"]
-        installed = Path(sys.prefix) / "bin/yq" if name == "yq" else Path("/usr/bin/envsubst")
+        installed = Path(sys.prefix) / "bin/yq" if name == "yq" else Path("/usr/local/bin/envsubst")
         if (
             path.is_symlink()
             or path.stat().st_size != expected["size"]

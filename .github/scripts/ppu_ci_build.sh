@@ -8,17 +8,18 @@ set -u
 : "${PPU_TARGET_SHA:?Missing target commit SHA}"
 : "${PPU_CONTROL_SHA:?Missing trusted control commit SHA}"
 started_at=$(date +%s)
-cd "$PPU_SOURCE_ROOT"
-[[ ! -e .ppu-ci && ! -L .ppu-ci ]]
-ln -s "$PPU_ARTIFACT_DIR" .ppu-ci
-[[ -f .ppu-ci/manifest.json ]] || exit 1
 : "${PPU_ENVIRONMENT_DIGEST:?Missing trusted Dockerfile build digest}"
 python3 -I "$PPU_CONTROL_DIR/ppu_ci_container.py" verify-image \
     --artifact "$PPU_ARTIFACT_DIR" --digest "$PPU_ENVIRONMENT_DIGEST" \
     --control-sha "$PPU_CONTROL_SHA" --target-sha "$PPU_TARGET_SHA" \
     --source-root "$PPU_SOURCE_ROOT" \
     --base-image-digest "${PPU_BASE_IMAGE_DIGEST:?Missing trusted base image digest}" \
-    --image-digest "${PPU_IMAGE_DIGEST:?Missing trusted execution image digest}"
+    --image-digest "${PPU_IMAGE_DIGEST:?Missing trusted execution image digest}" \
+    --archive "${PPU_RUNTIME_ARCHIVE:?Missing verified runtime archive}"
+cd "$PPU_SOURCE_ROOT"
+[[ ! -e .ppu-ci && ! -L .ppu-ci ]]
+ln -s "$PPU_ARTIFACT_DIR" .ppu-ci
+[[ -f .ppu-ci/manifest.json ]] || exit 1
 export PATH="/opt/ppu-ci-venv/bin:$PATH"
 export VIRTUAL_ENV=/opt/ppu-ci-venv UV_PROJECT_ENVIRONMENT=/opt/ppu-ci-venv
 export PYTHONNOUSERSITE=1 UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never

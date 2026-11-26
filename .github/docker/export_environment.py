@@ -1,4 +1,4 @@
-"""Isolate vendor packages and export build evidence for PPU images."""
+"""Isolate vendor packages and export build evidence for the PPU runtime."""
 
 import hashlib
 import importlib.metadata as md
@@ -139,5 +139,5 @@ if __name__ == '__main__':
     {
         'isolate': isolate,
         'control': lambda: verify_reports(['/build/control-install.json']),
-        'runtime-image': runtime,
+        'runtime': runtime,
     }[sys.argv[1]]()

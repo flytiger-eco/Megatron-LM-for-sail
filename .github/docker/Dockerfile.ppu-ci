@@ -178,25 +178,11 @@ RUN --network=none test "${#TARGET_SHA}" = 40 && test "${#CONTROL_SHA}" = 40 \
     && python -m pip install --no-index --no-deps --ignore-installed \
         --report /build/source-package-install.json /build/wheels/*.whl \
     && python -m pip check \
-    && python /build/export_environment.py runtime-image
+    && python /build/export_environment.py runtime \
+    && mv /build/source /opt/ppu-ci-source \
+    && tar -C /opt \
+        --exclude=ppu-ci-venv/lib/python3.12/site-packages/torch \
+        --exclude=ppu-ci-venv/lib/python3.12/site-packages/triton \
+        -cf - ppu-ci-venv ppu-ci-source | gzip -1 > /exports/environment.tar.gz
 FROM scratch AS runtime-export
 COPY --from=runtime /exports/ /
-
-FROM runtime AS execution
-ARG TARGET_SHA
-ARG CONTROL_SHA
-ARG PPU_IMAGE
-LABEL org.opencontainers.image.source="https://github.com/flytiger-eco/Megatron-LM-for-sail" \
-    org.opencontainers.image.revision="${TARGET_SHA}" \
-    org.opencontainers.image.base.name="${PPU_IMAGE}" \
-    io.flytiger.ppu-ci.control="${CONTROL_SHA}"
-COPY release/docker-build.json /opt/ppu-ci-image/docker-build.json
-# The original training driver hardcodes this path; copy the digest-verified tool at build time only.
-RUN --network=none install -m 0755 /opt/ppu-ci-venv/bin/yq /usr/local/bin/yq \
-    && cmp /opt/ppu-ci-venv/bin/yq /usr/local/bin/yq \
-    && test "$(printf 'TEST_TYPE: regular\n' | /usr/local/bin/yq '.TEST_TYPE')" = regular \
-    && mv /build/source /opt/ppu-ci-source \
-    && python -c 'import shutil; shutil.rmtree("/build"); shutil.rmtree("/exports")'
-WORKDIR /opt/megatron-lm
-ENTRYPOINT []
-CMD ["/bin/bash"]

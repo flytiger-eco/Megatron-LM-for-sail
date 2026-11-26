@@ -61,7 +61,7 @@ def tool_environment(tmp_path, monkeypatch):
     (local / "yq").write_bytes(content)
     (local / "yq").chmod(0o755)
     (bundle / "docker-build.json").write_text(
-        json.dumps({"schema_version": 2, "files": tool_files})
+        json.dumps({"schema_version": 3, "files": tool_files})
     )
     (site / "ppu_functional_pytest.py").write_bytes(
         (bundle / "control/ppu_functional_pytest.py").read_bytes()
@@ -153,7 +153,7 @@ def tool_environment(tmp_path, monkeypatch):
             if value == "/usr/local/bin"
             else (
                 prefix / "bin/envsubst"
-                if value == "/usr/bin/envsubst"
+                if value == "/usr/local/bin/envsubst"
                 else tmp_path / "empty-load" if value == "/tmp/checkpoints" else Path(value)
             )
         ),

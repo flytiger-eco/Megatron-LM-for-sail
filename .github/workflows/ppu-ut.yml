@@ -82,24 +82,22 @@ jobs:
         with:
           name: ${{ inputs.artifact_prefix }}ppu-plan
           path: .ppu-ci
-      - uses: actions/download-artifact@v4
-        with:
-          name: ${{ inputs.artifact_prefix }}ppu-runtime-environment
-          path: ${{ runner.temp }}/ppu-runtime-export
-      - name: Verify execution image handoff before requesting PPU
-        run: >-
-          python3 -I control/.github/scripts/ppu_ci_container.py verify-image
-          --artifact "$RUNNER_TEMP/ppu-runtime-export"
-          --digest '${{ inputs.environment_digest }}'
-          --control-sha '${{ inputs.control_sha }}' --target-sha '${{ inputs.target_sha }}'
-          --image-digest '${{ inputs.runtime_image_digest }}'
-          --base-image-digest '${{ inputs.base_image_digest }}' --check-only
       - name: Validate trusted runtime directories
         env:
           PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
           PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
           PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
         run: python3 -I .ppu-ci/control/ppu_ci_paths.py run
+      - name: Verify SDK runtime handoff before requesting PPU
+        env:
+          PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+        run: >-
+          python3 -I control/.github/scripts/ppu_ci_container.py verify-image
+          --artifact "$PPU_CPU_RUN_ROOT/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build"
+          --digest '${{ inputs.environment_digest }}'
+          --control-sha '${{ inputs.control_sha }}' --target-sha '${{ inputs.target_sha }}'
+          --image-digest '${{ inputs.runtime_image_digest }}'
+          --base-image-digest '${{ inputs.base_image_digest }}' --check-only
       - name: Run PPU UT bucket
         id: ppu
         uses: flytiger-eco/shared-workflows/cluster-task@main
@@ -117,7 +115,7 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
-          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/ppu-ci-source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_ENVIRONMENT_DIGEST=${{ inputs.environment_digest }},PPU_IMAGE_DIGEST=${{ inputs.runtime_image_digest }},PPU_BASE_IMAGE_DIGEST=${{ inputs.base_image_digest }},PPU_RESULTS_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/unit/${{ matrix.id }}
+          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/ppu-ci-source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_RUNTIME_ARCHIVE=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/runtime/environment.tar.gz,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_ENVIRONMENT_DIGEST=${{ inputs.environment_digest }},PPU_IMAGE_DIGEST=${{ inputs.runtime_image_digest }},PPU_BASE_IMAGE_DIGEST=${{ inputs.base_image_digest }},PPU_RESULTS_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/unit/${{ matrix.id }}
           command: |
             set -euo pipefail
             cd /opt/megatron-lm

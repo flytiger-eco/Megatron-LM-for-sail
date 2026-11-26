@@ -524,6 +524,7 @@ chmod() { [[ "$FIXTURE_ARCHIVE_FAILURE" == false ]] && command chmod "$@"; }
         "PPU_SOURCE_ROOT": str(tmp_path),
         "PPU_CONTROL_DIR": str(SCRIPTS),
         "PPU_ARTIFACT_DIR": str(tmp_path),
+        "PPU_RUNTIME_ARCHIVE": str(tmp_path / "environment.tar.gz"),
         "PPU_ENVIRONMENT_DIGEST": "d" * 64,
         "PPU_IMAGE_DIGEST": "ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci@sha256:" + "e" * 64,
         "PPU_BASE_IMAGE_DIGEST": functional.IMAGE.rsplit(":", 1)[0] + "@sha256:" + "f" * 64,

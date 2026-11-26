@@ -899,6 +899,7 @@ def test_suite_runner_with_fake_hardware(tmp_path, failure):
         "PPU_RESULTS_DIR": str(results),
         "PPU_SOURCE_ROOT": str(source),
         "PPU_ARTIFACT_DIR": str(artifacts),
+        "PPU_RUNTIME_ARCHIVE": str(tmp_path / "environment.tar.gz"),
         "PPU_CONTROL_DIR": str(SCRIPTS),
         "PPU_TARGET_SHA": SHA,
         "PPU_CONTROL_SHA": CONTROL_SHA,
@@ -921,6 +922,7 @@ def test_suite_runner_with_fake_hardware(tmp_path, failure):
         ('--digest', 'PPU_ENVIRONMENT_DIGEST'),
         ('--image-digest', 'PPU_IMAGE_DIGEST'),
         ('--base-image-digest', 'PPU_BASE_IMAGE_DIGEST'),
+        ('--archive', 'PPU_RUNTIME_ARCHIVE'),
     ):
         args = verifications[0]['args']
         assert args[args.index(flag) + 1] == env[variable]

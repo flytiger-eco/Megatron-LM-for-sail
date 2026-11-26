@@ -11,9 +11,6 @@ selection_id="${1:?Missing UT bucket or suite ID}"
 : "${PPU_ARTIFACT_DIR:?Missing build artifact directory}"
 results_root="$PPU_RESULTS_DIR"
 suite_started=$(date +%s)
-cd "$PPU_SOURCE_ROOT"
-[[ ! -e .ppu-ci && ! -L .ppu-ci ]]
-ln -s "$PPU_ARTIFACT_DIR" .ppu-ci
 prepare_results_for_upload() {
     local exit_code="$1"
     trap - EXIT
@@ -37,7 +34,11 @@ python3 -I "$PPU_CONTROL_DIR/ppu_ci_container.py" verify-image \
     --control-sha "$PPU_CONTROL_SHA" --target-sha "$PPU_TARGET_SHA" \
     --source-root "$PPU_SOURCE_ROOT" \
     --base-image-digest "${PPU_BASE_IMAGE_DIGEST:?Missing trusted base image digest}" \
-    --image-digest "${PPU_IMAGE_DIGEST:?Missing trusted execution image digest}"
+    --image-digest "${PPU_IMAGE_DIGEST:?Missing trusted execution image digest}" \
+    --archive "${PPU_RUNTIME_ARCHIVE:?Missing verified runtime archive}"
+cd "$PPU_SOURCE_ROOT"
+[[ ! -e .ppu-ci && ! -L .ppu-ci ]]
+ln -s "$PPU_ARTIFACT_DIR" .ppu-ci
 export PATH="/opt/ppu-ci-venv/bin:$PATH"
 export VIRTUAL_ENV=/opt/ppu-ci-venv UV_PROJECT_ENVIRONMENT=/opt/ppu-ci-venv
 export PYTHONNOUSERSITE=1 UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never

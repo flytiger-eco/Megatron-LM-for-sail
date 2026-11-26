@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
-from test_ppu_ci_container import PUBLISHED, runtime_export, write_image_record
+from test_ppu_ci_container import PINNED, runtime_export, write_image_record
 from test_ppu_quick import (
     BASE_SHA,
     BRANCH,
@@ -831,7 +831,7 @@ def sealed_bundle(tmp_path):
     (tmp_path / "outside.txt").write_text("external fixture")
     (bundle / "commit.txt").write_text(SHA + "\n")
     (bundle / "control.txt").write_text(CONTROL_SHA + "\n")
-    (bundle / "image.txt").write_text(PUBLISHED + "\n")
+    (bundle / "image.txt").write_text(PINNED + "\n")
     (bundle / "build-timing.json").write_text('{"elapsed_seconds":1}')
     (bundle / "data").mkdir()
     (bundle / "data/blob").write_bytes(b"tokenizer data")
@@ -987,9 +987,7 @@ def test_bundle_workflow_digest_and_run_scoping():
         for step in ut["jobs"]["test"]["steps"]
         if step.get("uses") == "actions/download-artifact@v4"
     ]
-    assert downloads == [
-        "${{ inputs.artifact_prefix }}" + name for name in ["ppu-plan", "ppu-runtime-environment"]
-    ]
+    assert downloads == ["${{ inputs.artifact_prefix }}ppu-plan"]
     action = next(step for step in ut["jobs"]["test"]["steps"] if step.get("id") == "ppu")
     assert (
         "PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build"
