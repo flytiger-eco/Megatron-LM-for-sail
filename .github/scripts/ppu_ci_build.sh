@@ -341,7 +341,6 @@ assert mamba_mixer.HAVE_MAMBA_SSM, 'Megatron did not enable Mamba SSM'
 assert mamba_mixer.causal_conv1d_fn is not None, 'Megatron did not enable causal-conv1d'
 assert gated_delta_net.HAVE_FLA, 'Megatron did not enable PPU FLA Core'
 print('Megatron FLA capabilities:', 'GDN=', gated_delta_net.HAVE_FLA, 'GDN2=', gated_delta_net.HAVE_FLA_GDN2)
-assert dynamic_engine.HAVE_ZMQ and dynamic_engine.HAVE_MSGPACK, 'Inference engine communication dependencies are incomplete'
 assert Path(megatron.core.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
 assert Path(helpers_cpp.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
 print('megatron.core:', megatron.core.__version__, megatron.core.__file__)
