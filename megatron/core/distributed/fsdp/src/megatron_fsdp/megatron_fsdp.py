@@ -273,8 +273,15 @@ class MegatronFSDP(torch.nn.Module):
             self.ddp_config = ddp_config
         self.track_grad_usage = getattr(self.ddp_config, "megatron_fsdp_track_grad_usage", False)
         self.grad_usage_group = grad_usage_group
-        if self.track_grad_usage and grad_usage_group is None:
-            raise ValueError("Gradient usage tracking requires an explicit fixed model-replica group.")
+        if self.track_grad_usage:
+            if grad_usage_group is None:
+                raise ValueError(
+                    "Gradient usage tracking requires an explicit fixed model-replica group."
+                )
+            if self.ddp_config.megatron_fsdp_cuda_graph_mode:
+                raise ValueError("Gradient usage tracking does not support FSDP CUDA graph mode.")
+            if self.ddp_config.fsdp_double_buffer:
+                raise ValueError("Gradient usage tracking requires unpooled gradient buffers.")
         # Non-expert sharding strategy. Expert parameters may be sharded differently, so
         # decisions that cover the whole model must consult both strategies instead: see
         # any_sharding_strategy_in / all_sharding_strategies_in.
@@ -844,7 +851,7 @@ class MegatronFSDP(torch.nn.Module):
             else:
                 params_to_reduce = [p for p in param_list if self._reduces_grad_every_backward(p)]
 
-            if params_to_reduce:
+            if params_to_reduce and not self.track_grad_usage:
                 # Launch asynchronous reduce-scatter of gradients before the optimizer
                 # step. This requires a later call to finish_grad_sync() to wait for
                 # completion.
@@ -944,6 +951,22 @@ class MegatronFSDP(torch.nn.Module):
             )
             for param in ordered_params:
                 _grad_acc(param)
+
+            if self.track_grad_usage:
+                # Hooks may arrive in different orders on different ranks. Defer all
+                # collectives until this backward is complete, then include every
+                # bucket (unused parameters were zero-filled above) in fixed order.
+                # Do not accumulate processed parameters again: their full buckets
+                # already hold this microbatch's fused and autograd contributions.
+                ordered_params = sorted(
+                    [
+                        p
+                        for group in self.param_and_grad_buffer.parameter_groups
+                        if group.requires_grad
+                        for p in group.params
+                    ],
+                    key=lambda p: self.param_to_name[p],
+                )
 
             # Reduce the remaining gradients. Parameter classes that shard gradients reduce
             # on every backward pass; the rest accumulate locally and are only reduced once

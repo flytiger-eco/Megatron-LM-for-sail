@@ -129,6 +129,9 @@ class DistributedDataParallelConfig:
     """Track conditional parameter usage in V1 to skip globally unused masters and moments.
 
     Currently requires a caller-owned fixed DPxCP pool and ZeRO2 with TP1/PP1/EP1.
+    Reductions run in fixed bucket order at each backward's root callback, retaining
+    full gradient buckets until then and disabling backward/communication overlap.
+    Persistent communication-buffer pools and CUDA graph mode are not supported.
     """
 
     overlap_outer_communication: bool = False
@@ -454,6 +457,14 @@ class DistributedDataParallelConfig:
             raise ValueError(
                 "Gradient usage tracking requires Megatron-FSDP V1 ZeRO2 (optim_grads)."
             )
+        if self.megatron_fsdp_track_grad_usage:
+            if self.megatron_fsdp_cuda_graph_mode:
+                raise ValueError("Gradient usage tracking does not support FSDP CUDA graph mode.")
+            if self.fsdp_double_buffer:
+                raise ValueError(
+                    "Gradient usage tracking requires unpooled gradient buffers; "
+                    "disable persistent communication-buffer pooling (including nccl_ub)."
+                )
         if self.overlap_outer_communication:
             if not self.use_megatron_fsdp:
                 raise ValueError("overlap_outer_communication requires Megatron-FSDP.")

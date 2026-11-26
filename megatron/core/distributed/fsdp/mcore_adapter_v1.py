@@ -162,6 +162,10 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
 
         self.ddp_config = ddp_config
         if ddp_config.megatron_fsdp_track_grad_usage:
+            if config.cuda_graph_impl == "full_iteration":
+                raise ValueError(
+                    "Gradient usage tracking does not support full-iteration CUDA graphs."
+                )
             if pg_collection is None or pg_collection.dp_cp is None:
                 raise ValueError("Gradient usage tracking requires an explicit fixed DPxCP group.")
             if (
