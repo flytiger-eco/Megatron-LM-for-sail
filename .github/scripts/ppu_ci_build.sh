@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
+source /usr/local/pccl/envsetup.sh
+set -u
 : "${PPU_SOURCE_ROOT:?Missing source directory under test}"
 : "${PPU_ARTIFACT_DIR:?Missing build artifact directory}"
 : "${PPU_CONTROL_DIR:?Missing trusted control script directory}"
