@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+from contextlib import nullcontext
 from typing import Any, Callable
 
 import torch
@@ -11,6 +12,7 @@ from megatron.core.distributed import (
     DistributedDataParallelConfig,
     FullyShardedDataParallel,
 )
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from megatron.core.full_cuda_graph import get_shared_capture_stream
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
@@ -31,12 +33,16 @@ from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_model_config, get_pg_rank
 
-
 try:
     from megatron.core.fp8_utils import correct_amax_history_if_needed
 except ImportError:
     correct_amax_history_if_needed = None
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
+    RuntimePolicy,
+    fully_shard_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +62,7 @@ def unimodal_build_distributed_models(
     model_type: ModelType = ModelType.encoder_or_decoder,
     use_layer_wise_distributed_optimizer: bool = False,
     use_layer_wise_param_layout: bool = True,
+    device: torch.device | str | None = None,
 ) -> list[MegatronModule]:
     """Build model stages and wrap for distributed training.
 
@@ -80,6 +87,7 @@ def unimodal_build_distributed_models(
         use_torch_fsdp2: Whether to use Torch FSDP 2.0.
         wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
         data_parallel_random_init: Whether to broadcast parameters from data-parallel rank 0.
+        device: Explicit final device. None preserves the default placement policy.
         mixed_precision_wrapper: Mixed precision wrapper applied per model stage, e.g. ``Float16Module``.
             Pass ``None`` to skip.
         pre_wrap_hook: Hook applied to the model stage list before any wrapping.
@@ -125,6 +133,7 @@ def unimodal_build_distributed_models(
         mixed_precision_wrapper=mixed_precision_wrapper,
         use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
         use_layer_wise_param_layout=use_layer_wise_param_layout,
+        device=device,
     )
 
 
@@ -141,6 +150,7 @@ def prepare_existing_model_chunks_for_distributed_training(
     mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
     use_layer_wise_distributed_optimizer: bool = False,
     use_layer_wise_param_layout: bool = True,
+    device: torch.device | str | None = None,
 ) -> list[MegatronModule]:
     """Apply the shared post-build distributed lifecycle to already-built model chunks.
 
@@ -157,6 +167,7 @@ def prepare_existing_model_chunks_for_distributed_training(
         use_torch_fsdp2: Whether to use Torch FSDP 2.0.
         wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
         data_parallel_random_init: Whether to broadcast parameters from data-parallel rank 0.
+        device: Explicit final device. None preserves the default placement policy.
         mixed_precision_wrapper: Mixed precision wrapper applied per model stage, e.g. ``Float16Module``.
             Pass ``None`` to skip.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
@@ -185,16 +196,23 @@ def prepare_existing_model_chunks_for_distributed_training(
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
     use_cpu_initialization = transformer_config.use_cpu_initialization
-    if not use_torch_fsdp2 and not use_cpu_initialization and not init_model_with_meta_device:
-        for model_module in model_list:
-            model_module.cuda(torch.cuda.current_device())
+    if device is not None and (use_torch_fsdp2 or use_megatron_fsdp):
+        raise ValueError("Explicit device placement is not supported with FSDP-managed placement.")
+    target_device = torch.device(device) if device is not None else torch.device("cuda")
+    if not use_torch_fsdp2 and not init_model_with_meta_device:
+        if device is not None or not use_cpu_initialization:
+            for model_module in model_list:
+                if device is None:
+                    model_module.cuda(torch.cuda.current_device())
+                else:
+                    model_module.to(target_device)
 
     model_list = _wrap_with_mp_wrapper(model_list, transformer_config, mixed_precision_wrapper)
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if init_model_with_meta_device and not use_torch_fsdp2 and not use_megatron_fsdp:
         model_list = [
-            to_empty_if_meta_device(model_module, device=torch.device("cuda"))
+            to_empty_if_meta_device(model_module, device=target_device)
             for model_module in model_list
         ]
 
@@ -227,7 +245,14 @@ def _print_num_params(model: list[MegatronModule], pg_collection: ProcessGroupCo
         model: List of model modules to count parameters from
         pg_collection: Model communication process groups.
     """
-    if (pg_collection.dp.rank() == 0) and (pg_collection.cp.rank() == 0):
+    # GTP-remat peers hold replicas, so their counts are identical; without this the
+    # line repeats once per weight shard. TP ranks can hold different shards, so they
+    # stay un-deduplicated.
+    if (
+        (pg_collection.dp.rank() == 0)
+        and (pg_collection.cp.rank() == 0)
+        and (get_pg_rank(pg_collection.gtp_remat) == 0)
+    ):
         print(
             " > number of parameters on (tensor, gtp_remat, pipeline) model parallel rank ({}, {}, {}): {}".format(
                 pg_collection.tp.rank(),
@@ -301,22 +326,10 @@ def _ddp_wrap(
 
 
     if not use_torch_fsdp2:
-        if ddp_config.num_buckets is not None:
-            num_parameters = sum(
-                [sum([p.nelement() for p in model_module.parameters()]) for model_module in model]
-            )
-            ddp_config.bucket_size = num_parameters // ddp_config.num_buckets
-
-        # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
-        # If bucket_size is not provided as an input, use sane default.
-        # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
-        # ring-reduce implementations are large enough to remain bandwidth-bound rather than
-        # latency-bound.
-        if ddp_config.bucket_size is None:
-            ddp_config.bucket_size = max(40000000, 1000000 * pg_collection.dp_cp.size())
-        # Set bucket_size to infinity if overlap_grad_reduce is False.
-        if not ddp_config.overlap_grad_reduce:
-            ddp_config.bucket_size = None
+        num_parameters = sum(p.nelement() for chunk in model for p in chunk.parameters())
+        ddp_config.resolve_bucket_size(
+            num_parameters=num_parameters, data_parallel_size=pg_collection.dp_cp.size()
+        )
 
     # Argument validation converts --use-distributed-optimizer into
     # use_layer_wise_distributed_optimizer and clears the original, so re-enable it here:
@@ -337,74 +350,111 @@ def _ddp_wrap(
         # DistOpt-style buffer.
         tag_params_for_buffer_routing(model)
 
-    if get_model_config(model[0]).cuda_graph_impl == "full_iteration":
-        # DDP initialization must use the full-iteration capture stream so its retained
+    cuda_graph_impl = get_model_config(model[0]).cuda_graph_impl
+    current_stream = torch.cuda.current_stream()
+    if cuda_graph_impl in ("full_iteration", "local"):
+        # DDP initialization must use the CUDA graph capture stream so its retained
         # AccumulateGrad nodes do not reference a different, non-capturing stream.
         ddp_stream = get_shared_capture_stream()
+    elif cuda_graph_impl == "none":
+        # Eager initialization is serialized with the current stream. A one-shot side stream
+        # can leave cached blocks unavailable to later allocations on the current stream.
+        ddp_stream = current_stream
     else:
         # Preserve a dedicated initialization stream for all other implementations.
         ddp_stream = torch.cuda.Stream()
-    ddp_stream.wait_stream(torch.cuda.current_stream())
+    if ddp_stream is not current_stream:
+        ddp_stream.wait_stream(current_stream)
 
     with torch.cuda.stream(ddp_stream):
         dp_init_kwargs = {}
         if not use_torch_fsdp2:
             dp_init_kwargs["pg_collection"] = pg_collection
 
+        # MFSDP v2 rejects ``disable_bucketing=True`` (see
+        # FullyShardedDataParallelV2._validate_config) and does not use the classic
+        # per-chunk disabling that the DDP/distributed-optimizer path relies on to size
+        # only the first chunk's parameter layout. Each VPP chunk is sharded
+        # independently over its own FsdpModule, so bucketing must stay enabled for every
+        # chunk. Otherwise a multi-chunk (VPP) wrap sets ``disable_bucketing=True`` on
+        # non-first chunks and fails validation.
+        #
+        # For MFSDP v2 the adapter joins whatever FsdpContext is already active and only
+        # opens one when none is (see ``current_fully_shard_context``), so opening one
+        # ambient context around the loop below puts every chunk of this call on the same
+        # context, sharing communication streams and prefetch orders. Mirrors
+        # wrap_model_chunks_with_ddp() in megatron/training/training.py.
+        is_mfsdp_v2 = (
+            DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
+        ) and ddp_config.megatron_fsdp_version == 2
+        construction_context = (
+            fully_shard_context(
+                FsdpContext(
+                    runtime_policy=RuntimePolicy(
+                        use_symmetric_memory=ddp_config.nccl_ub,
+                        overlap_outer_communication=ddp_config.overlap_outer_communication,
+                    )
+                )
+            )
+            if is_mfsdp_v2
+            else nullcontext()
+        )
         wrapped_model = []
-        for model_chunk_idx, model_chunk in enumerate(model):
-            chunk_kwargs = dict(dp_init_kwargs)
-            disable_bucketing = (
-                (model_chunk_idx > 0)
-                or overlap_param_gather_with_optimizer_step
-            )
+        with construction_context:
+            for model_chunk_idx, model_chunk in enumerate(model):
+                chunk_kwargs = dict(dp_init_kwargs)
+                disable_bucketing = (
+                    (model_chunk_idx > 0)
+                    or overlap_param_gather_with_optimizer_step
+                ) if not is_mfsdp_v2 else False
 
-            # Pre-compute parameter layouts for the distributed optimizer.
-            # Only pass to DDP; FSDP variants don't accept full_param_layout.
-            if ddp_config.use_distributed_optimizer and DP is DistributedDataParallel:
-                all_params = [
-                    p for p in model_chunk.parameters() if p.requires_grad
-                ]
-                pp_rank = pg_collection.pp.rank()
-                effective_bucket_size = (
-                    None
-                    if disable_bucketing or pp_rank > 0
-                    else ddp_config.bucket_size
-                )
-                # Size the layout by the group the optimizer actually shards over, which is
-                # the intra-instance group when there are several optimizer instances. Using
-                # the full dp_cp would report more shards than the reduce-scatter uses and
-                # leave the trailing shard of every bucket owned by no rank.
-                intra_dp_cp_group = getattr(pg_collection, "intra_dp_cp", None)
-                intra_expt_dp_group = getattr(pg_collection, "intra_expt_dp", None)
-                chunk_kwargs["full_param_layout"] = compute_full_param_layout(
-                    all_params,
-                    effective_bucket_size,
-                    (
-                        intra_dp_cp_group
-                        if intra_dp_cp_group is not None
-                        else pg_collection.dp_cp
-                    ).size(),
-                    ddp_config,
-                    expert_data_parallel_world_size=(
-                        intra_expt_dp_group
-                        if intra_expt_dp_group is not None
-                        else pg_collection.expt_dp
-                    ).size(),
-                )
+                # Pre-compute parameter layouts for the distributed optimizer.
+                # Only pass to DDP; FSDP variants don't accept full_param_layout.
+                if ddp_config.use_distributed_optimizer and DP is DistributedDataParallel:
+                    all_params = [
+                        p for p in model_chunk.parameters() if p.requires_grad
+                    ]
+                    pp_rank = pg_collection.pp.rank()
+                    effective_bucket_size = (
+                        None
+                        if disable_bucketing or pp_rank > 0
+                        else ddp_config.bucket_size
+                    )
+                    # Size the layout by the group the optimizer actually shards over, which is
+                    # the intra-instance group when there are several optimizer instances. Using
+                    # the full dp_cp would report more shards than the reduce-scatter uses and
+                    # leave the trailing shard of every bucket owned by no rank.
+                    intra_dp_cp_group = getattr(pg_collection, "intra_dp_cp", None)
+                    intra_expt_dp_group = getattr(pg_collection, "intra_expt_dp", None)
+                    chunk_kwargs["full_param_layout"] = compute_full_param_layout(
+                        all_params,
+                        effective_bucket_size,
+                        (
+                            intra_dp_cp_group
+                            if intra_dp_cp_group is not None
+                            else pg_collection.dp_cp
+                        ).size(),
+                        ddp_config,
+                        expert_data_parallel_world_size=(
+                            intra_expt_dp_group
+                            if intra_expt_dp_group is not None
+                            else pg_collection.expt_dp
+                        ).size(),
+                    )
 
-            wrapped_chunk = DP(
-                config=get_model_config(model_chunk),
-                ddp_config=ddp_config,
-                module=model_chunk,
-                disable_bucketing=disable_bucketing,
-                **chunk_kwargs,
-            )
-            wrapped_model.append(wrapped_chunk)
+                wrapped_chunk = DP(
+                    config=get_model_config(model_chunk),
+                    ddp_config=ddp_config,
+                    module=model_chunk,
+                    disable_bucketing=disable_bucketing,
+                    **chunk_kwargs,
+                )
+                wrapped_model.append(wrapped_chunk)
         model = wrapped_model
 
-    # Ensure initialization-stream work completes before touching params on the default stream.
-    torch.cuda.current_stream().wait_stream(ddp_stream)
+    # Ensure side-stream initialization completes before touching params on the current stream.
+    if ddp_stream is not current_stream:
+        current_stream.wait_stream(ddp_stream)
 
     # Broadcast params from data parallel src rank to other data parallel ranks.
     if data_parallel_random_init:
