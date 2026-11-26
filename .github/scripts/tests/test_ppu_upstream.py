@@ -181,11 +181,11 @@ def test_gate_depends_on_scope_not_trigger(tmp_path, scope, expected):
         )
 
 
-def test_nvidia_full_is_dev_half_of_release():
+def test_nvidia_full_is_dev_subset_of_release():
     config = {"repeat": 1, "timeout": 30}
     release = ci.unit_cases({**config, "suite_family": "release-dev-lts"})
     dev = ci.unit_cases({**config, "suite_family": "nvidia-dev"})
-    assert len(dev) == 37 and len(release) == 74
+    assert dev and len(release) > len(dev)
     assert dev == {k: v for k, v in release.items() if v["environment"] == "dev"}
     assert sum(EXCLUDED_UT in row["excluded"] for row in dev.values()) == 1
 
@@ -328,6 +328,47 @@ def test_each_rank_requires_complete_timing(tmp_path, field):
     assert not ci.case_results(case, tmp_path, IDENTITY, require_timing=True)["complete"]
 
 
+@pytest.mark.parametrize("scope", ["quick", "full"])
+def test_new_two_card_bucket_preserves_quick_and_full_plans(tmp_path, monkeypatch, capsys, scope):
+    # A new two-replica bucket outside the representative Quick suite.
+    bucket = "tests/unit_tests/inference/engines/test_future_two_card_bucket.py"
+    recipe = yaml.safe_load((ROOT / ci.RECIPE_PATH).read_text())
+    product = copy.deepcopy(recipe["products"][0])
+    product["test_case"] = [bucket]
+    for variant in product["products"]:
+        variant["gpus"] = [2]
+    recipe["products"].append(product)
+    for path in [*(p.relative_to(ROOT) for p in (ROOT / "tests/unit_tests").rglob("*.py")), bucket]:
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("raise RuntimeError('configure must not import source')\n")
+    target = tmp_path / ci.RECIPE_PATH
+    target.parent.mkdir(parents=True)
+    target.write_text(yaml.safe_dump(recipe))
+    monkeypatch.setattr(ci, "ROOT", tmp_path)
+    manifest = ci.generate(
+        {
+            "scope": scope,
+            "suite_family": "nvidia-dev",
+            "repeat": 1,
+            "timeout": 30,
+            "unit_test": True,
+        },
+        tmp_path / "plan",
+    )
+    rows = json.loads(capsys.readouterr().out.removeprefix("unit_matrix="))["include"]
+    if scope == "quick":
+        assert len(manifest["unit"]) == len(ci.load_policy()["groups"])
+        assert len(rows) == 1 and rows[0]["cards"] == 8
+        assert all(
+            bucket not in case["source_buckets"].values() for case in manifest["unit"].values()
+        )
+    else:
+        case = next(case for case in manifest["unit"].values() if case["bucket"] == bucket)
+        assert case["cards"] == 2 and case["files"] == [bucket]
+        assert next(row for row in rows if row["id"] == case["id"])["cards"] == 2
+
+
 @pytest.mark.parametrize(
     "mutation,reason",
     [
@@ -343,7 +384,7 @@ def test_recipe_changes_cannot_silently_drop_workloads(tmp_path, monkeypatch, mu
     if mutation == "duplicate":
         recipe["products"][0]["products"] *= 2
     elif mutation == "missing":
-        recipe["products"][0]["products"][0]["environment"] = ["lts"]
+        recipe["products"][0]["products"][0]["tag"] = ["legacy"]
     elif mutation == "nodes":
         recipe["spec"]["nodes"] = 2
     elif mutation == "fraction":
@@ -627,14 +668,14 @@ def test_build_and_run_embedded_python_syntax(script_name):
         compile(block, script_name, "exec")
 
 
-GDN_BUCKET = "tests/unit_tests/ssm/test_gated_delta_net.py"
+DIAGNOSTIC_BUCKET = "tests/unit_tests/test_model_configs.py"
 
 
 def diagnostic_config(**inputs):
     return ci.select_config(
         {"ref": BRANCH},
         "workflow_dispatch",
-        {"scope": "full", "suite_family": "nvidia-dev", "unit_bucket": GDN_BUCKET, **inputs},
+        {"scope": "full", "suite_family": "nvidia-dev", "unit_bucket": DIAGNOSTIC_BUCKET, **inputs},
     )
 
 
@@ -644,10 +685,11 @@ def test_diagnostic_generates_one_unchanged_upstream_bucket(tmp_path, capsys):
     assert config["threshold_percent"] == 90
     full = ci.unit_cases(config)
     manifest = ci.generate(config, tmp_path, IDENTITY)
-    assert list(manifest["unit"]) == ["dev-023"]
-    assert manifest["unit"]["dev-023"] == full["dev-023"]
-    assert manifest["unit"]["dev-023"]["args"] == [GDN_BUCKET]
-    assert len(full) == 37
+    case_id = next(key for key, case in full.items() if case["bucket"] == DIAGNOSTIC_BUCKET)
+    assert list(manifest["unit"]) == [case_id]
+    assert manifest["unit"][case_id] == full[case_id]
+    assert manifest["unit"][case_id]["args"] == [DIAGNOSTIC_BUCKET]
+    assert len(full) > 1
     output = capsys.readouterr().out
     matrix = json.loads(
         next(
@@ -657,7 +699,7 @@ def test_diagnostic_generates_one_unchanged_upstream_bucket(tmp_path, capsys):
         )
     )
     assert len(matrix["include"]) == 1
-    assert matrix["include"][0]["id"] == "dev-023"
+    assert matrix["include"][0]["id"] == case_id
     assert matrix["include"][0]["cards"] == 8
     workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
     events = workflow.get("on", workflow.get(True))
@@ -676,7 +718,7 @@ def test_diagnostic_generates_one_unchanged_upstream_bucket(tmp_path, capsys):
         {"repeat": 0},
         {"repeat": 2},
         {"unit_bucket": None},
-        {"unit_bucket": [GDN_BUCKET]},
+        {"unit_bucket": [DIAGNOSTIC_BUCKET]},
         {"pr_number": "7", "pr_sha": SHA, "pr_base_sha": BASE_SHA},
     ],
 )
@@ -696,17 +738,17 @@ def test_diagnostic_rejects_incompatible_manual_inputs(inputs):
 )
 def test_diagnostic_cannot_reduce_automatic_coverage(event_name, event):
     with pytest.raises(ValueError, match="only allowed for non-PR manual"):
-        ci.select_config(event, event_name, {"scope": "full", "unit_bucket": GDN_BUCKET})
+        ci.select_config(event, event_name, {"scope": "full", "unit_bucket": DIAGNOSTIC_BUCKET})
 
 
 @pytest.mark.parametrize(
     "bucket",
     [
-        GDN_BUCKET + "::test_constructor",
+        DIAGNOSTIC_BUCKET + "::test_constructor",
         "tests/unit_tests/ssm/*.py",
         "../test.py",
-        GDN_BUCKET + ";echo x",
-        GDN_BUCKET + "\n",
+        DIAGNOSTIC_BUCKET + ";echo x",
+        DIAGNOSTIC_BUCKET + "\n",
         "tests/unit_tests/ssm/missing.py",
     ],
 )
@@ -719,7 +761,8 @@ def test_diagnostic_requires_exact_recipe_bucket(tmp_path, bucket):
 def test_diagnostic_results_never_count_as_full_baseline(tmp_path, capsys, state):
     config = diagnostic_config()
     manifest = ci.generate(config, tmp_path / "plan", IDENTITY)
-    case = manifest["unit"]["dev-023"]
+    case_id = next(iter(manifest["unit"]))
+    case = manifest["unit"][case_id]
     directory = ci.result_directory(manifest, tmp_path, case["id"])
     write_reports(directory, case, failed=0, skipped=state == "all_skipped")
     for path in directory.glob("*-rank-*.json"):
@@ -751,6 +794,7 @@ def test_diagnostic_results_never_count_as_full_baseline(tmp_path, capsys, state
 def test_diagnostic_runner_selects_only_requested_group(tmp_path, monkeypatch, capsys):
     manifest = ci.generate(diagnostic_config(), tmp_path / ".ppu-ci", IDENTITY)
     capsys.readouterr()
+    case_id = next(iter(manifest["unit"]))
     script = (ROOT / ".github/scripts/ppu_ci_run.sh").read_text()
     block = next(
         block
@@ -760,11 +804,11 @@ def test_diagnostic_runner_selects_only_requested_group(tmp_path, monkeypatch, c
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PPU_TARGET_SHA", SHA)
     monkeypatch.setenv("PPU_CONTROL_SHA", CONTROL_SHA)
-    monkeypatch.setattr(sys, "argv", ["-", "dev-023"])
+    monkeypatch.setattr(sys, "argv", ["-", case_id])
     exec(compile(block, "ppu-suite-settings", "exec"), {})
     assert capsys.readouterr().out.splitlines() == [
-        str(manifest["unit"]["dev-023"]["minutes"] * 60),
-        "dev-023",
+        str(manifest["unit"][case_id]["minutes"] * 60),
+        case_id,
     ]
 
 

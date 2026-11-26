@@ -1,10 +1,6 @@
 name: PPU control tests
 on:
   workflow_dispatch:
-    inputs:
-      diagnose:
-        type: boolean
-        default: false
   pull_request:
     branches: [main, dev]
     paths:
@@ -25,7 +21,6 @@ concurrency:
   cancel-in-progress: true
 jobs:
   test:
-    if: inputs.diagnose != true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -38,38 +33,3 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r .github/docker/control-requirements.txt transformers==4.57.3 tokenizers==0.22.2 uv==0.13.0
       - run: python -m pytest -q -o addopts= .github/scripts/tests
-  inspect-container-startup:
-    if: inputs.diagnose == true && github.ref == 'refs/heads/davidsophus/ppu-ci-thin-adapter'
-    runs-on: k8s-runner-group-cpu-flytiger
-    timeout-minutes: 10
-    container:
-      image: python:3.12-slim-bookworm
-    steps:
-      - name: Inspect this acceptance runner and control container
-        shell: bash
-        run: |
-          set -euo pipefail
-          namespace=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
-          /opt/bin/kubectl get pods -n "$namespace" -o json > "$RUNNER_TEMP/pods.json"
-          /opt/bin/kubectl get events -n "$namespace" \
-            --field-selector involvedObject.name=k8s-runner-group-cpu-flytiger-bjxrc-runner-2rvj8-workflow \
-            -o json > "$RUNNER_TEMP/events.json"
-          python3 - "$RUNNER_TEMP/pods.json" <<'PY'
-          import json, sys
-          for pod in json.load(open(sys.argv[1]))['items']:
-              if ('k8s-runner-group-cpu-flytiger-bjxrc-runner-2rvj8' not in pod['metadata']['name']
-                  and not any('megatron-lm-for-sail/ppu-ci-control@' in c['image']
-                              for c in pod['spec'].get('containers', []))):
-                  continue
-              print(json.dumps({
-                  'name': pod['metadata']['name'], 'phase': pod['status'].get('phase'),
-                  'conditions': pod['status'].get('conditions', []),
-                  'containers': [{k: c.get(k) for k in ('name', 'state', 'lastState', 'restartCount')}
-                                 for c in pod['status'].get('containerStatuses', [])],
-              }))
-          PY
-          python3 - "$RUNNER_TEMP/events.json" <<'PY'
-          import json, sys
-          for event in json.load(open(sys.argv[1]))['items']:
-              print(json.dumps({k: event.get(k) for k in ('reason', 'message', 'count', 'lastTimestamp')}))
-          PY

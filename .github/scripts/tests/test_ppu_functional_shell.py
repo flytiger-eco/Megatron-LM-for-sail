@@ -129,6 +129,9 @@ def fixture_training():
             values.append(Summary.Value(tag=metric, simple_value=float(value)))
         writer.add_event(Event(step=step, summary=Summary(value=values)))
     writer.close()
+    checkpoint = Path(os.environ["CHECKPOINT_SAVE_PATH"]) / f"iter_{final // 2:07d}"
+    checkpoint.mkdir(parents=True, exist_ok=True)
+    (checkpoint / "train_state.pt").write_text("Mock training state")
     for rank in range(8):
         logs = directory / "logs/1" / f"mock_{phase}" / "attempt_0" / str(rank)
         logs.mkdir(parents=True)
@@ -157,10 +160,11 @@ class ShellRunner(runtime.ProcessRunner):
 
 @pytest.fixture
 def shell_case(tmp_path, monkeypatch):
-    def prepare(name, **overrides):
+    def prepare(name, lightweight=False, **overrides):
         config = functional.select_config(
             {"functional_mode": "regression", "functional_repeat": 1, "functional_cases": name}
         )
+        config["lightweight"] = lightweight
         catalogue = functional.catalogue(ROOT, ROOT, config)
         case = next(iter(catalogue["functional"].values()))
         # training boundary is replaced by a synthetic TensorBoard generator and never
@@ -214,7 +218,7 @@ def test_original_shell_tensorboard_extraction_and_comparison(shell_case, kind, 
         monkeypatch.setattr(functional, "SKIPPED_CASES", {})
     catalogue = functional.catalogue(ROOT, ROOT, functional.select_config({}))
     cases = list(catalogue["functional"].values())
-    if kind == "regular":
+    if kind in ("regular", "lightweight"):
         name = "bert/bert_mcore_tp1_pp2"
     elif kind == "resume":
         name = next(
@@ -232,9 +236,9 @@ def test_original_shell_tensorboard_extraction_and_comparison(shell_case, kind, 
         name = next(
             row["name"]
             for row in cases
-            if row["observation"] == ("lightweight" if kind == "lightweight" else "SKIP_PYTEST")
+            if row["observation"] == "SKIP_PYTEST"
         )
-    manifest, case, directory, record = shell_case(name)
+    manifest, case, directory, record = shell_case(name, lightweight=kind == "lightweight")
     repeat = directory / "attempt-1/repeat-1"
     assert record["success"], (
         (repeat / "driver.log").read_text()

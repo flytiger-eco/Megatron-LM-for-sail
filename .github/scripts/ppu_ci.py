@@ -198,7 +198,12 @@ def unit_cases(config: dict) -> dict:
         selected_buckets = [spec["test_case"] for spec in specs]
         if len(selected_buckets) != len(set(selected_buckets)):
             raise ValueError(f"{environment} UT recipe has duplicate matches")
-        if set(selected_buckets) != set(buckets):
+        expected_buckets = {
+            product["test_case"][0]
+            for product in recipe["products"]
+            if any(environment in variant["environment"] for variant in product["products"])
+        }
+        if set(selected_buckets) != expected_buckets:
             raise ValueError(
                 f"{environment} UT recipe has unmatched buckets requiring explicit adaptation"
             )

@@ -1,17 +1,32 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from argparse import ArgumentParser
+from contextlib import nullcontext
+from dataclasses import replace
 from functools import partial
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.dist_checkpointing.optimizer import get_param_id_to_sharded_param_map
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+if HAVE_TE:
+    import transformer_engine.common.recipe as te_recipe
+    import transformer_engine.pytorch as te_pytorch
+    from transformer_engine.pytorch.tensor import QuantizedTensor as TEQuantizedTensor
+else:
+    te_recipe = None
+    te_pytorch = None
+    TEQuantizedTensor = None
 
 try:
     from fast_hadamard_transform import hadamard_transform as _hadamard_transform
@@ -22,6 +37,12 @@ except ImportError:
     _hadamard_transform = None
 
 _SEED = 42
+
+
+def _get_te_batched_linear():
+    """Return TE's batched-linear operation when supported by the installed version."""
+    te_ops = getattr(te_pytorch, "ops", None)
+    return getattr(te_ops, "BatchedLinear", None)
 
 
 def _mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
@@ -74,6 +95,9 @@ def _make_config(
     """Create an MLATransformerConfig for DSv4 hybrid attention tests."""
     if csa_compress_ratios is None:
         csa_compress_ratios = [0, 4, 128, 4]
+    extra_config_kwargs.setdefault('experimental_attention_variant', 'dsv4_hybrid')
+    # Native attention fixtures opt out of the DSv4 fused backend default.
+    extra_config_kwargs.setdefault('dsa_kernel_backend', 'none')
     return MLATransformerConfig(
         num_layers=num_layers,
         hidden_size=hidden_size,
@@ -95,7 +119,6 @@ def _make_config(
         rotary_base=10000,
         rotary_percent=1.0,
         multi_latent_attention=True,
-        experimental_attention_variant='dsv4_hybrid',
         csa_compress_ratios=csa_compress_ratios,
         csa_window_size=csa_window_size,
         dsa_indexer_n_heads=dsa_indexer_n_heads,
@@ -121,6 +144,12 @@ def test_attention_latent_norm_epsilon_defaults_to_layernorm_epsilon():
     config = _make_config(layernorm_epsilon=3e-6)
 
     assert config.attention_latent_norm_epsilon == pytest.approx(3e-6)
+
+
+def test_config_rejects_dynamic_context_parallel():
+    """DSv4 has no dynamic context parallelism path yet."""
+    with pytest.raises(ValueError, match="DSv4 dynamic context parallelism is not supported"):
+        _make_config(dynamic_context_parallel=True, max_seqlen_per_dp_cp_rank=4096)
 
 
 def test_attention_latent_norm_epsilon_accepts_override():
@@ -250,22 +279,199 @@ def test_config_includes_mtp_ratio_and_derives_dimensions():
     assert config.hetereogenous_dist_checkpoint is True
 
 
-def test_config_rejects_context_parallelism():
-    """The SBHD slice should fail early instead of silently accepting unsupported CP."""
-    with pytest.raises(AssertionError, match="does not support context parallelism"):
+def test_config_requires_contiguous_context_parallelism():
+    """Static packed CP uses the main-owned contiguous layout contract."""
+    with pytest.raises(ValueError, match="attention_cp_layout='contiguous'"):
         _make_config(context_parallel_size=2)
+    config = _make_config(context_parallel_size=2, attention_cp_layout="contiguous")
+    assert config.context_parallel_size == 2
 
 
-def test_config_rejects_fused_backend_in_native_slice():
-    """Fused DSv4 backends belong to the follow-up kernel-integration slice."""
-    with pytest.raises(ValueError, match="requires dsa_kernel_backend='none'"):
-        _make_config(dsa_kernel_backend="cudnn")
+def test_config_accepts_cudnn_backend_for_fused_sbhd():
+    """DSv4 may select the CSA cuDNN adapter while ordinary DSA keeps its own router."""
+    with (
+        patch(
+            'megatron.core.transformer.transformer_config._validate_dsa_kernel_backend_dependencies'
+        ),
+        patch.object(torch.cuda, 'get_device_capability', return_value=(10, 0)),
+    ):
+        config = _make_config(dsa_kernel_backend="cudnn")
+
+    assert config.dsa_kernel_backend == "cudnn"
+
+
+def test_config_rejects_sm90_ratio4_dense_indexer_loss():
+    """SM90 must use sparse indexer loss for the fused ratio-4 CSA path."""
+    with (
+        patch(
+            'megatron.core.transformer.transformer_config._validate_dsa_kernel_backend_dependencies'
+        ),
+        patch.object(torch.cuda, 'get_device_capability', return_value=(9, 0)),
+        pytest.raises(ValueError, match="dense indexer loss is not supported on SM90"),
+    ):
+        _make_config(dsa_kernel_backend="cudnn", dsa_indexer_loss_coeff=0.1)
+
+
+def test_config_rejects_tilelang_backend_for_dsv4():
+    """The main-owned TileLang ordinary-DSA backend is not a CSA implementation."""
+    with pytest.raises(ValueError, match="does not support.*tilelang"):
+        _make_config(dsa_kernel_backend="tilelang")
+
+
+@pytest.mark.parametrize(
+    ("variant", "requested", "expected"),
+    [("dsv4_hybrid", None, "cudnn"), ("dsv4_hybrid", "none", "none"), ("dsa", None, "none")],
+)
+def test_cli_backend_default_preserves_explicit_none(variant, requested, expected):
+    """The generated CLI preserves omission for variant-aware config defaults."""
+    from megatron.training.arguments import _add_network_size_args
+
+    parser = _add_network_size_args(ArgumentParser())
+    argv = [] if requested is None else ['--dsa-kernel-backend', requested]
+    args = parser.parse_args(argv)
+    assert args.dsa_kernel_backend == requested
+    with (
+        patch(
+            'megatron.core.transformer.transformer_config._validate_dsa_kernel_backend_dependencies'
+        ),
+        patch.object(torch.cuda, 'get_device_capability', return_value=(10, 0)),
+    ):
+        config = _make_config(
+            experimental_attention_variant=variant, dsa_kernel_backend=args.dsa_kernel_backend
+        )
+    assert config.dsa_kernel_backend == expected
 
 
 def test_config_accepts_hybrid_model_ratio_tail():
     """HybridModel may expand each MTP depth into multiple attention layers."""
     config = _make_config(num_layers=2, mtp_num_layers=1, csa_compress_ratios=[0, 4, 128, 4])
     assert config.csa_compress_ratios == [0, 4, 128, 4]
+
+
+def test_hybrid_stack_spec_uses_static_ratio_agnostic_specs():
+    """C/H/W use static norm/no-norm specs; layer configs provide their ratios."""
+    from megatron.core.models.hybrid.hybrid_layer_specs import (
+        hybrid_dsv4_stack_spec,
+        hybrid_stack_spec,
+    )
+    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+        DSv4HybridSelfAttention,
+    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    assert isinstance(hybrid_dsv4_stack_spec, ModuleSpec)
+    assert hybrid_dsv4_stack_spec is hybrid_stack_spec
+    attention = hybrid_stack_spec.submodules.csa_layer.submodules.self_attention
+    assert attention.module is DSv4HybridSelfAttention
+    assert "compress_ratio" not in attention.params
+    assert attention.submodules.q_layernorm is IdentityOp
+    assert attention.submodules.kv_layernorm is IdentityOp
+    normalized = hybrid_stack_spec.submodules.csa_qk_layernorm_layer.submodules.self_attention
+    assert normalized.module is DSv4HybridSelfAttention
+    assert "compress_ratio" not in normalized.params
+    assert normalized.submodules.q_layernorm is not IdentityOp
+    assert normalized.submodules.kv_layernorm is not IdentityOp
+
+
+@pytest.mark.parametrize("variant", [None, "dsa"])
+@pytest.mark.parametrize("entrypoint", ["hybrid_stack", "attention"])
+def test_dsv4_construction_rejects_incompatible_variant_before_backend_work(variant, entrypoint):
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_dsv4_stack_spec
+    from megatron.core.transformer.attention import Attention
+    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+        DSv4HybridSelfAttention,
+    )
+    from megatron.core.transformer.spec_utils import build_module
+
+    config = replace(_make_config(), experimental_attention_variant=variant)
+    with (
+        patch.object(Attention, "__init__", return_value=None) as attention_init,
+        pytest.raises(ValueError, match="DSv4 attention requires.*dsv4_hybrid"),
+    ):
+        if entrypoint == "hybrid_stack":
+            build_module(
+                hybrid_dsv4_stack_spec.submodules.csa_layer.submodules.self_attention,
+                config=config,
+                layer_number=1,
+                pg_collection=ProcessGroupCollection(),
+            )
+        else:
+            DSv4HybridSelfAttention(
+                config=config,
+                submodules=None,
+                layer_number=1,
+                pg_collection=ProcessGroupCollection(),
+            )
+    attention_init.assert_not_called()
+
+
+def _build_cpu_attention_for_ratio_resolution(monkeypatch, config, explicit_ratio=None):
+    """Build enough of DSv4 attention on CPU to exercise ratio selection."""
+    from megatron.core.transformer import identity_op
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as dsv4_attention,
+    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    class SizeOneGroup:
+        def size(self) -> int:
+            return 1
+
+    monkeypatch.setattr(dsv4_attention, "RotaryEmbedding", identity_op.IdentityOp)
+    monkeypatch.setattr(dsv4_attention, "YarnRotaryEmbedding", identity_op.IdentityOp)
+    monkeypatch.setattr(dsv4_attention, "TELinear", identity_op.IdentityOp)
+
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = SizeOneGroup()
+    pg_collection.cp = SizeOneGroup()
+    submodules = dsv4_attention.DSv4HybridSelfAttentionSubmodules(
+        q_layernorm=identity_op.IdentityOp,
+        kv_layernorm=identity_op.IdentityOp,
+        linear_q_down_proj=identity_op.IdentityOp,
+        linear_q_up_proj=identity_op.IdentityOp,
+        linear_kv_proj=identity_op.IdentityOp,
+        core_attention=ModuleSpec(module=identity_op.IdentityOp),
+        linear_proj=identity_op.IdentityOp,
+    )
+    kwargs = {}
+    if explicit_ratio is not None:
+        kwargs["compress_ratio"] = explicit_ratio
+    return dsv4_attention.DSv4HybridSelfAttention(
+        config=config,
+        submodules=submodules,
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+        pg_collection=pg_collection,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    ("config_ratio", "explicit_ratio", "expected_ratio"),
+    [
+        pytest.param(None, None, 4, id="global-list-fallback"),
+        pytest.param(128, None, 128, id="layer-config-precedes-global-list"),
+        pytest.param(128, 4, 4, id="explicit-argument-precedes-layer-config"),
+    ],
+)
+def test_compress_ratio_resolution_precedence(
+    monkeypatch, config_ratio, explicit_ratio, expected_ratio
+):
+    """Resolve explicit, per-layer, and legacy-list ratios in that priority order."""
+    from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+        CSALayerConfig,
+    )
+
+    config = _make_config(perform_initialization=False, csa_compress_ratios=[4, 0, 0, 0])
+    if config_ratio is not None:
+        config = CSALayerConfig.from_config(config)
+        config.compress_ratio = config_ratio
+
+    attention = _build_cpu_attention_for_ratio_resolution(
+        monkeypatch, config, explicit_ratio=explicit_ratio
+    )
+
+    assert attention._dsv4_compress_ratio == expected_ratio
 
 
 def test_constructor_requires_explicit_process_groups():
@@ -279,10 +485,16 @@ def test_constructor_requires_explicit_process_groups():
 
 
 def _build_attention(config, layer_number, pg_collection, **kwargs):
-    """Instantiate a DSv4HybridSelfAttention from config."""
+    """Instantiate DSv4 attention through HybridModel's static spec."""
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
     from megatron.core.transformer.spec_utils import build_module
 
-    spec = _make_attention_spec(config)
+    layer_spec = (
+        hybrid_stack_spec.submodules.csa_qk_layernorm_layer
+        if config.qk_layernorm
+        else hybrid_stack_spec.submodules.csa_layer
+    )
+    spec = layer_spec.submodules.self_attention
     return build_module(
         spec, config=config, layer_number=layer_number, pg_collection=pg_collection, **kwargs
     )
@@ -311,6 +523,7 @@ class TestDSv4HybridAttentionConstructor:
         from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
             DSv4HybridSelfAttention,
         )
+        from megatron.core.transformer.identity_op import IdentityOp
 
         torch.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
@@ -326,8 +539,11 @@ class TestDSv4HybridAttentionConstructor:
         assert hasattr(attn, 'linear_proj')
         assert hasattr(attn, 'linear_o_group_proj')
         assert hasattr(attn, 'core_attention')
-        assert hasattr(attn, 'q_layernorm')
-        assert hasattr(attn, 'kv_layernorm')
+        assert isinstance(attn.q_layernorm, IdentityOp)
+        assert isinstance(attn.kv_layernorm, IdentityOp)
+        assert not any(
+            key.startswith(("q_layernorm.", "kv_layernorm.")) for key in attn.state_dict()
+        )
 
     def test_latent_norm_epsilon_is_scoped_to_q_and_kv_latents(self):
         """The dedicated epsilon must not change the compressor norm."""
@@ -342,6 +558,8 @@ class TestDSv4HybridAttentionConstructor:
 
         assert attn.q_layernorm.eps == pytest.approx(1e-6)
         assert attn.kv_layernorm.eps == pytest.approx(1e-6)
+        assert attn.state_dict()["q_layernorm.weight"].shape == (config.q_lora_rank,)
+        assert attn.state_dict()["kv_layernorm.weight"].shape == (config.v_head_dim,)
         assert attn.core_attention.compressor.norm.eps == pytest.approx(1e-5)
 
     def test_q_head_dim_equals_v_head_dim(self):
@@ -617,10 +835,302 @@ class TestDSv4HybridGroupedOutput:
         pg = ProcessGroupCollection.use_mpu_process_groups()
         attn = _build_attention(config, layer_number=1, pg_collection=pg)
 
-        expected_out = output_projection_groups * output_projection_lora_rank
         expected_in = (config.v_head_dim * config.num_attention_heads) // output_projection_groups
-        assert attn.linear_o_group_proj.shape == (expected_out, expected_in)
-        assert attn.linear_o_group_proj.requires_grad
+        weight = attn._linear_o_group_proj_weight
+        expected_shape = (output_projection_groups * output_projection_lora_rank, expected_in)
+        assert weight.shape == expected_shape
+        assert weight.requires_grad
+        if attn._uses_te_batched_linear:
+            assert attn.linear_o_group_proj.save_original_input
+
+    @pytest.mark.parametrize(
+        "quantized_weight", [False, True], ids=["bf16", "mxfp8_quantized_weight"]
+    )
+    def test_o_group_proj_legacy_checkpoint_compatibility(self, quantized_weight):
+        """Legacy 2D checkpoints should load into BF16 and quantized weights."""
+        if _get_te_batched_linear() is None:
+            pytest.skip("Transformer Engine BatchedLinear is not available")
+
+        recipe = None
+        if quantized_weight:
+            available, reason = te_pytorch.is_mxfp8_available(return_reason=True)
+            if not available:
+                pytest.skip(reason)
+            recipe = te_recipe.MXFP8BlockScaling(
+                fp8_format=te_recipe.Format.E4M3, backward_override=None
+            )
+
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        config = _make_config(output_projection_groups=8, output_projection_lora_rank=64)
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        legacy_attn = _build_attention(config, layer_number=1, pg_collection=pg)
+        runtime_weight = legacy_attn._linear_o_group_proj_weight.detach().clone()
+        checkpoint_shape = (
+            config.output_projection_groups * config.output_projection_lora_rank,
+            legacy_attn._linear_o_group_proj_weight.size(-1),
+        )
+
+        state_dict = legacy_attn.state_dict()
+        assert state_dict["linear_o_group_proj"].shape == checkpoint_shape
+        assert "linear_o_group_proj.weight" not in state_dict
+        assert "linear_o_group_proj._extra_state" not in state_dict
+
+        init_context = (
+            te_pytorch.quantized_model_init(enabled=True, recipe=recipe)
+            if quantized_weight
+            else nullcontext()
+        )
+        with init_context:
+            reloaded_attn = _build_attention(config, layer_number=1, pg_collection=pg)
+        incompatible_keys = reloaded_attn.load_state_dict(state_dict)
+        assert not incompatible_keys.missing_keys
+        assert not incompatible_keys.unexpected_keys
+        reloaded_weight = reloaded_attn._linear_o_group_proj_weight
+        assert (isinstance(reloaded_weight, TEQuantizedTensor)) == quantized_weight
+        assert reloaded_weight.shape == runtime_weight.shape
+        tolerances = {"rtol": 0.125, "atol": 0.0675} if quantized_weight else {}
+        # MXFP8 quantization runs on GPU, so a quantized reload lands on CUDA even though the
+        # BF16 reference was built with use_cpu_initialization.
+        torch.testing.assert_close(
+            reloaded_weight, runtime_weight.to(reloaded_weight.device), **tolerances
+        )
+        reloaded_state_dict = reloaded_attn.state_dict()
+        assert reloaded_state_dict["linear_o_group_proj"].shape == checkpoint_shape
+        assert "linear_o_group_proj.weight" not in reloaded_state_dict
+        assert "linear_o_group_proj._extra_state" not in reloaded_state_dict
+
+        sharded_state_dict = reloaded_attn.sharded_state_dict()
+        checkpoint_shard = sharded_state_dict["linear_o_group_proj"]
+        assert isinstance(checkpoint_shard, ShardedTensor)
+        assert checkpoint_shard.data is reloaded_weight
+        optim_param_map = get_param_id_to_sharded_param_map(sharded_state_dict, [reloaded_weight])
+        assert optim_param_map[0] is checkpoint_shard
+        assert checkpoint_shard.local_shape == checkpoint_shape
+        assert checkpoint_shard.global_shape == checkpoint_shape
+        assert checkpoint_shard.global_offset == (0, 0)
+
+        checkpoint_shard = reloaded_attn.sharded_state_dict(sharded_offsets=((0, 1, 2),))[
+            "linear_o_group_proj"
+        ]
+        assert checkpoint_shard.global_shape == (2, *checkpoint_shape)
+        assert checkpoint_shard.global_offset == (1, 0, 0)
+        assert checkpoint_shard.prepend_axis_num == 1
+
+    @pytest.mark.parametrize(
+        ("use_mxfp8", "quantized_weight"),
+        [(False, False), (True, False), (True, True)],
+        ids=["bf16", "mxfp8", "mxfp8_quantized_weight"],
+    )
+    def test_o_group_proj_numerics_and_gradients(self, use_mxfp8, quantized_weight):
+        """TE BatchedLinear should match einsum with BF16 and MXFP8 weights."""
+        te_batched_linear = _get_te_batched_linear()
+        if te_batched_linear is None:
+            pytest.skip("Transformer Engine BatchedLinear is not available")
+        if use_mxfp8:
+            available, reason = te_pytorch.is_mxfp8_available(return_reason=True)
+            if not available:
+                pytest.skip(reason)
+            recipe = te_recipe.MXFP8BlockScaling(
+                fp8_format=te_recipe.Format.E4M3, backward_override=None
+            )
+        else:
+            recipe = None
+
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        config = _make_config(output_projection_groups=8, output_projection_lora_rank=64)
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        init_context = (
+            te_pytorch.quantized_model_init(enabled=True, recipe=recipe)
+            if quantized_weight
+            else nullcontext()
+        )
+        with init_context:
+            attn = _build_attention(config, layer_number=1, pg_collection=pg)
+        # use_cpu_initialization leaves BF16 weights on CPU; training moves them to the GPU
+        # before forward, and BatchedLinear requires input and weight on the same device.
+        attn = attn.cuda()
+        module = attn.linear_o_group_proj
+        weight = module.weight
+        assert isinstance(module, te_batched_linear)
+        assert (isinstance(weight, TEQuantizedTensor)) == quantized_weight
+        group_proj_param_names = [
+            name for name, param in attn.named_parameters(remove_duplicate=False) if param is weight
+        ]
+        assert group_proj_param_names == ["linear_o_group_proj.weight"]
+
+        seq_len, batch_size = 4, 8
+        in_features = weight.size(-1)
+        input_ref = torch.empty(
+            seq_len,
+            batch_size,
+            config.output_projection_groups,
+            in_features,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).uniform_(-0.25, 0.25)
+        input_ref.requires_grad_(True)
+        input_test = input_ref.detach().clone().requires_grad_(True)
+
+        weight_ref = torch.empty(weight.shape, device="cuda", dtype=torch.bfloat16).uniform_(
+            -0.25, 0.25
+        )
+        with torch.no_grad():
+            weight.copy_(weight_ref)
+        weight_ref.requires_grad_(True)
+
+        output_ref = torch.einsum(
+            "...gd,grd->...gr",
+            input_ref,
+            weight_ref.view(
+                config.output_projection_groups, config.output_projection_lora_rank, -1
+            ),
+        )
+        grad_output = torch.empty_like(output_ref).uniform_(-0.25, 0.25)
+        output_ref.backward(grad_output)
+
+        if use_mxfp8:
+            with te_pytorch.autocast(enabled=True, recipe=recipe):
+                output_test = module(input_test)
+        else:
+            output_test = module(input_test)
+        output_test.backward(grad_output)
+
+        assert module is attn.linear_o_group_proj
+        assert module.weight is weight
+        assert output_test.shape == output_ref.shape
+        if use_mxfp8:
+            tolerances = {"rtol": 0.125, "atol": 0.0675}
+        else:
+            tolerances = {"rtol": 0.016, "atol": 1e-5}
+        torch.testing.assert_close(output_test, output_ref, **tolerances)
+        torch.testing.assert_close(input_test.grad, input_ref.grad, **tolerances)
+        torch.testing.assert_close(weight.grad, weight_ref.grad, **tolerances)
+
+    @pytest.mark.parametrize(
+        "quantized_weight", [False, True], ids=["bf16", "mxfp8_quantized_weight"]
+    )
+    def test_o_group_proj_uses_config_init_method(self, quantized_weight):
+        """TE BatchedLinear should initialize BF16 and quantized weights from the config."""
+        if _get_te_batched_linear() is None:
+            pytest.skip("Transformer Engine BatchedLinear is not available")
+
+        recipe = None
+        if quantized_weight:
+            available, reason = te_pytorch.is_mxfp8_available(return_reason=True)
+            if not available:
+                pytest.skip(reason)
+            recipe = te_recipe.MXFP8BlockScaling(
+                fp8_format=te_recipe.Format.E4M3, backward_override=None
+            )
+
+        config = _make_config(output_projection_groups=8, output_projection_lora_rank=64)
+        config.init_method = lambda weight: torch.nn.init.constant_(weight, 0.25)
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        init_context = (
+            te_pytorch.quantized_model_init(enabled=True, recipe=recipe)
+            if quantized_weight
+            else nullcontext()
+        )
+        with init_context:
+            attn = _build_attention(config, layer_number=1, pg_collection=pg)
+
+        weight = attn.linear_o_group_proj.weight
+        assert (isinstance(weight, TEQuantizedTensor)) == quantized_weight
+        expected = torch.full(weight.shape, 0.25, device=weight.device, dtype=torch.bfloat16)
+        tolerances = {"rtol": 0.125, "atol": 0.0675} if quantized_weight else {}
+        torch.testing.assert_close(weight, expected, **tolerances)
+
+    @pytest.mark.parametrize("use_quantized_model_init", [False, True], ids=["bf16", "qmi"])
+    def test_o_group_proj_falls_back_to_einsum(self, monkeypatch, use_quantized_model_init):
+        """Missing TE BatchedLinear should retain a BF16 einsum path."""
+        recipe = None
+        if use_quantized_model_init:
+            available, reason = te_pytorch.is_mxfp8_available(return_reason=True)
+            if not available:
+                pytest.skip(reason)
+            recipe = te_recipe.MXFP8BlockScaling(
+                fp8_format=te_recipe.Format.E4M3, backward_override=None
+            )
+
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+
+        te_ops = getattr(te_pytorch, "ops", None)
+        if te_ops is not None:
+            monkeypatch.delattr(te_ops, "BatchedLinear", raising=False)
+        # HybridModel's static spec resolves BatchedLinear once at import time.
+        for layer_spec in (
+            hybrid_stack_spec.submodules.csa_layer,
+            hybrid_stack_spec.submodules.csa_qk_layernorm_layer,
+        ):
+            monkeypatch.setattr(
+                layer_spec.submodules.self_attention.submodules, "linear_o_group_proj", None
+            )
+        config = _make_config(output_projection_groups=8, output_projection_lora_rank=64)
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        init_context = (
+            te_pytorch.quantized_model_init(
+                enabled=True, recipe=recipe, preserve_high_precision_init_val=True
+            )
+            if use_quantized_model_init
+            else nullcontext()
+        )
+        with pytest.warns(UserWarning, match="upgrade Transformer Engine.*performance regression"):
+            with init_context:
+                attn = _build_attention(config, layer_number=1, pg_collection=pg)
+        attn = attn.cuda()  # use_cpu_initialization leaves the weights on CPU
+        assert not attn._uses_te_batched_linear
+        weight = attn._linear_o_group_proj_weight
+        assert weight is attn.linear_o_group_proj
+        assert not isinstance(weight, TEQuantizedTensor)
+        checkpoint_shape = (
+            config.output_projection_groups * config.output_projection_lora_rank,
+            (config.v_head_dim * config.num_attention_heads) // config.output_projection_groups,
+        )
+        assert weight.shape == checkpoint_shape
+        assert "linear_o_group_proj" in attn.state_dict()
+        assert "linear_o_group_proj.weight" not in attn.state_dict()
+        sharded_weight = attn.sharded_state_dict()["linear_o_group_proj"]
+        assert isinstance(sharded_weight, ShardedTensor)
+        assert sharded_weight.data is weight
+        assert sharded_weight.local_shape == checkpoint_shape
+        assert sharded_weight.global_shape == checkpoint_shape
+
+        seq_len, batch_size = 4, 8
+        in_features = weight.size(-1)
+        input_ref = torch.empty(
+            seq_len,
+            batch_size,
+            config.output_projection_groups,
+            in_features,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).uniform_(-0.25, 0.25)
+        input_ref.requires_grad_(True)
+        input_test = input_ref.detach().clone().requires_grad_(True)
+        weight_ref = weight.detach().clone().requires_grad_(True)
+
+        output_ref = torch.einsum(
+            "...gd,grd->...gr",
+            input_ref,
+            weight_ref.reshape(
+                config.output_projection_groups, config.output_projection_lora_rank, -1
+            ),
+        )
+        output_test = attn._apply_linear_o_group_proj(input_test)
+        grad_output = torch.empty_like(output_ref).uniform_(-0.25, 0.25)
+        output_ref.backward(grad_output)
+        output_test.backward(grad_output)
+
+        torch.testing.assert_close(output_test, output_ref)
+        torch.testing.assert_close(input_test.grad, input_ref.grad)
+        torch.testing.assert_close(weight.grad, weight_ref.grad)
 
 
 # ===========================================================================
@@ -698,3 +1208,76 @@ class TestDSv4HybridRopeFusion:
         for name, param in attn_fused.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for parameter {name}"
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_output_rope_is_delegated_to_fused_core_once(monkeypatch, packed):
+    """The fused core owns output rotation; the outer projection must not rotate twice."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as hybrid,
+    )
+
+    batch = 1 if packed else 2
+    hidden = torch.randn(4, batch, 4, requires_grad=True)
+    cu = torch.tensor([0, 1, 4], dtype=torch.int32) if packed else None
+    params = (
+        PackedSeqParams(
+            qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=3, max_seqlen_kv=3
+        )
+        if packed
+        else None
+    )
+    cos, sin = torch.ones(4, 2), torch.zeros(4, 2)
+    cache = Mock(return_value=(cos, sin))
+    observed = []
+
+    def core(query, *_args, out_rope, **_kwargs):
+        observed.append(out_rope)
+        # Sentinel output stands for a core that has already applied inverse RoPE.
+        return query.reshape(4, batch, 4) * 3
+
+    core.use_fused_kernels = True
+    monkeypatch.setattr(hybrid, "apply_module", lambda module: module)
+    outer_rope = Mock(side_effect=AssertionError("output RoPE applied twice"))
+    monkeypatch.setattr(hybrid, "fused_mla_rope_out_of_place", outer_rope)
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            apply_rope_fusion=True,
+            v_head_dim=4,
+            qk_pos_emb_head_dim=2,
+            output_projection_lora_rank=4,
+            dsa_kernel_backend="cudnn",
+            deterministic_mode=False,
+            attention_cp_layout="contiguous",
+        ),
+        pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 1, rank=lambda: 0)),
+        rotary_pos_emb=SimpleNamespace(get_cached_cos_sin=cache),
+        get_query_key_value_tensors=lambda *_args, **_kwargs: (hidden, hidden, hidden, None, None),
+        core_attention=core,
+        offload_core_attention=False,
+        offload_attn_proj=False,
+        training=True,
+        recompute_up_proj=False,
+        output_projection_local_groups=1,
+        # Identity grouped output projection, so the output is the core's sentinel.
+        _apply_linear_o_group_proj=lambda x: x,
+        linear_proj=lambda x: (x, None),
+    )
+    output, _ = hybrid.DSv4HybridAttention.forward(model, hidden, None, packed_seq_params=params)
+    torch.testing.assert_close(output, hidden * 3)
+    output.sum().backward()
+    torch.testing.assert_close(hidden.grad, torch.full_like(hidden, 3))
+    assert len(observed) == 1
+    rope = observed[0]
+    assert rope.cos is cos and rope.sin is sin
+    assert rope.cu_seqlens_q is cu
+    assert rope.sbhd_batch_size == (None if packed else batch)
+    assert (rope.nope_dim, rope.pos_dim, rope.cp_rank, rope.cp_size) == (2, 2, 0, 1)
+    cache.assert_called_once_with(
+        3 if packed else 4, dtype=hidden.dtype, packed_seq=packed, mscale=1.0
+    )
+    outer_rope.assert_not_called()

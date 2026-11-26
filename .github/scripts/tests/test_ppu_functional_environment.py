@@ -114,7 +114,7 @@ def tool_environment(tmp_path, monkeypatch):
         HAVE_PERSIST_LAYER_NORM=True,
         FusedLayerNorm=type("FusedLayerNorm", (), {}),
     )
-    fused_name = "megatron.core.fusions.fused_layer_norm"
+    fused_name = "megatron.core.ops.norm.fused_layer_norm"
     training_modules[fused_name] = fused
     monkeypatch.setitem(sys.modules, fused_name, fused)
     path = ROOT / "megatron/core/models/backends.py"

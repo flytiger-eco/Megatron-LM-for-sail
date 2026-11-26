@@ -1,19 +1,47 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-"""Model and data parallel groups."""
+"""Model and data parallel groups.
+
+.. warning::
+    **This module is being deprecated.** It holds the process groups for a single, global
+    parallel grid. Megatron-Core is migrating to explicit process-group passing via
+    :class:`~megatron.core.process_groups_config.ProcessGroupCollection`.
+
+    The group / rank / world-size accessors here read that global grid. A model using an
+    independent grid, such as an encoder with different parallelism from its language model,
+    can receive a group or rank from the wrong grid, or fail if the globals are uninitialized.
+    Passing the owning model's groups explicitly avoids that dependency.
+
+    What this means for a change you are writing:
+
+    * **New features in Megatron Core must use explicit process groups.** Accept a
+      ``ProcessGroupCollection`` or an explicit ``torch.distributed.ProcessGroup`` and pass it
+      through.
+    * **Bug fixes may leave existing calls alone.** Changing the process-group plumbing belongs
+      in its own change, not bundled into a fix.
+    * ``ProcessGroupCollection.use_mpu_process_groups()`` is **not** a migration target. It is a
+      backward-compatibility shim that reads this same global state, so swapping a direct
+      accessor for it preserves the global dependency. Bootstrap code and explicitly commented
+      migration fallbacks may still use it during the transition.
+
+    ``initialize_model_parallel`` / ``destroy_model_parallel`` / ``is_initialized`` are not
+    deprecated by this migration.
+
+    See ``docs/developer/parallel-state-deprecation.md``.
+"""
 
 import logging
 import os
 import warnings
 from datetime import timedelta
-from math import log2
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
 
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
+from .tensor_parallel.gtp_parallel_layout import GTPParallelLayout
 from .utils import GlobalMemoryBuffer, is_torch_min_version
 
 logger = logging.getLogger(__name__)
@@ -30,6 +58,8 @@ _TENSOR_MODEL_PARALLEL_GROUP = None
 # Generalized tensor parallelism group that the current rank belongs to.
 _GTP_WEIGHT_REMAT_GROUP = None
 _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
+# All dense replica rank lists, also used to construct a separate optimizer AG communicator.
+_WEIGHT_REPLICA_RANK_SETS = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
@@ -127,8 +157,10 @@ _CONTEXT_PARALLEL_GROUP = None
 _CONTEXT_PARALLEL_GLOBAL_RANKS = None
 # Hierarchical context parallel groups
 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
-# Hybrid context parallel groups
-_HYBRID_DP_CP_GROUPS = {}
+# Dynamic context parallel groups, indexed by the runtime CP group size.
+_DYNAMIC_DP_CP_GROUPS = {}
+# Cartesian TP x dynamic-DP-CP groups used for sequence-parallel CP layout conversion.
+_DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS = {}
 
 # Full data-parallel groups: span every distinct-data rank
 # (size = replicate_DP x gtp_remat). Used for data distribution (batch split, num-microbatches,
@@ -145,6 +177,8 @@ _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
 # Partial Data parallel group information with context parallel combined.
 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
+# Aliases _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP when the instance counts match.
+_INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
 
 # combined parallel group of TP and CP
 _TENSOR_AND_CONTEXT_PARALLEL_GROUP = None
@@ -437,29 +471,54 @@ def create_hierarchical_groups(
     return hierarchical_groups, hierarchical_groups_gloo
 
 
-def create_hybrid_dp_cp_groups(rank, ranks, pg_options):
+def get_valid_dynamic_context_parallel_group_sizes(total_size: int) -> List[int]:
+    """Compatibility alias for the pure dynamic-CP topology helper."""
+    # Import lazily because context_parallel's layouts depend on tensor_parallel,
+    # which imports parallel_state during its own initialization.
+    from megatron.core.context_parallel.groups import (
+        get_valid_dynamic_context_parallel_group_sizes as get_group_sizes,
+    )
+
+    return get_group_sizes(total_size)
+
+
+def create_dynamic_dp_cp_groups(
+    rank: int,
+    ranks: Sequence[int],
+    pg_options: object,
+    min_cp_size: int = 1,
+    timeout: Optional[timedelta] = None,
+) -> Dict[int, torch.distributed.ProcessGroup]:
     """
-    Creates groups required for hybrid DPxCP.
-    Creates a new group for every power of 2 up to the number of DPxCP ranks.
+    Creates groups required for dynamic DPxCP.
+    Creates a new group for every power of 2 from min_cp_size up to the full
+    DPxCP group. The full group reuses the existing DPxCP communicator.
     Returns a dictionary indexed by group size.
     """
-    hybrid_dp_cp_groups = {}
-    # Generate group for every power of 2 up to the number of CP ranks
-    # We limit the allowed group sizes in order to avoid excessive overhead.
-    group_sizes = [2**i for i in range(int(log2(len(ranks))))][1:]
+    dynamic_dp_cp_groups = {}
+    valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(len(ranks))
+    if min_cp_size not in valid_group_sizes:
+        raise ValueError(
+            f"min_dynamic_context_parallel_size={min_cp_size} is not a valid group size "
+            f"for DPxCP size {len(ranks)}; expected one of {valid_group_sizes}"
+        )
+    group_sizes = [
+        group_size for group_size in valid_group_sizes if min_cp_size <= group_size < len(ranks)
+    ]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
             group = create_group(
                 ranks[i : i + group_size],
+                timeout=timeout,
                 pg_options=pg_options,
-                group_desc=f"HYBRID_DP_CP_GROUP_{group_size}",
+                group_desc=f"DYNAMIC_DP_CP_GROUP_{group_size}",
             )
             if rank in ranks[i : i + group_size]:
                 assert (
-                    group_size not in hybrid_dp_cp_groups
-                ), f"Rank {rank} appears in multiple Hybrid DP CP groups of size {group_size}"
-                hybrid_dp_cp_groups[group_size] = group
-    return hybrid_dp_cp_groups
+                    group_size not in dynamic_dp_cp_groups
+                ), f"Rank {rank} appears in multiple Dynamic DP CP groups of size {group_size}"
+                dynamic_dp_cp_groups[group_size] = group
+    return dynamic_dp_cp_groups
 
 
 class RankGenerator(object):
@@ -605,7 +664,6 @@ def initialize_model_parallel(
     use_sharp: bool = False,
     context_parallel_size: int = 1,
     hierarchical_context_parallel_sizes: Optional[List[int]] = None,
-    hybrid_context_parallel: bool = False,
     expert_model_parallel_size: int = 1,
     gtp_remat_size: int = 1,
     expert_gtp_remat_size: int = 1,
@@ -621,6 +679,10 @@ def initialize_model_parallel(
     sharp_enabled_group: Optional[str] = None,
     rank_offset: int = 0,
     local_world_size: Optional[int] = None,
+    dynamic_context_parallel: bool = False,
+    min_dynamic_context_parallel_size: int = 1,
+    gtp_remat_num_sequence_shards: int = 1,
+    expert_num_distributed_optimizer_instances: Optional[int] = None,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -661,6 +723,11 @@ def initialize_model_parallel(
             the SHARP application target groups.
 
         context_parallel_size (int, default = 1):
+            Runtime context-parallel group size, excluding TP/SP. When sequence sharding
+            within GTP_remat is enabled, this includes those additional sequence partitions:
+            runtime_CP = configured_CP * gtp_remat_num_sequence_shards.
+            Python callers must supply runtime_CP.
+
             The number of tensor parallel GPU groups to split the
             network input sequence length across. Compute of attention
             module requires tokens of full sequence length, so GPUs
@@ -684,6 +751,14 @@ def initialize_model_parallel(
             GPUs of context parallelism on data parallel group for
             weight gradient all-reduce.
 
+        dynamic_context_parallel (bool, default = False):
+            Create the runtime DPxCP subgroup family used by dynamic context
+            parallelism.
+
+        min_dynamic_context_parallel_size (int, default = 1):
+            Smallest runtime CP group to create. It must be one of the valid
+            subgroup sizes for the DPxCP domain.
+
         expert_model_parallel_size (int, default = 1):
             The number of Mixture of Experts parallel GPUs in each expert
             parallel group.
@@ -696,6 +771,10 @@ def initialize_model_parallel(
             first-class orthogonal axis (world_size = TP*CP*GTP*DP). Maps to the
             dataclass field ``ModelParallelConfig.gtp_weight_remat_size``.
             NOTE: "remat" here is NOT activation recomputation/checkpointing.
+
+        gtp_remat_num_sequence_shards (int, default = 1):
+            Sequence-shard count within GTP_remat, excluding TP/SP. Must divide gtp_remat_size
+            and context_parallel_size, which is the total runtime CP group size.
 
         expert_gtp_remat_size (int, default = 1):
             Expert-side counterpart of ``gtp_remat_size`` — shards routed-expert
@@ -751,6 +830,10 @@ def initialize_model_parallel(
             By default (None), it is enabled from dp group.
             Available options (choose one): [dp, dp_replica]
 
+        expert_num_distributed_optimizer_instances (int, default = None):
+            Same as ``num_distributed_optimizer_instances``, for the expert data-parallel
+            domain. Defaults to ``num_distributed_optimizer_instances``.
+
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
     the model pipeline. The present function will
@@ -767,6 +850,9 @@ def initialize_model_parallel(
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
     """
+    if expert_num_distributed_optimizer_instances is None:
+        expert_num_distributed_optimizer_instances = num_distributed_optimizer_instances
+
     # NCCL restricts IB SHARP usage to a single communicator group—the first one created
     # with NCCL_COLLNET_ENABLE=1. After this group is created, NCCL_COLLNET_ENABLE must be
     # set to 0 for subsequent groups.
@@ -782,8 +868,8 @@ def initialize_model_parallel(
             assert sharp_enabled_group in ["dp", "dp_replica"], "Invalid sharp_enabled_group"
             if sharp_enabled_group == "dp_replica":
                 assert (
-                    num_distributed_optimizer_instances > 1
-                ), "dp_replica group requires num_distributed_optimizer_instances > 1"
+                    expert_num_distributed_optimizer_instances > 1
+                ), "dp_replica group requires expert_num_distributed_optimizer_instances > 1"
     else:
         assert (
             sharp_enabled_group is None
@@ -806,17 +892,36 @@ def initialize_model_parallel(
     # assume one instance when GTP_remat/EGTP is active.
     assert not (
         (gtp_remat_size > 1 or expert_gtp_remat_size > 1)
-        and num_distributed_optimizer_instances > 1
+        and max(num_distributed_optimizer_instances, expert_num_distributed_optimizer_instances) > 1
     ), "GTP_remat with num_distributed_optimizer_instances > 1 is not yet supported."
 
-    # gtp_remat counts toward model_size (it consumes its own ranks and carries distinct data),
-    # so data_parallel_size becomes the replicate degree.
+    # Resolve weight placement separately from token ownership. Only bootstrap sees
+    # the shared CP/GTP factors; downstream consumers receive concrete groups.
+    layout = None
+    if gtp_remat_num_sequence_shards != 1:
+        if context_parallel_size % gtp_remat_num_sequence_shards:
+            raise ValueError(
+                f"Runtime context_parallel_size ({context_parallel_size}) must be divisible by "
+                f"gtp_remat_num_sequence_shards ({gtp_remat_num_sequence_shards})"
+            )
+        layout = GTPParallelLayout(
+            world_size,
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            context_parallel_size // gtp_remat_num_sequence_shards,
+            gtp_remat_size,
+            num_sequence_shards=gtp_remat_num_sequence_shards,
+            rank_offset=rank_offset,
+        )
+
     model_size = (
         tensor_model_parallel_size
         * pipeline_model_parallel_size
         * context_parallel_size
         * gtp_remat_size
     )
+    if layout is not None:
+        model_size = layout.minimum_world_size
 
     if world_size % model_size != 0:
         raise RuntimeError(f"world_size ({world_size}) is not divisible by {model_size}")
@@ -855,15 +960,25 @@ def initialize_model_parallel(
 
     decoder_order = _inject_gtp_remat_axis(order, after="cp")
 
-    decoder_rank_generator = RankGenerator(
-        tp=tensor_model_parallel_size,
-        ep=1,
-        dp=data_parallel_size,
-        pp=pipeline_model_parallel_size,
-        cp=context_parallel_size,
-        order=decoder_order,
-        rank_offset=rank_offset,
-        gtp_remat=gtp_remat_size,
+    if layout is not None:
+        token_rank_generator = layout.data
+        weight_rank_generator = layout.weights
+    else:
+        token_rank_generator = RankGenerator(
+            tp=tensor_model_parallel_size,
+            ep=1,
+            dp=data_parallel_size,
+            pp=pipeline_model_parallel_size,
+            cp=context_parallel_size,
+            order=decoder_order,
+            rank_offset=rank_offset,
+            gtp_remat=gtp_remat_size,
+        )
+        weight_rank_generator = token_rank_generator
+    weight_replica_rank_sets = (
+        layout.weights.get_ranks("dp")
+        if layout is not None
+        else token_rank_generator.get_ranks("dp-cp")
     )
 
     # Build expert rank generator
@@ -900,10 +1015,11 @@ def initialize_model_parallel(
         or expert_data_parallel_size == data_parallel_size
     ), "When not using pp-last rank ordering, the data parallel size of the attention and moe layers must be the same"
 
-    assert decoder_rank_generator.get_ranks("pp") == expert_decoder_rank_generator.get_ranks(
-        "pp"
-    ), f"Pipeline parallel groups are expected to be the same for Non-Expert and Expert part, \
-    but got {decoder_rank_generator.get_ranks('pp')} and {expert_decoder_rank_generator.get_ranks('pp')}"
+    assert token_rank_generator.get_ranks("pp") == expert_decoder_rank_generator.get_ranks("pp"), (
+        "Pipeline parallel groups must match for dense and expert layers, "
+        f"but got {token_rank_generator.get_ranks('pp')} "
+        f"and {expert_decoder_rank_generator.get_ranks('pp')}"
+    )
 
     timeout = timedelta(minutes=distributed_timeout_minutes)
 
@@ -918,24 +1034,19 @@ def initialize_model_parallel(
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
     assert _DATA_PARALLEL_GROUP is None, "data parallel group is already initialized"
 
+    num_weight_replicas = len(weight_replica_rank_sets[0])
     assert (
-        data_parallel_size * context_parallel_size
-    ) % num_distributed_optimizer_instances == 0, (
-        "Data parallel size should be divisible by partial DistOpt shard factor"
-    )
-    intra_partial_data_parallel_size = (
-        data_parallel_size * context_parallel_size
-    ) // num_distributed_optimizer_instances
+        num_weight_replicas % num_distributed_optimizer_instances == 0
+    ), "Data parallel size should be divisible by partial DistOpt shard factor"
+    intra_partial_data_parallel_size = num_weight_replicas // num_distributed_optimizer_instances
 
-    # Build the generalized tensor parallel groups.
-    # GTP_remat overlaps with the CP-DP domain because GTP_remat only shards weights
-    # while CP only shards activations — they are independent and can share ranks.
+    # Build the actual weight-shard group, independently of the token layout.
     global _GTP_WEIGHT_REMAT_GROUP
     global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
     assert (
         _GTP_WEIGHT_REMAT_GROUP is None
     ), "generalized tensor parallel group is already initialized"
-    for gtp_ranks in decoder_rank_generator.get_gtp_ranks(gtp_remat_size):
+    for gtp_ranks in weight_rank_generator.get_ranks("gtp_remat"):
         group = create_group(
             gtp_ranks,
             timeout=timeout,
@@ -959,7 +1070,9 @@ def initialize_model_parallel(
     # is eligible for using the NCCL COLLNET feature.
     # Therefore, dp-cp group, which potentially requires SHARP-enablement,
     # need to be created before all the other groups
-    for ranks_with_cp in decoder_rank_generator.get_ranks("dp-cp"):
+    global _WEIGHT_REPLICA_RANK_SETS
+    _WEIGHT_REPLICA_RANK_SETS = weight_replica_rank_sets
+    for ranks_with_cp in weight_replica_rank_sets:
         group_with_cp = create_group(
             ranks_with_cp,
             timeout=timeout,
@@ -1028,7 +1141,7 @@ def initialize_model_parallel(
         # PyTorch is performing lazy initialization of the communicator group.
         # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
         torch.distributed.barrier(
-            group=get_data_parallel_group(with_context_parallel=True),
+            group=get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False),
             device_ids=[torch.cuda.current_device()],
         )
         torch.cuda.synchronize()
@@ -1036,20 +1149,89 @@ def initialize_model_parallel(
         if "NCCL_COLLNET_ENABLE" in os.environ:
             del os.environ["NCCL_COLLNET_ENABLE"]
 
-    if hybrid_context_parallel:
-        global _HYBRID_DP_CP_GROUPS
-        for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
-            assert (
-                len(ranks_with_cp) % 2 == 0
-            ), "Hybrid context parallel requires an even number of ranks"
-            _HYBRID_DP_CP_GROUPS.update(
-                create_hybrid_dp_cp_groups(
-                    rank, ranks_with_cp, get_nccl_options("dp_cp", nccl_comm_cfgs)
+    if dynamic_context_parallel:
+        global _DYNAMIC_DP_CP_GROUPS
+        global _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS
+        dp_cp_rank_groups = token_rank_generator.get_ranks("dp-cp")
+        for ranks_with_cp in dp_cp_rank_groups:
+            _DYNAMIC_DP_CP_GROUPS.update(
+                create_dynamic_dp_cp_groups(
+                    rank,
+                    ranks_with_cp,
+                    get_nccl_options("dp_cp", nccl_comm_cfgs),
+                    min_cp_size=min_dynamic_context_parallel_size,
+                    timeout=timeout,
                 )
             )
-        # TODO: Are gloo groups needed for hybrid cp?
 
-    for ranks in decoder_rank_generator.get_ranks("dp"):
+        # Include the full domain in the snapshot even when min_cp_size selects
+        # only this group. The communicator already exists; no new group is needed.
+        _DYNAMIC_DP_CP_GROUPS[data_parallel_size * context_parallel_size] = (
+            _DATA_PARALLEL_GROUP_WITH_CP
+        )
+
+        # A layout conversion after TP sequence scattering must communicate
+        # over the Cartesian product of TP and the runtime DPxCP subgroup.
+        # Build those products from matching DPxCP lanes while keeping the
+        # GTP-remat and PP coordinates fixed.
+        if tensor_model_parallel_size > 1:
+            valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(
+                data_parallel_size * context_parallel_size
+            )
+            for tp_dp_cp_ranks in token_rank_generator.get_ranks('tp-dp-cp'):
+                parent_ranks = set(tp_dp_cp_ranks)
+                dp_cp_lanes = [
+                    lane for lane in dp_cp_rank_groups if set(lane).issubset(parent_ranks)
+                ]
+                assert len(dp_cp_lanes) == tensor_model_parallel_size
+                for group_size in valid_group_sizes:
+                    if group_size < min_dynamic_context_parallel_size:
+                        continue
+                    for start in range(0, len(dp_cp_lanes[0]), group_size):
+                        subgroup_ranks = [
+                            lane[dp_cp_index]
+                            for dp_cp_index in range(start, start + group_size)
+                            for lane in dp_cp_lanes
+                        ]
+                        group = create_group(
+                            subgroup_ranks,
+                            timeout=timeout,
+                            pg_options=get_nccl_options("tp_cp", nccl_comm_cfgs),
+                            group_desc=f"DYNAMIC_TENSOR_DATA_CONTEXT_GROUP_{group_size}",
+                        )
+                        if rank in subgroup_ranks:
+                            assert group_size not in _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS
+                            _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS[group_size] = group
+
+        # NCCL initializes communicators lazily. Touch every local runtime
+        # group, including the singleton CP-off group, in a deterministic order.
+        data_parallel_size_with_cp = data_parallel_size * context_parallel_size
+        valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(
+            data_parallel_size_with_cp
+        )
+        if min_dynamic_context_parallel_size not in valid_group_sizes:
+            raise ValueError(
+                "min_dynamic_context_parallel_size="
+                f"{min_dynamic_context_parallel_size} is not a valid group size for "
+                f"DPxCP size {data_parallel_size_with_cp}; expected one of {valid_group_sizes}"
+            )
+        for group_size in valid_group_sizes:
+            if group_size < min_dynamic_context_parallel_size:
+                continue
+            group = get_dynamic_data_context_parallel_groups(group_size=group_size)
+            torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+            torch.cuda.synchronize()
+            if tensor_model_parallel_size > 1:
+                # TP groups are initialized later in this function, so do not
+                # route this eager communicator touch through the public
+                # accessor (which consults TP parallel state).
+                tp_cp_group = _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS[group_size]
+                torch.distributed.barrier(
+                    group=tp_cp_group, device_ids=[torch.cuda.current_device()]
+                )
+                torch.cuda.synchronize()
+
+    for ranks in token_rank_generator.get_ranks("dp"):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1076,7 +1258,7 @@ def initialize_model_parallel(
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT
     if gtp_remat_size > 1:
         # Every rank iterates all groups so each create_group collective is entered by all ranks.
-        for dp_ranks in decoder_rank_generator.get_ranks("gtp_remat-dp"):
+        for dp_ranks in token_rank_generator.get_ranks("gtp_remat-dp"):
             group = create_group(
                 dp_ranks,
                 timeout=timeout,
@@ -1086,7 +1268,7 @@ def initialize_model_parallel(
             if rank in dp_ranks:
                 _DATA_PARALLEL_GROUP_WITH_GTP_REMAT = group
 
-        for dp_cp_ranks in decoder_rank_generator.get_ranks("gtp_remat-dp-cp"):
+        for dp_cp_ranks in token_rank_generator.get_ranks("gtp_remat-dp-cp"):
             group = create_group(
                 dp_cp_ranks,
                 timeout=timeout,
@@ -1113,7 +1295,7 @@ def initialize_model_parallel(
     global _CONTEXT_PARALLEL_GROUP
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('cp'):
+    for ranks in token_rank_generator.get_ranks("cp"):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1143,7 +1325,7 @@ def initialize_model_parallel(
     global _MODEL_PARALLEL_GROUP
     global _MODEL_PARALLEL_GLOBAL_RANKS
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-gtp_remat-pp'):
+    for ranks in weight_rank_generator.get_ranks("tp-gtp_remat-pp"):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1160,7 +1342,7 @@ def initialize_model_parallel(
     assert (
         _TENSOR_MODEL_PARALLEL_GROUP is None
     ), 'tensor model parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp'):
+    for ranks in token_rank_generator.get_ranks("tp"):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1236,7 +1418,7 @@ def initialize_model_parallel(
         os.environ["UCX_NET_DEVICES"] = "all"
         os.environ["UCC_CL_BASIC_TLS"] = "^sharp,nccl"
 
-    for ranks in decoder_rank_generator.get_ranks('pp'):
+    for ranks in token_rank_generator.get_ranks("pp"):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1296,7 +1478,7 @@ def initialize_model_parallel(
     # Spans gtp_remat (like dp): gtp_remat peers are distinct-data ranks, so this group serves both
     # FP8 amax reduction and the MoE router's expert-bias / load-balancing token reduction. The
     # gtp_remat axis is a no-op when its size is 1.
-    for ranks in decoder_rank_generator.get_ranks('tp-gtp_remat-dp-cp'):
+    for ranks in token_rank_generator.get_ranks("tp-gtp_remat-dp-cp"):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1305,7 +1487,7 @@ def initialize_model_parallel(
         )
         if rank in ranks:
             _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
-    for ranks in decoder_rank_generator.get_ranks('tp-gtp_remat-dp'):
+    for ranks in token_rank_generator.get_ranks("tp-gtp_remat-dp"):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1319,7 +1501,7 @@ def initialize_model_parallel(
     assert (
         _TENSOR_AND_CONTEXT_PARALLEL_GROUP is None
     ), 'Tensor + context parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-cp'):
+    for ranks in token_rank_generator.get_ranks("tp-cp"):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1444,10 +1626,10 @@ def initialize_model_parallel(
     ), "Inter partial expert data group is already initialized"
 
     assert (
-        expert_data_parallel_size % num_distributed_optimizer_instances == 0
+        expert_data_parallel_size % expert_num_distributed_optimizer_instances == 0
     ), "Expert data parallel size should be divisible by partial DistOpt shard factor"
     intra_partial_expert_data_parallel_size = (
-        expert_data_parallel_size // num_distributed_optimizer_instances
+        expert_data_parallel_size // expert_num_distributed_optimizer_instances
     )
 
     # Gloo only on the non-EGTP path (EGTP + Gloo out of scope; the EGTP optimizer uses DCP).
@@ -1462,7 +1644,7 @@ def initialize_model_parallel(
         )
         if create_gloo_process_groups:
             group_gloo = create_group(
-                ranks, backend="gloo", group_desc="EXPERT_DATA_PARALLEL_GROUP_GLOO"
+                ranks, timeout=timeout, backend="gloo", group_desc="EXPERT_DATA_PARALLEL_GROUP_GLOO"
             )
         else:
             group_gloo = None
@@ -1470,7 +1652,7 @@ def initialize_model_parallel(
             _EXPERT_DATA_PARALLEL_GROUP = group
             _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
 
-        if num_distributed_optimizer_instances > 1:
+        if expert_num_distributed_optimizer_instances > 1:
             # Create groups for Partial DistOpt, one for intra-partial DP domain
             # Another for inter-partial DP domain
 
@@ -1480,7 +1662,10 @@ def initialize_model_parallel(
             hierarchical_groups, hierarchical_groups_gloo = create_hierarchical_groups(
                 rank,
                 ranks,
-                [intra_partial_expert_data_parallel_size, num_distributed_optimizer_instances],
+                [
+                    intra_partial_expert_data_parallel_size,
+                    expert_num_distributed_optimizer_instances,
+                ],
                 create_gloo_process_groups=create_gloo_process_groups,
                 pg_options=[
                     get_nccl_options("intra_ep_dp", nccl_comm_cfgs),
@@ -1533,6 +1718,23 @@ def initialize_model_parallel(
         )
 
     ### End of expert related parallel groups initialization
+
+    # Dense inter-instance group: the expert one when the counts match, else built from dense ranks.
+    global _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    if num_distributed_optimizer_instances == expert_num_distributed_optimizer_instances:
+        _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+    elif num_distributed_optimizer_instances > 1:
+        for ranks_with_cp in weight_replica_rank_sets:
+            for offset in range(intra_partial_data_parallel_size):
+                inter_ranks = ranks_with_cp[offset::intra_partial_data_parallel_size]
+                group = create_group(
+                    inter_ranks,
+                    timeout=timeout,
+                    pg_options=get_nccl_options("inter_ep_dp", nccl_comm_cfgs),
+                    group_desc="INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP",
+                )
+                if rank in inter_ranks:
+                    _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = group
 
     # build the intra distributed optimizer instance group
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
@@ -1617,26 +1819,12 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
 
     rank = torch.distributed.get_rank()
     pp_size = get_pipeline_model_parallel_world_size()
-    cp_size = get_context_parallel_world_size()
-    tp_size = get_tensor_model_parallel_world_size()
     ep_size = get_expert_model_parallel_world_size()
-    dp_size = get_data_parallel_world_size()
-    gtp_remat_size = get_gtp_weight_remat_world_size() or 1
-
-    # Create regular DP all-gather group
+    # Reuse the resolved weight layout, including rank offsets and CP overlap.
+    # Reconstructing it from CP and GTP sizes would count shared ranks twice.
     dp_cp_ag_group = None
-    decoder_rank_gen = RankGenerator(
-        tp=tp_size,
-        ep=1,
-        dp=dp_size,
-        pp=pp_size,
-        cp=cp_size,
-        gtp_remat=gtp_remat_size,
-        order=_inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='cp'),
-        rank_offset=0,
-    )
-
-    for ranks_with_cp in decoder_rank_gen.get_ranks('dp-cp'):
+    assert _WEIGHT_REPLICA_RANK_SETS is not None
+    for ranks_with_cp in _WEIGHT_REPLICA_RANK_SETS:
         group_with_cp_ag = create_group(
             ranks_with_cp,
             timeout=timeout,
@@ -1694,14 +1882,24 @@ def model_parallel_is_initialized():
 
 
 def get_model_parallel_group(check_initialized=True):
-    """Get the model-parallel group the caller rank belongs to."""
+    """Get the model-parallel group the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use the caller-provided pg_collection.mp group.
+    See docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+    """
     if check_initialized:
         assert _MODEL_PARALLEL_GROUP is not None, "model parallel group is not initialized"
     return _MODEL_PARALLEL_GROUP
 
 
 def get_tensor_model_parallel_group(check_initialized=True):
-    """Get the tensor-model-parallel group the caller rank belongs to."""
+    """Get the tensor-model-parallel group the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use the caller-provided pg_collection.tp group.
+    See docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+    """
     if check_initialized:
         assert (
             _TENSOR_MODEL_PARALLEL_GROUP is not None
@@ -1710,7 +1908,12 @@ def get_tensor_model_parallel_group(check_initialized=True):
 
 
 def get_gtp_weight_remat_group(check_initialized=True):
-    """Get the parameter-sharding group the caller rank belongs to."""
+    """Get the parameter-sharding group the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use the caller-provided pg_collection.gtp_remat
+    group. See docs/developer/parallel-state-deprecation.md for migration details and
+    optional-group handling.
+    """
     if check_initialized:
         assert (
             _GTP_WEIGHT_REMAT_GROUP is not None
@@ -1719,7 +1922,12 @@ def get_gtp_weight_remat_group(check_initialized=True):
 
 
 def get_gtp_weight_remat_world_size():
-    """Return world size for the parameter-sharding group."""
+    """Return world size for the parameter-sharding group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.gtp_remat.size() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         group = get_gtp_weight_remat_group(check_initialized=False)
         return group.size() if group is not None else 0
@@ -1728,7 +1936,12 @@ def get_gtp_weight_remat_world_size():
 
 
 def get_gtp_weight_remat_rank():
-    """Return caller's rank in the parameter-sharding group."""
+    """Return caller's rank in the parameter-sharding group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.gtp_remat.rank() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         group = get_gtp_weight_remat_group(check_initialized=False)
         return group.rank() if group is not None else 0
@@ -1737,7 +1950,13 @@ def get_gtp_weight_remat_rank():
 
 
 def get_gtp_weight_remat_global_ranks(check_initialized=True):
-    """Get all global ranks of the parameter-sharding group that the caller rank belongs to."""
+    """Get all global ranks of the parameter-sharding group that the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use
+    torch.distributed.get_process_group_ranks(pg_collection.gtp_remat) on the caller-provided
+    group. See docs/developer/parallel-state-deprecation.md for migration details and
+    optional-group handling.
+    """
     if check_initialized:
         assert (
             _GTP_WEIGHT_REMAT_GLOBAL_RANKS is not None
@@ -1746,7 +1965,12 @@ def get_gtp_weight_remat_global_ranks(check_initialized=True):
 
 
 def get_pipeline_model_parallel_group(check_initialized=True):
-    """Get the pipeline-model-parallel group the caller rank belongs to."""
+    """Get the pipeline-model-parallel group the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use the caller-provided pg_collection.pp group.
+    See docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+    """
     if check_initialized:
         assert (
             _PIPELINE_MODEL_PARALLEL_GROUP is not None
@@ -1758,6 +1982,11 @@ def get_data_parallel_group(
     with_context_parallel=False, with_gtp_remat=True, partial_data_parallel=False
 ):
     """Get the data-parallel group the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use the caller-provided data group matching the
+    context, GTP-remat, and partial-group flags. See
+    docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
 
     GTP_remat is an independent axis layered on DP.
     DEFAULT (``with_gtp_remat=True``): full data-distribution group (replicate_DP x
@@ -1806,33 +2035,63 @@ def get_data_parallel_group(
     return group
 
 
-def get_data_parallel_group_gloo(with_context_parallel=False, partial_data_parallel=False):
-    """Get the Gloo data-parallel group the caller rank belongs to."""
+def get_data_parallel_group_gloo(
+    with_context_parallel=False, partial_data_parallel=False, check_initialized=True
+):
+    """Get the Gloo data-parallel group the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Pass an explicit Gloo data-parallel group from
+    the caller, such as pg_collection.intra_dp_cp_gloo for the partial data-parallel group; the
+    other Gloo groups have no ProcessGroupCollection field. See
+    docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+
+    Args:
+        check_initialized: When False, return None instead of asserting if the gloo group was
+            never created (``initialize_model_parallel(create_gloo_process_groups=False)``).
+            Needed so a ProcessGroupCollection can be materialised in gloo-less jobs.
+    """
     if with_context_parallel:
         if partial_data_parallel:
-            assert (
-                _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
-            ), "Intra partial data parallel group is not initialized"
+            if check_initialized:
+                assert (
+                    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
+                ), "Intra partial data parallel group is not initialized"
             return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
-        assert (
-            _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
-        ), "data parallel group-gloo with context parallel combined is not initialized"
+        if check_initialized:
+            assert (
+                _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
+            ), "data parallel group-gloo with context parallel combined is not initialized"
         return _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     else:
-        assert _DATA_PARALLEL_GROUP_GLOO is not None, "data parallel group-gloo is not initialized"
-        assert partial_data_parallel == False, "Partial DP for Optimizer needs to include CP"
+        assert not partial_data_parallel, "Partial DP for Optimizer needs to include CP"
+        if check_initialized:
+            assert (
+                _DATA_PARALLEL_GROUP_GLOO is not None
+            ), "data parallel group-gloo is not initialized"
         return _DATA_PARALLEL_GROUP_GLOO
 
 
 def get_context_parallel_group(check_initialized=True):
-    """Get the context-parallel group the caller rank belongs to."""
+    """Get the context-parallel group the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use the caller-provided pg_collection.cp group.
+    See docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+    """
     if check_initialized:
         assert _CONTEXT_PARALLEL_GROUP is not None, "context parallel group is not initialized"
     return _CONTEXT_PARALLEL_GROUP
 
 
 def get_context_parallel_global_ranks(check_initialized=True):
-    """Get all global ranks of the context-parallel group that the caller rank belongs to."""
+    """Get all global ranks of the context-parallel group that the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use
+    torch.distributed.get_process_group_ranks(pg_collection.cp) on the caller-provided group.
+    See docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+    """
     if check_initialized:
         assert (
             _CONTEXT_PARALLEL_GLOBAL_RANKS is not None
@@ -1841,40 +2100,123 @@ def get_context_parallel_global_ranks(check_initialized=True):
 
 
 def get_hierarchical_context_parallel_groups(check_initialized=True):
-    """Get the inner ring of context parallel group the caller rank belongs to."""
+    """Get the inner ring of context parallel group the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use the caller-provided pg_collection.hcp list.
+    See docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+    """
     if check_initialized:
         assert _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS is not None
     return _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
 
 
-def get_hybrid_data_context_parallel_groups(check_initialized=True, group_size=None):
-    """Get the hybrid context parallel groups the caller rank belongs to."""
-    # If the group size is the same as the entire DPxCP group, return the original group
-    if get_data_parallel_world_size(with_context_parallel=True) == group_size:
+def get_dynamic_data_context_parallel_group_map() -> Dict[int, torch.distributed.ProcessGroup]:
+    """Snapshot local runtime CP groups keyed by CP size.
+
+    Deprecated: reads the global parallel state. Use the caller-provided pg_collection.dynamic_cp
+    map. See docs/developer/parallel-state-deprecation.md for migration details and
+    optional-group handling.
+
+    The map includes the full DPxCP domain and, when initialized, the singleton
+    CP-off group. It is empty before initialization and when dynamic CP is disabled.
+    """
+    return dict(_DYNAMIC_DP_CP_GROUPS)
+
+
+def get_dynamic_tensor_data_context_parallel_group_map() -> (
+    Dict[int, torch.distributed.ProcessGroup]
+):
+    """Snapshot TP x runtime-CP groups, keyed by the runtime CP size.
+
+    Deprecated: reads the global parallel state. Use the caller-provided
+    pg_collection.dynamic_tp_cp map. See docs/developer/parallel-state-deprecation.md for
+    migration details and optional-group handling.
+
+    With TP1 these are the runtime CP groups themselves. The returned maps keep
+    the original process-group handles without exposing the global dictionaries.
+    """
+    if not _DYNAMIC_DP_CP_GROUPS:
+        return {}
+    if get_tensor_model_parallel_world_size() == 1:
+        return dict(_DYNAMIC_DP_CP_GROUPS)
+    return dict(_DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS)
+
+
+def get_dynamic_data_context_parallel_groups(
+    check_initialized: bool = True, group_size: Optional[int] = None
+) -> torch.distributed.ProcessGroup:
+    """Get the dynamic CP group of ``group_size`` containing the caller rank.
+
+    Deprecated: reads the global parallel state. Use pg_collection.dynamic_cp[group_size] from
+    the caller-provided collection. See docs/developer/parallel-state-deprecation.md for
+    migration details and optional-group handling.
+    """
+    # Runtime DCP subdivides the replicate DPxCP domain, not the independent
+    # GTP-remat data-distribution axis.
+    if get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False) == group_size:
         if check_initialized:
             assert _DATA_PARALLEL_GROUP_WITH_CP is not None
         return _DATA_PARALLEL_GROUP_WITH_CP
     if check_initialized:
-        assert _HYBRID_DP_CP_GROUPS is not None
-    return _HYBRID_DP_CP_GROUPS[group_size]
+        assert _DYNAMIC_DP_CP_GROUPS is not None
+    return _DYNAMIC_DP_CP_GROUPS[group_size]
+
+
+def get_dynamic_tensor_data_context_parallel_group(
+    check_initialized: bool = True, group_size: Optional[int] = None
+) -> torch.distributed.ProcessGroup:
+    """Get the TP x runtime-DPxCP group containing the caller rank.
+
+    Deprecated: reads the global parallel state. Use pg_collection.dynamic_tp_cp[group_size] from
+    the caller-provided collection. See docs/developer/parallel-state-deprecation.md for
+    migration details and optional-group handling.
+
+    ``group_size`` is the runtime CP size; the returned process group has
+    ``tensor_model_parallel_size * group_size`` ranks. With TP1 the dynamic
+    DPxCP group itself is already the required Cartesian product.
+    """
+    if get_tensor_model_parallel_world_size() == 1:
+        return get_dynamic_data_context_parallel_groups(check_initialized, group_size)
+    if check_initialized:
+        assert (
+            group_size in _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS
+        ), f"Dynamic TPxDPxCP group of CP size {group_size} is not initialized"
+    return _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS[group_size]
 
 
 def get_embedding_group(check_initialized=True):
-    """Get the embedding group the caller rank belongs to."""
+    """Get the embedding group the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use the caller-provided pg_collection.embd
+    group. See docs/developer/parallel-state-deprecation.md for migration details and
+    optional-group handling.
+    """
     if check_initialized:
         assert _EMBEDDING_GROUP is not None, "embedding group is not initialized"
     return _EMBEDDING_GROUP
 
 
 def get_position_embedding_group(check_initialized=True):
-    """Get the position embedding group the caller rank belongs to."""
+    """Get the position embedding group the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use the caller-provided pg_collection.pos_embd
+    group. See docs/developer/parallel-state-deprecation.md for migration details and
+    optional-group handling.
+    """
     if check_initialized:
         assert _POSITION_EMBEDDING_GROUP is not None, "position embedding group is not initialized"
     return _POSITION_EMBEDDING_GROUP
 
 
 def get_amax_reduction_group(with_context_parallel=False, tp_only_amax_red=False):
-    """Get the FP8 amax reduction group the caller rank belongs to."""
+    """Get the FP8 amax reduction group the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Pass the caller-provided reduction group
+    matching both flags; tp, tp_cp, and tp_dp_cp cover three of the four variants. See
+    docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+    """
     if with_context_parallel:
         if not tp_only_amax_red:
             assert (
@@ -1902,6 +2244,11 @@ def get_amax_reduction_group(with_context_parallel=False, tp_only_amax_red=False
 def get_tensor_and_data_parallel_group(check_initialized=True, with_context_parallel=False):
     """Get the tensor- and data-parallel group the caller rank belongs to.
 
+    Deprecated: reads the global parallel state. Use pg_collection.tp_dp_cp when
+    with_context_parallel=True; otherwise pass the tensor/data group explicitly. See
+    docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+
     The group spans gtp_remat (like dp), so it serves both FP8 amax reduction and the MoE router's
     expert-bias / load-balancing token reduction across every distinct-data rank.
     """
@@ -1920,7 +2267,12 @@ def get_tensor_and_data_parallel_group(check_initialized=True, with_context_para
 
 
 def get_tensor_and_context_parallel_group(check_initialized=True):
-    """Get the tensor- and context-parallel group the caller rank belongs to."""
+    """Get the tensor- and context-parallel group the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use the caller-provided pg_collection.tp_cp
+    group. See docs/developer/parallel-state-deprecation.md for migration details and
+    optional-group handling.
+    """
     if check_initialized:
         assert (
             _TENSOR_AND_CONTEXT_PARALLEL_GROUP is not None
@@ -1947,7 +2299,12 @@ def set_virtual_pipeline_model_parallel_world_size(world_size):
 
 
 def get_tensor_model_parallel_world_size():
-    """Return world size for the tensor-model-parallel group."""
+    """Return world size for the tensor-model-parallel group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.tp.size() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     global _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     if _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
@@ -1955,7 +2312,12 @@ def get_tensor_model_parallel_world_size():
 
 
 def get_pipeline_model_parallel_world_size():
-    """Return world size for the pipeline-model-parallel group."""
+    """Return world size for the pipeline-model-parallel group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.pp.size() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     global _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     if _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
@@ -1975,7 +2337,12 @@ def set_pipeline_model_parallel_rank(rank):
 
 
 def get_tensor_model_parallel_rank():
-    """Return caller's rank for the tensor-model-parallel group."""
+    """Return caller's rank for the tensor-model-parallel group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.tp.rank() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     global _MPU_TENSOR_MODEL_PARALLEL_RANK
     if _MPU_TENSOR_MODEL_PARALLEL_RANK is not None:
         return _MPU_TENSOR_MODEL_PARALLEL_RANK
@@ -1983,7 +2350,12 @@ def get_tensor_model_parallel_rank():
 
 
 def get_pipeline_model_parallel_rank():
-    """Return caller's rank for the pipeline-model-parallel group."""
+    """Return caller's rank for the pipeline-model-parallel group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.pp.rank() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     global _MPU_PIPELINE_MODEL_PARALLEL_RANK
     if _MPU_PIPELINE_MODEL_PARALLEL_RANK is not None:
         return _MPU_PIPELINE_MODEL_PARALLEL_RANK
@@ -2060,7 +2432,13 @@ def get_virtual_pipeline_model_parallel_world_size():
 
 def get_tensor_model_parallel_src_rank():
     """Calculate the global rank corresponding to the first local rank
-    in the tensor model parallel group."""
+    in the tensor model parallel group.
+
+    Deprecated: reads the global parallel state. Use
+    torch.distributed.get_global_rank(pg_collection.tp, 0). See
+    docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+    """
     assert (
         _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS is not None
     ), "Tensor model parallel group is not initialized"
@@ -2069,14 +2447,26 @@ def get_tensor_model_parallel_src_rank():
 
 def get_model_parallel_src_rank():
     """Calculate the global rank corresponding to the first local rank
-    in the model parallel group."""
+    in the model parallel group.
+
+    Deprecated: reads the global parallel state. Use
+    torch.distributed.get_global_rank(pg_collection.mp, 0). See
+    docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+    """
     assert _MODEL_PARALLEL_GLOBAL_RANKS is not None, "Model parallel group is not initialized"
     return _MODEL_PARALLEL_GLOBAL_RANKS[0]
 
 
 def get_data_parallel_src_rank(with_context_parallel=False):
     """Calculate the global rank corresponding to the first local rank
-    in the data parallel group."""
+    in the data parallel group.
+
+    Deprecated: reads the global parallel state. Use torch.distributed.get_global_rank(pg, 0)
+    with pg_collection.dp or dp_cp according to with_context_parallel. See
+    docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+    """
     if with_context_parallel:
         assert (
             _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP is not None
@@ -2088,20 +2478,38 @@ def get_data_parallel_src_rank(with_context_parallel=False):
 
 
 def get_pipeline_model_parallel_first_rank():
-    """Return the global rank of the first stage in the current rank's pipeline."""
+    """Return the global rank of the first stage in the current rank's pipeline.
+
+    Deprecated: reads the global parallel state. Derive the global pipeline peer rank from the
+    caller-provided pp group; preserve pipeline ordering. See
+    docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+    """
     assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
     return _PIPELINE_GLOBAL_RANKS[0]
 
 
 def get_pipeline_model_parallel_last_rank():
-    """Return the global rank of the last stage in the current rank's pipeline."""
+    """Return the global rank of the last stage in the current rank's pipeline.
+
+    Deprecated: reads the global parallel state. Derive the global pipeline peer rank from the
+    caller-provided pp group; preserve pipeline ordering. See
+    docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+    """
     assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
     last_rank_local = get_pipeline_model_parallel_world_size() - 1
     return _PIPELINE_GLOBAL_RANKS[last_rank_local]
 
 
 def get_pipeline_model_parallel_next_rank():
-    """Return the global rank that follows the caller in the pipeline."""
+    """Return the global rank that follows the caller in the pipeline.
+
+    Deprecated: reads the global parallel state. Derive the global pipeline peer rank from the
+    caller-provided pp group; preserve pipeline ordering. See
+    docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+    """
     assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
     rank_in_pipeline = get_pipeline_model_parallel_rank()
     world_size = get_pipeline_model_parallel_world_size()
@@ -2109,7 +2517,13 @@ def get_pipeline_model_parallel_next_rank():
 
 
 def get_pipeline_model_parallel_prev_rank():
-    """Return the global rank that precedes the caller in the pipeline."""
+    """Return the global rank that precedes the caller in the pipeline.
+
+    Deprecated: reads the global parallel state. Derive the global pipeline peer rank from the
+    caller-provided pp group; preserve pipeline ordering. See
+    docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+    """
     assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
     rank_in_pipeline = get_pipeline_model_parallel_rank()
     world_size = get_pipeline_model_parallel_world_size()
@@ -2120,6 +2534,10 @@ def get_data_parallel_world_size(
     with_context_parallel=False, with_gtp_remat=True, partial_data_parallel=False
 ):
     """Return the data-parallel world size.
+
+    Deprecated: reads the global parallel state. Use pg.size() on the caller-provided group
+    matching all accessor flags. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
 
     DEFAULT (with_gtp_remat=True): full degree (replicate_DP x gtp_remat).
     with_gtp_remat=False: replicate degree.
@@ -2148,6 +2566,10 @@ def get_data_parallel_rank(
 ):
     """Return the caller's data-parallel rank.
 
+    Deprecated: reads the global parallel state. Use pg.rank() on the caller-provided group
+    matching all accessor flags. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+
     DEFAULT (with_gtp_remat=True): rank in the full group (replicate_DP x gtp_remat).
     with_gtp_remat=False: rank in the replicate group.
     """
@@ -2165,7 +2587,12 @@ def get_data_parallel_rank(
 
 
 def get_context_parallel_world_size():
-    """Return world size for the context parallel group."""
+    """Return world size for the context parallel group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.cp.size() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return get_context_parallel_group().size()
     else:
@@ -2173,7 +2600,12 @@ def get_context_parallel_world_size():
 
 
 def get_context_parallel_rank():
-    """Return caller's rank in the context-parallel group."""
+    """Return caller's rank in the context-parallel group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.cp.rank() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return get_context_parallel_group().rank()
     else:
@@ -2181,7 +2613,12 @@ def get_context_parallel_rank():
 
 
 def get_tensor_and_context_parallel_world_size():
-    """Return world size for the tensor and context-parallel group."""
+    """Return world size for the tensor and context-parallel group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.tp_cp.size() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return get_tensor_and_context_parallel_group().size()
     else:
@@ -2189,7 +2626,12 @@ def get_tensor_and_context_parallel_world_size():
 
 
 def get_tensor_and_context_parallel_rank():
-    """Return caller's rank in the joint tensor-model-parallel and context-parallel group."""
+    """Return caller's rank in the joint tensor-model-parallel and context-parallel group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.tp_cp.rank() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return get_tensor_and_context_parallel_group().rank()
     else:
@@ -2198,7 +2640,12 @@ def get_tensor_and_context_parallel_rank():
 
 ### Expert-related parallel states functions
 def get_expert_gtp_weight_remat_group(check_initialized=True):
-    """Get the expert-parameter-sharding group the caller rank belongs to."""
+    """Get the expert-parameter-sharding group the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use the caller-provided
+    pg_collection.expt_gtp_remat group. See docs/developer/parallel-state-deprecation.md for
+    migration details and optional-group handling.
+    """
     if check_initialized:
         assert (
             _EXPERT_GTP_WEIGHT_REMAT_GROUP is not None
@@ -2207,7 +2654,12 @@ def get_expert_gtp_weight_remat_group(check_initialized=True):
 
 
 def get_expert_gtp_weight_remat_world_size():
-    """Return world size for the expert-parameter-sharding group."""
+    """Return world size for the expert-parameter-sharding group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.expt_gtp_remat.size() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         group = get_expert_gtp_weight_remat_group(check_initialized=False)
         return group.size() if group is not None else 0
@@ -2216,7 +2668,12 @@ def get_expert_gtp_weight_remat_world_size():
 
 
 def get_expert_gtp_weight_remat_rank():
-    """Return caller's rank in the expert-parameter-sharding group."""
+    """Return caller's rank in the expert-parameter-sharding group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.expt_gtp_remat.rank() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         group = get_expert_gtp_weight_remat_group(check_initialized=False)
         return group.rank() if group is not None else 0
@@ -2225,7 +2682,13 @@ def get_expert_gtp_weight_remat_rank():
 
 
 def get_expert_gtp_weight_remat_global_ranks(check_initialized=True):
-    """Get all global ranks of the expert-parameter-sharding group that the caller rank belongs to."""
+    """Get all global ranks of the expert-parameter-sharding group that the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use
+    torch.distributed.get_process_group_ranks(pg_collection.expt_gtp_remat) on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     if check_initialized:
         assert (
             _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS is not None
@@ -2234,7 +2697,12 @@ def get_expert_gtp_weight_remat_global_ranks(check_initialized=True):
 
 
 def get_expert_model_parallel_group(check_initialized=True):
-    """Get the expert-model-parallel group the caller rank belongs to."""
+    """Get the expert-model-parallel group the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use the caller-provided pg_collection.ep group.
+    See docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+    """
     if check_initialized:
         assert (
             _EXPERT_MODEL_PARALLEL_GROUP is not None
@@ -2244,7 +2712,13 @@ def get_expert_model_parallel_group(check_initialized=True):
 
 def get_expert_model_parallel_src_rank():
     """Calculate the global rank corresponding to the first local rank
-    in the expert model parallel group."""
+    in the expert model parallel group.
+
+    Deprecated: reads the global parallel state. Use
+    torch.distributed.get_global_rank(pg_collection.ep, 0). See
+    docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+    """
     assert (
         _EXPERT_MODEL_PARALLEL_RANKS is not None
     ), "Expert model parallel group is not initialized"
@@ -2252,7 +2726,12 @@ def get_expert_model_parallel_src_rank():
 
 
 def get_expert_model_parallel_world_size():
-    """Return world size for the expert-model-parallel group."""
+    """Return world size for the expert-model-parallel group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.ep.size() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     if _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -2268,7 +2747,12 @@ def set_expert_model_parallel_world_size(world_size):
 
 
 def get_expert_model_parallel_rank():
-    """Return caller's rank in the expert-model-parallel group."""
+    """Return caller's rank in the expert-model-parallel group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.ep.rank() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     if _MPU_EXPERT_MODEL_PARALLEL_RANK is not None:
         return _MPU_EXPERT_MODEL_PARALLEL_RANK
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -2284,7 +2768,12 @@ def set_expert_model_parallel_rank(rank):
 
 
 def get_expert_tensor_parallel_group(check_initialized=True):
-    """Get the expert-tensor-parallel group the caller rank belongs to."""
+    """Get the expert-tensor-parallel group the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use the caller-provided pg_collection.expt_tp
+    group. See docs/developer/parallel-state-deprecation.md for migration details and
+    optional-group handling.
+    """
     if check_initialized:
         assert (
             _EXPERT_TENSOR_PARALLEL_GROUP is not None
@@ -2293,7 +2782,12 @@ def get_expert_tensor_parallel_group(check_initialized=True):
 
 
 def get_expert_tensor_parallel_world_size():
-    """Return world size for the expert tensor parallel group."""
+    """Return world size for the expert tensor parallel group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.expt_tp.size() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     global _MPU_EXPERT_TENSOR_PARALLEL_WORLD_SIZE
     if _MPU_EXPERT_TENSOR_PARALLEL_WORLD_SIZE is not None:
         return _MPU_EXPERT_TENSOR_PARALLEL_WORLD_SIZE
@@ -2311,7 +2805,12 @@ def set_expert_tensor_parallel_world_size(world_size):
 
 
 def get_expert_tensor_parallel_rank():
-    """Return my rank for the expert tensor parallel group."""
+    """Return my rank for the expert tensor parallel group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.expt_tp.rank() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     global _MPU_EXPERT_TENSOR_PARALLEL_RANK
     if _MPU_EXPERT_TENSOR_PARALLEL_RANK is not None:
         return _MPU_EXPERT_TENSOR_PARALLEL_RANK
@@ -2329,7 +2828,12 @@ def set_expert_tensor_parallel_rank(rank):
 
 
 def get_expert_tensor_and_model_parallel_group(check_initialized=True):
-    """Get the expert-tensor and expert-model group the caller rank belongs to."""
+    """Get the expert-tensor and expert-model group the caller rank belongs to.
+
+    Deprecated: reads the global parallel state. Use the caller-provided pg_collection.tp_ep
+    group. See docs/developer/parallel-state-deprecation.md for migration details and
+    optional-group handling.
+    """
     if check_initialized:
         assert (
             _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP is not None
@@ -2338,7 +2842,12 @@ def get_expert_tensor_and_model_parallel_group(check_initialized=True):
 
 
 def get_expert_tensor_and_model_parallel_world_size():
-    """Return world size for the expert model parallel group times expert tensor parallel group."""
+    """Return world size for the expert model parallel group times expert tensor parallel group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.tp_ep.size() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         world_size = get_expert_tensor_and_model_parallel_group().size()
         return world_size
@@ -2347,7 +2856,12 @@ def get_expert_tensor_and_model_parallel_world_size():
 
 
 def get_expert_tensor_and_model_parallel_rank():
-    """Return caller's rank in the joint tensor- and expert-model-parallel group."""
+    """Return caller's rank in the joint tensor- and expert-model-parallel group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.tp_ep.rank() on the
+    caller-provided group. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return get_expert_tensor_and_model_parallel_group().rank()
     else:
@@ -2356,6 +2870,11 @@ def get_expert_tensor_and_model_parallel_rank():
 
 def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True, with_egtp_remat=False):
     """Get expert tensor-model-pipeline parallel group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.tp_ep_pp, or
+    pg_collection.tp_ep_pp_with_egtp_remat when with_egtp_remat=True. See
+    docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
 
     Args:
         check_initialized: If True (default), asserts the group has been created.
@@ -2382,6 +2901,11 @@ def get_expert_data_parallel_group(
     check_initialized=True, with_gtp_remat=True, partial_expert_data_parallel=False
 ):
     """Get the expert data parallel group.
+
+    Deprecated: reads the global parallel state. Use pg_collection.expt_dp_gtp_remat by default,
+    expt_dp for with_gtp_remat=False, or the matching partial group. See
+    docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
 
     DEFAULT (with_gtp_remat=True): full group for data distribution (EGTP_remat peers
     hold distinct micro-batches).
@@ -2410,22 +2934,40 @@ def get_expert_data_parallel_group(
     return group
 
 
-def get_expert_data_parallel_group_gloo(partial_expert_data_parallel=False):
-    """Get expert data parallel group-gloo."""
+def get_expert_data_parallel_group_gloo(partial_expert_data_parallel=False, check_initialized=True):
+    """Get expert data parallel group-gloo.
+
+    Deprecated: reads the global parallel state. Pass an explicit Gloo expert-data-parallel
+    group from the caller, such as pg_collection.intra_expt_dp_gloo for the partial expert
+    data-parallel group; the other expert Gloo group has no ProcessGroupCollection field. See
+    docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
+
+    Args:
+        check_initialized: When False, return None instead of asserting if the gloo group was
+            never created. See get_data_parallel_group_gloo.
+    """
     if partial_expert_data_parallel:
-        assert (
-            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
-        ), "Intra partial expert data parallel group-gloo is not initialized"
+        if check_initialized:
+            assert (
+                _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
+            ), "Intra partial expert data parallel group-gloo is not initialized"
         return _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
     else:
-        assert (
-            _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
-        ), "Expert data parallel group-gloo is not initialized"
+        if check_initialized:
+            assert (
+                _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
+            ), "Expert data parallel group-gloo is not initialized"
         return _EXPERT_DATA_PARALLEL_GROUP_GLOO
 
 
 def get_expert_data_parallel_rank(with_gtp_remat=True, partial_expert_data_parallel=False):
-    """Return the caller's expert-data-parallel rank (default: EGTP_remat-inclusive)."""
+    """Return the caller's expert-data-parallel rank (default: EGTP_remat-inclusive).
+
+    Deprecated: reads the global parallel state. Use pg.rank() on the caller-provided group
+    matching all accessor flags. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return get_expert_data_parallel_group(
             with_gtp_remat=with_gtp_remat, partial_expert_data_parallel=partial_expert_data_parallel
@@ -2435,7 +2977,12 @@ def get_expert_data_parallel_rank(with_gtp_remat=True, partial_expert_data_paral
 
 
 def get_expert_data_parallel_world_size(with_gtp_remat=True, partial_expert_data_parallel=False):
-    """Return the expert-data-parallel world size (default: EGTP_remat-inclusive)."""
+    """Return the expert-data-parallel world size (default: EGTP_remat-inclusive).
+
+    Deprecated: reads the global parallel state. Use pg.size() on the caller-provided group
+    matching all accessor flags. See docs/developer/parallel-state-deprecation.md for migration
+    details and optional-group handling.
+    """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return get_expert_data_parallel_group(
             with_gtp_remat=with_gtp_remat, partial_expert_data_parallel=partial_expert_data_parallel
@@ -2445,7 +2992,12 @@ def get_expert_data_parallel_world_size(with_gtp_remat=True, partial_expert_data
 
 
 def get_intra_distributed_optimizer_instance_group(check_initialized=True):
-    """Get the group of all GPUs in a distributed optimizer instance."""
+    """Get the group of all GPUs in a distributed optimizer instance.
+
+    Deprecated: reads the global parallel state. Use the caller-provided
+    pg_collection.intra_dist_opt group. See docs/developer/parallel-state-deprecation.md for
+    migration details and optional-group handling.
+    """
     if check_initialized:
         assert (
             _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is not None
@@ -2453,17 +3005,23 @@ def get_intra_distributed_optimizer_instance_group(check_initialized=True):
     return _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
 
 
-def get_inter_distributed_optimizer_instance_group(check_initialized=True):
-    """Get the group spanning the different distributed optimizer instances.
-    Attention and MLP/Expert share same inter-instance group, so only built
-    inter_partial_expert_data_parallel_group, and return it at here.
+def get_inter_distributed_optimizer_instance_group(check_initialized=True, expert=False):
+    """Get the group spanning the different distributed optimizer instances, for the dense
+    (default) or expert parameters. Both are the same group when their instance counts match.
+
+    Deprecated: reads the global parallel state. Use the caller-provided
+    pg_collection.inter_dist_opt (dense) or pg_collection.inter_expt_dist_opt (expert) group.
+    See docs/developer/parallel-state-deprecation.md for migration details and optional-group
+    handling.
     """
+    group = (
+        _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+        if expert
+        else _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    )
     if check_initialized:
-        assert _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None, (
-            "Attention and MLP/Expert share same inter distributed optimize instance group, "
-            "which has not been initialized"
-        )
-    return _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+        assert group is not None, "Inter distributed optimizer instance group is not initialized"
+    return group
 
 
 ### End of expert-related functions region
@@ -2504,6 +3062,17 @@ def get_all_ranks():
 
 def destroy_model_parallel():
     """Set the groups to none."""
+    # MoonEP's symmetric-memory windows must be released while their expert process group
+    # is still alive. Idempotent and a no-op when virtual experts were never initialized.
+    try:
+        from megatron.core.transformer.moe.virtual_expert_load_balancer import (
+            VirtualExpertLoadBalancer,
+        )
+
+        VirtualExpertLoadBalancer.finalize()
+    except Exception:
+        logger.warning("Failed to finalize MoonEP resources during teardown", exc_info=True)
+
     # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
     # process group's communicator is torn down. TE registers an atexit ep_finalize that would
     # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.
@@ -2526,6 +3095,8 @@ def destroy_model_parallel():
 
     global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
     _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
+    global _WEIGHT_REPLICA_RANK_SETS
+    _WEIGHT_REPLICA_RANK_SETS = None
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
@@ -2550,6 +3121,12 @@ def destroy_model_parallel():
 
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     _CONTEXT_PARALLEL_GLOBAL_RANKS = None
+
+    global _DYNAMIC_DP_CP_GROUPS
+    _DYNAMIC_DP_CP_GROUPS = {}
+
+    global _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS
+    _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS = {}
 
     global _EMBEDDING_GROUP
     _EMBEDDING_GROUP = None
@@ -2681,6 +3258,9 @@ def destroy_model_parallel():
     global _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
     # End of expert parallelism destroy.
+
+    global _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
 
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None

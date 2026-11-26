@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
+source /usr/local/pccl/envsetup.sh
+export CPATH="$NCCL_HOME/include${CPATH:+:$CPATH}"
+set -u
 selection_id="${1:?Missing UT bucket or suite ID}"
 [[ "$selection_id" == quick || "$selection_id" =~ ^(dev|lts)-[0-9]+$ ]]
 : "${PPU_RESULTS_DIR:?Missing results directory for this job}"

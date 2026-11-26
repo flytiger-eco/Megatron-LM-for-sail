@@ -65,7 +65,7 @@ def command_output(command):
 
 def check_apex_layer_norm() -> dict:
     """Verify Apex backend selection without running training kernels."""
-    fused = importlib.import_module("megatron.core.fusions.fused_layer_norm")
+    fused = importlib.import_module("megatron.core.ops.norm.fused_layer_norm")
     if not fused.HAVE_FUSED_LAYER_NORM or not fused.HAVE_PERSIST_LAYER_NORM:
         raise ValueError("Megatron did not enable Apex fused and persistent LayerNorm")
     backends = importlib.import_module("megatron.core.models.backends")

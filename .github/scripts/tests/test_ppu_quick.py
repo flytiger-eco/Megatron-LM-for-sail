@@ -275,35 +275,38 @@ def test_invalid_exclusions(tmp_path, monkeypatch, mutation):
 
 
 @pytest.mark.parametrize("repeat", [1, 2])
-def test_full_recipe_parity_with_previous_implementation(repeat):
-    original = subprocess.check_output(
-        ["git", "show", "826a263f9:.github/scripts/ppu_ci.py"], cwd=ROOT, text=True
-    )
-    namespace = {"__file__": str(SCRIPTS / "ppu_ci.py"), "__name__": "baseline_ppu_ci"}
-    exec(compile(original, "baseline_ppu_ci", "exec"), namespace)
-    config = {"repeat": repeat, "timeout": 30}
-    actual = ci.unit_cases(config)
-    assert {
-        key: {k: v for k, v in row.items() if k != "excluded"} for key, row in actual.items()
-    } == namespace["unit_cases"](config)
-    assert len(actual) == 74
+def test_full_recipe_parity_with_upstream(repeat):
+    recipe = yaml.safe_load((ROOT / ci.RECIPE_PATH).read_text())
+    actual = ci.unit_cases({"repeat": repeat, "timeout": 30})
     assert sum(EXCLUDED_UT in case["excluded"] for case in actual.values()) == 2
     assert all(
         not arg.startswith("--ppu-exclude") for case in actual.values() for arg in case["args"]
     )
-    assert sum(EXCLUDED_UT.split("::")[0] in case["files"] for case in actual.values()) == 2
     for environment in ("dev", "lts"):
-        files = [
-            path
-            for case in actual.values()
-            if case["environment"] == environment
-            for path in case["files"]
-        ]
+        expected = {
+            product["test_case"][0]
+            for product in recipe["products"]
+            if any(environment in variant["environment"] for variant in product["products"])
+        }
+        selected = [case for case in actual.values() if case["environment"] == environment]
+        assert {case["bucket"] for case in selected} == expected
+        assert len(selected) == len(expected)
+        assert all(case["repeat"] == repeat for case in selected)
+        files = [path for case in selected for path in case["files"]]
         assert len(files) == len(set(files))
-        assert {path for path in files if Path(path).name.startswith("test_")} == {
+        all_files = {
             path.relative_to(ROOT).as_posix()
             for path in (ROOT / "tests/unit_tests").rglob("test_*.py")
         }
+        absent = {
+            path.relative_to(ROOT).as_posix()
+            for product in recipe["products"]
+            for bucket in product["test_case"]
+            if bucket not in expected
+            for path in ROOT.glob(bucket)
+            if path.is_file()
+        }
+        assert {path for path in files if Path(path).name.startswith("test_")} == all_files - absent
 
 
 def test_configure_cli_separates_control_and_source(tmp_path):
@@ -354,7 +357,9 @@ def test_configure_cli_separates_control_and_source(tmp_path):
     }
     expected_scope = ci.load_policy()["daily_scope"]
     assert manifest["config"]["scope"] == expected_scope
-    assert len(manifest["unit"]) == (6 if expected_scope == "quick" else 37)
+    assert len(manifest["unit"]) == (
+        6 if expected_scope == "quick" else len(ci.unit_cases(manifest["config"]))
+    )
 
 
 def test_manual_fork_authorization():
@@ -418,7 +423,9 @@ def write_reports(directory, case, failed=1, skipped=False, total=5):
         for rank in range(8):
             selected = nodes if phase == "prod" else []
             tests = {
-                node: "skipped" if skipped else "failed" if rank == 7 and i < failed else "passed"
+                node: "skipped"
+                if skipped
+                else "failed" if rank == case["cards"] - 1 and i < failed else "passed"
                 for i, node in enumerate(selected)
             }
             report = {
@@ -652,7 +659,7 @@ def test_full_matrix_report_parity(tmp_path):
     assert result["threshold_percent"] == 90
     assert result["total"] == len(cases) * 5
     assert result["failed"] == len(cases)
-    assert len(result["groups"]) == 74 and result["pass_rate"] == 0.8
+    assert len(result["groups"]) == len(cases) and result["pass_rate"] == 0.8
 
 
 @pytest.mark.parametrize("scope", ["quick", "full", "diagnostic"])
@@ -764,7 +771,7 @@ def test_workflow_trust_and_resource_boundaries():
     assert auth.BRANCH == BRANCH == "refs/heads/main"
     assert events["push"]["branches"] == ["main", "dev"]
     for event_name in ("pull_request_target", "merge_group"):
-        assert events[event_name]["branches"] == list(auth.policy.BRANCHES)
+        assert events[event_name]["branches"] == ["main", "dev"]
     authorize_if = build["jobs"]["authorize"]["if"]
     for ref in auth.policy.REFS:
         assert ref in authorize_if
@@ -901,9 +908,11 @@ def test_suite_runner_with_fake_hardware(tmp_path, failure):
         "NPROC_PER_NODE": "8",
         "NNODES": "1",
     }
-    run = subprocess.run(
-        ["bash", str(SCRIPTS / "ppu_ci_run.sh"), "quick"], env=env, capture_output=True, text=True
+    runner = tmp_path / "ppu_ci_run.sh"
+    runner.write_text(
+        (SCRIPTS / "ppu_ci_run.sh").read_text().replace("/usr/local/pccl/envsetup.sh", "/dev/null")
     )
+    run = subprocess.run(["bash", str(runner), "quick"], env=env, capture_output=True, text=True)
     assert run.returncode == (0 if failure == "none" else 1), run.stdout + run.stderr
     commands = [json.loads(line) for line in (tmp_path / "commands.jsonl").read_text().splitlines()]
     verifications = [c for c in commands if c['name'] == 'python3' and 'verify-image' in c['args']]

@@ -429,9 +429,11 @@ socket.socket.connect_ex = no_network
 socket.create_connection = no_network
 socket.getaddrinfo = no_network
 from transformers import AutoTokenizer
+from transformers.utils import cached_file
 source, repository, cache, revision, include_special = sys.argv[1:]
 source, cache = Path(source), Path(cache)
 namespace = dict(AutoTokenizer=AutoTokenizer, List=List, Optional=Optional,
+                 json=json, cached_file=cached_file,
                  logging=logging, logger=logging.getLogger("original-tokenizer"),
                  log_single_rank=lambda logger, level, message: logger.log(level, message))
 path = source / "abstract_tokenizer.py"
@@ -444,6 +446,7 @@ for filename, class_name in [
     module = ast.parse(path.read_text())
     nodes = [node for node in module.body if
              (isinstance(node, ast.ClassDef) and node.name == class_name) or
+             (isinstance(node, ast.FunctionDef) and node.name == "_load_generation_config") or
              (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and
               target.id == "MEGATRON_CONFIG_MAP" for target in node.targets))]
     assert sum(isinstance(node, ast.ClassDef) for node in nodes) == 1
