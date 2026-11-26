@@ -349,9 +349,9 @@ print('PPU build and import checks passed:', helpers_cpp.__file__)
 PY
 python - <<'PY'
 from pathlib import Path
-import megatron.post_training.model_builder
-import megatron.rl.rl_utils
-for module in (megatron.post_training.model_builder, megatron.rl.rl_utils):
+import megatron.post_training
+import megatron.rl
+for module in (megatron.post_training, megatron.rl):
     assert Path(module.__file__).resolve().is_relative_to(Path.cwd().resolve())
     print('UT source import check passed:', module.__name__, module.__file__)
 PY
