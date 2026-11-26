@@ -41,9 +41,13 @@ jobs:
   inspect-worker-events:
     if: inputs.diagnose == true && github.ref == 'refs/heads/davidsophus/ppu-ci-thin-adapter'
     runs-on: k8s-runner-group-cpu-flytiger
+    environment: ppu-ci
     timeout-minutes: 12
     container:
-      image: ghcr.io/actions/actions-runner:latest
+      image: ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci-control@sha256:0d5099d6c72a9dc7101f3494c14001fbf525478db5bf1f1f06a07988b97eecf2
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
     steps:
       - name: Read events for the stopped acceptance worker only
         shell: bash
