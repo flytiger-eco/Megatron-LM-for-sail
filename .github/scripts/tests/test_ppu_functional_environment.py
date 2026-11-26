@@ -246,11 +246,13 @@ def test_compiler_probe_uses_real_isolated_cpu_interpreter(tmp_path, monkeypatch
     assert os.environ["TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"] == "1"
 
 
-@pytest.mark.parametrize("launcher", ["torchrun", "ft_launcher"])
+@pytest.mark.parametrize(("launcher", "devices"), [("torchrun", 1), ("torchrun", 8), ("ft_launcher", 8)])
 def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
-    tool_environment, launcher, monkeypatch
+    tool_environment, launcher, devices, monkeypatch
 ):
-    bundle, site, manifest, calls, _, _ = tool_environment
+    bundle, site, manifest, calls, _, cuda = tool_environment
+    cuda.device_count = lambda: devices
+    monkeypatch.setenv("NPROC_PER_NODE", str(devices))
     invoked = []
     command_output = environment.command_output
 
@@ -265,12 +267,12 @@ def test_prepare_attests_prebuilt_tools_without_installing_dependencies(
         bundle / "control/ppu_functional_pytest.py"
     ).read_bytes()
     assert calls == []
-    environment.check(bundle, manifest, bundle / "reports")
+    environment.check(bundle, manifest, bundle / "reports", devices=devices)
     report = json.loads((bundle / "reports/functional-environment.json").read_text())
     assert (site / environment.NAMESPACE_PTH).read_text() == environment.NAMESPACE_BOOTSTRAP
     assert report["postprocessing"] == {"event_roundtrip": True}
     assert "protobuf" in report["packages"]
-    assert report["identity"] == manifest["identity"] and report["devices"] == 8
+    assert report["identity"] == manifest["identity"] and report["devices"] == devices
     delivery = json.loads((bundle / "runtime-image.json").read_text())
     assert {field: report[field] for field in delivery} == delivery
     assert report["training_dependencies"]["packages"] == environment.TRAINING_PACKAGES

@@ -128,7 +128,7 @@ for dtype in (torch.float32, torch.bfloat16):
 PY
 make -q -C megatron/core/datasets
 if python -c 'import json; raise SystemExit(json.load(open(".ppu-ci/manifest.json")).get("test_kind") not in ("functional", "combined"))'; then
-    python -I "$PPU_CONTROL_DIR/ppu_functional_environment.py" --bundle "$PPU_ARTIFACT_DIR"
+    python -I "$PPU_CONTROL_DIR/ppu_functional_environment.py" --bundle "$PPU_ARTIFACT_DIR" --devices 1
 fi
 python -I - <<'PY'
 import sys

@@ -288,7 +288,7 @@ def check_compiler(manifest: dict) -> dict:
     return report
 
 
-def check(bundle: Path, manifest: dict, output: Path):
+def check(bundle: Path, manifest: dict, output: Path, *, devices: int = 8):
     compiler = check_compiler(manifest)
     tools = bundle / "functional-tools"
     arch, expected = YQ[platform.machine()]
@@ -337,10 +337,11 @@ def check(bundle: Path, manifest: dict, output: Path):
     packages.update(training_dependencies["packages"])
     import torch
 
-    if not torch.cuda.is_available() or torch.cuda.device_count() != 8:
-        raise ValueError("Functional tests require exactly eight visible PPU devices")
-    if int(os.environ.get("NPROC_PER_NODE", "8")) != 8 or int(os.environ.get("NNODES", "1")) != 1:
-        raise ValueError("Functional tests require one eight-card node")
+    visible_devices = torch.cuda.device_count()
+    if not torch.cuda.is_available() or visible_devices != devices:
+        raise ValueError(f"Expected {devices} visible PPU devices, found {visible_devices}")
+    if int(os.environ.get("NPROC_PER_NODE", str(devices))) != devices or int(os.environ.get("NNODES", "1")) != 1:
+        raise ValueError(f"Expected one node with {devices} processes")
     # Upstream uses this path for the empty initial load only, never to save these cases.
     empty = Path("/tmp/checkpoints")
     if empty.is_symlink() or (empty.exists() and (not empty.is_dir() or any(empty.iterdir()))):
@@ -363,7 +364,7 @@ def check(bundle: Path, manifest: dict, output: Path):
                 "envsubst": envsubst,
                 "uv": command_output(["uv", "--version"]),
                 "architecture": arch,
-                "devices": torch.cuda.device_count(),
+                "devices": visible_devices,
             },
             indent=2,
         )
@@ -375,6 +376,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", required=True, type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--devices", type=int, choices=(1, 8), default=8)
     args = parser.parse_args()
     spec = importlib.util.spec_from_file_location(
         "ppu_functional_control", Path(__file__).with_name("ppu_functional.py")
@@ -389,7 +391,7 @@ def main():
         sys.dont_write_bytecode = previous_dont_write_bytecode
     if manifest.get("test_kind") != "functional" or not manifest["config"]["build"]:
         raise ValueError("Functional environment setup requires a regression build")
-    check(args.bundle, manifest, args.output or args.bundle)
+    check(args.bundle, manifest, args.output or args.bundle, devices=args.devices)
 
 
 if __name__ == "__main__":
