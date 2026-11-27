@@ -1,11 +1,11 @@
 #
-# Megatron-LM-for-SAIL (core_v0.19.0-SAIL) on PPU
+# Megatron-LM-for-SAIL (core_r0.19.0) on PPU
 #
 # Base image: Flytiger PPU PyTorch runtime (SDK 2.2.0 / PyTorch 2.13.0 / CUDA 13.0 / py312).
 # This Dockerfile reproduces the verified flow:
 #   1. fix the build toolchain (setuptools 75.8 needs packaging>=24.2)
 #   2. remove any pre-installed megatron-core
-#   3. clone Megatron-LM-for-sail @ core_v0.19.0-SAIL and `pip install --no-build-isolation .`
+#   3. clone Megatron-LM-for-sail @ core_r0.19.0 and `pip install --no-build-isolation .`
 #   4. install the unit-test toolchain
 #
 # NOTE on the pip index: the base image's default index is the Flytiger artifactory,
@@ -17,7 +17,7 @@ FROM ${BASE_IMAGE}
 
 # --- Build/source configuration -------------------------------------------
 ARG MEGATRON_REPO=https://github.com/flytiger-eco/Megatron-LM-for-sail.git
-ARG MEGATRON_BRANCH=core_v0.19.0-SAIL
+ARG MEGATRON_BRANCH=core_r0.19.0
 ARG PYPI_INDEX=https://pypi.org/simple
 ARG WORKDIR=/opt/megatron
 

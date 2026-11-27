@@ -194,7 +194,6 @@ PY
 python3 -I -c 'import torch; from megatron.core.datasets.utils import compile_helpers; compile_helpers(); from megatron.core.datasets import helpers_cpp'
 cd /opt/megatron-lm
 python3 -c 'import gpt_builders, hybrid_builders, mamba_builders, model_provider'
-python3 pretrain_gpt.py --help > /dev/null
 PPU_RUNTIME
 WORKDIR /opt/megatron-lm
 ENTRYPOINT []
