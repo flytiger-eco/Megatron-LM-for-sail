@@ -11,7 +11,7 @@ runner/NAS 接线、M890 golden 和结果汇总；不在适配层重新实现模
 flowchart TD
     S[已有同步流程：发布成功] --> A[cicd-ppu：准入与固定 SHA]
     P[main/dev push、PR、merge queue] --> A
-    A --> Q{文档或纯 CI 编排 PR？}
+    A --> Q{无测试标签的文档或纯编排 PR？}
     Q -->|是| X[豁免设备测试]
     Q -->|否| C[ppu-execute：读取 recipe，生成计划]
     C --> D[CPU：资产预检查]
@@ -25,9 +25,9 @@ flowchart TD
 
 - 同步沿用现有 main 候选 PR / dev 直接发布机制。发布后通过 `sync_request`
   调用 `cicd-ppu.yml`，无需依赖 `GITHUB_TOKEN` push 再触发 Actions。
-- 普通 push、同步和无标签 PR：UT quick、FT L0、运行一次、每 case 30 分钟训练预算。
-  `Run tests` 选择轻量观察，`Run functional tests` 扩大数值测试到 L1。
-- 文档和纯编排 PR 豁免设备；镜像、依赖、执行脚本、recipe、golden 和模型代码仍需测试。
+- 普通 push、同步和无测试标签 PR：UT quick、FT L0、运行一次。显式测试标签选择 full UT
+  以及下表中的 FT 模式。
+- 无测试标签的文档和纯编排 PR 豁免设备；镜像、依赖、执行脚本、recipe、golden 和模型代码仍需测试。
   自动 combined 路径先 UT 后 FT，共用 runtime bundle；任一失败则组合失败。
 - 手动 `cicd-ppu.yml` 支持单 UT bucket、FT assets 或 regression。assets 不训练；
   release tag 当前只执行 UT。手动诊断使用受信任的 main/dev 分支。
@@ -37,6 +37,33 @@ flowchart TD
 `ppu_policy.py` 集中维护规则；`ppu_pr_authorize.py` 读取 GitHub 状态、固定 head/base/merge SHA，
 并在排队后复查，防止旧提交的结果用于新提交。SAIL 保留 `pull_request_target` 入口，
 没有接入 NVIDIA copy-pr-bot 或 NVIDIA runner。控制代码来自受信任分支，被测代码使用固定的 target SHA。
+
+### 在 PR 上选择测试
+
+| PR 标签或事件 | UT | FT | FT 次数 |
+|---|---|---|---|
+| 无测试标签 | quick | L0 数值验证 | 1 |
+| `Run tests` | full | L1 轻量观察，不按 cadence 筛选 | 1 |
+| `Run functional tests` | full | L1 数值验证，不按 cadence 筛选 | 5 |
+| `Run Merge-Queue jobs` 或 merge-group 事件 | full | L1 数值验证，按 `mergegroup` cadence 筛选 | 1 |
+
+标签优先级依次为 `Run Merge-Queue jobs`、`Run tests`、`Run functional tests`。
+merge-queue 标签与真实 merge-group 事件共用同一 FT 策略。
+L1 加 `mergegroup` cadence 选择具有 M890 golden 的上游合并队列用例，并保留现有排除规则；
+该范围不是 L0-L3 的并集。full UT 保留现有 90% 通过率门槛和执行完整性检查。
+轻量 FT 不比较 golden，也不计作数值验证。
+每个 FT case 的重复和重试共用 30 分钟训练预算，recipe 的 `time_limit_override` 可覆盖该预算。
+
+上线后开启 `PPU_CI_ENABLED=true`，并在仓库 Labels 中创建上表中尚不存在的测试标签，名称须完全一致。
+对于来自本仓库、目标为 main/dev、已打开且非 Draft 的 PR，
+添加 `Run Merge-Queue jobs`，即可先运行一次 full UT，再运行一次合并队列 FT。
+添加或移除任一测试标签都会重新进行准入检查；标签在后续 PR 提交中持续生效。
+
+Fork PR 仍需维护者从 main/dev 手动调度 `cicd-ppu.yml`，填写 `test_kind=unit`、
+`pr_number` 及当前完整的 `pr_sha` / `pr_base_sha`。functional 参数保持默认，
+由授权快照中的 PR 标签决定 UT/FT 联合计划；有测试标签时，即使填写 `scope=quick`，也会运行 full UT。
+该入口也可用于保持标签不变的 PR 重跑。重跑请重新 dispatch，不使用 Actions 的 re-run 按钮。
+head、base 或测试标签快照变化后，必须重新准入，才能执行测试或发布状态。
 
 ## 维护入口
 

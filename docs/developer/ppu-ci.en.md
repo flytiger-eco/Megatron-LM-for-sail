@@ -12,7 +12,7 @@ M890 golden values, and result aggregation. Model tests remain in the upstream d
 flowchart TD
     S[Existing sync workflow: publication succeeds] --> A[cicd-ppu: admission and pinned SHA]
     P[main/dev push, PR, merge queue] --> A
-    A --> Q{Docs or CI orchestration only PR?}
+    A --> Q{Docs or CI only PR without a test label?}
     Q -->|Yes| X[Skip device tests]
     Q -->|No| C[ppu-execute: read recipes and plan]
     C --> D[CPU: asset preflight]
@@ -28,10 +28,9 @@ flowchart TD
   publication for dev. After publication, `sync_request` calls `cicd-ppu.yml`
   directly, without relying on a `GITHUB_TOKEN` push to trigger Actions.
 - Ordinary pushes, synchronization, and PRs without scope labels run UT quick
-  and FT L0 once, with a 30-minute training budget per case. `Run tests` selects
-  lightweight observation; `Run functional tests` expands numerical testing to L1.
-- Documentation and orchestration-only PRs skip device tests. Image, dependency,
-  execution-script, recipe, golden, and model changes still require testing.
+  and FT L0 once. Explicit test labels select full UT and the FT modes below.
+- Documentation and orchestration-only PRs without a test label skip device tests.
+  Image, dependency, execution-script, recipe, golden, and model changes still require testing.
   The automatic combined path runs UT before FT and shares the runtime bundle;
   either failure fails the combined result.
 - Manual `cicd-ppu.yml` dispatch supports a single UT bucket, FT assets, or FT
@@ -45,6 +44,39 @@ pins head/base/merge SHAs, and rechecks them after queueing so that stale result
 cannot apply to a newer commit. SAIL retains `pull_request_target` without NVIDIA's
 copy-pr-bot or runners. Control code comes from a trusted branch; tested code uses
 the pinned target SHA.
+
+### Selecting tests on a PR
+
+| PR label or event | UT | FT | FT repetitions |
+|---|---|---|---|
+| No test label | quick | L0 numerical validation | 1 |
+| `Run tests` | full | L1 lightweight observation, across cadences | 1 |
+| `Run functional tests` | full | L1 numerical validation, across cadences | 5 |
+| `Run Merge-Queue jobs` or a merge-group event | full | L1 numerical validation, `mergegroup` cadence | 1 |
+
+Label priority is `Run Merge-Queue jobs`, then `Run tests`, then
+`Run functional tests`. The merge-queue label and actual merge-group events share
+the same FT policy. L1 with `mergegroup` cadence selects the upstream merge-queue
+cases with M890 goldens, subject to existing exclusions; it is not the L0-L3 union.
+Full UT retains the existing 90% pass-rate gate and execution-integrity checks.
+Lightweight FT does not compare golden values or count as numerical validation.
+Each FT case has a total 30-minute training budget across repetitions and retries
+unless its recipe sets `time_limit_override`.
+
+After deployment, enable `PPU_CI_ENABLED=true` and create any missing test labels
+under the repository's Labels page, using the exact names above.
+On an open, non-draft PR from this repository targeting main or dev, add
+`Run Merge-Queue jobs` to request one full UT run followed by one merge-queue FT
+run. Adding or removing any test label
+triggers a new admission check. Labels remain active for later PR commits.
+
+Fork PRs still require a maintainer to dispatch `cicd-ppu.yml` from main or dev with
+`test_kind=unit`, `pr_number`, and the current full `pr_sha` / `pr_base_sha` values.
+Leave the functional inputs at their defaults: the authorized PR labels select the
+combined UT/FT plan, and any test label forces full UT even if `scope=quick` was
+requested. This dispatch also reruns an existing PR without changing its labels.
+Use a fresh dispatch instead of Actions' re-run button. A changed head, base, or
+test-label snapshot requires fresh admission before tests or status publication.
 
 ## Maintenance entry points
 

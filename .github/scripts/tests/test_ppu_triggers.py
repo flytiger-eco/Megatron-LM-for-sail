@@ -2,12 +2,14 @@
 
 import copy
 import json
+import sys
 
 import pytest
+import yaml
 from test_ppu_functional import ROOT, functional
 from test_ppu_functional_results import results
 from test_ppu_lifecycle import FakeGitHub, github
-from test_ppu_quick import BASE_SHA, CONTROL_SHA, MERGE_SHA, REPOSITORY, SHA, auth, context
+from test_ppu_quick import BASE_SHA, CONTROL_SHA, MERGE_SHA, REPOSITORY, SHA, auth, ci, context
 
 WORKFLOWS = ROOT / ".github/workflows"
 
@@ -33,15 +35,25 @@ def label(github, *names):
     "trigger,labels,expected",
     [
         ("push", (), ("push", "L0", "bypass", 1, 30, False)),
-        ("merge_group", (), ("merge_group", "L0", "bypass", 1, 30, False)),
+        ("merge_group", (), ("merge_group", "L1", "mergegroup", 1, 30, False)),
         ("pr", (), ("pr", "L0", "bypass", 1, 30, False)),
         ("pr", ("Run tests",), ("Run tests", "L1", "bypass", 1, 30, True)),
-        ("pr", ("Run functional tests",), ("Run functional tests", "L1", "bypass", 1, 30, False)),
+        ("pr", ("Run functional tests",), ("Run functional tests", "L1", "bypass", 5, 30, False)),
         ("pr", ("Run functional tests", "Run tests"), ("Run tests", "L1", "bypass", 1, 30, True)),
+        (
+            "pr",
+            ("Run Merge-Queue jobs",),
+            ("Run Merge-Queue jobs", "L1", "mergegroup", 1, 30, False),
+        ),
+        (
+            "pr",
+            ("Run tests", "Run functional tests", "Run Merge-Queue jobs"),
+            ("Run Merge-Queue jobs", "L1", "mergegroup", 1, 30, False),
+        ),
         ("pr", ("bug",), ("pr", "L0", "bypass", 1, 30, False)),
     ],
 )
-def test_event_policy_uses_shared_sail_defaults(trigger, labels, expected):
+def test_event_policy_resolves_label_priority_and_sail_defaults(trigger, labels, expected):
     policy = functional.event_policy(trigger, labels)
     keys = ("trigger", "functional_scope", "cadence", "repeat", "timeout", "lightweight")
     assert tuple(policy[key] for key in keys) == expected
@@ -76,6 +88,7 @@ def selections():
         "pr": names("pr"),
         "Run tests": names("pr", ("Run tests",)),
         "Run functional tests": names("pr", ("Run functional tests",)),
+        "Run Merge-Queue jobs": names("pr", ("Run Merge-Queue jobs",)),
         "L1": functional.catalogue(
             ROOT, ROOT, functional.select_config({"functional_scope": "L1"})
         )["functional"],
@@ -87,11 +100,94 @@ def test_automatic_selections_are_nonempty_and_follow_cadence(selections):
     assert all(case_names.values())
     assert case_names["merge_group"] <= case_names["L1"]
     assert case_names["Run tests"] == case_names["Run functional tests"] == case_names["L1"]
-    assert case_names["push"] == case_names["pr"] == case_names["merge_group"]
+    assert case_names["push"] == case_names["pr"]
+    assert case_names["Run Merge-Queue jobs"] == case_names["merge_group"]
     # Explicit labels may request the larger upstream L1 suite.
     assert case_names["push"] != case_names["L1"]
     assert all(row["observation"] for row in selections["Run tests"].values())
     assert not all(row["observation"] for row in selections["Run functional tests"].values())
+    assert all(
+        row["repeat"] == 5
+        for row in selections["Run functional tests"].values()
+        if not row["observation"]
+    )
+    assert all("mergegroup" in row["cadence"] for row in selections["merge_group"].values())
+
+
+def test_merge_queue_filters_nightly_only_cases_but_functional_label_includes_them(
+    selections, monkeypatch
+):
+    nightly = next(iter(selections["merge_group"].values()))["name"]
+    rows = functional.load_recipes(ROOT)
+    for row in rows:
+        if f"{row['model']}/{row['test_case']}" == nightly:
+            row["cadence"] = ["nightly"]
+    monkeypatch.setattr(functional, "load_recipes", lambda _: rows)
+    for trigger, labels, included in (
+        ("merge_group", (), False),
+        ("pr", ("Run Merge-Queue jobs",), False),
+        ("pr", ("Run functional tests",), True),
+    ):
+        config = functional.select_config({}, functional.event_policy(trigger, labels))
+        cases = functional.catalogue(ROOT, ROOT, config)["functional"]
+        assert (nightly in {row["name"] for row in cases.values()}) is included
+
+
+@pytest.mark.parametrize("event_name", ["pull_request_target", "workflow_dispatch"])
+@pytest.mark.parametrize(
+    "scope_label,repeats,cadence,lightweight",
+    [
+        ("Run tests", 1, "bypass", True),
+        ("Run functional tests", 5, "bypass", False),
+        ("Run Merge-Queue jobs", 1, "mergegroup", False),
+    ],
+)
+def test_authorized_pr_labels_drive_full_ut_and_combined_ft(
+    github, tmp_path, monkeypatch, event_name, scope_label, repeats, cadence, lightweight
+):
+    label(github, scope_label)
+    event = pr_event(github) if event_name == "pull_request_target" else {}
+    inputs = {"scope": "quick", "build": False, "unit_test": False, "repeat": 0}
+    if event_name == "workflow_dispatch":
+        inputs.update(pr_number="7", pr_sha=SHA, pr_base_sha=BASE_SHA)
+    authorization = auth.authorize(event, inputs, context(event_name), github, lambda _: None)
+    assert authorization["allowed"]
+    output = tmp_path / "plan"
+    output.mkdir()
+    (output / "authorization.json").write_text(json.dumps(authorization))
+    event_path = tmp_path / "event.json"
+    event_path.write_text(json.dumps(event))
+    for key, value in {
+        "GITHUB_EVENT_NAME": event_name,
+        "GITHUB_REF": "refs/heads/main",
+        "GITHUB_EVENT_PATH": str(event_path),
+        "GITHUB_OUTPUT": str(tmp_path / "outputs"),
+        "PPU_DEFAULTS": "{}",
+        "PPU_INPUTS": json.dumps(inputs),
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(sys, "argv", ["ppu_ci.py", "configure", "--output", str(output)])
+    ci.main()
+    unit = json.loads((output / "manifest.json").read_text())
+    recipe = yaml.safe_load((ROOT / ci.RECIPE_PATH).read_text())
+    expected_buckets = {
+        product["test_case"][0]
+        for product in recipe["products"]
+        if any("dev" in variant["environment"] for variant in product["products"])
+    }
+    assert unit["config"]["scope"] == "full"
+    assert {case["bucket"] for case in unit["unit"].values()} == expected_buckets
+    assert all(case["repeat"] == 1 for case in unit["unit"].values())
+    plan = functional.combine(ROOT, ROOT, output)
+    assert plan["identity"]["target_sha"] == unit["identity"]["target_sha"] == MERGE_SHA
+    assert plan["config"]["repeat"] == repeats
+    assert plan["config"]["cadence"] == cadence
+    assert plan["config"]["lightweight"] is lightweight
+    assert plan["functional"]
+    assert all(
+        case["repeat"] == (1 if case["observation"] else repeats)
+        for case in plan["functional"].values()
+    )
 
 
 @pytest.mark.parametrize("outcome", [True, False])
@@ -263,7 +359,12 @@ def test_merge_queue_is_combined():
 
 
 @pytest.mark.parametrize(
-    "labels,trigger", [((), "pr"), (("Run functional tests", "bug"), "Run functional tests")]
+    "labels,trigger",
+    [
+        ((), "pr"),
+        (("Run functional tests", "bug"), "Run functional tests"),
+        (("Run Merge-Queue jobs", "Run tests"), "Run Merge-Queue jobs"),
+    ],
 )
 def test_pr_authorization_records_label_snapshot_and_policy(github, labels, trigger):
     label(github, *labels)
@@ -275,20 +376,40 @@ def test_pr_authorization_records_label_snapshot_and_policy(github, labels, trig
 
 
 @pytest.mark.parametrize("action", ["labeled", "unlabeled"])
-def test_scope_label_events_rerun_and_other_labels_are_ignored(github, action):
-    label(github, "Run tests")
-    assert authorize_pr(github, action, "Run tests")["decision"] == "run"
+@pytest.mark.parametrize(
+    "scope_label", ["Run tests", "Run functional tests", "Run Merge-Queue jobs"]
+)
+def test_scope_label_events_rerun_and_other_labels_are_ignored(github, action, scope_label):
+    label(github, *([scope_label] if action == "labeled" else []))
+    assert authorize_pr(github, action, scope_label)["decision"] == "run"
     ignored = authorize_pr(github, action, "bug")
     assert ignored["decision"] == "ignore" and not ignored["allowed"]
 
 
-def test_label_change_invalidates_previous_authorization(github):
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ((), ("Run tests",)),
+        ((), ("Run Merge-Queue jobs",)),
+        (("Run Merge-Queue jobs",), ()),
+        (("Run functional tests",), ("Run Merge-Queue jobs",)),
+    ],
+)
+def test_label_change_invalidates_previous_authorization(github, before, after):
+    label(github, *before)
     result = authorize_pr(github)
     assert auth.publish_status(result, "pending", result["reason"], github) == "published"
     assert auth.current_pr(github.pull, result, REPOSITORY)
-    label(github, "Run tests")
+    label(github, *after)
     assert not auth.current_pr(github.pull, result, REPOSITORY)
     assert not auth.execution_guard(result, github)
+
+
+def test_merge_queue_label_does_not_bypass_fork_authorization(github):
+    github.pull["head"]["repo"]["full_name"] = "someone/fork"
+    label(github, "Run Merge-Queue jobs")
+    result = authorize_pr(github, "labeled", "Run Merge-Queue jobs")
+    assert not result["allowed"] and result["decision"] == "authorization_required"
 
 
 class DocsGitHub(FakeGitHub):
@@ -299,7 +420,10 @@ class DocsGitHub(FakeGitHub):
         return super().__call__(path, payload)
 
 
-@pytest.mark.parametrize("labels,decision", [((), "cpu_only"), (("Run tests",), "run")])
+@pytest.mark.parametrize(
+    "labels,decision",
+    [((), "cpu_only"), (("Run tests",), "run"), (("Run Merge-Queue jobs",), "run")],
+)
 def test_scope_label_overrides_cpu_only_exemption(monkeypatch, labels, decision):
     monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
     github = DocsGitHub()
