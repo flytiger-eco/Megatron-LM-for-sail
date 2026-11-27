@@ -47,7 +47,7 @@ jobs:
         id: ppu
         uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
-          image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+          image: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001@sha256:cfecb7a38dd83afc6a302f72ad05423863bb892e0ab7b1cc6173ca3b871a133c
           nnodes: 0
           nproc_per_node: ${{ matrix.cards }}
           namespace: ${{ vars.PPU_NAMESPACE || 'ppu-sched' }}
