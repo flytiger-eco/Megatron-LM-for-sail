@@ -116,7 +116,7 @@ jobs:
       !(github.event_name == 'pull_request_target' && github.event.action == 'edited' && !github.event.changes.base) &&
       !(github.event_name == 'pull_request_target' &&
         contains(fromJSON('["labeled","unlabeled"]'), github.event.action) &&
-        !contains(fromJSON('["Run tests","Run functional tests"]'), github.event.label.name))
+        !contains(fromJSON('["Run Merge-Queue jobs","Run tests","Run functional tests"]'), github.event.label.name))
     runs-on: ubuntu-latest
     permissions:
       contents: read

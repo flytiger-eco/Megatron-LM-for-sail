@@ -56,7 +56,7 @@ def positive(value: object, name: str, maximum: int = 10000) -> int:
     return int(text)
 
 
-def select_config(event: dict, event_name: str, inputs: dict) -> dict:
+def select_config(event: dict, event_name: str, inputs: dict, *, pr_labels=()) -> dict:
     if event_name not in {"pull_request_target", "push", "workflow_dispatch", "merge_group"}:
         raise ValueError(f"Unsupported trigger event: {event_name}")
     config = {"build": inputs.get("build", True), "unit_test": inputs.get("unit_test", True)}
@@ -111,6 +111,9 @@ def select_config(event: dict, event_name: str, inputs: dict) -> dict:
                 raise ValueError("PR SHAs must be full 40-character hexadecimal strings")
             family, trigger = "nvidia-dev", "pr"
             config.update(build=True, unit_test=True, repeat=1)
+    # Use the authorized label snapshot for both automatic and manual PR runs.
+    if trigger == "pr" and set(pr_labels) & set(policy.SCOPE_LABELS):
+        scope = "full"
     if scope == "auto":
         scope = "full" if family == "release-dev-lts" else unit_policy["daily_scope"]
     if scope == "quick":
@@ -896,7 +899,7 @@ def main() -> None:
         if authorization.get("sync_request"):
             event, event_name = {"ref": authorization["base_ref"]}, authorization["event_name"]
             inputs = {}
-        config = select_config(event, event_name, inputs)
+        config = select_config(event, event_name, inputs, pr_labels=authorization.get("labels", []))
         if authorization["allowed"] is not True:
             config.update(build=False, unit_test=False)
         identity = {

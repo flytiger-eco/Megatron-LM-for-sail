@@ -46,14 +46,16 @@ UT_PROCESS_OVERRIDES = {"tests/unit_tests/generalized_tensor_parallel/**/*.py": 
 # Shared preflight/configure selection policy. Keep hardware paths and recipe parsing
 # in ppu_functional.py; admission must run with only this standard-library module.
 FUNCTIONAL_TIERS = ("L0", "L1", "L2", "L3")
-SCOPE_LABELS = ("Run tests", "Run functional tests")
-# SAIL shares one numeric default across branch updates and PRs; upstream recipes remain authoritative.
+SCOPE_LABELS = ("Run Merge-Queue jobs", "Run tests", "Run functional tests")
+# Keep SAIL's ordinary push/PR defaults; explicit labels follow NVIDIA's test modes.
 # Values: scope, cadence, repeats, timeout in minutes, lightweight.
+MERGE_QUEUE_POLICY = ("L1", "mergegroup", 1, 30, False)
 FUNCTIONAL_EVENT_POLICIES = {
     "push": ("L0", "bypass", 1, 30, False),
-    "merge_group": ("L0", "bypass", 1, 30, False),
+    "merge_group": MERGE_QUEUE_POLICY,
+    "Run Merge-Queue jobs": MERGE_QUEUE_POLICY,
     "Run tests": ("L1", "bypass", 1, 30, True),
-    "Run functional tests": ("L1", "bypass", 1, 30, False),
+    "Run functional tests": ("L1", "bypass", 5, 30, False),
     "pr": ("L0", "bypass", 1, 30, False),
 }
 FUNCTIONAL_DEFAULTS = {
@@ -105,7 +107,7 @@ def validate_route(event_name: str, ref: str, inputs: dict) -> str:
 def event_policy(trigger: str, labels=()) -> dict | None:
     """Functional policy of an automatic trigger; release tags and other events run UT only."""
     if trigger == "pr":
-        # `Run tests` wins over `Run functional tests`, as in the upstream workflow.
+        # Match upstream precedence: merge queue, lightweight, then repeated numerics.
         trigger = next((label for label in SCOPE_LABELS if label in labels), "pr")
     elif trigger not in ("push", "merge_group"):
         return None
