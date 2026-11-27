@@ -21,12 +21,12 @@ flowchart TD
 ```
 
 - 同步沿用现有 main 候选 PR / dev 直接发布机制。发布后通过 `sync_request`
-  调用 `ppu-build.yml`，无需依赖 `GITHUB_TOKEN` push 再触发 Actions。
+  调用 `cicd-ppu.yml`，无需依赖 `GITHUB_TOKEN` push 再触发 Actions。
 - 普通 push、同步和无标签 PR：UT quick、FT L0、重复一次、每 case 30 分钟训练预算。
   `Run tests` 选择轻量观察，`Run functional tests` 扩大到 L1。
 - 文档和纯编排 PR 豁免设备；镜像、依赖、执行脚本、recipe、golden 和模型代码仍需测试。
   自动 combined 路径先 UT 后 FT，共用镜像；任一失败则组合失败。
-- 手动 `ppu-build.yml` 支持单 UT bucket、FT assets 或 regression。assets 不训练；
+- 手动 `cicd-ppu.yml` 支持单 UT bucket、FT assets 或 regression。assets 不训练；
   release tag 当前只执行 UT。正式入口只允许 main/dev，临时验证分支另行维护。
 - `ppu-control-tests.yml` 是独立的 CPU 脚本回归，只在相关路径 PR 或手动运行时执行，
   不是每次 Build/UT/FT 的前置 job，也不消耗 PPU。
@@ -97,7 +97,7 @@ python -m pytest -q -o addopts= .github/scripts/tests
 上线后的手动诊断从 main 调度；独立验证分支使用该分支专用入口。每次只选一个 case：
 
 ```bash
-gh workflow run ppu-build.yml --repo flytiger-eco/Megatron-LM-for-sail --ref main \
+gh workflow run cicd-ppu.yml --repo flytiger-eco/Megatron-LM-for-sail --ref main \
   -f test_kind=functional -f functional_mode=assets -f functional_scope=all \
   -f functional_cases=gpt/gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files \
   -f functional_repeat=1 -f functional_timeout=15

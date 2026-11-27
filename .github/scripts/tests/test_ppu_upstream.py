@@ -701,7 +701,7 @@ def test_diagnostic_generates_one_unchanged_upstream_bucket(tmp_path, capsys):
     assert len(matrix["include"]) == 1
     assert matrix["include"][0]["id"] == case_id
     assert matrix["include"][0]["cards"] == 8
-    workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
+    workflow = yaml.safe_load((ROOT / ".github/workflows/cicd-ppu.yml").read_text())
     events = workflow.get("on", workflow.get(True))
     assert events["workflow_dispatch"]["inputs"]["unit_bucket"]["default"] == ""
     assert len(events["workflow_dispatch"]["inputs"]) <= 25

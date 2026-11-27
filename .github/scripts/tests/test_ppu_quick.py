@@ -51,7 +51,7 @@ def context(event="workflow_dispatch", ref=BRANCH):
         "ref": ref,
         "sha": CONTROL_SHA,
         "control_sha": CONTROL_SHA,
-        "workflow_ref": f"{REPOSITORY}/.github/workflows/ppu-build.yml@{ref}",
+        "workflow_ref": f"{REPOSITORY}/.github/workflows/cicd-ppu.yml@{ref}",
         "actor": "maintainer",
         "triggering_actor": "maintainer",
         "run_id": "123",
@@ -386,7 +386,7 @@ def test_authorization_rejects_stale_or_untrusted_inputs(mutation):
     elif mutation == "ref":
         ctx["ref"] = "refs/heads/ci/ppu-validation"
     elif mutation == "workflow":
-        ctx["workflow_ref"] = "attacker/repo/.github/workflows/ppu-build.yml@" + BRANCH
+        ctx["workflow_ref"] = "attacker/repo/.github/workflows/cicd-ppu.yml@" + BRANCH
     elif mutation == "sha":
         pull["head"]["sha"] = "c" * 40
     elif mutation == "closed":
@@ -756,7 +756,7 @@ def test_real_pytest_plugin_reports(tmp_path, source, complete, extra):
 
 
 def test_workflow_trust_and_resource_boundaries():
-    build = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
+    build = yaml.safe_load((ROOT / ".github/workflows/cicd-ppu.yml").read_text())
     execute = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())
     ut = yaml.safe_load((ROOT / ".github/workflows/ppu-ut.yml").read_text())
     events = build.get("on", build.get(True))
@@ -812,7 +812,7 @@ def test_workflow_trust_and_resource_boundaries():
     dockerfile = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
     assert 'install -m 0644 /build/control/ppu_pytest_policy.py' in dockerfile
     assert "install -m 0644 .github/scripts/ppu_pytest_policy.py" not in build_script
-    assert "secrets: inherit" not in (ROOT / ".github/workflows/ppu-build.yml").read_text()
+    assert "secrets: inherit" not in (ROOT / ".github/workflows/cicd-ppu.yml").read_text()
     assert "release-{0}" in build["concurrency"]["group"]
     assert "full-{0}" in build["concurrency"]["group"]
     assert "workflow_dispatch" not in build["concurrency"]["cancel-in-progress"]

@@ -8,6 +8,7 @@ on:
       - '.github/scripts/tests/test_ppu*'
       - '.github/docker/**'
       - '.github/actions/ppu-build-cache/**'
+      - '.github/workflows/cicd-ppu.yml'
       - '.github/workflows/ppu-*.yml'
       - '.github/workflows/copilot-upstream-sync*.yml'
       - '.github/ppu-*.json'

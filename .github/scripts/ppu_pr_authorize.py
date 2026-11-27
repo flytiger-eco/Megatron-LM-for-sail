@@ -155,7 +155,7 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
         "test_kind": test_kind,
     }
     if event_name == "workflow_dispatch":
-        expected_workflow = f"{repository}/.github/workflows/ppu-build.yml@{ref}"
+        expected_workflow = f"{repository}/.github/workflows/cicd-ppu.yml@{ref}"
         if context["workflow_ref"] != expected_workflow:
             raise ValueError("Authorization must originate from the trusted workflow branch")
         for actor in {context["actor"], context["triggering_actor"]}:
@@ -171,7 +171,7 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
                 )
             requested_sha, requested_base = full_sha(requested_sha), full_sha(requested_base)
     elif event_name == "pull_request_target":
-        expected_workflow = f"{repository}/.github/workflows/ppu-build.yml@{BRANCH}"
+        expected_workflow = f"{repository}/.github/workflows/cicd-ppu.yml@{BRANCH}"
         if ref != BRANCH or context["workflow_ref"] != expected_workflow:
             raise ValueError("PR events must use the trusted default main workflow")
         if str(context["run_attempt"]) != "1":

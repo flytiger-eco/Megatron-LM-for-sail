@@ -1,4 +1,4 @@
-name: PPU Build
+name: CICD Megatron-LM (PPU)
 on:
   workflow_call:
     inputs:

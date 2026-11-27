@@ -20,7 +20,7 @@ def test_manual_dispatch_is_bound_to_its_trusted_workflow(branch):
     result = auth.authorize({}, {}, context(ref=ref), FakeGitHub())
     assert result["allowed"] and result["base_ref"] == ref
     wrong = context(ref=ref)
-    wrong["workflow_ref"] = wrong["workflow_ref"].replace("ppu-build.yml", "untrusted.yml")
+    wrong["workflow_ref"] = wrong["workflow_ref"].replace("cicd-ppu.yml", "untrusted.yml")
     with pytest.raises(ValueError, match="trusted"):
         auth.authorize({}, {}, wrong, FakeGitHub())
     assert ci.select_config({"ref": ref}, "workflow_dispatch", {})["scope"] == "quick"
@@ -53,7 +53,7 @@ def test_combined_functional_job_requires_successful_unit_tests():
     assert "test_kind == 'combined' && needs.unit-tests.result == 'success'" in condition
     result = workflow["jobs"]["result"]["steps"][0]["run"]
     assert '[[ "$UT_RESULT" == success && "$UT_ENABLED" == true ]]' in result
-    build = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
+    build = yaml.safe_load((ROOT / ".github/workflows/cicd-ppu.yml").read_text())
     assert build["jobs"]["execute"]["concurrency"] == {
         "group": "sail-ppu-hardware",
         "queue": "max",
@@ -72,7 +72,7 @@ def test_manual_dispatch_cannot_request_a_test_only_combined_route(branch, kind)
     "filename,expected",
     [
         ("docs/usage.rst", True),
-        (".github/workflows/ppu-build.yml", True),
+        (".github/workflows/cicd-ppu.yml", True),
         (".github/scripts/tests/test_ppu_ci.py", True),
         (".github/scripts/ppu_ci_run.sh", False),
         (".github/scripts/ppu_functional_runtime.py", False),
@@ -164,7 +164,7 @@ def test_sync_handoff_uses_published_commit_and_rechecks_before_execution(branch
 def test_sync_handoff_rejects_forged_or_stale_provenance(change):
     request, ctx, api, state = sync_fixture("main")
     if change == "caller":
-        ctx["workflow_ref"] = ctx["workflow_ref"].replace("copilot-upstream-sync", "ppu-build")
+        ctx["workflow_ref"] = ctx["workflow_ref"].replace("copilot-upstream-sync", "cicd-ppu")
     elif change == "ref":
         ctx["ref"] = "refs/heads/dev"
         ctx["workflow_ref"] = ctx["workflow_ref"].replace("refs/heads/main", ctx["ref"])
