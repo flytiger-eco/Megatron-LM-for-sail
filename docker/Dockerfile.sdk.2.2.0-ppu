@@ -54,7 +54,8 @@ from pathlib import Path
 from packaging.requirements import Requirement
 
 native = [
-    'transformer-engine==2.16+v0.1.0.ppu2.2.0',
+    'transformer-engine==2.18.0+v0.2.0.ppu2.2.0',
+    'nvidia-cudnn-frontend==1.26.0',
     'flash-attn==2.8.2+v0.2.0.ppu2.2.0',
     'mamba-ssm==2.3.1+v0.1.0.ppu2.2.0',
     'causal-conv1d==1.7.0+v0.1.0.ppu2.2.0',
@@ -91,7 +92,8 @@ python3 -m pip install --no-build-isolation -r requirements.txt \
 python3 vendor_hashes.py > vendor-after.json
 cmp vendor-before.json vendor-after.json
 
-# Adapt the pinned vendor wheels to Megatron's FLA call and context-parallel padding.
+# Adapt the pinned FLA wheel to Megatron's l2norm call.
+# TE 2.18 already supplies capture-aware context-parallel padding handling.
 python3 -I - <<'PY'
 import importlib.metadata as md
 import sysconfig
@@ -99,14 +101,14 @@ from pathlib import Path
 
 site = Path(sysconfig.get_path('purelib')).resolve()
 
-def patch(package, relative_path, original, replacement, tail=''):
+def patch(package, relative_path, original, replacement):
     path = Path(md.distribution(package).locate_file(relative_path)).resolve()
     if not path.is_relative_to(site):
         raise RuntimeError(f'Patch target is outside the Python installation: {path}')
     source = path.read_text()
     if source.count(original) != 1:
         raise RuntimeError(f'Unexpected content in PPU patch target: {path}')
-    patched = source.replace(original, replacement) + tail
+    patched = source.replace(original, replacement)
     compile(patched, str(path), 'exec')
     path.write_text(patched)
 
@@ -128,22 +130,6 @@ patch(
     if not isinstance(dim, int) or isinstance(dim, bool) or dim not in (-1, x.ndim - 1):
         raise ValueError("PPU FLA Core l2norm only supports the last dimension")
     return L2NormFunction.apply(x, eps, output_dtype)''',
-)
-patch(
-    'transformer-engine', 'transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py',
-    '''            dq[cu_seqlens_q_padded[-1] :].fill_(0)
-            dk[cu_seqlens_kv_padded[-1] :].fill_(0)
-            dv[cu_seqlens_kv_padded[-1] :].fill_(0)''',
-    '''            _ppu_zero_cp_padding(dq, cu_seqlens_q_padded)
-            _ppu_zero_cp_padding(dk, cu_seqlens_kv_padded)
-            _ppu_zero_cp_padding(dv, cu_seqlens_kv_padded)''',
-    '''
-
-def _ppu_zero_cp_padding(gradient, cu_seqlens):
-    indices = torch.arange(gradient.shape[0], device=gradient.device)
-    mask = (indices >= cu_seqlens[-1]).view(-1, *([1] * (gradient.ndim - 1)))
-    gradient.masked_fill_(mask, 0)
-''',
 )
 PY
 python3 -m pip check
