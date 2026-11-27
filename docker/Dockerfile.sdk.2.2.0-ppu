@@ -1,0 +1,215 @@
+# syntax=docker/dockerfile:1.7
+# Self-contained PPU training image: entry scripts live in /opt/megatron-lm and
+# Megatron is installed from a wheel built out of the same checkout.
+# Build from the repository root with docker build -f docker/Dockerfile.sdk.2.2.0-ppu .
+ARG PPU_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch@sha256:cfecb7a38dd83afc6a302f72ad05423863bb892e0ab7b1cc6173ca3b871a133c
+FROM ${PPU_IMAGE} AS dependencies
+USER root
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
+    PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL="" PIP_FIND_LINKS="" \
+    PIP_NO_INPUT=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
+    PYTHONNOUSERSITE=1 MAX_JOBS=16
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git make wget gettext-base \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip uninstall --yes megatron-core cloud-tpu-client protobuf
+
+RUN --mount=type=bind,source=pyproject.toml,target=/run/pyproject.toml <<'PPU_DEPENDENCIES'
+build_dir=$(mktemp -d)
+trap 'rm -rf "$build_dir"' EXIT
+cd "$build_dir"
+
+# Remove the inherited startup hooks before replacing the old Google packages.
+site=$(python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
+find "$site" -maxdepth 1 -name '*.pth' ! -name distutils-precedence.pth -delete
+
+cat > vendor_hashes.py <<'PY'
+import hashlib
+import json
+import sysconfig
+from pathlib import Path
+
+site = Path(sysconfig.get_path('purelib'))
+hashes = {}
+for name in ('torch', 'triton'):
+    package = site / name
+    if not package.is_dir():
+        raise RuntimeError(f'Missing PPU package: {name}')
+    for path in package.rglob('*'):
+        if path.is_file() and path.suffix != '.pyc':
+            with path.open('rb') as stream:
+                hashes[str(path.relative_to(site))] = hashlib.file_digest(stream, 'sha256').hexdigest()
+print(json.dumps(hashes, sort_keys=True))
+PY
+python3 vendor_hashes.py > vendor-before.json
+
+python3 - <<'PY'
+import importlib.metadata as md
+import tomllib
+from pathlib import Path
+
+from packaging.requirements import Requirement
+
+native = [
+    'transformer-engine==2.16+v0.1.0.ppu2.2.0',
+    'flash-attn==2.8.2+v0.2.0.ppu2.2.0',
+    'mamba-ssm==2.3.1+v0.1.0.ppu2.2.0',
+    'causal-conv1d==1.7.0+v0.1.0.ppu2.2.0',
+    'pla==1.0.0+v0.1.0.ppu2.2.0',
+    'fla-core==0.4.1+v0.1.0.ppu2.2.0',
+    'flash-linear-attention==0.4.1+v0.1.0.ppu2.2.0',
+    'emerging-optimizers==0.3.0',
+    'apex==24.4.1+v0.1.0.ppu2.2.0',
+    'nvidia-resiliency-ext==0.6.0',
+]
+base = []
+for name in ('torch', 'triton', 'torchvision', 'scipy', 'scikit-learn'):
+    try:
+        base.append(f'{name}=={md.version(name)}')
+    except md.PackageNotFoundError:
+        if name in ('torch', 'triton'):
+            raise
+project = tomllib.loads(Path('/run/pyproject.toml').read_text())['project']
+requirements = project['dependencies'] + project['optional-dependencies']['training']
+if any('\n' in spec or '\r' in spec or Requirement(spec).url for spec in requirements):
+    raise RuntimeError('Training dependencies must be package requirements from the configured index')
+Path('requirements.txt').write_text('\n'.join(requirements + native) + '\n')
+Path('constraints.txt').write_text('\n'.join(base + native + ['numpy==1.26.4', 'pyarrow==21.0.0']) + '\n')
+PY
+
+export PIP_CONSTRAINT="$build_dir/constraints.txt"
+python3 -m pip install --upgrade 'packaging>=24.2'
+python3 -m pip install 'setuptools>=80' wheel pybind11 ninja click pyyaml numpy
+python3 -m pip install --no-build-isolation -r requirements.txt \
+    wrapt requests tensorstore scipy scikit-learn 'pydantic<2.14' boto3 \
+    'multi-storage-client~=0.50' 'einops~=0.8' 'google-api-python-client>=2' \
+    pyzmq msgpack 'openai[aiohttp]' fastapi uvicorn datasets \
+    'nvidia-modelopt==0.45.0' 'tensorboard==2.20.0' 'google-crc32c==1.7.1' 'pyyaml==6.0.3'
+python3 vendor_hashes.py > vendor-after.json
+cmp vendor-before.json vendor-after.json
+
+# Adapt the pinned vendor wheels to Megatron's FLA call and context-parallel padding.
+python3 -I - <<'PY'
+import importlib.metadata as md
+import sysconfig
+from pathlib import Path
+
+site = Path(sysconfig.get_path('purelib')).resolve()
+
+def patch(package, relative_path, original, replacement, tail=''):
+    path = Path(md.distribution(package).locate_file(relative_path)).resolve()
+    if not path.is_relative_to(site):
+        raise RuntimeError(f'Patch target is outside the Python installation: {path}')
+    source = path.read_text()
+    if source.count(original) != 1:
+        raise RuntimeError(f'Unexpected content in PPU patch target: {path}')
+    patched = source.replace(original, replacement) + tail
+    compile(patched, str(path), 'exec')
+    path.write_text(patched)
+
+patch(
+    'fla-core', 'fla/modules/l2norm.py',
+    '''def l2norm(
+    x: torch.Tensor,
+    eps: float = 1e-6,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    return L2NormFunction.apply(x, eps, output_dtype)''',
+    '''def l2norm(
+    x: torch.Tensor,
+    eps: float = 1e-6,
+    output_dtype: torch.dtype | None = None,
+    *,
+    dim: int = -1,
+) -> torch.Tensor:
+    if not isinstance(dim, int) or isinstance(dim, bool) or dim not in (-1, x.ndim - 1):
+        raise ValueError("PPU FLA Core l2norm only supports the last dimension")
+    return L2NormFunction.apply(x, eps, output_dtype)''',
+)
+patch(
+    'transformer-engine', 'transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py',
+    '''            dq[cu_seqlens_q_padded[-1] :].fill_(0)
+            dk[cu_seqlens_kv_padded[-1] :].fill_(0)
+            dv[cu_seqlens_kv_padded[-1] :].fill_(0)''',
+    '''            _ppu_zero_cp_padding(dq, cu_seqlens_q_padded)
+            _ppu_zero_cp_padding(dk, cu_seqlens_kv_padded)
+            _ppu_zero_cp_padding(dv, cu_seqlens_kv_padded)''',
+    '''
+
+def _ppu_zero_cp_padding(gradient, cu_seqlens):
+    indices = torch.arange(gradient.shape[0], device=gradient.device)
+    mask = (indices >= cu_seqlens[-1]).view(-1, *([1] * (gradient.ndim - 1)))
+    gradient.masked_fill_(mask, 0)
+''',
+)
+PY
+python3 -m pip check
+PPU_DEPENDENCIES
+
+FROM dependencies AS wheel
+RUN --network=none --mount=type=bind,source=.,target=/src,rw \
+    python3 -m pip wheel --no-build-isolation --no-deps --wheel-dir /wheels /src
+
+FROM dependencies AS runtime
+COPY pretrain_gpt.py pretrain_hybrid.py pretrain_mamba.py pretrain_vlm.py \
+    gpt_builders.py hybrid_builders.py mamba_builders.py model_provider.py \
+    /opt/megatron-lm/
+RUN --network=none --mount=from=wheel,source=/wheels,target=/wheels <<'PPU_RUNTIME'
+python3 -m pip install --no-index --no-deps /wheels/*.whl
+python3 -m pip check
+
+# The wheel ships a prebuilt helpers_cpp extension but not the datasets Makefile,
+# so only fall back to building it when the extension is missing.
+python3 -I - <<'PY'
+import importlib.metadata as md
+import sysconfig
+from pathlib import Path
+
+site = Path(sysconfig.get_path('purelib')).resolve()
+
+def patch(package, relative_path, original, replacement):
+    path = Path(md.distribution(package).locate_file(relative_path)).resolve()
+    if not path.is_relative_to(site):
+        raise RuntimeError(f'Patch target is outside the Python installation: {path}')
+    source = path.read_text()
+    if source.count(original) != 1:
+        raise RuntimeError(f'Unexpected content in PPU patch target: {path}')
+    patched = source.replace(original, replacement)
+    compile(patched, str(path), 'exec')
+    path.write_text(patched)
+
+patch(
+    'megatron-core', 'megatron/core/datasets/utils.py',
+    '''def compile_helpers():
+    """Compile C++ helper functions at runtime. Make sure this is invoked on a single process."""
+    import os
+    import subprocess
+
+    command = ["make", "-C", os.path.abspath(os.path.dirname(__file__))]''',
+    '''def compile_helpers():
+    """Compile C++ helper functions at runtime. Make sure this is invoked on a single process."""
+    import os
+    import subprocess
+
+    try:
+        from . import helpers_cpp  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        return
+
+    command = ["make", "-C", os.path.abspath(os.path.dirname(__file__))]''',
+)
+PY
+
+python3 -I -c 'import torch; from megatron.core.datasets.utils import compile_helpers; compile_helpers(); from megatron.core.datasets import helpers_cpp'
+cd /opt/megatron-lm
+python3 -c 'import gpt_builders, hybrid_builders, mamba_builders, model_provider'
+python3 pretrain_gpt.py --help > /dev/null
+PPU_RUNTIME
+WORKDIR /opt/megatron-lm
+ENTRYPOINT []
+CMD ["/bin/bash"]
