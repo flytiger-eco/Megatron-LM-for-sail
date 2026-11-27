@@ -780,6 +780,8 @@ def test_workflow_trust_and_resource_boundaries():
     assert auth.policy.BRANCHES == ("main", "dev")
     assert "github.event_name == 'workflow_dispatch'" not in authorize_if
     assert build["jobs"]["authorize"]["runs-on"] == "ubuntu-latest"
+    control_ref = build["jobs"]["authorize"]["steps"][0]["with"]["ref"]
+    assert build["jobs"]["control-environment"]["steps"][0]["with"]["ref"] == control_ref
     assert execute["jobs"]["configure"]["if"] == "inputs.allowed"
     for name in ("build", "unit-tests"):
         assert "github.run_attempt == 1" in execute["jobs"][name]["if"]
