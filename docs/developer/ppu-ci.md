@@ -118,6 +118,22 @@ convention in the [H100 GPT recipe](../../tests/test_utils/recipes/h100/gpt.yaml
 
 For example, NVIDIA's DEV/H100 file is `golden_values_dev_dgx_h100.json`.
 The upstream launcher exposes `--environment dev|lts` as the PyTorch DEV/LTS choice.
+Here, an environment is the software stack used to run a test: the base container,
+PyTorch, CUDA, and additional libraries such as Transformer Engine.
+
+| NVIDIA environment | Purpose | Version policy |
+|---|---|---|
+| DEV | Validate current development against a newer software stack | Follow the DEV base image and the dependencies in `pyproject.toml` / `uv.lock` |
+| LTS | Check compatibility with an older supported software stack | Retain a separate base image and pinned LTS dependencies; the LTS Dockerfile documents an annual image upgrade |
+
+The base-image versions are recorded in [`.ngc_version.dev`](../../docker/.ngc_version.dev)
+and [`.ngc_version.lts`](../../docker/.ngc_version.lts). The
+[LTS Dockerfile](../../docker/Dockerfile.ci.lts) and
+[LTS requirements](../../docker/lts/requirements.txt) define its additional pins.
+The same Megatron commit can be tested in either software environment. Environment
+and hardware are included in golden names because different libraries and kernels
+can change numerical results and performance.
+
 In the upstream code included here, the GitHub H100/GB200 FT jobs explicitly pass
 `--environment dev`; the GitLab configuration has separate DEV and LTS paths.
 The recipe resolves `GOLDEN_VALUES_PATH`, which `run_ci_test.sh` passes to pytest.
@@ -129,10 +145,17 @@ the L0/L1 test scope. In SAIL, `load_recipes()` explicitly selects `dev` recipes
 `describe_case()` selects `golden_values_dev_m890.json`; see
 [`ppu_functional.py`](../../.github/scripts/ppu_functional.py).
 Both main and dev therefore use the DEV/M890 reference for the selected case;
-the branch name does not switch FT golden files. SAIL currently has no separate
-LTS FT golden-selection path. Its actual runtime is the fixed SAIL SDK image and
-verified bundle described above; the `dev` filename does not select an NVIDIA image.
-Git records baseline revisions, so the filename is not a commit or SDK version.
+the branch name does not switch FT golden files. No separate
+`golden_values_main_m890.json` is expected. The same filename can contain different
+baseline revisions in different Git commits.
+
+SAIL currently uses one SDK-based FT environment, without NVIDIA's separate DEV/LTS
+runtime matrix or an LTS FT golden-selection path. In this adapter, `dev` preserves
+the upstream recipe selection and golden naming convention. The actual software
+stack comes from the fixed SAIL SDK image and verified bundle described above;
+the `dev` filename does not select an NVIDIA image or switch SAIL environments.
+Git records baseline revisions, while image and bundle digests identify the runtime;
+the filename itself is not a commit or SDK version.
 Keep the convention to preserve alignment with upstream recipes and existing assets.
 
 Use the adjacent `model_config.yaml` by default; add `model_config_m890.yaml` only
@@ -279,6 +302,19 @@ PR 优先读自己的同指纹缓存，再读目标分支；PR/候选提交分�
 
 例如 NVIDIA 的 DEV/H100 文件是 `golden_values_dev_dgx_h100.json`。
 上游 launcher 的 `--environment dev|lts` 对应 PyTorch DEV/LTS 环境选择。
+这里的环境是跑测试使用的软件栈，包括基础容器、PyTorch、CUDA，以及 Transformer Engine 等附加依赖。
+
+| NVIDIA 环境 | 用途 | 版本策略 |
+|---|---|---|
+| DEV | 验证当前开发代码在较新软件栈上的行为 | 跟进 DEV 基础镜像及 `pyproject.toml` / `uv.lock` 中的依赖 |
+| LTS | 验证代码对较旧受支持软件栈的兼容性 | 保留独立基础镜像和固定的 LTS 依赖；LTS Dockerfile 说明镜像按年升级 |
+
+基础镜像版本记录在 [`.ngc_version.dev`](../../docker/.ngc_version.dev) 和
+[`.ngc_version.lts`](../../docker/.ngc_version.lts)，额外依赖的固定版本见
+[LTS Dockerfile](../../docker/Dockerfile.ci.lts) 和
+[LTS requirements](../../docker/lts/requirements.txt)。同一个 Megatron commit 可以在两套软件环境中测试。
+不同依赖和 kernel 可能改变数值结果与性能，因此 golden 命名包含环境和硬件两个维度。
+
 本仓库包含的上游代码中，GitHub 的 H100/GB200 FT job 显式传入 `--environment dev`；
 GitLab 配置则分别有 DEV 和 LTS 路径。recipe 解析出 `GOLDEN_VALUES_PATH`，
 再由 `run_ci_test.sh` 传给 pytest，见 [`cicd-main.yml`](../../.github/workflows/cicd-main.yml)
@@ -288,8 +324,13 @@ GitLab 配置则分别有 DEV 和 LTS 路径。recipe 解析出 `GOLDEN_VALUES_P
 SAIL 适配层的 `load_recipes()` 显式筛选 `dev` recipe，`describe_case()` 选择
 `golden_values_dev_m890.json`，见 [`ppu_functional.py`](../../.github/scripts/ppu_functional.py)。
 因此 main 和 dev 分支都使用所选 case 的 DEV/M890 参考值，分支名不会切换 FT golden。
-SAIL 当前没有独立的 LTS FT golden 选择路径；实际运行环境是前述固定 SAIL SDK 镜像和经过校验的
-bundle，文件名中的 `dev` 不会选择 NVIDIA 镜像。基线版本由 Git 记录，文件名不代表 commit 或 SDK 版本。
+无需另建 `golden_values_main_m890.json`；同名文件在不同 Git commit 中可以有不同的基线内容。
+
+SAIL 当前只有一套基于 SDK 的 FT 环境，没有建立 NVIDIA 那样独立的 DEV/LTS 运行环境矩阵，
+也没有 LTS FT golden 选择路径。适配层中的 `dev` 保留了上游 recipe 选取方式和 golden 命名约定。
+实际软件栈来自前述固定 SAIL SDK 镜像和经过校验的 bundle；文件名中的 `dev` 不会选择 NVIDIA 镜像，
+也不会切换 SAIL 运行环境。基线版本由 Git 记录，运行环境由镜像和 bundle digest 标识，
+文件名本身不代表 commit 或 SDK 版本。
 保留该命名是为了与上游 recipe 和已有资产保持一致。
 
 配置默认复用同目录 `model_config.yaml`；只有保留平台参数差异时才提供 `model_config_m890.yaml`。
