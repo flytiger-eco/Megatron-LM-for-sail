@@ -1,0 +1,36 @@
+name: PPU control tests
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - '.github/scripts/ppu*'
+      - '.github/scripts/tests/test_ppu*'
+      - '.github/docker/**'
+      - '.github/actions/ppu-build-cache/**'
+      - '.github/workflows/cicd-ppu.yml'
+      - '.github/workflows/ppu-*.yml'
+      - '.github/workflows/copilot-upstream-sync*.yml'
+      - '.github/ppu-*.json'
+      - 'tests/test_utils/recipes/**'
+      - 'tests/test_utils/python_scripts/recipe_parser.py'
+      - 'tests/functional_tests/**'
+permissions:
+  contents: read
+concurrency:
+  group: ppu-control-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r .github/docker/control-requirements.txt transformers==4.57.3 tokenizers==0.22.2 uv==0.13.0
+      - run: python -m pytest -q -o addopts= .github/scripts/tests

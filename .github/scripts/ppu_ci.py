@@ -9,7 +9,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 CONTROL_ROOT = Path(os.environ.get("PPU_CONTROL_ROOT", Path(__file__).resolve().parents[2]))
 ROOT = Path(os.environ.get("PPU_SOURCE_ROOT", CONTROL_ROOT)).resolve()
@@ -17,6 +17,13 @@ ENVIRONMENTS = ("dev", "lts")
 OUTCOME_ORDER = {"skipped": 0, "passed": 1, "failed": 2}
 RECIPE_PATH = "tests/test_utils/recipes/h100/unit-tests.yaml"
 POLICY_PATH = ".github/ppu-pr-tests.json"
+
+
+_policy_spec = importlib.util.spec_from_file_location(
+    "ppu_policy", Path(__file__).with_name("ppu_policy.py")
+)
+policy = importlib.util.module_from_spec(_policy_spec)
+exec(compile(Path(_policy_spec.origin).read_bytes(), _policy_spec.origin, "exec"), policy.__dict__)
 
 
 def load_policy() -> dict:
@@ -61,7 +68,7 @@ def select_config(event: dict, event_name: str, inputs: dict) -> dict:
     repeat = inputs.get("repeat", 1)
     config["repeat"] = 0 if str(repeat) == "0" else positive(repeat, "repeat", 10)
     config["timeout"] = positive(inputs.get("timeout", 30), "timeout", 1380)
-    policy = load_policy()
+    unit_policy = load_policy()
     scope = inputs.get("scope", "auto")
     family = inputs.get("suite_family", "nvidia-dev")
     if scope not in ("auto", "quick", "full") or family not in ("nvidia-dev", "release-dev-lts"):
@@ -72,20 +79,20 @@ def select_config(event: dict, event_name: str, inputs: dict) -> dict:
         if ref.startswith("refs/tags/v"):
             scope, family, trigger = "full", "release-dev-lts", "release"
             config.update(build=True, unit_test=True, repeat=1)
-        elif ref == "refs/heads/main":
+        elif ref in policy.REFS:
             scope, family, trigger = "auto", "nvidia-dev", "push"
             config.update(build=True, unit_test=True, repeat=1)
         else:
             raise ValueError("Unsupported push ref")
     if event_name == "merge_group":
-        if event["merge_group"]["base_ref"] != "refs/heads/main":
+        if event["merge_group"]["base_ref"] not in policy.REFS:
             raise ValueError("The merge queue base must be main")
         scope, family, trigger = "full", "nvidia-dev", "merge_group"
         config.update(build=True, unit_test=True, repeat=1)
     if event_name == "pull_request_target":
         scope, family, trigger = "auto", "nvidia-dev", "pr"
         pr = event["pull_request"]
-        if pr["base"]["ref"] != "main":
+        if pr["base"]["ref"] not in policy.BRANCHES:
             raise ValueError("The PR base must be main")
         config.update(build=True, unit_test=True, repeat=1)
         if not pr["head"].get("repo") or (
@@ -93,7 +100,7 @@ def select_config(event: dict, event_name: str, inputs: dict) -> dict:
         ):
             config["build"] = False
     if event_name == "workflow_dispatch":
-        if ref != "refs/heads/main":
+        if ref not in policy.REFS:
             raise ValueError("Manual dispatch is only allowed on main")
         number, sha, base = (inputs.get(key, "") for key in ("pr_number", "pr_sha", "pr_base_sha"))
         if any((number, sha, base)) and not all((number, sha, base)):
@@ -105,11 +112,11 @@ def select_config(event: dict, event_name: str, inputs: dict) -> dict:
             family, trigger = "nvidia-dev", "pr"
             config.update(build=True, unit_test=True, repeat=1)
     if scope == "auto":
-        scope = "full" if family == "release-dev-lts" else policy["daily_scope"]
+        scope = "full" if family == "release-dev-lts" else unit_policy["daily_scope"]
     if scope == "quick":
-        if family != "nvidia-dev" or policy["quick_state"] == "unavailable":
+        if family != "nvidia-dev" or unit_policy["quick_state"] == "unavailable":
             raise ValueError("Quick is unavailable for this suite or policy state")
-        if policy["quick_state"] == "candidate" and trigger != "manual":
+        if unit_policy["quick_state"] == "candidate" and trigger != "manual":
             raise ValueError("Candidate quick is limited to non-PR manual validation")
         config["repeat"] = 1
     config.update(scope=scope, suite_family=family, trigger_kind=trigger)
@@ -164,7 +171,8 @@ def unit_cases(config: dict) -> dict:
         raise ValueError("Duplicate UT bucket")
     for bucket in buckets:
         if not re.fullmatch(
-            r"tests/unit_tests/(?:[A-Za-z0-9_]+/)*(?:[A-Za-z0-9_]+\.py|\*\*/\*\.py)", bucket
+            r"(?:tests/unit_tests|examples/multimodal_dev/tests)/(?:[A-Za-z0-9_]+/)*(?:[A-Za-z0-9_]+\.py|\*\*/\*\.py)",
+            bucket,
         ):
             raise ValueError(f"Unsupported UT bucket; refusing to skip silently: {bucket}")
     excluded = policy_exclusions()
@@ -190,7 +198,12 @@ def unit_cases(config: dict) -> dict:
         selected_buckets = [spec["test_case"] for spec in specs]
         if len(selected_buckets) != len(set(selected_buckets)):
             raise ValueError(f"{environment} UT recipe has duplicate matches")
-        if set(selected_buckets) != set(buckets):
+        expected_buckets = {
+            product["test_case"][0]
+            for product in recipe["products"]
+            if any(environment in variant["environment"] for variant in product["products"])
+        }
+        if set(selected_buckets) != expected_buckets:
             raise ValueError(
                 f"{environment} UT recipe has unmatched buckets requiring explicit adaptation"
             )
@@ -199,13 +212,23 @@ def unit_cases(config: dict) -> dict:
         for index, spec in enumerate(sorted(specs, key=lambda row: row["test_case"])):
             bucket = spec["test_case"]
             target = helper.get_base_path(bucket)
+            test_root = ROOT / (
+                "examples/multimodal_dev/tests"
+                if bucket.startswith("examples/multimodal_dev/tests/")
+                else "tests/unit_tests"
+            )
             if not (ROOT / target).exists() or not (ROOT / target).resolve().is_relative_to(
-                ROOT / "tests/unit_tests"
+                test_root
             ):
                 raise ValueError(f"UT path does not exist: {target}")
             cards = positive(spec["gpus"], "gpus")
             if positive(spec["nodes"], "nodes") != 1 or cards not in (1, 2, 4, 8):
                 raise ValueError(f"UT topology requires explicit adaptation: {bucket}")
+            if bucket in policy.UT_PROCESS_OVERRIDES:
+                processes = policy.UT_PROCESS_OVERRIDES[bucket]
+                if cards not in (processes, 8):
+                    raise ValueError(f"Upstream UT process override requires adaptation: {bucket}")
+                cards = processes
             files = {
                 path.relative_to(ROOT).as_posix() for path in ROOT.glob(bucket) if path.is_file()
             }
@@ -217,10 +240,7 @@ def unit_cases(config: dict) -> dict:
                         for path in ROOT.glob(child)
                         if path.is_file()
                     )
-            if any(
-                not (ROOT / path).resolve().is_relative_to(ROOT / "tests/unit_tests")
-                for path in files
-            ):
+            if any(not (ROOT / path).resolve().is_relative_to(test_root) for path in files):
                 raise ValueError("UT file path escapes the unit test root")
             if not files - ignored:
                 raise ValueError(f"Empty UT bucket: {bucket}")
@@ -553,8 +573,8 @@ def case_results(
 
 def result_directory(manifest: dict, directory: Path, case_id: str) -> Path:
     if manifest["config"].get("scope") == "quick":
-        return directory / "ppu-ut-quick" / case_id
-    return directory / f"ppu-ut-{case_id}"
+        return directory / f"{policy.artifact_prefix()}ppu-ut-quick" / case_id
+    return directory / f"{policy.artifact_prefix()}ppu-ut-{case_id}"
 
 
 def read_timing(path: Path, errors: list, suite: bool = False) -> dict:
@@ -644,7 +664,7 @@ def summarize(manifest: dict, directory: Path) -> dict:
     timings = {}
     if manifest["config"].get("scope") == "quick":
         for name in ("build", "suite"):
-            path = directory / "ppu-ut-quick" / f"{name}-timing.json"
+            path = directory / f"{policy.artifact_prefix()}ppu-ut-quick" / f"{name}-timing.json"
             timings[name] = read_timing(path, errors, suite=name == "suite")
     if scope in ("full", "diagnostic") and manifest.get("schema_version", 2) >= 3:
         first = next(iter(manifest["unit"]), None)
@@ -736,9 +756,10 @@ def bundle_inventory(directory: Path) -> dict:
         with path.open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
         inventory[name] = {"size": path.stat().st_size, "sha256": digest}
+    manifest = json.loads((directory / "manifest.json").read_text())
     for name in (
-        "source.tar.gz",
-        "environment.tar.gz",
+        "runtime-image.json",
+        "docker-build.json",
         "manifest.json",
         "commit.txt",
         "control.txt",
@@ -747,9 +768,49 @@ def bundle_inventory(directory: Path) -> dict:
         "control/ppu_ci.py",
         "control/ppu_ci_run.sh",
         "control/ppu_pytest_policy.py",
+        "control/ppu_ci_container.py",
+        "control/ppu_ci_paths.py",
+        "control/ppu_ci_export.py",
     ):
-        if name not in inventory or inventory[name]["size"] == 0:
+        if inventory.get(name, {}).get("size", 0) == 0:
             raise ValueError(f"Missing or empty build artifact: {name}")
+    spec = importlib.util.spec_from_file_location(
+        "ppu_container_inventory", Path(__file__).with_name("ppu_ci_container.py")
+    )
+    environment = importlib.util.module_from_spec(spec)
+    # Inventory validation must not add bytecode to the trusted control tree.
+    exec(compile(Path(spec.origin).read_bytes(), spec.origin, "exec"), environment.__dict__)
+    record = json.loads((directory / "runtime-image.json").read_text())
+    environment.verify_image(
+        SimpleNamespace(
+            artifact=directory,
+            digest=inventory["docker-build.json"]["sha256"],
+            control_sha=manifest["identity"]["control_sha"],
+            target_sha=manifest["identity"]["target_sha"],
+            base_image_digest=record["base_image_digest"],
+            image_digest=(directory / "image.txt").read_text().strip(),
+            source_root=None,
+            check_only=True,
+        )
+    )
+    if manifest.get("test_kind") in ("functional", "combined"):
+        required = [
+            "functional-tools/yq",
+            "functional-tools/envsubst",
+            "functional-environment.json",
+            "functional-package-install.json",
+            "installed-packages.json",
+            "control/ppu_functional_run.sh",
+        ]
+        required += [
+            f"control/ppu_functional{suffix}.py"
+            for suffix in ("", "_results", "_runtime", "_environment", "_pytest", "_hf")
+        ]
+        if manifest["test_kind"] == "combined":
+            required.append("functional-manifest.json")
+        for name in required:
+            if name not in inventory or inventory[name]["size"] == 0:
+                raise ValueError(f"Missing or empty functional build artifact: {name}")
     return inventory
 
 
@@ -771,6 +832,12 @@ def verify_bundle(directory: Path, plan: Path, digest: str) -> None:
         raise ValueError("Build artifacts are missing, truncated, or failed content verification")
     if (directory / "manifest.json").read_bytes() != (plan / "manifest.json").read_bytes():
         raise ValueError("Build artifacts do not match the trusted test plan")
+    combined = json.loads((plan / "manifest.json").read_text()).get("test_kind") == "combined"
+    if combined and (
+        (directory / "functional-manifest.json").read_bytes()
+        != (plan / "functional-manifest.json").read_bytes()
+    ):
+        raise ValueError("Build artifacts do not match the trusted functional plan")
     identity = json.loads((plan / "manifest.json").read_text())["identity"]
     for filename, key in (
         (".complete", "target_sha"),
@@ -825,13 +892,23 @@ def main() -> None:
         event.setdefault("ref", os.environ["GITHUB_REF"])
         inputs = json.loads(os.environ.get("PPU_DEFAULTS", "{}"))
         inputs.update(json.loads(os.environ.get("PPU_INPUTS", "{}")))
-        config = select_config(event, event_name, inputs)
         authorization = json.loads((args.output / "authorization.json").read_text())
+        if authorization.get("sync_request"):
+            event, event_name = {"ref": authorization["base_ref"]}, authorization["event_name"]
+            inputs = {}
+        config = select_config(event, event_name, inputs)
         if authorization["allowed"] is not True:
             config.update(build=False, unit_test=False)
         identity = {
             key: authorization.get(key, "")
-            for key in ("target_sha", "control_sha", "pr_head_sha", "base_sha")
+            for key in (
+                "target_sha",
+                "control_sha",
+                "pr_head_sha",
+                "base_sha",
+                "run_id",
+                "run_attempt",
+            )
         }
         emit("config", json.dumps(config))
         emit("build", config["build"])

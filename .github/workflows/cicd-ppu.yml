@@ -1,0 +1,322 @@
+name: CICD Megatron-LM (PPU)
+on:
+  workflow_call:
+    inputs:
+      artifact_prefix:
+        description: Isolate artifacts and NAS output for main and dev in one synchronization run
+        type: string
+        default: ''
+      sync_request:
+        description: Published commit handoff from the trusted upstream sync workflow
+        type: string
+        required: true
+    secrets:
+      PPU_HOST_VOLUMES:
+        required: false
+      PPU_CPU_RUN_ROOT:
+        required: false
+      PPU_POD_RUN_ROOT:
+        required: false
+      PPU_CPU_ASSETS_ROOT:
+        required: false
+      PPU_POD_ASSETS_ROOT:
+        required: false
+  push:
+    branches: [main, dev]
+    tags: ['v*']
+  pull_request_target:
+    branches: [main, dev]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, edited, closed, labeled, unlabeled]
+  merge_group:
+    types: [checks_requested]
+    branches: [main, dev]
+  workflow_dispatch:
+    inputs:
+      test_kind:
+        description: Unit tests or functional asset/regression checks
+        type: choice
+        options: [unit, functional]
+        default: unit
+      functional_mode:
+        description: Read-only CPU asset preflight or explicitly requested PPU regression
+        type: choice
+        options: [assets, regression]
+        default: assets
+      functional_scope:
+        description: Exact upstream DEV tier, the mr tier, the deduplicated active L0-L3 union, or auto (L1 nightly cadence for regression, all for assets)
+        type: choice
+        options: [all, auto, mr, L0, L1, L2, L3]
+        default: all
+      functional_cases:
+        description: all or comma-separated complete model/case identifiers
+        type: string
+        default: all
+      functional_repeat:
+        description: Independent repetitions per numeric case (1-10)
+        type: number
+        default: 1
+      functional_timeout:
+        description: Total training minutes per case including repeats and retries (1-1380)
+        type: number
+        default: 30
+      scope:
+        description: auto follows the validated policy; full uses a 90% gate; candidate quick uses a 100% gate for non-PR manual validation
+        type: choice
+        options: [auto, quick, full]
+        default: auto
+      suite_family:
+        description: NVIDIA DEV scope or release DEV/LTS scope (PRs always use NVIDIA DEV)
+        type: choice
+        options: [nvidia-dev, release-dev-lts]
+        default: nvidia-dev
+      unit_bucket:
+        description: Exact bucket for non-PR manual DEV/full diagnostics only; leave empty to preserve the original scope
+        type: string
+        default: ''
+      pr_number:
+        description: Maintainer-authorized PR number (provide with full SHAs)
+        type: string
+        default: ''
+      pr_sha:
+        description: Reviewed full 40-character PR head SHA; new commits require reauthorization
+        type: string
+        default: ''
+      pr_base_sha:
+        description: Reviewed full 40-character target branch SHA (required for PR authorization)
+        type: string
+        default: ''
+      build:
+        description: Build artifacts (disabling also skips UT)
+        type: boolean
+        default: true
+      unit_test:
+        description: Run UT
+        type: boolean
+        default: true
+      repeat:
+        description: Full-suite repetitions (0 skips UT; quick always runs once)
+        type: number
+        default: 1
+      timeout:
+        description: Total minutes per full-suite bucket (quick uses fixed group budgets)
+        type: number
+        default: 30
+permissions:
+  contents: read
+concurrency:
+  group: ppu-build-${{ inputs.artifact_prefix }}${{ (github.event_name == 'pull_request_target' && format('preflight-{0}', github.run_id)) || (github.event_name == 'workflow_dispatch' && (inputs.pr_number != '' || inputs.pr_sha != '' || inputs.pr_base_sha != '') && format('preflight-{0}', github.run_id)) || (startsWith(github.ref, 'refs/tags/v') && format('release-{0}', github.ref)) || (github.event_name == 'workflow_dispatch' && format('full-{0}', github.run_id)) || format('daily-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v') || github.event_name == 'merge_group' }}
+jobs:
+  authorize:
+    if: >-
+      vars.PPU_CI_ENABLED == 'true' &&
+      (contains(fromJSON('["refs/heads/main","refs/heads/dev"]'), github.ref) ||
+       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+       (github.event_name == 'merge_group' && contains(fromJSON('["refs/heads/main","refs/heads/dev"]'), github.event.merge_group.base_ref))) &&
+      !(github.event_name == 'pull_request_target' && github.event.action == 'edited' && !github.event.changes.base) &&
+      !(github.event_name == 'pull_request_target' &&
+        contains(fromJSON('["labeled","unlabeled"]'), github.event.action) &&
+        !contains(fromJSON('["Run tests","Run functional tests"]'), github.event.label.name))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      allowed: ${{ steps.authorize.outputs.allowed }}
+      target_sha: ${{ steps.authorize.outputs.target_sha }}
+      control_sha: ${{ steps.authorize.outputs.control_sha }}
+      pr_number: ${{ steps.authorize.outputs.pr_number }}
+      manual_pr: ${{ steps.authorize.outputs.manual_pr }}
+      decision: ${{ steps.authorize.outputs.decision }}
+      test_kind: ${{ steps.authorize.outputs.test_kind }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.workflow_sha }}
+          path: control
+          persist-credentials: false
+      - name: Resolve admission, test scope and source SHA
+        id: authorize
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PPU_INPUTS: ${{ toJSON(inputs) }}
+          PPU_ARTIFACT_PREFIX: ${{ inputs.artifact_prefix || '' }}
+          PPU_SYNC_REQUEST: ${{ inputs.sync_request || '' }}
+          PPU_CONTROL_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.workflow_sha }}
+          PPU_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          python3 -I control/.github/scripts/ppu_pr_authorize.py authorize
+          mkdir -p .ppu-ci/control
+          cp control/.github/scripts/{ppu_pr_authorize.py,ppu_policy.py,ppu_ci_paths.py,ppu_ci_export.py} .ppu-ci/control/
+      - name: Export checked public evidence
+        id: public-authorize-140
+        env:
+          EXPORT_SOURCE: .ppu-ci/
+        run: python3 -I control/.github/scripts/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/authorize-140 --kind evidence
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.public-authorize-140.outcome == 'success' }}
+        with:
+          name: ${{ inputs.artifact_prefix }}ppu-authorization
+          path: .ppu-public/authorize-140/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+  pr-pending:
+    needs: authorize
+    if: needs.authorize.outputs.pr_number != '0' && needs.authorize.outputs.decision != 'ignore'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      statuses: write
+    outputs:
+      status_result: ${{ steps.status.outputs.status_result }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}ppu-authorization
+          path: .ppu-ci
+      - id: status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .ppu-ci/control/ppu_pr_authorize.py status
+  invalidate-base:
+    needs: authorize
+    if: github.event_name == 'push' && contains(fromJSON('["refs/heads/main","refs/heads/dev"]'), github.ref)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      statuses: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}ppu-authorization
+          path: .ppu-ci
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .ppu-ci/control/ppu_pr_authorize.py invalidate-base
+  control-environment:
+    needs: [authorize, pr-pending]
+    if: >-
+      always() && !cancelled() && needs.authorize.result == 'success' &&
+      needs.authorize.outputs.allowed == 'true' &&
+      (needs.authorize.outputs.pr_number == '0' ||
+       (needs.pr-pending.result == 'success' && needs.pr-pending.outputs.status_result == 'published'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      packages: write
+    outputs:
+      control_image: ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci-control@${{ steps.control.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.workflow_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}ppu-authorization
+          path: .ppu-ci
+      - name: Revalidate authorization before accessing build cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I control/.github/scripts/ppu_pr_authorize.py guard
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build the trusted CPU control image
+        id: control
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0, matching upstream
+        with:
+          context: control/.github/docker
+          file: control/.github/docker/Dockerfile.ppu-control
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci-control:run-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.authorize.outputs.control_sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/flytiger-eco/Megatron-LM-for-sail
+            org.opencontainers.image.revision=${{ needs.authorize.outputs.control_sha }}
+          cache-from: type=gha,scope=ppu-control
+          cache-to: type=gha,scope=ppu-control,mode=max
+  execute:
+    needs: [authorize, pr-pending, control-environment]
+    if: >-
+      always() && !cancelled() && needs.authorize.result == 'success' &&
+      needs.authorize.outputs.allowed == 'true' && needs.control-environment.result == 'success' &&
+      (needs.authorize.outputs.pr_number == '0' ||
+       (needs.pr-pending.result == 'success' && needs.pr-pending.outputs.status_result == 'published'))
+    concurrency:
+      group: sail-ppu-hardware
+      queue: max
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      packages: write
+    uses: ./.github/workflows/ppu-execute.yml
+    secrets:
+      PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+      PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+      PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+      PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+      PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
+    with:
+      artifact_prefix: ${{ inputs.artifact_prefix || '' }}
+      allowed: ${{ needs.authorize.outputs.allowed == 'true' }}
+      target_sha: ${{ needs.authorize.outputs.target_sha }}
+      control_sha: ${{ needs.authorize.outputs.control_sha }}
+      manual_pr: ${{ needs.authorize.outputs.manual_pr == 'true' }}
+      request_inputs: ${{ toJSON(inputs) }}
+      control_image: ${{ needs.control-environment.outputs.control_image }}
+  pr-result:
+    needs: [authorize, pr-pending, execute]
+    if: >-
+      always() && needs.authorize.result == 'success' &&
+      needs.authorize.outputs.allowed == 'true' && needs.authorize.outputs.pr_number != '0' &&
+      github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      statuses: write
+    steps:
+      - uses: actions/download-artifact@v4
+        if: always()
+        with:
+          name: ${{ inputs.artifact_prefix }}ppu-authorization
+          path: .ppu-ci
+      - id: cancellation
+        if: cancelled()
+        run: echo 'cancelled=true' >> "$GITHUB_OUTPUT"
+      - if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANCELLED: ${{ steps.cancellation.outputs.cancelled == 'true' || needs.execute.result == 'cancelled' }}
+          PENDING_RESULT: ${{ needs.pr-pending.result }}
+          STATE: ${{ needs.pr-pending.result == 'success' && needs.execute.result == 'success' && needs.execute.outputs.execution_success == 'true' && 'success' || 'failure' }}
+          DESCRIPTION: PPU ${{ needs.execute.outputs.scope }} check finished; gate ${{ needs.execute.outputs.threshold_percent }}%${{ needs.execute.outputs.functional_label && format('; {0}', needs.execute.outputs.functional_label) || '' }}
+        run: |
+          if [[ "$CANCELLED" == true ]]; then
+            python3 -I .ppu-ci/control/ppu_pr_authorize.py status --state error --cancelled --description 'PPU run cancelled; revalidate'
+          elif [[ "$PENDING_RESULT" != success ]]; then
+            python3 -I .ppu-ci/control/ppu_pr_authorize.py status --state error --description 'PPU status initialization failed; tests not started'
+          else
+            python3 -I .ppu-ci/control/ppu_pr_authorize.py status --state "$STATE" --description "$DESCRIPTION"
+          fi

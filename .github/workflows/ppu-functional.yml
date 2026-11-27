@@ -1,0 +1,226 @@
+name: PPU Functional
+on:
+  workflow_call:
+    secrets:
+      PPU_HOST_VOLUMES:
+        required: false
+      PPU_CPU_RUN_ROOT:
+        required: false
+      PPU_POD_RUN_ROOT:
+        required: false
+      PPU_CPU_ASSETS_ROOT:
+        required: false
+      PPU_POD_ASSETS_ROOT:
+        required: false
+    inputs:
+      artifact_prefix:
+        description: Isolate artifacts and NAS output for main and dev in one synchronization run
+        type: string
+        default: ''
+      matrix:
+        type: string
+        required: true
+      bundle_digest:
+        type: string
+        required: true
+      target_sha:
+        type: string
+        required: true
+      control_sha:
+        type: string
+        required: true
+      control_image:
+        type: string
+        required: true
+      environment_digest:
+        type: string
+        required: true
+      runtime_image_digest:
+        type: string
+        required: true
+      base_image_digest:
+        type: string
+        required: true
+permissions:
+  contents: read
+  packages: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    environment: ppu-ci
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      packages: read
+    container:
+      image: ${{ inputs.control_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+    timeout-minutes: ${{ matrix.job_minutes }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.control_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}ppu-plan
+          path: .ppu-ci
+      - name: Verify current PR ownership before requesting PPU for this case
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .ppu-ci/control/ppu_pr_authorize.py guard
+      - name: Record action request time
+        id: timing
+        shell: bash
+        run: printf 'requested_at=%s\n' "$(date +%s)" >> "$GITHUB_OUTPUT"
+      - name: Validate trusted runtime directories
+        env:
+          PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+          PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+          PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+          PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+          PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
+        run: python3 -I .ppu-ci/control/ppu_ci_paths.py functional
+      - name: Verify SDK runtime handoff before requesting PPU
+        env:
+          PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+        run: >-
+          python3 -I control/.github/scripts/ppu_ci_container.py verify-image
+          --artifact "$PPU_CPU_RUN_ROOT/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build"
+          --digest '${{ inputs.environment_digest }}'
+          --control-sha '${{ inputs.control_sha }}' --target-sha '${{ inputs.target_sha }}'
+          --image-digest '${{ inputs.runtime_image_digest }}'
+          --base-image-digest '${{ inputs.base_image_digest }}' --check-only
+      - name: Run unchanged upstream functional case on eight PPU cards
+        id: ppu
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          image: ${{ inputs.runtime_image_digest }}
+          nnodes: 0
+          nproc_per_node: 8
+          namespace: ${{ vars.PPU_NAMESPACE || 'ppu-sched' }}
+          node_selector: "board-type=ZW-M890P"
+          host_volumes: ${{ secrets.PPU_HOST_VOLUMES }}
+          source_dir: /opt/megatron-lm
+          artifact_paths: .ppu-ci
+          timeout_minutes: ${{ matrix.action_minutes }}
+          cleanup_policy: always
+          dmesg_policy: on_failure
+          container_options: |
+            shm_size: "64Gi"
+          extra_env: PPU_TARGET_SHA=${{ inputs.target_sha }},PPU_CONTROL_SHA=${{ inputs.control_sha }},PPU_SOURCE_ROOT=/opt/ppu-ci-source,PPU_CONTROL_DIR=/opt/megatron-lm/.ppu-ci/control,PPU_ARTIFACT_DIR=/opt/megatron-lm/.ppu-bundle,PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build,PPU_RUNTIME_ARCHIVE=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/runtime/environment.tar.gz,PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }},PPU_ENVIRONMENT_DIGEST=${{ inputs.environment_digest }},PPU_IMAGE_DIGEST=${{ inputs.runtime_image_digest }},PPU_BASE_IMAGE_DIGEST=${{ inputs.base_image_digest }},PPU_RESULTS_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }},PPU_POD_ASSETS_ROOT=${{ secrets.PPU_POD_ASSETS_ROOT }}
+          command: |
+            set -euo pipefail
+            cd /opt/megatron-lm
+            [[ -d "$PPU_BUNDLE_DIR" ]]
+            mkdir .ppu-bundle
+            cp -a "$PPU_BUNDLE_DIR/." .ppu-bundle/
+            python3 -I -B "$PPU_CONTROL_DIR/ppu_ci.py" verify-bundle \
+              --output "$PPU_ARTIFACT_DIR" --plan .ppu-ci --bundle-digest "$PPU_BUNDLE_DIGEST"
+            [[ "$(< "$PPU_ARTIFACT_DIR/commit.txt")" == "$PPU_TARGET_SHA" ]]
+            [[ "$(< "$PPU_ARTIFACT_DIR/control.txt")" == "$PPU_CONTROL_SHA" ]]
+            bash "$PPU_CONTROL_DIR/ppu_functional_run.sh" '${{ matrix.id }}'
+      - name: Record execution and scheduling envelope
+        if: always()
+        shell: bash
+        env:
+          REQUESTED_AT: ${{ steps.timing.outputs.requested_at }}
+          ACTION_OUTCOME: ${{ steps.ppu.outcome }}
+          ACTION_STATUS: ${{ steps.ppu.outputs.job_status }}
+          ACTION_OUTPUTS: ${{ toJSON(steps.ppu.outputs) }}
+          RESULT_DIR: .ppu-action
+        run: |
+          mkdir -p "$RESULT_DIR"
+          ACTION_OUTPUTS=$(python3 -I .ppu-ci/control/ppu_ci_export.py --action-outputs)
+          printf '{"requested_at":%s,"completed_at":%s,"action_outcome":"%s","action_status":"%s","outputs":%s}\n' \
+            "${REQUESTED_AT:-0}" "$(date +%s)" "$ACTION_OUTCOME" "$ACTION_STATUS" "$ACTION_OUTPUTS" > "$RESULT_DIR/action-timing.json"
+      - name: Export checked public evidence
+        id: public-test-152
+        if: ${{ always() && !cancelled() }}
+        env:
+          PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+          PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+          PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+          PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+          PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
+          EXPORT_SOURCE: ${{ secrets.PPU_CPU_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/functional/${{ matrix.id }}
+        run: >-
+          python3 -I .ppu-ci/control/ppu_ci_export.py
+          --source "$EXPORT_SOURCE" --destination .ppu-public/test-152 --kind evidence --overlay .ppu-action
+      - name: Upload declared reports, actual values and text logs
+        uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.public-test-152.outcome == 'success' }}
+        with:
+          name: ${{ inputs.artifact_prefix }}${{ matrix.id }}
+          path: .ppu-public/test-152/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+      - name: Check action execution completeness
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        env:
+          PPU_STATUS: ${{ steps.ppu.outputs.job_status }}
+          PPU_OUTCOME: ${{ steps.ppu.outcome }}
+        run: '[[ "$PPU_OUTCOME" == success && "$PPU_STATUS" == succeeded ]]'
+  result:
+    name: Functional integrity and 100% numeric gate
+    needs: test
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.control_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.control_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}ppu-plan
+          path: .ppu-ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact_prefix }}functional-*
+          path: results
+      - name: Require complete upstream pytest results for every repetition
+        env:
+          PPU_ARTIFACT_PREFIX: ${{ inputs.artifact_prefix }}
+        run: |
+          python3 -I .ppu-ci/control/ppu_functional_results.py \
+            --manifest .ppu-ci/manifest.json --results results
+      - name: Require successful execution and artifact upload for every matrix job
+        if: ${{ always() && !cancelled() }}
+        env:
+          MATRIX_RESULT: ${{ needs.test.result }}
+        run: '[[ "$MATRIX_RESULT" == success ]]'
+      - name: Export checked public evidence
+        id: public-result-208
+        if: ${{ always() && !cancelled() }}
+        env:
+          EXPORT_SOURCE: results/summary.json
+        run: 'python3 -I .ppu-ci/control/ppu_ci_export.py --source "$EXPORT_SOURCE" --destination .ppu-public/result-208 --kind evidence'
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.public-result-208.outcome == 'success' }}
+        with:
+          name: ${{ inputs.artifact_prefix }}ppu-functional-summary
+          path: .ppu-public/result-208/
+          if-no-files-found: error
+          retention-days: 7

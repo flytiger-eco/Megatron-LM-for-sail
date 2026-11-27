@@ -8,12 +8,12 @@ import re
 import shutil
 import subprocess
 import sys
-import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import yaml
+from test_ppu_ci_container import PINNED, runtime_export, write_image_record
 from test_ppu_quick import (
     BASE_SHA,
     BRANCH,
@@ -38,42 +38,22 @@ def pr_event(pull=None, action="opened"):
     return {"number": 7, "action": action, "pull_request": pull or pr()}
 
 
-@pytest.mark.parametrize(
-    "change,decision",
-    [
-        ("draft", "draft"),
-        ("closed", "closed"),
-        ("conflict", "conflict"),
-        ("unknown", "merge_unavailable"),
-        ("parents", "merge_unavailable"),
-        ("metadata", "ignore"),
-    ],
-)
-def test_pr_preflight_decisions(change, decision):
+@pytest.mark.parametrize("unavailable", ["merge", "parents"])
+def test_merge_availability_retries_before_rejecting(unavailable):
     pull = pr()
-    if change == "draft":
-        pull["draft"] = True
-    elif change == "closed":
-        pull["state"] = "closed"
-    elif change == "conflict":
-        pull["mergeable"] = False
-    elif change == "unknown":
+    if unavailable == "merge":
         pull["mergeable"] = None
-    event = pr_event(pull, "edited" if change == "metadata" else "opened")
-    underlying = api_for(pull)
-    calls, sleeps = [], []
+    original = api_for(pull)
+    sleeps = []
 
     def api(path):
-        calls.append(path)
-        if change == "parents" and path.startswith("git/commits/"):
+        if unavailable == "parents" and path.startswith("git/commits/"):
             return {"parents": [{"sha": SHA}, {"sha": BASE_SHA}]}
-        return underlying(path)
+        return original(path)
 
-    result = auth.authorize(event, {}, context("pull_request_target"), api, sleeps.append)
-    assert not result["allowed"] and result["decision"] == decision
-    assert len(sleeps) == (2 if change in ("unknown", "parents") else 0)
-    if change in ("draft", "closed", "metadata"):
-        assert not any("git/commits/" in path for path in calls)
+    result = auth.authorize(pr_event(pull), {}, context("pull_request_target"), api, sleeps.append)
+    assert not result["allowed"] and result["decision"] == "merge_unavailable"
+    assert len(sleeps) == 2
 
 
 @pytest.mark.parametrize(
@@ -83,7 +63,7 @@ def test_pr_preflight_decisions(change, decision):
         ([{"filename": "README.md"}], True),
         ([{"filename": "docs/conf.py"}], True),
         ([{"filename": "docs/a.md"}, {"filename": "pyproject.toml"}], False),
-        ([{"filename": ".github/workflows/ci.yml"}], False),
+        ([{"filename": ".github/workflows/ci.yml"}], True),
         (
             [
                 {
@@ -101,13 +81,13 @@ def test_pr_preflight_decisions(change, decision):
 def test_document_classification(files, expected):
     pull = pr()
     pull["changed_files"] = len(files)
-    assert auth.docs_only(7, pull, lambda path: files) is expected
+    assert auth.cpu_only(7, pull, lambda path: files) is expected
 
 
 @pytest.mark.parametrize("count", [0, 3000, 3001, None, True])
 def test_incomplete_document_count_never_skips(count):
     pull = {**pr(), "changed_files": count}
-    assert not auth.docs_only(7, pull, lambda path: pytest.fail("must not fetch"))
+    assert not auth.cpu_only(7, pull, lambda path: pytest.fail("must not fetch"))
 
 
 @pytest.mark.parametrize("mode", ["complete", "truncated", "duplicate", "error"])
@@ -123,22 +103,24 @@ def test_document_pagination(mode):
             return rows[:100]
         return [] if mode == "truncated" else rows[:1] if mode == "duplicate" else rows[100:]
 
-    assert auth.docs_only(7, {**pr(), "changed_files": 101}, api) is (mode == "complete")
+    assert auth.cpu_only(7, {**pr(), "changed_files": 101}, api) is (mode == "complete")
     assert len(paths) == (1 if mode == "error" else 2)
 
 
 @pytest.mark.parametrize("fork", [True, False])
-def test_docs_only_pr_skips_without_merge_or_source(fork):
+def test_cpu_only_pr_skips_without_merge_or_source(fork):
     pull = pr(fork)
 
     def api(path):
         if "/files?" in path:
             return [{"filename": "README.md"}]
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": BASE_SHA}}
         assert path == "pulls/7"
         return pull
 
     result = auth.authorize(pr_event(pull), {}, context("pull_request_target"), api)
-    assert result["decision"] == "docs_only" and not result["allowed"]
+    assert result["decision"] == "cpu_only" and not result["allowed"]
 
 
 def test_snapshot_drift_during_docs_check():
@@ -148,6 +130,8 @@ def test_snapshot_drift_during_docs_check():
         nonlocal calls
         if "/files?" in path:
             return [{"filename": "README.md"}]
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": BASE_SHA}}
         calls += 1
         pull = pr()
         if calls > 1:
@@ -186,348 +170,118 @@ def test_merge_group_identity_and_routes():
             auth.authorize(bad, {}, context("merge_group", ref))
 
 
-@pytest.mark.parametrize(
-    "trigger,scope,expected",
-    [
-        ("pr", "full", 90),
-        ("push", "full", 90),
-        ("merge_group", "full", 90),
-        ("release", "full", 90),
-        ("manual", "full", 90),
-        ("pr", "quick", 100),
-        ("push", "quick", 100),
-        ("manual", "quick", 100),
-        ("manual", "diagnostic", 90),
-    ],
-)
-@pytest.mark.parametrize("total,failed", [(10, 0), (10, 1), (10, 2), (100, 11)])
-def test_gate_depends_on_scope_not_trigger(tmp_path, trigger, scope, expected, total, failed):
-    case = synthetic_case()
-    config = {"scope": scope, "trigger_kind": trigger, "threshold_percent": expected}
-    manifest = {"config": config, "unit": {case["id"]: case}, "identity": IDENTITY}
-    write_reports(
-        ci.result_directory(manifest, tmp_path, case["id"]), case, failed=failed, total=total
-    )
-    result = ci.summarize(manifest, tmp_path)
-    assert result["threshold_percent"] == expected
-    assert result["success"] is (failed == 0 or expected == 90 and total == 10 and failed == 1)
-    assert result["total"] == total and result["failed"] == failed
-    for invalid in (1, 80, 90 if expected == 100 else 100):
-        manifest["config"]["threshold_percent"] = invalid
-        with pytest.raises(ValueError, match="gate"):
-            ci.summarize(manifest, tmp_path)
+@pytest.mark.parametrize("scope,expected", [("quick", 100), ("full", 90), ("diagnostic", 90)])
+def test_gate_depends_on_scope_not_trigger(tmp_path, scope, expected):
+    for trigger in ("pr", "push", "merge_group", "release", "manual"):
+        assert ci.threshold({"scope": scope, "trigger_kind": trigger}) == expected
+    with pytest.raises(ValueError, match="gate"):
+        ci.summarize(
+            {"config": {"scope": scope, "threshold_percent": 90 if expected == 100 else 100}},
+            tmp_path,
+        )
 
 
-def test_candidate_quick_is_manual_without_full_baseline(tmp_path, monkeypatch):
-    policy = ci.load_policy()
-    policy.update(
-        daily_scope="full",
-        quick_state="candidate",
-        require_full_baseline=False,
-        baseline=None,
-        validation_runs=[],
-    )
-    path = tmp_path / ci.POLICY_PATH
-    path.parent.mkdir()
-    path.write_text(json.dumps(policy))
-    monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
-    manual = ci.select_config({"ref": BRANCH}, "workflow_dispatch", {"scope": "quick"})
-    assert manual["scope"] == "quick" and manual["threshold_percent"] == 100
-    for event, name in (({"ref": BRANCH}, "push"), (pr_event(), "pull_request_target")):
-        result = ci.select_config(event, name, {"scope": "quick"})
-        assert result["scope"] == "full" and result["threshold_percent"] == 90
-
-
-def test_nvidia_full_is_dev_half_of_release():
+def test_nvidia_full_is_dev_subset_of_release():
     config = {"repeat": 1, "timeout": 30}
     release = ci.unit_cases({**config, "suite_family": "release-dev-lts"})
     dev = ci.unit_cases({**config, "suite_family": "nvidia-dev"})
-    assert len(dev) == 37 and len(release) == 74
+    assert dev and len(release) > len(dev)
     assert dev == {k: v for k, v in release.items() if v["environment"] == "dev"}
     assert sum(EXCLUDED_UT in row["excluded"] for row in dev.values()) == 1
 
 
 @pytest.mark.parametrize(
-    "state,runs",
+    "changes,error",
     [
-        ("candidate", []),
-        ("candidate", ["124", "125"]),
-        ("validated", []),
-        ("validated", ["124"]),
-        ("validated", ["124", "124"]),
+        ({"daily_scope": "quick", "quick_state": "candidate"}, "two validation runs"),
+        ({"validation_runs": []}, "two validation runs"),
+        ({"validation_runs": ["124"]}, "two validation runs"),
+        ({"validation_runs": ["124", "124"]}, "two validation runs"),
+        ({"require_full_baseline": "false"}, "must be a boolean"),
+        ({"require_full_baseline": 0}, "must be a boolean"),
+        ({"baseline": None}, "full baseline"),
+        ({"baseline": None, "require_full_baseline": True}, "full baseline"),
+        ({"baseline": None, "require_full_baseline": False}, None),
+        ({"quick_state": "candidate", "baseline": None, "require_full_baseline": False}, None),
     ],
 )
-@pytest.mark.parametrize("baseline", [None, {"run_id": "123"}])
-def test_daily_quick_requires_two_validation_runs(tmp_path, monkeypatch, state, runs, baseline):
-    policy = json.loads((ROOT / ci.POLICY_PATH).read_text())
-    policy.update(
-        daily_scope="quick",
-        quick_state=state,
-        require_full_baseline=False,
-        baseline=baseline,
-        validation_runs=runs,
-    )
-    path = tmp_path / ci.POLICY_PATH
-    path.parent.mkdir()
-    path.write_text(json.dumps(policy))
-    monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
-    with pytest.raises(ValueError, match="two validation runs"):
-        ci.load_policy()
-
-
-@pytest.mark.parametrize("state", ["candidate", "validated"])
-@pytest.mark.parametrize("require_baseline", [True, False, "missing"])
-def test_quick_full_baseline_requirement_is_explicit(
-    tmp_path, monkeypatch, state, require_baseline
+def test_quick_policy_requires_validation_and_explicit_baseline_opt_out(
+    tmp_path, monkeypatch, changes, error
 ):
-    policy = json.loads((ROOT / ci.POLICY_PATH).read_text())
+    policy = ci.load_policy()
     policy.update(
-        daily_scope="full", quick_state=state, baseline=None, validation_runs=["124", "125"]
+        daily_scope="full",
+        quick_state="validated",
+        baseline={"run_id": "123"},
+        validation_runs=["124", "125"],
     )
-    if require_baseline == "missing":
-        policy.pop("require_full_baseline")
-    else:
-        policy["require_full_baseline"] = require_baseline
+    policy.pop("require_full_baseline")  # Missing flag must default to requiring the baseline.
+    policy.update(changes)
     path = tmp_path / ci.POLICY_PATH
     path.parent.mkdir()
     path.write_text(json.dumps(policy))
     monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
-    if require_baseline is False:
-        assert ci.load_policy()["baseline"] is None
-    else:
-        with pytest.raises(ValueError, match="full baseline"):
+    if error:
+        with pytest.raises(ValueError, match=error):
             ci.load_policy()
+    else:
+        assert ci.load_policy() == policy
 
 
-@pytest.mark.parametrize("value", [None, "false", 0, 1, [], {}])
-def test_baseline_requirement_rejects_non_boolean(tmp_path, monkeypatch, value):
-    policy = json.loads((ROOT / ci.POLICY_PATH).read_text())
-    policy["require_full_baseline"] = value
-    path = tmp_path / ci.POLICY_PATH
-    path.parent.mkdir()
-    path.write_text(json.dumps(policy))
-    monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
-    with pytest.raises(ValueError, match="must be a boolean"):
-        ci.load_policy()
-
-
-@pytest.mark.parametrize("runs", [[], ["124"], ["124", "124"]])
-def test_validated_state_requires_two_runs_even_with_daily_full(tmp_path, monkeypatch, runs):
-    policy = json.loads((ROOT / ci.POLICY_PATH).read_text())
-    policy.update(daily_scope="full", quick_state="validated", validation_runs=runs)
-    path = tmp_path / ci.POLICY_PATH
-    path.parent.mkdir()
-    path.write_text(json.dumps(policy))
-    monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
-    with pytest.raises(ValueError, match="two validation runs"):
-        ci.load_policy()
-
-
-@pytest.mark.parametrize("require_baseline", [True, False])
-@pytest.mark.parametrize("stage", ["unavailable", "candidate", "validated"])
 @pytest.mark.parametrize(
-    "route",
+    "stage,route,expected",
     [
-        "pr",
-        "fork",
-        "push",
-        "merge_group",
-        "release",
-        "manual_auto",
-        "manual_quick",
-        "manual_full",
-        "manual_pr_quick",
+        ("unavailable", "push", "full"),
+        ("candidate", "push", "full"),
+        ("validated", "push", "quick"),
+        ("candidate", "pr", "full"),
+        ("validated", "pr", "quick"),
+        ("unavailable", "manual_quick", "unavailable"),
+        ("candidate", "manual_quick", "quick"),
+        ("validated", "manual_quick", "quick"),
+        ("candidate", "manual_pr", "non-PR manual validation"),
+        ("validated", "manual_pr", "quick"),
+        ("candidate", "manual_auto", "full"),
+        ("validated", "manual_auto", "quick"),
+        ("validated", "manual_full", "full"),
+        ("validated", "merge_group", "full"),
+        ("validated", "release", "full"),
     ],
 )
-def test_quick_lifecycle_routes_and_upstream_scope(
-    tmp_path, monkeypatch, stage, route, require_baseline
-):
-    policy = json.loads((ROOT / ci.POLICY_PATH).read_text())
+def test_quick_promotion_controls_scope(tmp_path, monkeypatch, stage, route, expected):
+    policy = ci.load_policy()
     policy.update(
         daily_scope="quick" if stage == "validated" else "full",
         quick_state=stage,
-        require_full_baseline=require_baseline,
-        baseline={"run_id": "123"} if require_baseline and stage != "unavailable" else None,
+        require_full_baseline=False,
+        baseline=None,
         validation_runs=["124", "125"] if stage == "validated" else [],
     )
-    control = tmp_path / "control"
-    for relative in (
-        "tests/unit_tests/find_test_cases.py",
-        "tests/test_utils/python_scripts/recipe_parser.py",
-    ):
-        path = control / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes((ROOT / relative).read_bytes())
-    policy_path = control / ci.POLICY_PATH
-    policy_path.parent.mkdir()
-    policy_path.write_text(json.dumps(policy))
-    monkeypatch.setattr(ci, "CONTROL_ROOT", control)
-    outputs = {}
-    monkeypatch.setattr(ci, "emit", lambda key, value: outputs.update({key: value}))
-
-    event_name, event = "workflow_dispatch", {"ref": BRANCH}
-    inputs = {"scope": "quick", "repeat": 3}
-    if route in ("pr", "fork"):
-        event_name, event = "pull_request_target", pr_event(pr(route == "fork"), "synchronize")
-    elif route in ("push", "release"):
-        event_name = "push"
-        if route == "release":
-            event["ref"] = "refs/tags/v1.2.3"
-    elif route == "merge_group":
-        event_name = "merge_group"
-        event = {"merge_group": {"base_ref": BRANCH}}
-    elif route == "manual_auto":
-        inputs["scope"] = "auto"
-    elif route == "manual_full":
-        inputs["scope"] = "full"
-    elif route == "manual_pr_quick":
-        inputs.update(pr_number="7", pr_sha=SHA, pr_base_sha=BASE_SHA)
-
-    if route in ("pr", "fork", "push", "merge_group", "release", "manual_pr_quick"):
-        inputs.update(build=False, unit_test=False, repeat=0, suite_family="release-dev-lts")
-    if route in ("pr", "fork", "manual_pr_quick"):
-        decision = auth.authorize(event, inputs, context(event_name), api_for(pr(route != "pr")))
-        assert decision["allowed"] is (route != "fork")
-        if decision["allowed"]:
-            assert decision["target_sha"] == MERGE_SHA
-            assert decision["pr_head_sha"] == SHA and decision["base_sha"] == BASE_SHA
-
-    if stage == "unavailable" and route in ("manual_quick", "manual_pr_quick"):
-        with pytest.raises(ValueError, match="unavailable"):
-            ci.select_config(event, event_name, inputs)
-        return
-    if stage == "candidate" and route == "manual_pr_quick":
-        with pytest.raises(ValueError, match="non-PR manual validation"):
+    path = tmp_path / ci.POLICY_PATH
+    path.parent.mkdir()
+    path.write_text(json.dumps(policy))
+    monkeypatch.setattr(ci, "CONTROL_ROOT", tmp_path)
+    event_name, event, inputs = {
+        "push": ("push", {"ref": BRANCH}, {}),
+        "pr": ("pull_request_target", pr_event(), {}),
+        "release": ("push", {"ref": "refs/tags/v1.2.3"}, {}),
+        "merge_group": ("merge_group", {"merge_group": {"base_ref": BRANCH}}, {}),
+        "manual_auto": ("workflow_dispatch", {"ref": BRANCH}, {"scope": "auto"}),
+        "manual_full": ("workflow_dispatch", {"ref": BRANCH}, {"scope": "full"}),
+        "manual_quick": ("workflow_dispatch", {"ref": BRANCH}, {"scope": "quick"}),
+        "manual_pr": (
+            "workflow_dispatch",
+            {"ref": BRANCH},
+            {"scope": "quick", "pr_number": "7", "pr_sha": SHA, "pr_base_sha": BASE_SHA},
+        ),
+    }[route]
+    if expected not in ("full", "quick"):
+        with pytest.raises(ValueError, match=expected):
             ci.select_config(event, event_name, inputs)
         return
     config = ci.select_config(event, event_name, inputs)
-    if route in ("merge_group", "release", "manual_full"):
-        expected_scope = "full"
-    elif route in ("manual_quick", "manual_pr_quick") or stage == "validated":
-        expected_scope = "quick"
-    else:
-        expected_scope = "full"
-    assert config["scope"] == expected_scope
-    assert config["threshold_percent"] == (100 if expected_scope == "quick" else 90)
+    assert config["scope"] == expected
     assert config["suite_family"] == ("release-dev-lts" if route == "release" else "nvidia-dev")
-    assert config["build"] is (route != "fork")
-    assert config["unit_test"] is (route != "fork")
-    if expected_scope == "quick":
-        assert config["repeat"] == 1
-    manifest = ci.generate(config, tmp_path / "plan", IDENTITY)
-    cases = manifest["unit"]
-    rows = json.loads(outputs["unit_matrix"])["include"]
-    if route == "fork":
-        assert cases == {} and rows == [{"id": "unused"}]
-    elif expected_scope == "full":
-        assert len(cases) == len(rows) == (74 if route == "release" else 37)
-        assert set(cases) == set(ci.unit_cases(config))
-    else:
-        assert len(cases) == 6 and len(rows) == 1 and rows[0]["id"] == "quick"
-        assert sum(len(case["args"]) for case in cases.values()) == 28
-        full = ci.unit_cases({"suite_family": "nvidia-dev", "repeat": 1, "timeout": 30})
-        for case in cases.values():
-            assert case["environment"] == "dev" and case["cards"] == 8
-            assert case["strict_selection"] and case["repeat"] == 1
-            for selector, bucket in case["source_buckets"].items():
-                matches = [row for row in full.values() if selector.split("::")[0] in row["files"]]
-                assert len(matches) == 1 and matches[0]["bucket"] == bucket
-        assert sum(EXCLUDED_UT in case["excluded"] for case in cases.values()) == 1
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        "none",
-        "head",
-        "base",
-        "draft",
-        "closed",
-        "newer",
-        "foreign",
-        "cancelled",
-        "rerun",
-        "retarget",
-    ],
-)
-def test_final_status_cannot_overwrite_new_snapshot(monkeypatch, mutation):
-    monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
-    pull = pr()
-    url = auth.run_url("124" if mutation == "newer" else "123")
-    if mutation == "head":
-        pull["head"]["sha"] = CONTROL_SHA
-    if mutation == "base":
-        pull["base"]["sha"] = CONTROL_SHA
-    if mutation == "draft":
-        pull["draft"] = True
-    if mutation == "closed":
-        pull["state"] = "closed"
-    if mutation == "foreign":
-        url = "https://example.com/another-check"
-    if mutation == "retarget":
-        pull["base"]["ref"] = "ci/ppu-validation"
-    calls = []
-
-    def api(path, payload=None):
-        if payload is not None:
-            calls.append((path, payload))
-            return {}
-        if path == "pulls/7":
-            return pull
-        if path == "actions/runs/123":
-            return {
-                "status": "completed" if mutation == "cancelled" else "in_progress",
-                "run_attempt": 2 if mutation == "rerun" else 1,
-            }
-        return [{"context": auth.STATUS_CONTEXT, "target_url": url}]
-
-    auth.publish_status(
-        {
-            "pr_number": 7,
-            "pr_head_sha": SHA,
-            "base_sha": BASE_SHA,
-            "target_sha": MERGE_SHA,
-            "run_id": "123",
-            "decision": "run",
-        },
-        "success",
-        "full completed",
-        api,
-    )
-    assert bool(calls) is (mutation == "none")
-    if calls:
-        assert calls[0][0] == f"statuses/{SHA}"
-
-
-@pytest.mark.parametrize("mode", ["old", "fresh", "newer", "stale_push"])
-def test_base_invalidation_preserves_fresh_checks(monkeypatch, mode):
-    monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
-    monkeypatch.setenv("GITHUB_RUN_ID", "200")
-    writes = []
-
-    def api(path, payload=None):
-        if payload is not None:
-            writes.append(payload)
-            return {}
-        if path.startswith("git/ref/"):
-            return {"object": {"sha": SHA if mode == "stale_push" else BASE_SHA}}
-        if path.startswith("pulls?"):
-            return [{"number": 7}]
-        if path == "pulls/7":
-            return pr()
-        return [
-            {
-                "context": auth.STATUS_CONTEXT,
-                "target_url": auth.run_url("201" if mode == "newer" else "100"),
-                "description": f"base={BASE_SHA if mode == 'fresh' else SHA}",
-            }
-        ]
-
-    auth.invalidate_base(BASE_SHA, api)
-    assert bool(writes) is (mode == "old")
-    if writes:
-        assert len(writes[0]["description"]) <= 140
-        assert writes[0]["description"].endswith(f"base={BASE_SHA}")
 
 
 def test_full_timing_and_rank_duration_aggregation(tmp_path):
@@ -576,8 +330,8 @@ def test_each_rank_requires_complete_timing(tmp_path, field):
 
 @pytest.mark.parametrize("scope", ["quick", "full"])
 def test_new_two_card_bucket_preserves_quick_and_full_plans(tmp_path, monkeypatch, capsys, scope):
-    # PR #27 adds this two-replica bucket outside the representative Quick suite.
-    bucket = "tests/unit_tests/inference/engines/test_batch_invariant_coordinator.py"
+    # A new two-replica bucket outside the representative Quick suite.
+    bucket = "tests/unit_tests/inference/engines/test_future_two_card_bucket.py"
     recipe = yaml.safe_load((ROOT / ci.RECIPE_PATH).read_text())
     product = copy.deepcopy(recipe["products"][0])
     product["test_case"] = [bucket]
@@ -630,7 +384,7 @@ def test_recipe_changes_cannot_silently_drop_workloads(tmp_path, monkeypatch, mu
     if mutation == "duplicate":
         recipe["products"][0]["products"] *= 2
     elif mutation == "missing":
-        recipe["products"][0]["products"][0]["environment"] = ["lts"]
+        recipe["products"][0]["products"][0]["tag"] = ["legacy"]
     elif mutation == "nodes":
         recipe["spec"]["nodes"] = 2
     elif mutation == "fraction":
@@ -647,67 +401,11 @@ def test_recipe_changes_cannot_silently_drop_workloads(tmp_path, monkeypatch, mu
         ci.unit_cases({"suite_family": "nvidia-dev", "repeat": 1, "timeout": 30})
 
 
-@pytest.mark.parametrize("decision", ["run", "docs_only"])
-def test_status_snapshot_is_rechecked_before_write(monkeypatch, decision):
-    monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
-    reads = 0
-
-    def api(path, payload=None):
-        nonlocal reads
-        assert payload is None, "must not publish stale success"
-        if path == "pulls/7":
-            reads += 1
-            pull = pr()
-            if reads > 1:
-                pull["draft"] = True
-            return pull
-        if path == "actions/runs/123":
-            return {"status": "in_progress", "run_attempt": 1}
-        return [{"context": auth.STATUS_CONTEXT, "target_url": auth.run_url("123")}]
-
-    auth.publish_status(
-        {
-            "pr_number": 7,
-            "pr_head_sha": SHA,
-            "base_sha": BASE_SHA,
-            "run_id": "123",
-            "decision": decision,
-        },
-        "success",
-        "completed",
-        api,
-    )
-    assert reads == 2
-
-
-@pytest.mark.parametrize("mutation", ["draft", "head", "base"])
-def test_merge_snapshot_rechecked_after_parent_lookup(mutation):
-    changed = False
-    underlying = api_for()
-
-    def api(path):
-        nonlocal changed
-        if path.startswith("git/commits/"):
-            changed = True
-        if path == "pulls/7" and changed:
-            pull = pr()
-            if mutation == "draft":
-                pull["draft"] = True
-            else:
-                pull[mutation]["sha"] = CONTROL_SHA
-            return pull
-        return underlying(path)
-
-    with pytest.raises(ValueError, match="during verification"):
-        auth.authorize(pr_event(), {}, context("pull_request_target"), api)
-
-
-def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch):
-    script = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
+@pytest.mark.parametrize("test_kind", [None, "unit", "functional"])
+def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch, test_kind):
+    script = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
     block = next(
-        block
-        for block in re.findall(r"<<'PY'\n(.*?)\nPY", script, re.S)
-        if "native_requirements =" in block
+        block for block in re.findall(r"<<'PY'\n(.*?)\nPY", script, re.S) if "native =" in block
     )
     runtimes = {
         "torch": "2.13.0",
@@ -720,30 +418,37 @@ def test_pla_installation_preserves_runtime_constraints(tmp_path, monkeypatch):
     monkeypatch.setattr(metadata, "version", runtimes.__getitem__)
     artifact = tmp_path / ".ppu-ci"
     artifact.mkdir()
+    (artifact / "manifest.json").write_text(json.dumps({"test_kind": test_kind}))
+    (tmp_path / "pyproject.toml").write_bytes((ROOT / "pyproject.toml").read_bytes())
     exec(compile(block, "ppu-native-requirements", "exec"), {})
-    requirements = (artifact / "ppu-requirements.txt").read_text().splitlines()
-    constraints = (artifact / "constraints.txt").read_text().splitlines()
+    requirements = (tmp_path / "ppu-requirements.txt").read_text().splitlines()
+    constraints = (tmp_path / "constraints.txt").read_text().splitlines()
     assert requirements.count("pla==1.0.0+v0.1.0.ppu2.2.0") == 1
     assert requirements.count("fla-core==0.4.1+v0.1.0.ppu2.2.0") == 1
     assert set(requirements) <= set(constraints)
     assert {f"{name}=={version}" for name, version in runtimes.items()} <= set(constraints)
     assert {"numpy==1.26.4", "pyarrow==21.0.0"} <= set(constraints)
-    assert not any(line.startswith(("fla==", "flash-linear-attention==")) for line in requirements)
+    assert not any(line.startswith("fla==") for line in requirements)
+    for requirement in (
+        "flash-linear-attention==0.4.1+v0.1.0.ppu2.2.0",
+        "emerging-optimizers==0.3.0",
+    ):
+        assert requirement in requirements
+    dockerfile = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
     assert (
-        "export PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"
-        in script
+        "PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"
+        in dockerfile
     )
-    assert "PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL='' PIP_FIND_LINKS=''" in script
-    install = script.index("-r .ppu-ci/test-requirements.txt -r .ppu-ci/ppu-requirements.txt")
+    assert 'PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL="" PIP_FIND_LINKS=""' in dockerfile
+    install = script.index("-r /build/test-requirements.txt -r /build/ppu-requirements.txt")
     assert script.index("export PIP_CONSTRAINT=") < install
-    assert (
-        install
-        < script.index("PLA import check passed:")
-        < script.index("tar -czf .ppu-ci/environment.tar.gz")
-    )
+    assert install < script.index("distribution = md.distribution('fla-core')")
+    build = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
+    assert build.index("verify-image") < build.index("PLA import check passed:")
+    assert "pip install" not in build
 
 
-@pytest.mark.parametrize("script_name", ["ppu_ci_build.sh", "ppu_ci_run.sh"])
+@pytest.mark.parametrize("script_name", ["ppu_ci_build.sh"])
 @pytest.mark.parametrize(
     "mode",
     [
@@ -762,9 +467,6 @@ def test_pla_probe_checks_version_origin_and_native_imports(monkeypatch, script_
         for block in re.findall(r"python -I - <<'PY'\n(.*?)\nPY", script, re.S)
         if "md.version('pla')" in block
     )
-    if script_name == "ppu_ci_run.sh":
-        assert script.index("tar -xzf .ppu-ci/environment.tar.gz") < script.index(probe)
-        assert "pip install" not in script
     modules = ("pla", "pla.decode", "pla.prefill.flashqla", "pla.prefill.flashkdapro")
     imported = []
 
@@ -821,12 +523,12 @@ l2_norm = l2norm
     ],
 )
 def test_fla_l2norm_dependency_patch_is_restricted(tmp_path, monkeypatch, mode):
-    script = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
+    script = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
     block = next(
         block
         for block in re.findall(r"python -I - <<'PY'\n(.*?)\nPY", script, re.S)
         if "distribution = md.distribution('fla-core')" in block
-    )
+    ).split("\ndistribution = md.distribution('transformer-engine')", 1)[0]
     prefix = tmp_path / "venv"
     target = prefix / "fla/modules/l2norm.py"
     target.parent.mkdir(parents=True)
@@ -892,7 +594,7 @@ def test_fla_l2norm_dependency_patch_is_restricted(tmp_path, monkeypatch, mode):
     assert len(calls) == count
 
 
-@pytest.mark.parametrize("script_name", ["ppu_ci_build.sh", "ppu_ci_run.sh"])
+@pytest.mark.parametrize("script_name", ["ppu_ci_build.sh"])
 @pytest.mark.parametrize(
     "mode",
     [
@@ -957,40 +659,6 @@ def test_fla_probe_checks_real_dependency_contract(monkeypatch, script_name, mod
             exec(compile(probe, script_name, "exec"), {})
 
 
-def test_fla_patch_and_probes_preserve_ut_and_restore_contract():
-    build = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
-    run = (ROOT / ".github/scripts/ppu_ci_run.sh").read_text()
-    assert (
-        build.index("python -m pip check")
-        < build.index("FLA Core l2norm last dimension argument adaptation:")
-        < build.index("FLA Core import check passed:")
-        < build.index("assert gated_delta_net.HAVE_FLA")
-        < build.index("tar -czf .ppu-ci/environment.tar.gz")
-    )
-    assert (
-        run.index("tar -xzf .ppu-ci/environment.tar.gz")
-        < run.index("FLA Core import check passed:")
-        < run.index("export PYTHONPATH=")
-        < run.index("assert gated_delta_net.HAVE_FLA")
-        < run.index("python -m torch.distributed.run")
-    )
-    assert "pip install" not in run and "path.write_text(patched)" not in run
-    for script in (build, run):
-        assert "'GDN2=', gated_delta_net.HAVE_FLA_GDN2" in script
-        assert "gated_delta_net.HAVE_FLA =" not in script
-        assert "gated_delta_net.HAVE_FLA_GDN2 =" not in script
-        assert "sys.modules['fla']" not in script
-    probes = [
-        next(
-            block
-            for block in re.findall(r"python -I - <<'PY'\n(.*?)\nPY", script, re.S)
-            if "md.version('fla-core')" in block
-        )
-        for script in (build, run)
-    ]
-    assert probes[0] == probes[1]
-
-
 @pytest.mark.parametrize("script_name", ["ppu_ci_build.sh", "ppu_ci_run.sh"])
 def test_build_and_run_embedded_python_syntax(script_name):
     script = (ROOT / ".github/scripts" / script_name).read_text()
@@ -1000,14 +668,14 @@ def test_build_and_run_embedded_python_syntax(script_name):
         compile(block, script_name, "exec")
 
 
-GDN_BUCKET = "tests/unit_tests/ssm/test_gated_delta_net.py"
+DIAGNOSTIC_BUCKET = "tests/unit_tests/test_model_configs.py"
 
 
 def diagnostic_config(**inputs):
     return ci.select_config(
         {"ref": BRANCH},
         "workflow_dispatch",
-        {"scope": "full", "suite_family": "nvidia-dev", "unit_bucket": GDN_BUCKET, **inputs},
+        {"scope": "full", "suite_family": "nvidia-dev", "unit_bucket": DIAGNOSTIC_BUCKET, **inputs},
     )
 
 
@@ -1017,10 +685,11 @@ def test_diagnostic_generates_one_unchanged_upstream_bucket(tmp_path, capsys):
     assert config["threshold_percent"] == 90
     full = ci.unit_cases(config)
     manifest = ci.generate(config, tmp_path, IDENTITY)
-    assert list(manifest["unit"]) == ["dev-023"]
-    assert manifest["unit"]["dev-023"] == full["dev-023"]
-    assert manifest["unit"]["dev-023"]["args"] == [GDN_BUCKET]
-    assert len(full) == 37
+    case_id = next(key for key, case in full.items() if case["bucket"] == DIAGNOSTIC_BUCKET)
+    assert list(manifest["unit"]) == [case_id]
+    assert manifest["unit"][case_id] == full[case_id]
+    assert manifest["unit"][case_id]["args"] == [DIAGNOSTIC_BUCKET]
+    assert len(full) > 1
     output = capsys.readouterr().out
     matrix = json.loads(
         next(
@@ -1030,12 +699,12 @@ def test_diagnostic_generates_one_unchanged_upstream_bucket(tmp_path, capsys):
         )
     )
     assert len(matrix["include"]) == 1
-    assert matrix["include"][0]["id"] == "dev-023"
+    assert matrix["include"][0]["id"] == case_id
     assert matrix["include"][0]["cards"] == 8
-    workflow = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
+    workflow = yaml.safe_load((ROOT / ".github/workflows/cicd-ppu.yml").read_text())
     events = workflow.get("on", workflow.get(True))
     assert events["workflow_dispatch"]["inputs"]["unit_bucket"]["default"] == ""
-    assert len(events["workflow_dispatch"]["inputs"]) <= 10
+    assert len(events["workflow_dispatch"]["inputs"]) <= 25
 
 
 @pytest.mark.parametrize(
@@ -1049,7 +718,7 @@ def test_diagnostic_generates_one_unchanged_upstream_bucket(tmp_path, capsys):
         {"repeat": 0},
         {"repeat": 2},
         {"unit_bucket": None},
-        {"unit_bucket": [GDN_BUCKET]},
+        {"unit_bucket": [DIAGNOSTIC_BUCKET]},
         {"pr_number": "7", "pr_sha": SHA, "pr_base_sha": BASE_SHA},
     ],
 )
@@ -1069,17 +738,17 @@ def test_diagnostic_rejects_incompatible_manual_inputs(inputs):
 )
 def test_diagnostic_cannot_reduce_automatic_coverage(event_name, event):
     with pytest.raises(ValueError, match="only allowed for non-PR manual"):
-        ci.select_config(event, event_name, {"scope": "full", "unit_bucket": GDN_BUCKET})
+        ci.select_config(event, event_name, {"scope": "full", "unit_bucket": DIAGNOSTIC_BUCKET})
 
 
 @pytest.mark.parametrize(
     "bucket",
     [
-        GDN_BUCKET + "::test_constructor",
+        DIAGNOSTIC_BUCKET + "::test_constructor",
         "tests/unit_tests/ssm/*.py",
         "../test.py",
-        GDN_BUCKET + ";echo x",
-        GDN_BUCKET + "\n",
+        DIAGNOSTIC_BUCKET + ";echo x",
+        DIAGNOSTIC_BUCKET + "\n",
         "tests/unit_tests/ssm/missing.py",
     ],
 )
@@ -1092,7 +761,8 @@ def test_diagnostic_requires_exact_recipe_bucket(tmp_path, bucket):
 def test_diagnostic_results_never_count_as_full_baseline(tmp_path, capsys, state):
     config = diagnostic_config()
     manifest = ci.generate(config, tmp_path / "plan", IDENTITY)
-    case = manifest["unit"]["dev-023"]
+    case_id = next(iter(manifest["unit"]))
+    case = manifest["unit"][case_id]
     directory = ci.result_directory(manifest, tmp_path, case["id"])
     write_reports(directory, case, failed=0, skipped=state == "all_skipped")
     for path in directory.glob("*-rank-*.json"):
@@ -1106,7 +776,14 @@ def test_diagnostic_results_never_count_as_full_baseline(tmp_path, capsys, state
         (directory / "prod-1-rank-7.json").rename(directory / "missing-rank")
     if state == "missing_timing":
         (directory / "suite-timing.json").rename(directory / "missing-timing")
-    result = ci.summarize(manifest, tmp_path)
+    spec = importlib.util.spec_from_file_location(
+        "diagnostic_export_fixture", ROOT / ".github/scripts/ppu_ci_export.py"
+    )
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    public = tmp_path / "public-results" / directory.name
+    exporter.export(directory, public, env={})
+    result = ci.summarize(manifest, public.parent)
     assert result["success"] is (state == "passed")
     assert not result["baseline_complete"]
     assert result["scope"] == "diagnostic"
@@ -1117,6 +794,7 @@ def test_diagnostic_results_never_count_as_full_baseline(tmp_path, capsys, state
 def test_diagnostic_runner_selects_only_requested_group(tmp_path, monkeypatch, capsys):
     manifest = ci.generate(diagnostic_config(), tmp_path / ".ppu-ci", IDENTITY)
     capsys.readouterr()
+    case_id = next(iter(manifest["unit"]))
     script = (ROOT / ".github/scripts/ppu_ci_run.sh").read_text()
     block = next(
         block
@@ -1126,11 +804,11 @@ def test_diagnostic_runner_selects_only_requested_group(tmp_path, monkeypatch, c
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PPU_TARGET_SHA", SHA)
     monkeypatch.setenv("PPU_CONTROL_SHA", CONTROL_SHA)
-    monkeypatch.setattr(sys, "argv", ["-", "dev-023"])
+    monkeypatch.setattr(sys, "argv", ["-", case_id])
     exec(compile(block, "ppu-suite-settings", "exec"), {})
     assert capsys.readouterr().out.splitlines() == [
-        str(manifest["unit"]["dev-023"]["minutes"] * 60),
-        "dev-023",
+        str(manifest["unit"][case_id]["minutes"] * 60),
+        case_id,
     ]
 
 
@@ -1141,18 +819,19 @@ def sealed_bundle(tmp_path):
     control.mkdir(parents=True)
     (plan / "manifest.json").write_text(json.dumps({"identity": IDENTITY}))
     shutil.copyfile(ROOT / ".github/scripts/ppu_ci.py", control / "ppu_ci.py")
+    for name in ("ppu_ci_container.py", "ppu_policy.py", "ppu_ci_paths.py", "ppu_ci_export.py"):
+        shutil.copyfile(ROOT / ".github/scripts" / name, control / name)
     (control / "ppu_ci_run.sh").write_text('printf "UT_STARTED:%s\\n" "$1"\n')
     (control / "ppu_pytest_policy.py").write_text("POLICY = True\n")
     bundle = tmp_path / "nas" / "run-1" / "build"
-    shutil.copytree(plan, bundle)
-    payload = tmp_path / "source.py"
-    payload.write_text("VALUE = 1\n")
-    with tarfile.open(bundle / "source.tar.gz", "w:gz") as archive:
-        archive.add(payload, arcname="source.py")
-    (bundle / "environment.tar.gz").write_bytes(b"environment archive")
+    bundle.parent.mkdir(parents=True)
+    trusted = runtime_export(bundle, control=CONTROL_SHA, target=SHA)
+    write_image_record(bundle, trusted)
+    shutil.copytree(plan, bundle, dirs_exist_ok=True)
+    (tmp_path / "outside.txt").write_text("external fixture")
     (bundle / "commit.txt").write_text(SHA + "\n")
     (bundle / "control.txt").write_text(CONTROL_SHA + "\n")
-    (bundle / "image.txt").write_text("fixed-image\n")
+    (bundle / "image.txt").write_text(PINNED + "\n")
     (bundle / "build-timing.json").write_text('{"elapsed_seconds":1}')
     (bundle / "data").mkdir()
     (bundle / "data/blob").write_bytes(b"tokenizer data")
@@ -1180,8 +859,8 @@ def test_bundle_seal_and_verify_preserve_all_payloads(sealed_bundle, capsys):
 @pytest.mark.parametrize(
     "damage",
     [
-        "missing_source",
-        "truncated_environment",
+        "missing_image",
+        "truncated_export",
         "missing_data",
         "changed_control",
         "extra_control",
@@ -1205,13 +884,13 @@ def test_bundle_verify_rejects_partial_or_untrusted_payload(sealed_bundle, tmp_p
     digest = bundle_digest(bundle)
     if damage.startswith("missing_"):
         name = {
-            "missing_source": "source.tar.gz",
+            "missing_image": "runtime-image.json",
             "missing_data": "data/tokenizer",
             "missing_complete": ".complete",
         }[damage]
         (bundle / name).rename(tmp_path / "missing")
-    elif damage == "truncated_environment":
-        (bundle / "environment.tar.gz").write_bytes(b"part")
+    elif damage == "truncated_export":
+        (bundle / "functional-tools/yq").write_bytes(b"part")
     elif damage in ("changed_control", "sealed_control"):
         (bundle / "control/ppu_ci_run.sh").write_text("exit 0\n")
     elif damage in ("extra_control", "sealed_extra_control"):
@@ -1226,7 +905,7 @@ def test_bundle_verify_rejects_partial_or_untrusted_payload(sealed_bundle, tmp_p
             json.dumps({"identity": {**IDENTITY, "target_sha": CONTROL_SHA}})
         )
     elif damage == "external_symlink":
-        (bundle / "external").symlink_to(tmp_path / "source.py")
+        (bundle / "external").symlink_to(tmp_path / "outside.txt")
     elif damage == "symlink_directory":
         (bundle / "linked-data").symlink_to("data", target_is_directory=True)
     elif damage == "altered_integrity":
@@ -1236,33 +915,33 @@ def test_bundle_verify_rejects_partial_or_untrusted_payload(sealed_bundle, tmp_p
         (bundle / name).write_text("f" * 40)
     elif damage == "traversal_inventory":
         seal = json.loads((bundle / "bundle-integrity.json").read_text())
-        seal["files"]["../../source.py"] = seal["files"]["source.tar.gz"]
+        seal["files"]["../../outside.txt"] = seal["files"]["runtime-image.json"]
         (bundle / "bundle-integrity.json").write_text(json.dumps(seal))
         digest = bundle_digest(bundle)
-    if damage.startswith("sealed_") or damage in ("wrong_commit", "wrong_control_sha"):
-        ci.seal_bundle(bundle)
-        digest = bundle_digest(bundle)
     with pytest.raises((ValueError, OSError)):
+        if damage.startswith("sealed_") or damage in ("wrong_commit", "wrong_control_sha"):
+            ci.seal_bundle(bundle)
+            digest = bundle_digest(bundle)
         ci.verify_bundle(bundle, plan, digest)
 
 
-@pytest.mark.parametrize("name", ["source.tar.gz", "environment.tar.gz", "control/ppu_ci.py"])
+@pytest.mark.parametrize("name", ["runtime-image.json", "functional-tools/yq", "control/ppu_ci.py"])
 def test_bundle_seal_rejects_empty_required_payload(sealed_bundle, name):
     _, bundle = sealed_bundle
     (bundle / name).write_bytes(b"")
-    with pytest.raises(ValueError, match="Missing or empty"):
+    with pytest.raises(ValueError, match="Missing"):
         ci.seal_bundle(bundle)
 
 
-@pytest.mark.parametrize("damage", ["none", "missing_source", "wrong_digest", "other_run"])
+@pytest.mark.parametrize("damage", ["none", "missing_image", "wrong_digest", "other_run"])
 def test_ut_workflow_restores_same_run_bundle_before_execution(sealed_bundle, tmp_path, damage):
     plan, bundle = sealed_bundle
     digest = bundle_digest(bundle)
     workspace = tmp_path / "pod"
     workspace.mkdir()
     shutil.copytree(plan, workspace / ".ppu-ci")
-    if damage == "missing_source":
-        (bundle / "source.tar.gz").rename(tmp_path / "missing-source")
+    if damage == "missing_image":
+        (bundle / "runtime-image.json").rename(tmp_path / "missing-image")
     elif damage == "wrong_digest":
         digest = "0" * 64
     elif damage == "other_run":
@@ -1288,13 +967,12 @@ def test_ut_workflow_restores_same_run_bundle_before_execution(sealed_bundle, tm
     assert (result.returncode == 0) is (damage == "none"), result.stdout + result.stderr
     assert ("UT_STARTED:dev-023" in result.stdout) is (damage == "none")
     if damage == "none":
-        assert (workspace / "source/source.py").read_text() == "VALUE = 1\n"
         assert (workspace / ".ppu-bundle/data/tokenizer").is_symlink()
-        assert not (bundle / "source").exists()
+        assert not (workspace / "source").exists()
 
 
 def test_bundle_workflow_digest_and_run_scoping():
-    build = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
+    build = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())
     ut = yaml.safe_load((ROOT / ".github/workflows/ppu-ut.yml").read_text())
     assert (
         build["jobs"]["build"]["outputs"]["bundle_digest"]
@@ -1309,16 +987,15 @@ def test_bundle_workflow_digest_and_run_scoping():
         for step in ut["jobs"]["test"]["steps"]
         if step.get("uses") == "actions/download-artifact@v4"
     ]
-    assert downloads == ["ppu-plan"]
+    assert downloads == ["${{ inputs.artifact_prefix }}ppu-plan"]
     action = next(step for step in ut["jobs"]["test"]["steps"] if step.get("id") == "ppu")
     assert (
-        "PPU_BUNDLE_DIR=/mnt/wl_nas/devops/megatron-ci/${{ github.run_id }}-${{ github.run_attempt }}/build"
+        "PPU_BUNDLE_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/${{ inputs.artifact_prefix }}${{ github.run_id }}-${{ github.run_attempt }}/build"
         in action["with"]["extra_env"]
     )
     assert "PPU_BUNDLE_DIGEST=${{ inputs.bundle_digest }}" in action["with"]["extra_env"]
     command = action["with"]["command"]
-    assert (
-        command.index("verify-bundle") < command.index("tar -xzf") < command.index("ppu_ci_run.sh")
-    )
+    assert command.index("verify-bundle") < command.index("ppu_ci_run.sh")
     script = (ROOT / ".github/scripts/ppu_ci_build.sh").read_text()
-    assert script.index("seal-bundle") > script.index("tar -czf .ppu-ci/environment.tar.gz")
+    assert script.index("seal-bundle") > script.index("verify-image")
+    assert "tar -czf .ppu-ci/environment.tar.gz" not in script

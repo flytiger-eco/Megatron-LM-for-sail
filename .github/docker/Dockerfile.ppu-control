@@ -1,0 +1,16 @@
+FROM python:3.12-slim-bookworm
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+ENV PIP_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
+    PIP_CONFIG_FILE=/dev/null PIP_EXTRA_INDEX_URL="" PIP_FIND_LINKS="" \
+    PIP_NO_INPUT=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
+    PYTHONNOUSERSITE=1 DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash ca-certificates curl file git jq procps util-linux \
+    && rm -rf /var/lib/apt/lists/*
+COPY control-requirements.txt export_environment.py /build/
+RUN python -m pip install --index-url "$PIP_INDEX_URL" --report /build/control-install.json \
+        -r /build/control-requirements.txt \
+    && python -m pip check \
+    && python /build/export_environment.py control \
+    && python -c 'import click, yaml, numpy, pydantic, pytest, google_crc32c; from tensorboard.compat.proto.event_pb2 import Event; assert Event.FromString(Event(step=1).SerializeToString()).step == 1' \
+    && rm -rf /build

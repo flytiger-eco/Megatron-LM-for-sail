@@ -1,0 +1,79 @@
+name: PPU dependency cache
+description: Select registry BuildKit caches by target branch, PR and dependency inputs
+inputs:
+  key:
+    description: Dependency fingerprint from ppu_ci_container.py
+    required: true
+  base-ref:
+    description: Authorized target branch
+    required: true
+  pr-number:
+    description: Authorized PR number; zero for branch builds
+    default: '0'
+  publish-target-cache:
+    description: Populate the shared dependency fingerprint cache
+    default: 'false'
+  write-baseline:
+    description: Source is a published branch commit, rather than a PR or merge candidate
+    default: 'false'
+outputs:
+  cache-from:
+    description: First available registry cache; empty on a cold build
+    value: ${{ steps.select.outputs.cache-from }}
+  cache-to:
+    description: Registry cache destination
+    value: ${{ steps.select.outputs.cache-to }}
+runs:
+  using: composite
+  steps:
+    - id: select
+      shell: bash
+      env:
+        BUILD_KEY: ${{ inputs.key }}
+        BASE_REF: ${{ inputs.base-ref }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        PUBLISH_TARGET_CACHE: ${{ inputs.publish-target-cache }}
+        WRITE_BASELINE: ${{ inputs.write-baseline }}
+      run: |
+        set -euo pipefail
+        [[ "$BUILD_KEY" =~ ^[0-9a-f]{64}$ ]]
+        [[ "$PR_NUMBER" =~ ^(0|[1-9][0-9]{0,8})$ ]]
+        [[ "$PUBLISH_TARGET_CACHE" == true || "$PUBLISH_TARGET_CACHE" == false ]]
+        [[ "$WRITE_BASELINE" == true || "$WRITE_BASELINE" == false ]]
+        branch="${BASE_REF#refs/heads/}"
+        case "$branch" in
+          main|dev) namespace="$branch" ;;
+          *) namespace=diagnostic ;;
+        esac
+        prefix="ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci:cache-${namespace}-runtime-amd64"
+        target_cache="${prefix}-build-${BUILD_KEY}"
+        baseline_cache="${prefix}-baseline"
+        candidates=()
+        if [[ "$PR_NUMBER" != 0 ]]; then
+          [[ "$PUBLISH_TARGET_CACHE" == false && "$WRITE_BASELINE" == false ]]
+          destination="${prefix}-pr-${PR_NUMBER}-${BUILD_KEY}"
+          candidates+=("$destination")
+        elif [[ "$PUBLISH_TARGET_CACHE" == true ]]; then
+          destination="$target_cache"
+        elif [[ "$WRITE_BASELINE" == true ]]; then
+          destination="$baseline_cache"
+        else
+          destination="${prefix}-candidate-${BUILD_KEY}"
+          candidates+=("$destination")
+        fi
+        candidates+=("$target_cache" "$baseline_cache")
+        donor=""
+        for candidate in "${candidates[@]}"; do
+          if docker buildx imagetools inspect "$candidate" >/dev/null 2>&1; then
+            donor="$candidate"
+            break
+          fi
+        done
+        printf 'cache-from=%s\ncache-to=%s\n' "$donor" "$destination" >> "$GITHUB_OUTPUT"
+        {
+          echo '### PPU dependency cache'
+          printf -- '- Read: `%s`\n' "${donor:-cold build (no readable cache)}"
+          printf -- '- Write: `%s`\n' "$destination"
+          echo '- BuildKit validates individual layers; a selected donor does not guarantee a cache hit.'
+          echo '- Only dependency layers are exported; source compilation and image verification still run.'
+        } >> "$GITHUB_STEP_SUMMARY"

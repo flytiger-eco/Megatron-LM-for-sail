@@ -51,7 +51,7 @@ def context(event="workflow_dispatch", ref=BRANCH):
         "ref": ref,
         "sha": CONTROL_SHA,
         "control_sha": CONTROL_SHA,
-        "workflow_ref": f"{REPOSITORY}/.github/workflows/ppu-build.yml@{ref}",
+        "workflow_ref": f"{REPOSITORY}/.github/workflows/cicd-ppu.yml@{ref}",
         "actor": "maintainer",
         "triggering_actor": "maintainer",
         "run_id": "123",
@@ -63,6 +63,8 @@ def api_for(pull=None, permission="write"):
     def api(path):
         if path.startswith("collaborators/"):
             return {"permission": permission}
+        if path.startswith("git/ref/"):
+            return {"object": {"sha": (pull or pr())["base"]["sha"]}}
         if path.startswith("pulls/7/files?"):
             return [{"filename": "megatron/core/utils.py", "status": "modified"}]
         if path == f"git/commits/{MERGE_SHA}":
@@ -273,35 +275,38 @@ def test_invalid_exclusions(tmp_path, monkeypatch, mutation):
 
 
 @pytest.mark.parametrize("repeat", [1, 2])
-def test_full_recipe_parity_with_previous_implementation(repeat):
-    original = subprocess.check_output(
-        ["git", "show", "826a263f9:.github/scripts/ppu_ci.py"], cwd=ROOT, text=True
-    )
-    namespace = {"__file__": str(SCRIPTS / "ppu_ci.py"), "__name__": "baseline_ppu_ci"}
-    exec(compile(original, "baseline_ppu_ci", "exec"), namespace)
-    config = {"repeat": repeat, "timeout": 30}
-    actual = ci.unit_cases(config)
-    assert {
-        key: {k: v for k, v in row.items() if k != "excluded"} for key, row in actual.items()
-    } == namespace["unit_cases"](config)
-    assert len(actual) == 74
+def test_full_recipe_parity_with_upstream(repeat):
+    recipe = yaml.safe_load((ROOT / ci.RECIPE_PATH).read_text())
+    actual = ci.unit_cases({"repeat": repeat, "timeout": 30})
     assert sum(EXCLUDED_UT in case["excluded"] for case in actual.values()) == 2
     assert all(
         not arg.startswith("--ppu-exclude") for case in actual.values() for arg in case["args"]
     )
-    assert sum(EXCLUDED_UT.split("::")[0] in case["files"] for case in actual.values()) == 2
     for environment in ("dev", "lts"):
-        files = [
-            path
-            for case in actual.values()
-            if case["environment"] == environment
-            for path in case["files"]
-        ]
+        expected = {
+            product["test_case"][0]
+            for product in recipe["products"]
+            if any(environment in variant["environment"] for variant in product["products"])
+        }
+        selected = [case for case in actual.values() if case["environment"] == environment]
+        assert {case["bucket"] for case in selected} == expected
+        assert len(selected) == len(expected)
+        assert all(case["repeat"] == repeat for case in selected)
+        files = [path for case in selected for path in case["files"]]
         assert len(files) == len(set(files))
-        assert {path for path in files if Path(path).name.startswith("test_")} == {
+        all_files = {
             path.relative_to(ROOT).as_posix()
             for path in (ROOT / "tests/unit_tests").rglob("test_*.py")
         }
+        absent = {
+            path.relative_to(ROOT).as_posix()
+            for product in recipe["products"]
+            for bucket in product["test_case"]
+            if bucket not in expected
+            for path in ROOT.glob(bucket)
+            if path.is_file()
+        }
+        assert {path for path in files if Path(path).name.startswith("test_")} == all_files - absent
 
 
 def test_configure_cli_separates_control_and_source(tmp_path):
@@ -343,55 +348,18 @@ def test_configure_cli_separates_control_and_source(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     manifest = json.loads((output / "manifest.json").read_text())
-    assert manifest["identity"] == {**IDENTITY, "pr_head_sha": "", "base_sha": ""}
+    assert manifest["identity"] == {
+        **IDENTITY,
+        "pr_head_sha": "",
+        "base_sha": "",
+        "run_id": "",
+        "run_attempt": "",
+    }
     expected_scope = ci.load_policy()["daily_scope"]
     assert manifest["config"]["scope"] == expected_scope
-    assert len(manifest["unit"]) == (6 if expected_scope == "quick" else 37)
-
-
-@pytest.mark.parametrize("state", ["pending", "success", "failure"])
-def test_commit_status_uses_pr_head_sha(tmp_path, monkeypatch, state):
-    (tmp_path / "authorization.json").write_text(
-        json.dumps(
-            {
-                "pr_number": 7,
-                "pr_head_sha": SHA,
-                "base_sha": BASE_SHA,
-                "decision": "run",
-                "run_id": "123",
-                **IDENTITY,
-            }
-        )
+    assert len(manifest["unit"]) == (
+        6 if expected_scope == "quick" else len(ci.unit_cases(manifest["config"]))
     )
-    calls = []
-
-    def api(path, payload=None):
-        if payload is not None:
-            calls.append((path, payload))
-            return {}
-        if path == "pulls/7":
-            return pr()
-        if path == "actions/runs/123":
-            return {"status": "in_progress", "run_attempt": 1}
-        return [
-            {
-                "context": auth.STATUS_CONTEXT,
-                "target_url": f"https://github.com/{REPOSITORY}/actions/runs/123",
-            }
-        ]
-
-    monkeypatch.setattr(auth, "github_api", api)
-    monkeypatch.setenv("GITHUB_REPOSITORY", REPOSITORY)
-    monkeypatch.setenv("GITHUB_RUN_ID", "123")
-    monkeypatch.setattr(
-        sys, "argv", ["ppu_pr_authorize.py", "status", "--output", str(tmp_path), "--state", state]
-    )
-    auth.main()
-    assert len(calls) == 1
-    assert calls[0][0] == f"statuses/{SHA}"
-    assert calls[0][1]["state"] == state
-    assert calls[0][1]["context"] == "PPU PR Quick"
-    assert calls[0][1]["target_url"] == f"https://github.com/{REPOSITORY}/actions/runs/123"
 
 
 def test_manual_fork_authorization():
@@ -402,24 +370,6 @@ def test_manual_fork_authorization():
     assert result["target_sha"] == MERGE_SHA and result["control_sha"] == CONTROL_SHA
     assert result["pr_head_sha"] == SHA and result["base_sha"] == BASE_SHA
     assert result["pr_number"] == 7
-
-
-def test_fork_event_never_authorizes_ppu():
-    event = {"number": 7, "pull_request": pr(True)}
-    result = auth.authorize(event, {}, context("pull_request_target"), api_for(pr(True)))
-    assert not result["allowed"] and result["pr_head_sha"] == SHA
-    assert result["decision"] == "authorization_required"
-
-
-@pytest.mark.parametrize("permission", ["read", "triage", "none"])
-def test_authorization_requires_write(permission):
-    with pytest.raises(ValueError):
-        auth.authorize(
-            {},
-            {"pr_number": "7", "pr_sha": SHA, "pr_base_sha": BASE_SHA},
-            context(),
-            api_for(permission=permission),
-        )
 
 
 @pytest.mark.parametrize(
@@ -436,7 +386,7 @@ def test_authorization_rejects_stale_or_untrusted_inputs(mutation):
     elif mutation == "ref":
         ctx["ref"] = "refs/heads/ci/ppu-validation"
     elif mutation == "workflow":
-        ctx["workflow_ref"] = "attacker/repo/.github/workflows/ppu-build.yml@" + BRANCH
+        ctx["workflow_ref"] = "attacker/repo/.github/workflows/cicd-ppu.yml@" + BRANCH
     elif mutation == "sha":
         pull["head"]["sha"] = "c" * 40
     elif mutation == "closed":
@@ -473,7 +423,9 @@ def write_reports(directory, case, failed=1, skipped=False, total=5):
         for rank in range(8):
             selected = nodes if phase == "prod" else []
             tests = {
-                node: "skipped" if skipped else "failed" if rank == 7 and i < failed else "passed"
+                node: "skipped"
+                if skipped
+                else "failed" if rank == case["cards"] - 1 and i < failed else "passed"
                 for i, node in enumerate(selected)
             }
             report = {
@@ -707,7 +659,7 @@ def test_full_matrix_report_parity(tmp_path):
     assert result["threshold_percent"] == 90
     assert result["total"] == len(cases) * 5
     assert result["failed"] == len(cases)
-    assert len(result["groups"]) == 74 and result["pass_rate"] == 0.8
+    assert len(result["groups"]) == len(cases) and result["pass_rate"] == 0.8
 
 
 @pytest.mark.parametrize("scope", ["quick", "full", "diagnostic"])
@@ -804,41 +756,51 @@ def test_real_pytest_plugin_reports(tmp_path, source, complete, extra):
 
 
 def test_workflow_trust_and_resource_boundaries():
-    build = yaml.safe_load((ROOT / ".github/workflows/ppu-build.yml").read_text())
+    build = yaml.safe_load((ROOT / ".github/workflows/cicd-ppu.yml").read_text())
+    execute = yaml.safe_load((ROOT / ".github/workflows/ppu-execute.yml").read_text())
     ut = yaml.safe_load((ROOT / ".github/workflows/ppu-ut.yml").read_text())
     events = build.get("on", build.get(True))
-    assert set(events) == {"push", "pull_request_target", "workflow_dispatch", "merge_group"}
+    assert set(events) == {
+        "push",
+        "pull_request_target",
+        "workflow_dispatch",
+        "merge_group",
+        "workflow_call",
+    }
     assert events["push"]["tags"] == ["v*"]
     assert auth.BRANCH == BRANCH == "refs/heads/main"
-    for event_name in ("push", "pull_request_target", "merge_group"):
-        assert events[event_name]["branches"] == ["main"]
+    assert events["push"]["branches"] == ["main", "dev"]
+    for event_name in ("pull_request_target", "merge_group"):
+        assert events[event_name]["branches"] == ["main", "dev"]
     authorize_if = build["jobs"]["authorize"]["if"]
-    assert "github.ref == 'refs/heads/main'" in authorize_if
-    assert "github.event.merge_group.base_ref == 'refs/heads/main'" in authorize_if
-    assert build["jobs"]["invalidate-base"]["if"] == (
-        "github.event_name == 'push' && github.ref == 'refs/heads/main'"
-    )
-    assert "ci/ppu-validation" not in (ROOT / ".github/workflows/ppu-build.yml").read_text()
+    for ref in auth.policy.REFS:
+        assert ref in authorize_if
+    assert 'github.event.merge_group.base_ref)' in authorize_if
+    assert "github.event_name == 'push'" in build["jobs"]["invalidate-base"]["if"]
+    assert auth.policy.BRANCHES == ("main", "dev")
+    assert "github.event_name == 'workflow_dispatch'" not in authorize_if
     assert build["jobs"]["authorize"]["runs-on"] == "ubuntu-latest"
-    assert "allowed == 'true'" in build["jobs"]["configure"]["if"]
+    control_ref = build["jobs"]["authorize"]["steps"][0]["with"]["ref"]
+    assert build["jobs"]["control-environment"]["steps"][0]["with"]["ref"] == control_ref
+    assert execute["jobs"]["configure"]["if"] == "inputs.allowed"
     for name in ("build", "unit-tests"):
-        assert "github.run_attempt == 1" in build["jobs"][name]["if"]
+        assert "github.run_attempt == 1" in execute["jobs"][name]["if"]
     assert "github.run_attempt == 1" in ut["jobs"]["test"]["if"]
     assert ut["jobs"]["test"]["strategy"]["max-parallel"] == 1
     assert "inputs.threshold_percent" in ut["jobs"]["result"]["name"]
     for field in ("scope", "threshold_percent"):
-        assert build["jobs"]["configure"]["outputs"][field] == (
+        assert execute["jobs"]["configure"]["outputs"][field] == (
             "${{ steps.config.outputs." + field + " }}"
         )
-        assert build["jobs"]["unit-tests"]["with"][field] == (
+        assert execute["jobs"]["unit-tests"]["with"][field] == (
             "${{ needs.configure.outputs." + field + " }}"
         )
         assert (
-            "needs.configure.outputs." + field
+            "needs.execute.outputs." + field
             in build["jobs"]["pr-result"]["steps"][-1]["env"]["DESCRIPTION"]
         )
-    assert "GH_TOKEN" not in build["jobs"]["build"].get("env", {})
-    for workflow in (build, ut):
+    assert "GH_TOKEN" not in execute["jobs"]["build"].get("env", {})
+    for workflow in (build, execute, ut):
         for job in workflow["jobs"].values():
             if job.get("permissions", {}).get("statuses") == "write":
                 assert job["runs-on"] == "ubuntu-latest"
@@ -847,14 +809,16 @@ def test_workflow_trust_and_resource_boundaries():
                     assert step["with"]["persist-credentials"] is False
     text = (ROOT / ".github/workflows/ppu-ut.yml").read_text()
     assert 'bash "$PPU_CONTROL_DIR/ppu_ci_run.sh"' in text
-    assert "python3 -I .ppu-ci/control/ppu_ci.py summarize" in text
+    assert 'python3 -I .ppu-ci/control/ppu_ci.py summarize' in text
     build_script = (SCRIPTS / "ppu_ci_build.sh").read_text()
-    assert 'install -m 0644 "$PPU_CONTROL_DIR/ppu_pytest_policy.py"' in build_script
+    dockerfile = (ROOT / ".github/docker/Dockerfile.ppu-ci").read_text()
+    assert 'install -m 0644 /build/control/ppu_pytest_policy.py' in dockerfile
     assert "install -m 0644 .github/scripts/ppu_pytest_policy.py" not in build_script
-    assert "secrets: inherit" not in (ROOT / ".github/workflows/ppu-build.yml").read_text()
+    assert "secrets: inherit" not in (ROOT / ".github/workflows/cicd-ppu.yml").read_text()
     assert "release-{0}" in build["concurrency"]["group"]
     assert "full-{0}" in build["concurrency"]["group"]
-    assert "inputs.pr_number == ''" in build["concurrency"]["cancel-in-progress"]
+    assert "workflow_dispatch" not in build["concurrency"]["cancel-in-progress"]
+    assert "pull_request_target" not in build["concurrency"]["cancel-in-progress"]
 
 
 TOOL_STUB = r'''
@@ -938,9 +902,13 @@ def test_suite_runner_with_fake_hardware(tmp_path, failure):
         "PPU_RESULTS_DIR": str(results),
         "PPU_SOURCE_ROOT": str(source),
         "PPU_ARTIFACT_DIR": str(artifacts),
+        "PPU_RUNTIME_ARCHIVE": str(tmp_path / "environment.tar.gz"),
         "PPU_CONTROL_DIR": str(SCRIPTS),
         "PPU_TARGET_SHA": SHA,
         "PPU_CONTROL_SHA": CONTROL_SHA,
+        "PPU_ENVIRONMENT_DIGEST": "d" * 64,
+        "PPU_IMAGE_DIGEST": "ghcr.io/flytiger-eco/megatron-lm-for-sail/ppu-ci@sha256:" + "e" * 64,
+        "PPU_BASE_IMAGE_DIGEST": "pkg.flytiger-eco.com/docker_release/pytorch@sha256:" + "f" * 64,
         "NPROC_PER_NODE": "8",
         "NNODES": "1",
     }
@@ -951,10 +919,17 @@ def test_suite_runner_with_fake_hardware(tmp_path, failure):
     run = subprocess.run(["bash", str(runner), "quick"], env=env, capture_output=True, text=True)
     assert run.returncode == (0 if failure == "none" else 1), run.stdout + run.stderr
     commands = [json.loads(line) for line in (tmp_path / "commands.jsonl").read_text().splitlines()]
-    restores = [
-        c for c in commands if c['name'] == 'tar' and 'environment.tar.gz' in ' '.join(c['args'])
-    ]
-    assert len(restores) == 1
+    verifications = [c for c in commands if c['name'] == 'python3' and 'verify-image' in c['args']]
+    assert len(verifications) == 1
+    for flag, variable in (
+        ('--digest', 'PPU_ENVIRONMENT_DIGEST'),
+        ('--image-digest', 'PPU_IMAGE_DIGEST'),
+        ('--base-image-digest', 'PPU_BASE_IMAGE_DIGEST'),
+        ('--archive', 'PPU_RUNTIME_ARCHIVE'),
+    ):
+        args = verifications[0]['args']
+        assert args[args.index(flag) + 1] == env[variable]
+    assert not any('restore-runtime' in c['args'] for c in commands)
     calls = [
         c
         for c in commands

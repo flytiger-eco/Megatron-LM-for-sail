@@ -1,6 +1,7 @@
-"""PPU PR."""
+"""SAIL PR admission and result binding; test selection rules live in ppu_policy."""
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -11,6 +12,14 @@ from pathlib import Path
 
 BRANCH = "refs/heads/main"
 STATUS_CONTEXT = "PPU PR Quick"
+
+
+_policy_spec = importlib.util.spec_from_file_location(
+    "ppu_policy", Path(__file__).with_name("ppu_policy.py")
+)
+policy = importlib.util.module_from_spec(_policy_spec)
+exec(compile(Path(_policy_spec.origin).read_bytes(), _policy_spec.origin, "exec"), policy.__dict__)
+SCOPE_LABELS = policy.SCOPE_LABELS
 
 
 def github_api(path: str, payload: dict | None = None) -> dict:
@@ -33,7 +42,7 @@ def full_sha(value: str) -> str:
     return value.lower()
 
 
-def docs_only(number: int, pr: dict, api=github_api) -> bool:
+def cpu_only(number: int, pr: dict, api=github_api) -> bool:
     count = pr.get("changed_files")
     if type(count) is not int or not 0 < count < 3000:
         return False
@@ -50,7 +59,7 @@ def docs_only(number: int, pr: dict, api=github_api) -> bool:
             paths = [row["filename"]]
             if row.get("status") == "renamed":
                 paths.append(row["previous_filename"])
-            if any(not (p.startswith("docs/") or p.endswith(".md")) for p in paths):
+            if any(not policy.cpu_only_path(p) for p in paths):
                 return False
     except (OSError, ValueError, KeyError, TypeError):
         return False
@@ -61,13 +70,68 @@ def snapshot(pr: dict) -> tuple:
     return full_sha(pr["head"]["sha"]), full_sha(pr["base"]["sha"])
 
 
+class StaleSnapshot(ValueError):
+    """The event no longer describes the current PR."""
+
+
+def scope_labels(pr: dict) -> list:
+    return sorted({label["name"] for label in pr.get("labels") or []} & set(SCOPE_LABELS))
+
+
+def pr_identity(pr: dict) -> tuple:
+    return (
+        *snapshot(pr),
+        pr["base"]["repo"]["full_name"],
+        pr["base"]["ref"],
+        (pr["head"].get("repo") or {}).get("full_name"),
+        pr["state"],
+        bool(pr.get("draft")),
+        tuple(scope_labels(pr)),
+    )
+
+
+def current_pr(pr: dict, authorization: dict, repository: str) -> bool:
+    return (
+        full_sha(pr["head"]["sha"]) == authorization["pr_head_sha"]
+        and pr["base"]["repo"]["full_name"] == repository
+        and pr["base"]["ref"] == authorization.get("base_ref", BRANCH).removeprefix("refs/heads/")
+        and bool(pr["head"].get("repo"))
+        and pr["head"]["repo"]["full_name"]
+        == authorization.get("head_repository", pr["head"]["repo"]["full_name"])
+        and scope_labels(pr) == authorization.get("labels", [])
+    )
+
+
+def current_base_sha(api, base_ref: str = BRANCH) -> str:
+    branch = policy.trusted_ref(base_ref).removeprefix("refs/heads/")
+    return full_sha(api(f"git/ref/heads/{branch}")["object"]["sha"])
+
+
+def base_is_current(base_sha: str, api, base_ref: str = BRANCH) -> bool:
+    return current_base_sha(api, base_ref) == base_sha
+
+
 def blocked(result: dict, decision: str, reason: str) -> dict:
     return {**result, "allowed": False, "decision": decision, "reason": reason}
 
 
 def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=time.sleep) -> dict:
     repository = context["repository"]
+    if context.get("artifact_prefix"):
+        raise ValueError("Artifact namespaces are reserved for the trusted sync handoff")
     event_name, ref = context["event_name"], context["ref"]
+    base_ref = (
+        f"refs/heads/{event['pull_request']['base']['ref']}"
+        if event_name == "pull_request_target"
+        else event.get("merge_group", {}).get("base_ref", ref)
+    )
+    if not (event_name == "push" and ref.startswith("refs/tags/v")):
+        policy.trusted_ref(base_ref)
+    test_kind = policy.validate_route(event_name, ref, inputs)
+    if test_kind == "functional":
+        policy.functional_request(inputs)
+        if full_sha(context["sha"]) != full_sha(context["control_sha"]):
+            raise ValueError("Functional dispatch must use the same trusted source/control commit")
     number = str(inputs.get("pr_number", ""))
     requested_sha, requested_base = inputs.get("pr_sha", ""), inputs.get("pr_base_sha", "")
     manual_pr = event_name == "workflow_dispatch" and bool(
@@ -86,16 +150,19 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
         "actor": context["actor"],
         "run_id": context["run_id"],
         "run_attempt": int(context["run_attempt"]),
+        "event_name": event_name,
+        "base_ref": base_ref,
+        "test_kind": test_kind,
     }
     if event_name == "workflow_dispatch":
-        expected_workflow = f"{repository}/.github/workflows/ppu-build.yml@{BRANCH}"
-        if ref != BRANCH or context["workflow_ref"] != expected_workflow:
-            raise ValueError("Authorization must originate from the trusted main branch")
+        expected_workflow = f"{repository}/.github/workflows/cicd-ppu.yml@{ref}"
+        if context["workflow_ref"] != expected_workflow:
+            raise ValueError("Authorization must originate from the trusted workflow branch")
         for actor in {context["actor"], context["triggering_actor"]}:
             if not re.fullmatch(r"[A-Za-z0-9_\[\]-]+", actor):
                 raise ValueError("Invalid actor")
             permission = api(f"collaborators/{actor}/permission")["permission"]
-            if permission not in ("write", "maintain", "admin"):
+            if permission not in policy.MANUAL_RUN_PERMISSIONS:
                 raise ValueError("The actor must have write/maintain/admin permission")
         if manual_pr:
             if str(context["run_attempt"]) != "1":
@@ -104,15 +171,18 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
                 )
             requested_sha, requested_base = full_sha(requested_sha), full_sha(requested_base)
     elif event_name == "pull_request_target":
-        if ref != BRANCH:
-            raise ValueError("Only PRs targeting the main branch are allowed")
+        expected_workflow = f"{repository}/.github/workflows/cicd-ppu.yml@{BRANCH}"
+        if ref != BRANCH or context["workflow_ref"] != expected_workflow:
+            raise ValueError("PR events must use the trusted default main workflow")
+        if str(context["run_attempt"]) != "1":
+            raise ValueError("PR runs cannot be rerun; use a new event or full-SHA dispatch")
         number = str(event["number"])
         requested_sha, requested_base = snapshot(event["pull_request"])
     elif event_name == "merge_group":
         group = event["merge_group"]
         if (
             event.get("action") != "checks_requested"
-            or group["base_ref"] != BRANCH
+            or group["base_ref"] != base_ref
             or event["repository"]["full_name"] != repository
             or group["head_ref"] != ref
             or not ref.startswith("refs/heads/gh-readonly-queue/")
@@ -122,25 +192,49 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
         if result["target_sha"] != full_sha(context["sha"]):
             raise ValueError("Merge queue SHA mismatch")
     elif event_name == "push":
-        if event.get("deleted") or not (ref == BRANCH or ref.startswith("refs/tags/v")):
+        if event.get("deleted") or not (ref in policy.REFS or ref.startswith("refs/tags/v")):
             raise ValueError("Unsupported push event")
     else:
         raise ValueError("Unsupported authorization event")
+    if event_name in ("push", "merge_group") and ref.startswith("refs/heads/"):
+        # Main pushes and merge queues pair UT with functional tests; release tags run UT only.
+        result.update(
+            test_kind="combined", labels=[], functional_policy=policy.event_policy(event_name)
+        )
 
     if not (manual_pr or event_name == "pull_request_target"):
         return result
     if not re.fullmatch(r"[1-9][0-9]{0,8}", number):
         raise ValueError("Invalid PR number")
     pr = api(f"pulls/{number}")
-    if pr["base"]["repo"]["full_name"] != repository or pr["base"]["ref"] != BRANCH.removeprefix(
+    if manual_pr:
+        base_ref = policy.trusted_ref(f"refs/heads/{pr['base']['ref']}")
+        result["base_ref"] = base_ref
+    if pr["base"]["repo"]["full_name"] != repository or pr["base"]["ref"] != base_ref.removeprefix(
         "refs/heads/"
     ):
-        raise ValueError("The PR must target this repository's main branch")
+        raise ValueError("The PR must target this repository's selected target branch")
     if not pr["head"].get("repo"):
         raise ValueError("The PR head repository does not exist")
-    if snapshot(pr) != (requested_sha, requested_base):
-        raise ValueError("PR head/base changed; revalidate the full snapshot")
-    result.update(pr_number=int(number), pr_head_sha=requested_sha, base_sha=requested_base)
+    if manual_pr:
+        if full_sha(pr["head"]["sha"]) != requested_sha or not base_is_current(
+            requested_base, api, result["base_ref"]
+        ):
+            raise StaleSnapshot("PR head/base changed; revalidate the full snapshot")
+    else:
+        if pr_identity(pr) != pr_identity(event["pull_request"]):
+            raise StaleSnapshot("PR identity or lifecycle state changed since the event")
+        requested_base = current_base_sha(api, base_ref)
+    labels = scope_labels(pr)
+    result.update(
+        pr_number=int(number),
+        pr_head_sha=requested_sha,
+        base_sha=requested_base,
+        head_repository=pr["head"]["repo"]["full_name"],
+        test_kind="combined",
+        labels=labels,
+        functional_policy=policy.event_policy("pr", labels),
+    )
     if pr["state"] != "open":
         if manual_pr:
             raise ValueError("The authorized PR must be open")
@@ -153,15 +247,34 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
         and "base" not in event.get("changes", {})
     ):
         return blocked(result, "ignore", "Title or body edits do not rerun tests")
-    only_docs = docs_only(int(number), pr, api)
+    if (
+        event_name == "pull_request_target"
+        and event.get("action") in ("labeled", "unlabeled")
+        and event.get("label", {}).get("name") not in SCOPE_LABELS
+    ):
+        return blocked(result, "ignore", "Labels outside the test scope do not rerun tests")
+    try:
+        return resolve_pr(result, pr, inputs, repository, api, sleep)
+    except StaleSnapshot:
+        raise
+    except (OSError, ValueError, KeyError, TypeError):
+        return blocked(
+            result, "preflight_error", "PR preflight failed; retry with a fresh snapshot"
+        )
+
+
+def resolve_pr(result: dict, pr: dict, inputs: dict, repository: str, api, sleep) -> dict:
+    number = result["pr_number"]
+    requested_sha, requested_base = result["pr_head_sha"], result["base_sha"]
+    only_docs = cpu_only(number, pr, api)
     checked = api(f"pulls/{number}")
-    if snapshot(checked) != snapshot(pr):
-        raise ValueError("PR snapshot changed during preflight")
-    if checked["state"] != "open" or checked.get("draft"):
-        return blocked(result, "changed", "PR state changed during preflight; revalidate")
-    if only_docs and inputs.get("scope", "auto") == "auto":
-        return blocked(result, "docs_only", "Docs-only changes; UT exempt under policy")
-    if pr["head"]["repo"]["full_name"] != repository and not manual_pr:
+    if pr_identity(checked) != pr_identity(pr) or not base_is_current(
+        requested_base, api, result["base_ref"]
+    ):
+        raise StaleSnapshot("PR snapshot changed during preflight")
+    if only_docs and inputs.get("scope", "auto") == "auto" and not result["labels"]:
+        return blocked(result, "cpu_only", "Docs/CI-only changes; UT and FT exempt under policy")
+    if pr["head"]["repo"]["full_name"] != repository and not result["manual_pr"]:
         return blocked(
             result,
             "authorization_required",
@@ -169,12 +282,10 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
         )
     for attempt in range(3):
         current = api(f"pulls/{number}")
-        if (
-            snapshot(current) != (requested_sha, requested_base)
-            or current["state"] != "open"
-            or current.get("draft")
+        if pr_identity(current) != pr_identity(pr) or not base_is_current(
+            requested_base, api, result["base_ref"]
         ):
-            raise ValueError("PR changed while resolving the synthetic merge commit")
+            raise StaleSnapshot("PR changed while resolving the synthetic merge commit")
         if current.get("mergeable") is False:
             return blocked(result, "conflict", "PR has merge conflicts; PPU not started")
         merge = current.get("merge_commit_sha")
@@ -187,12 +298,13 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
             if [full_sha(p["sha"]) for p in commit["parents"]] == [requested_base, requested_sha]:
                 checked = api(f"pulls/{number}")
                 if (
-                    snapshot(checked) != (requested_sha, requested_base)
-                    or checked["state"] != "open"
-                    or checked.get("draft")
+                    pr_identity(checked) != pr_identity(pr)
                     or checked.get("merge_commit_sha") != merge
+                    or not base_is_current(requested_base, api, result["base_ref"])
                 ):
-                    raise ValueError("PR changed during verification of the synthetic merge commit")
+                    raise StaleSnapshot(
+                        "PR changed during verification of the synthetic merge commit"
+                    )
                 result["target_sha"] = merge
                 return result
         if attempt < 2:
@@ -200,6 +312,72 @@ def authorize(event: dict, inputs: dict, context: dict, api=github_api, sleep=ti
     return blocked(
         result, "merge_unavailable", "Synthetic merge commit not ready; revalidate later"
     )
+
+
+def sync_is_current(request: dict, api=github_api) -> bool:
+    if (
+        full_sha(api(f"git/ref/heads/{request['source_ref']}")["object"]["sha"])
+        != request["target_sha"]
+    ):
+        return False
+    if request["source_ref"].startswith("sync/upstream-main/"):
+        return (
+            current_base_sha(api, f"refs/heads/{request['target_branch']}") == request["base_sha"]
+        )
+    return True
+
+
+def authorize_sync(request: dict, context: dict, api=github_api) -> dict:
+    """Accept only an explicit handoff from the trusted synchronization workflow."""
+    ref = context["ref"]
+    if ref != BRANCH or context["event_name"] not in ("schedule", "workflow_dispatch"):
+        raise ValueError("Sync handoff requires the trusted main workflow")
+    expected = f"{context['repository']}/.github/workflows/copilot-upstream-sync.yml@{ref}"
+    if context["workflow_ref"] != expected or full_sha(context["sha"]) != full_sha(
+        context["control_sha"]
+    ):
+        raise ValueError("Sync handoff did not originate in the trusted synchronization workflow")
+    if set(request) != {"target_branch", "source_ref", "base_sha", "upstream_sha", "target_sha"}:
+        raise ValueError("Unexpected sync handoff fields")
+    branch = request["target_branch"]
+    if branch not in ("main", "dev"):
+        raise ValueError("Sync target must be main or dev")
+    request = dict(request)
+    for key in ("base_sha", "upstream_sha", "target_sha"):
+        request[key] = full_sha(request[key])
+    if context.get("artifact_prefix") != f"sync-{branch}-":
+        raise ValueError("Sync handoff requires an isolated artifact namespace")
+    expected_source = "dev" if branch == "dev" else f"sync/upstream-main/{request['upstream_sha']}"
+    if request["source_ref"] != expected_source:
+        raise ValueError("Sync source is outside the permitted publication destination")
+    commit = api(f"git/commits/{request['target_sha']}")
+    if [full_sha(row["sha"]) for row in commit["parents"]] != [
+        request["base_sha"],
+        request["upstream_sha"],
+    ]:
+        raise ValueError("Published sync commit does not match the two-parent handoff")
+    if not sync_is_current(request, api):
+        raise StaleSnapshot("Published sync ref or base changed; PPU not started")
+    return {
+        "allowed": True,
+        "decision": "run",
+        "reason": "Published synchronization commit; awaiting UT and FT",
+        "target_sha": request["target_sha"],
+        "control_sha": full_sha(context["control_sha"]),
+        "pr_head_sha": "",
+        "base_sha": request["base_sha"],
+        "pr_number": 0,
+        "manual_pr": False,
+        "base_ref": f"refs/heads/{branch}",
+        "actor": context["actor"],
+        "run_id": context["run_id"],
+        "run_attempt": int(context["run_attempt"]),
+        "event_name": "push",
+        "test_kind": "combined",
+        "labels": [],
+        "sync_request": request,
+        "functional_policy": policy.event_policy("push"),
+    }
 
 
 def run_url(run_id: str) -> str:
@@ -217,67 +395,198 @@ def latest_status(sha: str, api=github_api) -> dict:
     raise ValueError("Status pagination limit exceeded; refusing to overwrite unknown status")
 
 
-def publish_status(authorization: dict, state: str, description: str, api=github_api) -> None:
-    number = authorization["pr_number"]
-    if not number or authorization.get("decision") == "ignore":
-        return
-    sha = full_sha(authorization["pr_head_sha"])
-    pr = api(f"pulls/{number}")
-    if (
-        snapshot(pr) != (sha, authorization["base_sha"])
-        or pr["base"]["ref"] != BRANCH.removeprefix("refs/heads/")
-        or pr["base"]["repo"]["full_name"] != os.environ["GITHUB_REPOSITORY"]
-    ):
-        return
-    if authorization["decision"] in ("run", "docs_only") and (
-        pr["state"] != "open" or pr.get("draft")
-    ):
-        return
+def status_description(reason: str, authorization: dict) -> str:
+    suffix = (
+        f" attempt={int(authorization.get('run_attempt', 1))}"
+        f" base={full_sha(authorization['base_sha'])}"
+    )
+    return reason[: 140 - len(suffix)] + suffix
+
+
+def initial_state(decision: str) -> str:
+    return {
+        "run": "pending",
+        "cpu_only": "success",
+        "draft": "pending",
+        "closed": "error",
+        "authorization_required": "pending",
+        "merge_unavailable": "pending",
+        "conflict": "failure",
+        "preflight_error": "error",
+    }[decision]
+
+
+def valid_lifecycle(pr: dict, decision: str) -> bool:
+    if decision == "closed":
+        return pr["state"] == "closed"
+    if decision == "draft":
+        return pr["state"] == "open" and bool(pr.get("draft"))
+    return pr["state"] == "open" and not pr.get("draft")
+
+
+def run_is_current(authorization: dict, api, cancelled: bool = False) -> bool:
     run = api(f"actions/runs/{authorization['run_id']}")
-    if (
-        run["status"] != "in_progress"
-        or run.get("conclusion") is not None
-        or run["run_attempt"] != authorization.get("run_attempt", 1)
-    ):
-        return
-    latest = latest_status(sha, api)
-    url = run_url(authorization["run_id"])
-    latest_url = latest.get("target_url", "") or ""
-    match = re.fullmatch(re.escape(run_url("")) + r"([0-9]+)", latest_url)
-    if match and int(match[1]) > int(authorization["run_id"]):
-        return
-    if state != "pending" and authorization["decision"] == "run" and latest_url != url:
-        return
-    checked = api(f"pulls/{number}")
-    if (
-        snapshot(checked) != snapshot(pr)
-        or checked["state"] != pr["state"]
-        or checked.get("draft") != pr.get("draft")
-        or checked["base"]["ref"] != pr["base"]["ref"]
-        or latest_status(sha, api) != latest
-    ):
-        return
-    api(
-        f"statuses/{sha}",
-        {
-            "state": state,
-            "context": STATUS_CONTEXT,
-            "description": description[:140],
-            "target_url": url,
-        },
+    active = run["status"] == "in_progress" and run.get("conclusion") is None
+    cancelled_run = run["status"] == "completed" and run.get("conclusion") == "cancelled"
+    return run["run_attempt"] == authorization.get("run_attempt", 1) and (
+        active or cancelled and cancelled_run
     )
 
 
-def invalidate_base(base_sha: str, api=github_api) -> None:
-    branch = BRANCH.removeprefix("refs/heads/")
+def status_owner(status: dict) -> tuple[int, int] | None:
+    match = re.fullmatch(re.escape(run_url("")) + r"([0-9]+)", status.get("target_url", "") or "")
+    if not match:
+        return None
+    attempt = re.search(r"(?:^| )attempt=([1-9][0-9]*)(?: |$)", status.get("description", ""))
+    return int(match[1]), int(attempt[1]) if attempt else 1
+
+
+def owns_pending(status: dict, authorization: dict) -> bool:
+    return (
+        status_owner(status) == (int(authorization["run_id"]), authorization.get("run_attempt", 1))
+        and status.get("state") == "pending"
+        and f"base={authorization['base_sha']}" in status.get("description", "").split()
+    )
+
+
+def publish_status(
+    authorization: dict, state: str, description: str, api=github_api, *, cancelled: bool = False
+) -> str:
+    number, decision = authorization["pr_number"], authorization.get("decision")
+    if authorization.get("test_kind", "unit") not in ("unit", "combined"):
+        return "rejected"
+    if not number or decision not in (
+        "run",
+        "cpu_only",
+        "draft",
+        "closed",
+        "authorization_required",
+        "merge_unavailable",
+        "conflict",
+        "preflight_error",
+    ):
+        return "rejected"
+    if state not in ("pending", "success", "failure", "error") or cancelled and state != "error":
+        return "rejected"
+    if decision != "run" and state != initial_state(decision):
+        return "rejected"
+    sha = full_sha(authorization["pr_head_sha"])
+    pr = api(f"pulls/{number}")
+    if (
+        not current_pr(pr, authorization, os.environ["GITHUB_REPOSITORY"])
+        or not valid_lifecycle(pr, decision)
+        or not base_is_current(
+            authorization["base_sha"], api, authorization.get("base_ref", BRANCH)
+        )
+    ):
+        return "stale"
+    if not run_is_current(authorization, api, cancelled):
+        return "stale"
+    latest = latest_status(sha, api)
+    owner = status_owner(latest)
+    identity = (int(authorization["run_id"]), authorization.get("run_attempt", 1))
+    if latest and (owner is None or owner > identity):
+        return "stale"
+    payload = {
+        "state": state,
+        "context": STATUS_CONTEXT,
+        "description": status_description(description, authorization),
+        "target_url": run_url(authorization["run_id"]),
+    }
+    if all(latest.get(key) == value for key, value in payload.items()):
+        return "published"
+    if decision == "run" and state != "pending" and not owns_pending(latest, authorization):
+        return "stale"
+    if owner == identity and latest.get("state") != "pending":
+        return "stale"
+    if decision == "run" and state == "success":
+        if (
+            pr.get("merge_commit_sha") != authorization["target_sha"]
+            or pr.get("mergeable") is not True
+        ):
+            return "stale"
+        commit = api(f"git/commits/{authorization['target_sha']}")
+        if [full_sha(parent["sha"]) for parent in commit["parents"]] != [
+            authorization["base_sha"],
+            sha,
+        ]:
+            return "stale"
+    checked = api(f"pulls/{number}")
+    if (
+        pr_identity(checked) != pr_identity(pr)
+        or (
+            decision == "run"
+            and state == "success"
+            and (
+                checked.get("merge_commit_sha") != authorization["target_sha"]
+                or checked.get("mergeable") is not True
+            )
+        )
+        or latest_status(sha, api) != latest
+        or not run_is_current(authorization, api, cancelled)
+        or not base_is_current(
+            authorization["base_sha"], api, authorization.get("base_ref", BRANCH)
+        )
+    ):
+        return "stale"
+    api(f"statuses/{sha}", payload)
+    return "published"
+
+
+def execution_guard(authorization: dict, api=github_api) -> bool:
+    if not authorization.get("allowed"):
+        return False
+    if not authorization["pr_number"]:
+        return not authorization.get("sync_request") or sync_is_current(
+            authorization["sync_request"], api
+        )
+    if (
+        int(os.environ["GITHUB_RUN_ID"]) != int(authorization["run_id"])
+        or int(os.environ["GITHUB_RUN_ATTEMPT"]) != authorization["run_attempt"]
+    ):
+        return False
+    pr = api(f"pulls/{authorization['pr_number']}")
+    if (
+        not current_pr(pr, authorization, os.environ["GITHUB_REPOSITORY"])
+        or not valid_lifecycle(pr, "run")
+        or not base_is_current(
+            authorization["base_sha"], api, authorization.get("base_ref", BRANCH)
+        )
+        or not run_is_current(authorization, api)
+        or not owns_pending(latest_status(authorization["pr_head_sha"], api), authorization)
+        or pr.get("mergeable") is not True
+        or pr.get("merge_commit_sha") != authorization["target_sha"]
+    ):
+        return False
+    commit = api(f"git/commits/{authorization['target_sha']}")
+    checked = api(f"pulls/{authorization['pr_number']}")
+    return (
+        [full_sha(parent["sha"]) for parent in commit["parents"]]
+        == [authorization["base_sha"], authorization["pr_head_sha"]]
+        and pr_identity(checked) == pr_identity(pr)
+        and checked.get("merge_commit_sha") == authorization["target_sha"]
+        and checked.get("mergeable") is True
+        and owns_pending(latest_status(authorization["pr_head_sha"], api), authorization)
+        and run_is_current(authorization, api)
+        and base_is_current(authorization["base_sha"], api, authorization.get("base_ref", BRANCH))
+    )
+
+
+def invalidate_base(base_sha: str, api=github_api, base_ref: str = BRANCH) -> None:
+    branch = policy.trusted_ref(base_ref).removeprefix("refs/heads/")
     if full_sha(api(f"git/ref/heads/{branch}")["object"]["sha"]) != base_sha:
         return
     for page in range(1, 101):
         rows = api(f"pulls?state=open&base={branch}&per_page=100&page={page}")
         for pull in rows:
             pr = api(f"pulls/{pull['number']}")
-            sha, current_base = snapshot(pr)
-            if pr["state"] != "open" or current_base != base_sha:
+            sha, _ = snapshot(pr)
+            if (
+                pr["state"] != "open"
+                or pr["base"]["ref"] != branch
+                or pr["base"]["repo"]["full_name"] != os.environ["GITHUB_REPOSITORY"]
+                or not pr["head"].get("repo")
+            ):
                 continue
             latest = latest_status(sha, api)
             match = re.fullmatch(
@@ -290,7 +599,7 @@ def invalidate_base(base_sha: str, api=github_api) -> None:
                 continue
             if (
                 full_sha(api(f"git/ref/heads/{branch}")["object"]["sha"]) != base_sha
-                or snapshot(api(f"pulls/{pull['number']}")) != (sha, base_sha)
+                or pr_identity(api(f"pulls/{pull['number']}")) != pr_identity(pr)
                 or latest_status(sha, api) != latest
             ):
                 continue
@@ -308,24 +617,74 @@ def invalidate_base(base_sha: str, api=github_api) -> None:
     raise ValueError("Open PR pagination limit exceeded")
 
 
+def preflight_summary(result: dict, inputs: dict) -> str:
+    """Expose the admission decision and immutable test identity in the Actions UI."""
+    rows = [("Decision", result["decision"]), ("Reason", result["reason"])]
+    rows += [
+        (key, result.get(key) or "—")
+        for key in (
+            "test_kind",
+            "base_ref",
+            "pr_number",
+            "control_sha",
+            "target_sha",
+            "pr_head_sha",
+            "base_sha",
+        )
+    ]
+    selection = (
+        policy.functional_request(inputs)
+        if result["test_kind"] == "functional"
+        else result.get("functional_policy")
+    )
+    if selection:
+        rows += [
+            ("FT scope", selection.get("functional_scope", selection.get("scope"))),
+            ("FT repeat / timeout (minutes)", f"{selection['repeat']} / {selection['timeout']}"),
+            (
+                "FT mode",
+                selection.get(
+                    "functional_mode", "lightweight" if selection["lightweight"] else "numeric"
+                ),
+            ),
+        ]
+    return "PPU preflight\n\n| Field | Value |\n|---|---|\n" + "".join(
+        f"| {key} | `{value}` |\n" for key, value in rows
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("authorize", "status", "invalidate-base"))
+    parser.add_argument("mode", choices=("authorize", "status", "invalidate-base", "guard"))
     parser.add_argument("--output", type=Path, default=Path(".ppu-ci"))
     parser.add_argument("--state", choices=("pending", "success", "failure", "error"))
     parser.add_argument("--description", default="PPU PR check")
+    parser.add_argument("--cancelled", action="store_true")
     args = parser.parse_args()
     path = args.output / "authorization.json"
     if args.mode == "invalidate-base":
-        invalidate_base(full_sha(os.environ["GITHUB_SHA"]), github_api)
+        invalidate_base(full_sha(os.environ["GITHUB_SHA"]), github_api, os.environ["GITHUB_REF"])
+        return
+    if args.mode == "guard":
+        if not execution_guard(json.loads(path.read_text()), github_api):
+            raise SystemExit("PR execution no longer owns the current snapshot; PPU not started")
         return
     if args.mode == "status":
         authorization = json.loads(path.read_text())
-        state = args.state or ("success" if authorization["decision"] == "docs_only" else "pending")
+        state = args.state or initial_state(authorization["decision"])
         description = args.description if args.state else authorization["reason"]
-        publish_status(
-            authorization, state, f"{description} base={authorization['base_sha']}", github_api
+        outcome = publish_status(
+            authorization, state, description, github_api, cancelled=args.cancelled
         )
+        print(f"PPU status: {outcome}")
+        if os.environ.get("GITHUB_OUTPUT"):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+                stream.write(f"status_result={outcome}\n")
+        if os.environ.get("GITHUB_STEP_SUMMARY"):
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
+                stream.write(f"PPU status: {outcome} ({state}) - {description}\n")
+        if outcome == "rejected":
+            raise SystemExit(1)
         return
     env_keys = {
         "repository": "GITHUB_REPOSITORY",
@@ -340,11 +699,15 @@ def main() -> None:
         "run_attempt": "GITHUB_RUN_ATTEMPT",
     }
     context = {key: os.environ[value] for key, value in env_keys.items()}
-    result = authorize(
-        json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text()),
-        json.loads(os.environ.get("PPU_INPUTS", "{}")),
-        context,
-    )
+    context["artifact_prefix"] = os.environ.get("PPU_ARTIFACT_PREFIX", "")
+    sync_request = os.environ.get("PPU_SYNC_REQUEST", "")
+    inputs = json.loads(os.environ.get("PPU_INPUTS", "{}"))
+    if sync_request:
+        result = authorize_sync(json.loads(sync_request), context)
+    else:
+        result = authorize(
+            json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text()), inputs, context
+        )
     args.output.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     if os.environ.get("GITHUB_OUTPUT"):
@@ -356,13 +719,14 @@ def main() -> None:
                 "pr_number",
                 "manual_pr",
                 "decision",
+                "test_kind",
             ):
                 value = result[key]
                 stream.write(f"{key}={str(value).lower() if isinstance(value, bool) else value}\n")
     print(json.dumps(result, ensure_ascii=False))
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
-            stream.write(f"PPU preflight: {result['decision']} - {result['reason']}\n")
+            stream.write(preflight_summary(result, inputs))
 
 
 if __name__ == "__main__":

@@ -56,3 +56,43 @@ jobs:
       upstream_branch: dev
       tracking_issue: '17'
       publish: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish)) }}
+
+  test-main:
+    needs: main
+    if: needs.main.outputs.sync_request != ''
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      statuses: write
+      packages: write
+    uses: ./.github/workflows/cicd-ppu.yml
+    with:
+      artifact_prefix: sync-main-
+      sync_request: ${{ needs.main.outputs.sync_request }}
+    secrets:
+      PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+      PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+      PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+      PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+      PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
+
+  test-dev:
+    needs: dev
+    if: needs.dev.outputs.sync_request != ''
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      statuses: write
+      packages: write
+    uses: ./.github/workflows/cicd-ppu.yml
+    with:
+      artifact_prefix: sync-dev-
+      sync_request: ${{ needs.dev.outputs.sync_request }}
+    secrets:
+      PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+      PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+      PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+      PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+      PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
