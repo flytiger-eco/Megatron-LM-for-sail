@@ -120,3 +120,37 @@ CPU 回归、assets 成功和镜像缓存命中都不代表训练精度或性能
 失败先按 authorize / configure / assets / runtime-environment / UT / FT 定位；保留日志与对应 SHA。
 仅已识别的基础设施故障允许在 case 剩余预算内重试；数值失败不靠重试或修改 golden 消除。
 历史调试记录查 Git 历史和 Actions，不在这份维护说明中累积运行日志。
+
+
+## 训练镜像构建与 FT
+
+`release-docker-ppu-nightly.yml` 将训练镜像的构建、发布和设备验收串联起来。
+每天 UTC 16:00 构建 `core_r0.19.0` 的 SDK 2.2.1 / PyTorch 2.13 镜像；也可以手动选择
+SDK 2.2.0 或 2.2.1，以及本仓库的分支或 commit。目标版本需要包含对应的
+`docker/Dockerfile.sdk.<版本>-ppu`（由 PR #37 提供）。
+
+流程先发布带完整源码 SHA、run ID 和 attempt 的 `candidate-...` 标签，再按发布返回的
+**同一个 image digest** 申请 8 张 M890P，运行一次 50 步标准 GPT FT：
+`gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files`。保留分布式优化器、checkpoint 保存、
+TensorBoard 提取和原始 pytest 的 `lm loss` / `num-zeros` 数值比较；这是一项镜像验收用例，
+不是全部 L0/L1 FT。配置必须与可信控制版本的 M890 golden 配套，差异会在构建前报错。
+该用例申请 64 核 CPU、256 GiB 主机内存和 64 GiB 共享内存；8 张 PPU 必须在同一节点可用。
+
+测试使用镜像内的训练入口和已安装的 Megatron wheel，不覆盖训练代码或安装另一套 native 依赖。
+只在临时、继承镜像依赖的 venv 中安装 pytest/uv 等测试工具，并复用现有共享数据、固定 tokenizer
+缓存与 `sail-ppu-hardware` 调度队列。训练未完成、pytest 跳过/失败、结果缺失均使流程失败。
+日志、实际指标和镜像版本报告经现有脱敏导出器处理后上传，checkpoint 留在共享存储。
+
+镜像仓库仍是 `ghcr.io/flytiger-eco/megatron-lm-ppu-nightly`：
+
+- `candidate-sdk<版本>-<完整SHA>-<run_id>-<attempt>`：已构建的候选，可能未通过 FT。
+- `core_r0.19.0-sdk<版本>`：通过 FT 后更新的滚动标签。
+- `nightly`：通过 FT 的 SDK 2.2.1 默认镜像。
+
+手动入口的 `push=true` 会发布候选并执行 FT，`push=false` 仅构建。
+`promote` 默认关闭；只有从默认分支运行 workflow、以 `core_r0.19.0` 为源码且 FT 成功时，
+才允许手动更新滚动标签。定时运行自动执行这一步。FT 失败保留候选供排查，不更新滚动标签。
+
+```bash
+gh workflow run release-docker-ppu-nightly.yml   --repo flytiger-eco/Megatron-LM-for-sail --ref main   -f source_ref=core_r0.19.0 -f sdk=2.2.1 -f push=true -f promote=true
+```

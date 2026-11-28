@@ -9,6 +9,7 @@ on:
       - '.github/docker/**'
       - '.github/actions/ppu-build-cache/**'
       - '.github/workflows/cicd-ppu.yml'
+      - '.github/workflows/release-docker-ppu-nightly.yml'
       - '.github/workflows/ppu-*.yml'
       - '.github/workflows/copilot-upstream-sync*.yml'
       - '.github/ppu-*.json'

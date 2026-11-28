@@ -1,78 +1,240 @@
-name: Release Docker Images Nightly (PPU)
+name: Release and Validate PPU Training Image
 
 on:
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: 'Same-repository source branch or commit to build (Dockerfiles from PR #37 are required)'
+        type: string
+        default: core_r0.19.0
+      sdk:
+        description: 'PPU SDK / PyTorch 2.13 image'
+        type: choice
+        options: ['2.2.1', '2.2.0']
+        default: '2.2.1'
       push:
-        description: 'Push the built images to GitHub Packages (ghcr.io); disable for a build-only dry run'
-        required: false
+        description: 'Publish a candidate and run the 8-PPU, 50-step GPT FT; false builds only'
         type: boolean
         default: true
+      promote:
+        description: 'After FT passes, update the SDK rolling tag (default-branch workflow and release source only)'
+        type: boolean
+        default: false
   schedule:
     - cron: '0 16 * * *'
 
-concurrency:
-  group: ${{ github.workflow }}-core_r0.19.0
-  cancel-in-progress: true
-
 permissions:
   contents: read
-  packages: write
+defaults:
+  run:
+    shell: bash
+concurrency:
+  group: ppu-image-${{ inputs.sdk || '2.2.1' }}
+  cancel-in-progress: false
 
 env:
-  SOURCE_BRANCH: core_r0.19.0
+  SOURCE_REF: ${{ inputs.source_ref || 'core_r0.19.0' }}
+  PPU_SDK: ${{ inputs.sdk || '2.2.1' }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
+      sha: ${{ steps.meta.outputs.sha }}
+      digest: ${{ steps.build.outputs.digest }}
+      control_image: ${{ steps.meta.outputs.control_image }}@${{ steps.control.outputs.digest }}
     steps:
-      - name: Checkout source branch
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          ref: ${{ env.SOURCE_BRANCH }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Compute image metadata
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare unchanged upstream FT and trusted M890 reference
+        run: |
+          set -euo pipefail
+          python -m pip install pyyaml==6.0.3
+          python control/.github/scripts/ppu_image_ci.py prepare \
+            --source source --control control --root image-ft --sdk "$PPU_SDK" \
+            --target-sha "$(git -C source rev-parse HEAD)" --control-sha "$(git -C control rev-parse HEAD)"
+          python -m pip download --only-binary=:all: --no-deps -d image-ft/wheels \
+            pytest==8.4.2 iniconfig==2.3.0 pluggy==1.6.0 pygments==2.19.2 uv==0.13.0
+          curl --fail --location --retry 3 --max-time 120 \
+            https://github.com/mikefarah/yq/releases/download/v4.47.2/yq_linux_amd64 -o image-ft/yq
+          echo '1bb99e1019e23de33c7e6afc23e93dad72aad6cf2cb03c797f068ea79814ddb0  image-ft/yq' | sha256sum --check
+      - name: Compute immutable candidate tag
         id: meta
         run: |
           set -euo pipefail
+          sha=$(git -C source rev-parse HEAD)
           owner_lc=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
-          date_tag=$(date -u +%Y%m%d)
-          short_sha=$(git rev-parse --short=7 HEAD)
-          branch=$(printf '%s' "$SOURCE_BRANCH" | sed 's|/|-|g; s/[^A-Za-z0-9._-]/-/g')
-          echo "image=ghcr.io/${owner_lc}/megatron-lm-ppu-nightly" >> "$GITHUB_OUTPUT"
-          echo "tag=${branch}-${date_tag}-cuda13.0.0-sdk2.2.0-${short_sha}" >> "$GITHUB_OUTPUT"
-          echo "rolling=nightly" >> "$GITHUB_OUTPUT"
-
-      - name: Log in to GitHub Packages
-        if: ${{ inputs.push || github.event_name != 'workflow_dispatch' }}
-        uses: docker/login-action@v3
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$owner_lc/megatron-lm-ppu-nightly" >> "$GITHUB_OUTPUT"
+          echo "control_image=ghcr.io/$owner_lc/megatron-lm-for-sail/ppu-ci-control" >> "$GITHUB_OUTPUT"
+          echo "tag=candidate-sdk${PPU_SDK}-${sha}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+      - name: Free space for native training dependencies
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: ${{ inputs.push || github.event_name == 'schedule' }}
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push image
+      - name: Build the existing CPU control image
+        id: control
+        if: ${{ inputs.push || github.event_name == 'schedule' }}
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: docker/Dockerfile.ppu
+          context: control/.github/docker
+          file: control/.github/docker/Dockerfile.ppu-control
           platforms: linux/amd64
-          push: ${{ inputs.push || github.event_name != 'workflow_dispatch' }}
+          push: true
+          tags: ${{ steps.meta.outputs.control_image }}:image-${{ github.run_id }}-${{ github.run_attempt }}
+          cache-from: type=gha,scope=ppu-control
+          cache-to: type=gha,mode=max,scope=ppu-control
+      - name: Build and publish candidate
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: source
+          file: source/docker/Dockerfile.sdk.${{ env.PPU_SDK }}-ppu
+          platforms: linux/amd64
+          push: ${{ inputs.push || github.event_name == 'schedule' }}
           provenance: false
-          tags: |
-            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
-            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.rolling }}
-          build-args: |
-            MEGATRON_REPO=${{ github.server_url }}/${{ github.repository }}.git
-            MEGATRON_BRANCH=${{ env.SOURCE_BRANCH }}
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.sha }}
+          cache-from: type=gha,scope=ppu-image-${{ env.PPU_SDK }}
+          cache-to: type=gha,mode=max,scope=ppu-image-${{ env.PPU_SDK }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppu-image-ft-inputs
+          path: image-ft/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Record candidate
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: printf 'Built `%s:%s`\n\nDigest `%s`\n' "$IMAGE" "$TAG" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Write image address to job summary
+  functional:
+    needs: build
+    if: ${{ inputs.push || github.event_name == 'schedule' }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    environment: ppu-ci
+    container:
+      image: ${{ needs.build.outputs.control_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+    timeout-minutes: 120
+    concurrency:
+      group: sail-ppu-hardware
+      queue: max
+    permissions:
+      contents: read
+      packages: read
+    env:
+      PPU_HOST_VOLUMES: ${{ secrets.PPU_HOST_VOLUMES }}
+      PPU_CPU_RUN_ROOT: ${{ secrets.PPU_CPU_RUN_ROOT }}
+      PPU_POD_RUN_ROOT: ${{ secrets.PPU_POD_RUN_ROOT }}
+      PPU_CPU_ASSETS_ROOT: ${{ secrets.PPU_CPU_ASSETS_ROOT }}
+      PPU_POD_ASSETS_ROOT: ${{ secrets.PPU_POD_ASSETS_ROOT }}
+      PPU_IMAGE_DIGEST: ${{ needs.build.outputs.image }}@${{ needs.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-image-ft-inputs
+          path: image-ft
+      - name: Check shared data and pinned tokenizer before reserving PPU
         run: |
-          printf 'PPU image: `%s:%s` (rolling `%s:%s`)\n' \
-            "${{ steps.meta.outputs.image }}" "${{ steps.meta.outputs.tag }}" \
-            "${{ steps.meta.outputs.image }}" "${{ steps.meta.outputs.rolling }}" \
-            | tee -a "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          python3 -I .github/scripts/ppu_ci_paths.py functional
+          python3 image-ft/control/ppu_image_ci.py assets --root image-ft --data "$PPU_CPU_ASSETS_ROOT"
+      - name: Run FT in the published image
+        id: ppu
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          image: ${{ env.PPU_IMAGE_DIGEST }}
+          nnodes: 0
+          nproc_per_node: 8
+          namespace: ${{ vars.PPU_NAMESPACE || 'ppu-sched' }}
+          node_selector: board-type=ZW-M890P
+          source_dir: /opt/ppu-image-test
+          artifact_paths: image-ft
+          host_volumes: ${{ secrets.PPU_HOST_VOLUMES }}
+          timeout_minutes: 100
+          cleanup_policy: always
+          dmesg_policy: on_failure
+          container_options: |
+            shm_size: "64Gi"
+            cpus: 64
+            memory: "256Gi"
+          extra_env: PPU_IMAGE_DIGEST=${{ env.PPU_IMAGE_DIGEST }},PPU_CPU_RUN_ROOT=${{ secrets.PPU_CPU_RUN_ROOT }},PPU_POD_RUN_ROOT=${{ secrets.PPU_POD_RUN_ROOT }},PPU_CPU_ASSETS_ROOT=${{ secrets.PPU_CPU_ASSETS_ROOT }},PPU_POD_ASSETS_ROOT=${{ secrets.PPU_POD_ASSETS_ROOT }},PPU_RESULTS_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/image-${{ github.run_id }}-${{ github.run_attempt }}
+          command: bash /opt/ppu-image-test/image-ft/control/ppu_image_ft.sh /opt/ppu-image-test/image-ft
+      - name: Require successful execution and numerical evidence
+        env:
+          ACTION_STATUS: ${{ steps.ppu.outputs.job_status }}
+        run: |
+          set -euo pipefail
+          [[ "$ACTION_STATUS" == succeeded ]]
+          python3 image-ft/control/ppu_image_ci.py check --root image-ft \
+            --result "$PPU_CPU_RUN_ROOT/image-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - name: Upload FT reports and logs
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-image-ft-results
+          path: ${{ secrets.PPU_CPU_RUN_ROOT }}/image-${{ github.run_id }}-${{ github.run_attempt }}-public/
+          if-no-files-found: error
+          retention-days: 7
+
+  promote:
+    needs: [build, functional]
+    if: >-
+      ${{ (github.event_name == 'schedule' || inputs.promote) &&
+          github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+          (inputs.source_ref == 'core_r0.19.0' || github.event_name == 'schedule') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote exactly the digest that passed FT
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --prefer-index=false \
+            --tag "$IMAGE:core_r0.19.0-sdk$PPU_SDK" "$IMAGE@$DIGEST"
+          if [[ "$PPU_SDK" == 2.2.1 ]]; then
+            docker buildx imagetools create --prefer-index=false --tag "$IMAGE:nightly" "$IMAGE@$DIGEST"
+          fi
+          printf 'FT passed. Published `%s:core_r0.19.0-sdk%s` from `%s`.\n' "$IMAGE" "$PPU_SDK" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
