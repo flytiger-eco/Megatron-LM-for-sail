@@ -152,3 +152,41 @@ UT / FT. Retain logs and the corresponding SHA. Retry only identified infrastruc
 failures within the remaining case budget; do not hide numerical failures with
 retries or golden changes. Keep historical debugging records in Git and Actions
 rather than accumulating run logs in this maintenance guide.
+
+
+## Training image build and functional acceptance
+
+`release-docker-ppu-nightly.yml` connects image builds, publication, and device acceptance.
+At 16:00 UTC daily it builds SDK 2.2.1 / PyTorch 2.13 from `core_r0.19.0`. Manual dispatch
+also supports SDK 2.2.0 and a same-repository source branch or commit. The source must
+contain `docker/Dockerfile.sdk.<version>-ppu` from PR #37.
+
+The workflow publishes a `candidate-...` tag containing the complete source SHA, run ID,
+and attempt, then runs **that exact published image digest** on eight M890P devices.
+Acceptance runs the full 50-step `gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files`
+GPT case once, retaining its distributed optimizer, checkpoint save, TensorBoard extraction,
+and upstream pytest comparisons of `lm loss` and `num-zeros`. This is one image acceptance
+case, not the entire L0/L1 suite. The source configuration must match the trusted control
+revision's M890 reference; incompatible configurations fail before the image build.
+
+Training uses the image's entry points and installed Megatron wheel. The workflow does not
+overlay training source or replace native dependencies. Only test tools such as pytest/uv
+are installed into a temporary venv inheriting the image packages. It reuses existing shared
+data, pinned tokenizer caches, and the `sail-ppu-hardware` execution queue. Incomplete training,
+skipped/failed pytest checks, and missing evidence fail acceptance. Reports and logs pass
+through the existing redaction exporter; checkpoints remain on shared storage.
+
+The registry remains `ghcr.io/flytiger-eco/megatron-lm-ppu-nightly`:
+
+- `candidate-sdk<version>-<full-SHA>-<run_id>-<attempt>`: built candidate, possibly not yet accepted.
+- `core_r0.19.0-sdk<version>`: rolling tag updated only after successful FT.
+- `nightly`: accepted SDK 2.2.1 default image.
+
+Manual `push=true` publishes a candidate and runs FT; `push=false` builds only.
+`promote` defaults to false. Manual promotion requires the workflow to run from the default
+branch with `source_ref=core_r0.19.0` and successful FT. Scheduled runs promote automatically.
+Failed FT leaves the candidate available for diagnosis without changing rolling tags.
+
+```bash
+gh workflow run release-docker-ppu-nightly.yml   --repo flytiger-eco/Megatron-LM-for-sail --ref main   -f source_ref=core_r0.19.0 -f sdk=2.2.1 -f push=true -f promote=true
+```
