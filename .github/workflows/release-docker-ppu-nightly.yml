@@ -25,6 +25,9 @@ on:
 
 permissions:
   contents: read
+defaults:
+  run:
+    shell: bash
 concurrency:
   group: ppu-image-${{ inputs.sdk || '2.2.1' }}
   cancel-in-progress: false
@@ -45,6 +48,7 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
       sha: ${{ steps.meta.outputs.sha }}
       digest: ${{ steps.build.outputs.digest }}
+      control_image: ${{ steps.meta.outputs.control_image }}@${{ steps.control.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -78,6 +82,7 @@ jobs:
           owner_lc=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/$owner_lc/megatron-lm-ppu-nightly" >> "$GITHUB_OUTPUT"
+          echo "control_image=ghcr.io/$owner_lc/megatron-lm-for-sail/ppu-ci-control" >> "$GITHUB_OUTPUT"
           echo "tag=candidate-sdk${PPU_SDK}-${sha}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
       - name: Free space for native training dependencies
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
@@ -88,6 +93,18 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the existing CPU control image
+        id: control
+        if: ${{ inputs.push || github.event_name == 'schedule' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: control/.github/docker
+          file: control/.github/docker/Dockerfile.ppu-control
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.control_image }}:image-${{ github.run_id }}-${{ github.run_attempt }}
+          cache-from: type=gha,scope=ppu-control
+          cache-to: type=gha,mode=max,scope=ppu-control
       - name: Build and publish candidate
         id: build
         uses: docker/build-push-action@v6
@@ -121,6 +138,11 @@ jobs:
     if: ${{ inputs.push || github.event_name == 'schedule' }}
     runs-on: k8s-runner-group-cpu-flytiger
     environment: ppu-ci
+    container:
+      image: ${{ needs.build.outputs.control_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
     timeout-minutes: 120
     concurrency:
       group: sail-ppu-hardware
