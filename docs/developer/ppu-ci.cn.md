@@ -134,6 +134,7 @@ SDK 2.2.0 或 2.2.1，以及本仓库的分支或 commit。目标版本需要包
 `gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files`。保留分布式优化器、checkpoint 保存、
 TensorBoard 提取和原始 pytest 的 `lm loss` / `num-zeros` 数值比较；这是一项镜像验收用例，
 不是全部 L0/L1 FT。配置必须与可信控制版本的 M890 golden 配套，差异会在构建前报错。
+该用例申请 64 核 CPU、256 GiB 主机内存和 64 GiB 共享内存；8 张 PPU 必须在同一节点可用。
 
 测试使用镜像内的训练入口和已安装的 Megatron wheel，不覆盖训练代码或安装另一套 native 依赖。
 只在临时、继承镜像依赖的 venv 中安装 pytest/uv 等测试工具，并复用现有共享数据、固定 tokenizer

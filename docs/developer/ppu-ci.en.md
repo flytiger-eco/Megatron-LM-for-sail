@@ -168,6 +168,8 @@ GPT case once, retaining its distributed optimizer, checkpoint save, TensorBoard
 and upstream pytest comparisons of `lm loss` and `num-zeros`. This is one image acceptance
 case, not the entire L0/L1 suite. The source configuration must match the trusted control
 revision's M890 reference; incompatible configurations fail before the image build.
+The case requests 64 CPUs, 256 GiB of host memory, and 64 GiB of shared memory;
+all eight PPUs must be available on the same node.
 
 Training uses the image's entry points and installed Megatron wheel. The workflow does not
 overlay training source or replace native dependencies. Only test tools such as pytest/uv

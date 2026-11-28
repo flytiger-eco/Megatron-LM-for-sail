@@ -188,6 +188,8 @@ jobs:
           dmesg_policy: on_failure
           container_options: |
             shm_size: "64Gi"
+            cpus: 64
+            memory: "256Gi"
           extra_env: PPU_IMAGE_DIGEST=${{ env.PPU_IMAGE_DIGEST }},PPU_CPU_RUN_ROOT=${{ secrets.PPU_CPU_RUN_ROOT }},PPU_POD_RUN_ROOT=${{ secrets.PPU_POD_RUN_ROOT }},PPU_CPU_ASSETS_ROOT=${{ secrets.PPU_CPU_ASSETS_ROOT }},PPU_POD_ASSETS_ROOT=${{ secrets.PPU_POD_ASSETS_ROOT }},PPU_RESULTS_DIR=${{ secrets.PPU_POD_RUN_ROOT }}/image-${{ github.run_id }}-${{ github.run_attempt }}
           command: bash /opt/ppu-image-test/image-ft/control/ppu_image_ft.sh /opt/ppu-image-test/image-ft
       - name: Require successful execution and numerical evidence
